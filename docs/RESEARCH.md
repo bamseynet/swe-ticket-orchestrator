@@ -290,6 +290,7 @@ could complete a gate.
 | Browser host allowlisting, including redirects | Managed Chromium policies exist, and are fixed at `CreateBrowser` [S70]. Whether `URLAllowlist` needs `URLBlocklist: ["*"]`, and stops every redirect and fetch, is our knowledge, **unverified** | D8-03, D12-09 |
 | A reused Cognito session cookie gives new tokens with no federated sign-in, and what `auth_time` holds then | **Unverified** | D12-10 |
 | A blank attribute from the Inbound federation trigger clears the stored value | The mapping page says a blank source value does [S66], **not tested** | D12-10 |
+| A branch matching an Environment's deployment rule gets its secrets | Inference from the docs [S77], **not tested** | D4-23 |
 | `POST /merges` on a fork reaching upstream commits, and promoting a fork SHA upstream | **Unverified** | D4-23 |
 | Enqueueing a merge queue entry through the API | **Unverified** | D4-12 |
 | App permission set beyond checks | Our knowledge of GitHub Apps, not checked on docs | D4-02, D4-15 |
@@ -384,4 +385,5 @@ could complete a gate.
 - [S74] [Cognito: Inbound federation trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-inbound-federation.html)
 - [S75] [GitHub: events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows), [triggering a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
 - [S76] [GitHub: REST Actions permissions](https://docs.github.com/en/rest/actions/permissions?apiVersion=2022-11-28)
+- [S77] [GitHub: workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax), [deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 - [S59] [GitHub: troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)

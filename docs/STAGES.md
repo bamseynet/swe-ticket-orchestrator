@@ -170,7 +170,7 @@ It uses stable `aws-cdk-lib` constructs and needs no account to synth.
 #### D0-05: First CI and ruleset
 One workflow with lint, typecheck and unit jobs, a filter job, and an always-running `ci-required` aggregator as the only required check, enforced by a ruleset on `main`.
 This lands straight after the skeleton, so everything later is covered. Other jobs join it in D0-03, D0-04, D0-08 and D0-09.
-**AC:** a failing job fails `ci-required`; a direct push to `main` is refused; a docs-only PR passes without running tests; a change to shared code, CI or lockfiles runs everything; pushes to `main` run everything; forks get no secrets.
+**AC:** workers use a separate bot account or GitHub App with no admin rights and no ruleset bypass, set up by Peter, and Peter's account keeps overrides; a failing job fails `ci-required`; a direct push to `main` is refused; a docs-only PR passes without running tests; a change to shared code, CI or lockfiles runs everything; pushes to `main` run everything; forks get no secrets.
 **Deps:** D0-01. **Size:** M. **Run:** serial. **Files:** `.github/workflows/ci.yml`, `deploy/ruleset-main.json`.
 
 #### D0-06: Contribution rules
@@ -200,7 +200,7 @@ They start with smoke tests, so issues in later stages have somewhere to put hea
 #### D0-10: Declared-files check
 A CI job reads a PR's issue ID, and compares touched files with that issue's `Files` here, plus an allow-list of lockfiles, `pyproject.toml`, `Makefile`, `web/package.json` and docs. It feeds `ci-required`.
 This is what keeps "parallel" honest, because file lists were the weak point of the first plan.
-**AC:** an undeclared file fails with a message naming the issue; an override needs a label set by a human reviewer, and a worker's own label is ignored; touching a serial area needs that issue to be marked serial.
+**AC:** an undeclared file fails with a message naming the issue; an override needs a label whose event actor is on a named list of humans, and a worker's own label is ignored; touching a serial area needs that issue to be marked serial.
 **Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `scripts/check_scope.py`, `tests/scripts/test_check_scope.py`, `.github/workflows/ci.yml`.
 
 ---
@@ -323,8 +323,10 @@ Property tests pass over all templates, with crash injection.
 | 2 | D2-18, D2-24 | - |
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
-| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-14, D2-15, D2-16, D2-17, D2-21 | - |
-| 6 | D2-09, D2-19, D2-20, D2-23, D2-25 | - |
+| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21 | - |
+| 6 | D2-09, D2-19, D2-23, D2-25 | - |
+| 7 | D2-14, D2-15 | - |
+| 8 | D2-20 | - |
 
 #### D2-01: Workflow schema
 Typed models for the whole schema in PLAN.md section 7.2, generating a JSON Schema for editors.
@@ -414,13 +416,13 @@ No compute is held while waiting, and `team_default` resolving to no checks bloc
 `sto validate` and `sto dry-run` walk a workflow with the fake LLM and print the path taken.
 A team can try any outcome without touching anything real.
 **AC:** a chosen outcome sequence is scriptable; no real writes occur (asserted by spy); output is usable in CI.
-**Deps:** D2-06, D2-02. **Size:** M. **Run:** parallel. **Files:** `src/sto/cli/`, `tests/cli/`.
+**Deps:** D2-06, D2-02, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `src/sto/cli/`, `tests/cli/`.
 
 #### D2-15: Property and crash tests
 Hypothesis generates valid workflows and event sequences, and a crash is injected at every commit.
 Invariants: terminates or waits, never runs gated effects unapproved, never loses a decision.
 **AC:** R3 and the store-level part of G6 pass; a seed is printed on failure; runs under a fixed time budget in CI.
-**Deps:** D2-06, D2-05. **Size:** M. **Run:** parallel. **Files:** `tests/engine/test_properties.py`, `tests/gates/test_crash.py`.
+**Deps:** D2-06, D2-05, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `tests/engine/test_properties.py`, `tests/gates/test_crash.py`.
 
 #### D2-16: Definition of done checks
 Machine-evaluated conditions from config, evaluated **before a gate opens** or before a stage exits, blocking with a clear reason.
@@ -460,8 +462,8 @@ This settles the rule that D2-08 and D2-21 both depend on.
 
 #### D2-23: Route stages
 A `route` stage picks an edge from a closed vocabulary, with no expressions, and a required `default`. Ticket-field inputs are frozen at intake, with a ratchet: raises apply, and lowering needs a named role, whose audited actor becomes ineligible for that run's gates.
-A routed gate once visited stays required, and the validator treats every edge as possible, so proofs still hold.
-**AC:** G21: risk lowered before the route runs, and between rounds, does not skip the gate; unknown values take `default`; route inputs are part of `ticket_revision`; `repo_ci_trust` is evaluated fresh each pass.
+A gate reached by a ticket-field route stays required once visited, and the validator treats every edge as possible, so proofs still hold.
+**AC:** G21: risk lowered before the route runs, and between rounds, does not skip the gate; on a route with `order`, a value outside it goes to `BLOCKED` with a reason and never takes `default`; route inputs are part of `ticket_revision`; `repo_ci_trust` is evaluated fresh each pass.
 **Deps:** D2-06, D2-08, D2-17. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/route.py`, `tests/engine/test_route.py`.
 
 #### D2-24: Team and org documents
@@ -637,11 +639,12 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 | 3 | D4-02, D4-04, D4-19, D4-20 | - |
 | 4 | D4-05, D4-06, D4-10 | D4-24 |
 | 5 | D4-07, D4-09, D4-13, D4-17, D4-25 | - |
-| 6 | D4-08, D4-26 | D4-11 |
-| 7 | - | D4-15, D4-21 |
+| 6 | D4-08 | D4-11 |
+| 7 | - | D4-21 |
 | 8 | D4-12, D4-14, D4-22 | - |
-| 9 | D4-28 | - |
-| 10 | - | D4-23 |
+| 9 | D4-26, D4-28 | - |
+| 10 | - | D4-15 |
+| 11 | - | D4-23 |
 
 #### D4-01: Conformance suite
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
@@ -735,14 +738,14 @@ The revert goes through normal review, and the run ends `done_with_incident`.
 
 #### D4-15: Live GitHub conformance
 Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** before a human approves it.
-It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow.
+It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow. The worker identity is not on that reviewer list.
 **AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself.
 **Deps:** D4-24, D4-05, D4-08, D4-26, D4-27. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
 
 #### D4-17: CI trust report
 Report a repo's `ci_trust`, which can only be `attested` or `unknown`, re-checked per round and expiring after 90 days. It reads secrets, Environment rules and `default_workflow_permissions`, scans workflow files for `pull_request_target` and `workflow_run`, and records a named human's statements on CI systems and OIDC trust.
 Anything it cannot prove stays `unknown`, because attestation fails closed. Fork mode is never `attested` here until D4-28 and D4-23 pass.
-**AC:** each condition in PLAN.md section 12's table flips `attested` to `unknown` in a test; a repo with a repo-level secret, a read-write default token, or a `pull_request_target` workflow is `unknown`; the human statements are audited, with name and date.
+**AC:** each condition in PLAN.md section 12's table flips `attested` to `unknown` in a test; a repo with a repo-level secret, a read-write default token, a `pull_request_target` workflow, a workflow on `sto/*` declaring write `permissions` or `id-token: write`, or no ruleset on `sto-approved/*` and `sto-revert/*` is `unknown`; the human statements are audited, with name and date.
 **Deps:** D4-06, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/ci_trust.py`, `tests/adapters/github/test_ci_trust.py`.
 
 #### D4-19: Fake GitHub: PRs and merges
@@ -790,8 +793,8 @@ Unknown owners or no owner for a path fail closed.
 #### D4-26: Pre-push gate
 The `exposing` class for `branch.push`, V16, and a `pre_push` gate holding the patch in S3, with no branch or PR until a person approves, on every round. It is not a review, and its rules are in PLAN.md section 12.
 `branch.push`'s claim checks for a human approval at this `patch_id` or a current attestation, so V16's proof holds at run time too.
-**AC:** G20: spy shows no push before approval, on the first round and after `qa_fix`, `merge_conflict` and `changes_requested`; approval does not count as the review gate; mutation: bypassing the gate fails V16; a waiver is org-only and audited.
-**Deps:** D4-17, D4-07, D2-23, D2-04. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/pre_push.py`, `src/sto/config/validate_exposure.py`, `tests/engine/test_pre_push.py`.
+**AC:** G20: spy shows no push before approval, on the first round and after `qa_fix`, `merge_conflict` and `changes_requested`; G23: an unattested run goes from this gate through a base update to a confirmed merge on fakes; approval does not count as the review gate, and the requester cannot give it; mutation: bypassing the gate fails V16; a waiver is org-only and audited.
+**Deps:** D4-17, D4-07, D2-23, D2-04, D4-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/pre_push.py`, `src/sto/config/validate_exposure.py`, `tests/engine/test_pre_push.py`.
 
 #### D4-27: Path deny list
 Default path policy refusing `.github/**`, CI config files, `CODEOWNERS` and the GitOps workflow path, configurable upward.
@@ -853,7 +856,7 @@ Scanning covers known formats and entropy, including inside source files.
 #### D5-05: Tool broker and read tools
 Registry that enforces a stage's allowlist, plus `ticket.*`, `repo.*`, `pr.diff`, `checks.read` and record tools. **Repo and SHA come from the signed step context, never from model arguments.** `ticket.read` serves a confirmed snapshot and member comments, with others withheld.
 All output passes through the scanner, and is framed as untrusted.
-**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; G11: a non-member's comment or a later edit never reaches an agent; every result is scanned; SHA-pinned reads.
+**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; G11: a non-member's comment or a later edit never reaches an agent, through `ticket.read` or `ticket.search_similar`; every result is scanned; SHA-pinned reads.
 **Deps:** D5-01, D5-04, D4-06, D5-19, D3-14. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/tools/registry.py`, `src/sto/agents/tools/read.py`, `tests/agents/test_tools.py`.
 
 #### D5-06: Workspace port and local Docker
@@ -1119,11 +1122,11 @@ Flaky retries are detected and reported.
 #### D8-02: Environment port
 Find the test URL from config or GitHub Deployments, and wait for readiness at a deployment containing the required SHA, recording `tested_sha`.
 An environment that never becomes ready ends in a defined timeout.
-**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; a host outside the team's preview domain is refused.
+**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; a host outside the team's `test_domains` is refused.
 **Deps:** D4-06, D2-13, D2-24. **Size:** S. **Run:** parallel. **Files:** `src/sto/qa/environment.py`, `tests/qa/test_environment.py`.
 
 #### D8-03: Browser port
-Port with a local Playwright provider and an AgentCore provider using **one custom browser per team**, with managed `URLBlocklist: ["*"]` and `URLAllowlist` for that team's preview wildcard domain, screenshots and recordings. Managed policies are fixed at `CreateBrowser`, so per-PR browsers or a shared one would not work.
+Port with a local Playwright provider and an AgentCore provider using **one custom browser per team**, with managed `URLBlocklist: ["*"]` and `URLAllowlist` for that team's `test_domains`, screenshots and recordings. Managed policies are fixed at `CreateBrowser`, so per-PR browsers or a shared one would not work.
 The AgentCore side is tested by stubs until D12-09. A tool-level check alone does not stop page-driven redirects, so tests include them.
 **AC:** navigation and redirects outside the allowlist are refused; a team's browser cannot reach another team's domain; artifacts land in the session prefix and are scanned, including screenshots flagged for review; page content is framed; real browser tests run only in CI, with a fake provider locally.
 **Deps:** D5-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/qa/browser/`, `src/sto/agents/tools/browser.py`, `tests/qa/test_browser.py`.
@@ -1162,18 +1165,18 @@ It is synthetic and stays in `examples/`.
 Full flow on the local stack, through the review gate, QA suite, agentic QA and QA gate, in all decisions.
 Code change after QA failure goes back through review.
 **AC:** request changes re-enters review; retest does not; approve leads to merge on the fake.
-**Deps:** D8-07, D8-08, D4-21, D8-13. **Size:** M. **Run:** serial. **Files:** `tests/e2e/test_qa_flow.py`.
+**Deps:** D8-07, D8-08, D4-21, D8-13, D4-26, D2-23. **Size:** M. **Run:** serial. **Files:** `tests/e2e/test_qa_flow.py`.
 
 #### D8-10: Merge-before-QA end to end
 Run the Kanban order: merge, QA on staging, fix forward on a new branch, reject with a revert PR, and reject a follow-up at review, with **two runs sharing staging**.
 Our own merge must not supersede the QA gate.
-**AC:** G22 passes with run B pending, rejected and cancelled after merge; a follow-up PR holds only the new change; a rejection at QA or on a follow-up opens a revert PR and alerts; a run closing unapproved ends `done_with_incident`.
+**AC:** G22 passes with run B pending, rejected and cancelled after merge; G23: Kanban's second merge succeeds after a QA `changes_requested`; a follow-up PR holds only the new change; a rejection at QA or on a follow-up opens a revert PR and alerts; a run closing unapproved ends `done_with_incident`.
 **Deps:** D8-09, D8-11, D3-13, D4-14. **Size:** M. **Run:** serial. **Files:** `tests/e2e/test_kanban_order.py`.
 
 #### D8-11: Release effect
 `release.trigger` dispatches the team's deploy workflow with the release SHA and the effect key as required inputs, shows the key in `run-name`, and reads back the run. The range check requires a QA approval for each run-merged commit since the last release, read from the deploy workflow's run history.
 A crash can lose the run ID, so retry looks up by key, and ambiguity means `BLOCKED`, never a second deploy.
-**AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake.
+**AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; a tested SHA that is an ancestor of the last release finishes as "already released"; a blocked good run takes `stale` back to QA; an alarm fires on hold age; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake.
 **Deps:** D4-11, D4-20. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/release.py`, `tests/effects/test_release.py`.
 
 #### D8-12: Live GitHub re-run
@@ -1183,9 +1186,9 @@ This closes the [GH] parts of FF-01, FF-03, FF-04, FF-05 and FF-09, which D4-23 
 **Deps:** D4-23, D8-10. **Size:** S. **Run:** serial. **Files:** `tests/live/github/test_full_flow.py`.
 
 #### D8-13: Preview environments
-`env.deploy_preview`, a gated effect that triggers the team's preview deployment after the review gate, on the team's preview wildcard domain, so agentic QA has somewhere to run on unmerged code.
+`env.deploy_preview`, a gated effect that triggers the team's preview deployment after the review gate, on the team's `test_domains`, so agentic QA has somewhere to run on unmerged code.
 It uses the same keyed dispatch as release.
-**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; a preview URL outside the team's domain is refused.
+**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; a preview URL outside the team's `test_domains` is refused.
 **Deps:** D8-02, D8-11, D4-17. **Size:** S. **Run:** parallel. **Files:** `src/sto/effects/preview.py`, `tests/effects/test_preview.py`.
 
 #### D8-14: Surface parity
@@ -1553,7 +1556,7 @@ GitHub stays on the KMS broker, as ADR-0010 explains.
 #### D11-12: AgentCore providers
 `agentcore_sandbox`, `code_interpreter` and Browser implementations, and session stop, tested with Stubber.
 Each lists what it cannot prove offline.
-**AC:** request shapes validate against botocore's model; command limits are enforced client-side; unknowns are listed for D12.
+**AC:** request shapes validate against botocore's model; command limits are enforced client-side; a change to a team's `test_domains` recreates its custom browser; unknowns are listed for D12.
 **Deps:** D5-06, D8-03, D8-04, D10-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/agentcore_sandbox.py`, `src/sto/qa/browser/agentcore.py`, `src/sto/qa/code_interpreter_agentcore.py`, `tests/workspace/test_agentcore_providers.py`.
 
 #### D11-13: Web stack
@@ -1715,7 +1718,7 @@ Measure startup and build times.
 **Deps:** D12-04, D11-21. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_sandbox.py`, `docs/findings/sandbox.md`.
 
 #### D12-09: Verify QA tools
-Real Browser against a test site, with recording and live view, proving the block-all rule and the team preview domain, redirects outside the allowlist, and real Code Interpreter in VPC mode, with a canary exfiltration test.
+Real Browser against a test site, with recording and live view, proving the block-all rule and the team's `test_domains`, redirects outside the allowlist, and real Code Interpreter in VPC mode, with a canary exfiltration test.
 Confirm artifacts arrive, and allowlists hold.
 **AC:** L10 confirmed or fixed; `URLBlocklist` plus `URLAllowlist` behaviour is answered; a QA gate shows real evidence; Sandbox mode's DNS behaviour is answered; costs recorded.
 **Deps:** D12-06, D11-12. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_qa_tools.py`, `docs/findings/qa-tools.md`.

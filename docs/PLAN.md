@@ -35,6 +35,8 @@ D0 to D2.
 - Live review tests need a **second GitHub user**, because the author cannot approve their own PR.
 - These live on a separate issue (D4-24), so no offline work waits for them.
 
+**One more action, before workers start (D0-05):** give workers a separate bot account or GitHub App, with no admin rights, no ruleset bypass, and not on any Environment's reviewer list. Every comment and commit on this PR comes from one identity, so until this exists the reviewer's label and the Environment's required reviewer cannot tell a worker from you.
+
 ### Your decisions, now built in
 
 | Topic | Decision | Where it lands |
@@ -137,7 +139,7 @@ subject = { head_sha, patch_id, evidence_digest, attention_digest, ticket_revisi
 the merge base, because the default mode ignores whitespace, so a re-indent that changes behaviour would keep the
 same ID (checked locally on git). `evidence_digest` hashes the review or QA artifacts shown to the human.
 `ticket_revision` hashes the normalised summary, description, acceptance criteria and route input fields only, so our own comments and
-transitions never change it. After a merge, the subject also records `merge_sha`.
+transitions never change it. After a merge, the subject also records `merge_sha`. A `pre_push` gate closes before any commit exists, so its subject is `{ base_sha, patch_id, ticket_revision }`, with no `head_sha`.
 An approval carries the subject digest the human saw, and the server refuses it if the subject has moved. A
 negative decision is exempt from the digest match, so an edited ticket can never delay a veto.
 
@@ -218,7 +220,7 @@ These are the rules the PoC review bugs came from. Each has a named test in sect
    both win. If Stop finds the effect already `ATTEMPTING`, it reports "the merge may have landed" and reconciles.
 2. **Approve is exactly as strong as the code it saw:** a merge needs the **latest instance** of each required gate to be
    approved, at the SHA being merged. A new SHA therefore always passes through the gate stage again, where section 4.6 may
-   close it without asking when the patch is unchanged. Once a gate has been visited in a run, it is required for the rest of that run, so a later change cannot route around it.
+   close it without asking when the patch is unchanged. Once a gate reached by a **ticket-field route** has been visited in a run, it is required for the rest of that run, so a later change cannot route around it.
 3. **While a gate is open, any negative decision closes it, regardless of earlier approvals.** A quorum gate with one
    approval and then a reject closes as rejected. Order is decided by commit: if the deciding approval commits first,
    the gate is already closed, and rule 5 applies. **Any non-approved close of a gate invalidates all earlier approvals of
@@ -277,7 +279,7 @@ These rules apply **at any stage**, not only while a gate is open. Reconciliatio
 | Workflow published | No effect. Runs stay on their pinned version (section 7.4) |
 | Approver loses eligibility | A pending vote stops counting, because eligibility is re-checked when the gate closes. Decisions on already closed gates stand, and are audited |
 
-**Agents read a confirmed snapshot, not the live ticket.** `ticket.read` serves the stored snapshot at the last confirmed revision, plus comments by team members. Other comments appear as withheld, so a comment on a public issue, or an edit between its webhook and the next sweep, never reaches an agent (T11, G11).
+**Agents read a confirmed snapshot, not the live ticket.** `ticket.read` serves the stored snapshot at the last confirmed revision, plus comments by team members. Other comments appear as withheld, so a comment on a public issue, or an edit between its webhook and the next sweep, never reaches an agent (T11, G11). `ticket.search_similar` serves the same filtered view.
 
 **A gate's evidence must cover what is being approved.** Every evidence record stores `tested_sha`, `patch_id` and a declared
 validity. A gate cannot open unless all its evidence is valid for the subject:
@@ -665,8 +667,8 @@ The orchestrator merges with these checks. The switches and gate conditions are 
 the rest are re-read immediately before it:
 
 1. Run is active. Team and fleet merge switches are on. No freeze or change window applies. `hold_after_approval` has passed.
-2. The **latest instance** of every gate in `requires_gates`, and any gate visited at any point in this run, is approved, with
-   `head_sha` equal to the current head. The carry-over rules in section 4.6 are the only way a new SHA gets that without a person.
+2. The **latest instance** of every gate in `requires_gates`, and any gate reached by a **ticket-field route** at any point in this run, is approved, with
+   `head_sha` equal to the current head. `pre_push` approvals are checked only by the `branch.push` claim, and are not part of this guard. The carry-over rules in section 4.6 are the only way a new SHA gets that without a person.
 3. Team-required checks are green at this exact SHA. A check that is merely pending means wait, not failure.
 4. Separation of duties still holds, including any commit added since the gate opened.
 5. PR is open, not draft (marked ready by a prior gated effect), and targets the expected base.
@@ -713,7 +715,7 @@ the review check.
 | Document | Owner | Lifetime | Holds |
 |---|---|---|---|
 | `OrgPolicy` | Org admin | **Live,** read at decision and effect time | Floors: who can be eligible, surfaces, waivers, minimum holds, identity age |
-| `TeamConfig` | Team admin | **Live,** except custom profiles, which are pinned per run | Calendar, sprint, budgets, WIP limit, change windows, QA preview domain, custom profiles |
+| `TeamConfig` | Team admin | **Live,** except custom profiles, which are pinned per run | Calendar, sprint, budgets, WIP limit, change windows, QA test domains, custom profiles |
 | Resource bindings | Org admin | **Live** | Which team owns which repo, Jira project and Slack channel |
 | `Workflow` | Team admin | **Versioned, immutable, pinned per run** | Intake, stages, edges, loop limits |
 
@@ -807,7 +809,7 @@ metadata: { team: string }
 calendar: { timezone: string, workdays: [mon..sun], hours: "09:00-17:30", holidays: ref }
 sprint: { cadence: 1w | 2w | 3w | 4w, anchor: date, merge_freeze_before_end: duration }
 wip_limit: integer
-qa: { preview_domain: "*.pr.team.example.com" }   # one custom browser per team, see T3
+qa: { test_domains: ["*.pr.team.example.com", "staging.team.example.com"] }   # one custom browser per team, see T3
 change_windows: { deny: [ { from: datetime, to: datetime, reason: string } ], allow_only: cron }
 budgets:
   run_usd: number
@@ -823,8 +825,8 @@ apiVersion: sto/v1
 kind: OrgPolicy
 floors:
   single_human_allowed: false        # true lets one person pass both mandatory gates (Q5)
-  requester_excluded_from: [review]
-  mandatory_gate_roles: { review: [reviewer], qa: [qa, reviewer] }    # never developer
+  requester_excluded_from: [review, pre_push]
+  mandatory_gate_roles: { pre_push: [reviewer], review: [reviewer], qa: [qa, reviewer] }    # never developer
   decision_surfaces: { review: [ui, slack, github], qa: [ui, slack] }
   waive_allowed: true
   hold_after_approval_min: 10m
@@ -854,11 +856,11 @@ also refuses duplicate keys, and YAML's other implicit booleans in keys.
 | `review_panel` | `clean`, `findings`, `degraded` |
 | `checks` | `green`, `red` |
 | `gate` | `approved`, `changes_requested`, `rejected`, plus `retest` if listed, plus `expired` if `expire_after` is set |
-| `effect` | `done`. `pr.merge` adds `conflict` and `stale`, and `pr.update_branch` adds `conflict` |
+| `effect` | `done`. `pr.merge` adds `conflict` and `stale`, `pr.update_branch` adds `conflict`, and `release.trigger` adds `stale` |
 | `wait` | `resumed`, `timeout` |
 | `route` | Each field value used, plus `default` |
 
-**Route fields are frozen, because a route must not be editable into skipping a gate.** Ticket-field routes are read once at intake and stored on the run. Later changes follow a **ratchet:** a change that raises the level by `order` applies at once, and lowering needs a named role, with the audited actor ineligible for that run's gates. Route inputs are part of `ticket_revision`, and once a routed gate has been visited it stays required for the rest of the run. **Limit:** a value set before intake is taken as given, so a team relying on one should restrict who can edit that field in Jira, and the gate page shows who set it. `repo_ci_trust` is different: it is evaluated fresh on each pass, because its safe direction is the gate.
+**Route fields are frozen, because a route must not be editable into skipping a gate.** Ticket-field routes are read once at intake and stored on the run. Later changes follow a **ratchet:** a change that raises the level by `order` applies at once, and lowering needs a named role, with the audited actor ineligible for that run's gates. Route inputs are part of `ticket_revision`, and once a routed gate has been visited it stays required for the rest of the run. **On a route with `order`, a value outside it goes to `BLOCKED` with a reason, and never takes `default`,** so a `Critical` or a differently cased `High` cannot skip a gate. **Limit:** a value set before intake is taken as given, so a team relying on one should restrict who can edit that field in Jira, and the gate page shows who set it. `repo_ci_trust` is different: it is evaluated fresh on each pass, because its safe direction is the gate.
 
 Engine-level failures (section 6.2) do not need edges, because they go to `BLOCKED`.
 
@@ -1076,7 +1078,7 @@ kind: TeamConfig
 metadata: { team: payments }
 calendar: { timezone: Europe/London, workdays: [mon, tue, wed, thu, fri], hours: "09:00-17:30" }
 sprint: { cadence: 2w, anchor: 2026-11-02, merge_freeze_before_end: 1d }
-qa: { preview_domain: "*.pr.payments.example.com" }
+qa: { test_domains: ["*.pr.payments.example.com"] }
 budgets:                     # placeholders until D12 measures real costs
   run_usd: 40
   team_monthly_usd: 3000
@@ -1102,6 +1104,7 @@ extends: standard@1
 intake: { source: github, project: example/platform, label: agent-ready }
 repo: { name: example/platform, base: main, sandbox_image: go1 }
 limits:
+  loops: { release_stale: 2 }
   max_steps_per_run: 100
   max_run_age: 30d
 definition_of_done: null
@@ -1134,7 +1137,7 @@ stages:
     effect: release.trigger
     with: { workflow: deploy-prod.yml, sha_input: release_sha }
     requires_gates: [qa_gate]
-    next: { done: ticket_done }
+    next: { done: ticket_done, stale: { to: qa_auto, loop: release_stale } }
   ticket_done: { requires_gates: [qa_gate] }
 ```
 
@@ -1147,7 +1150,9 @@ stages:
   - A rejected commit stops blocking only when its merged revert is also in the range, which means QA must have tested a later SHA.
   - **A commit a person merged outside the platform** needs an acknowledgement at the QA gate naming it.
   - **The last released SHA** comes from the deploy workflow's run history. If it is unknown, for example because the team also deploys outside the platform, release blocks with a message.
-  - A pending run holds the release in `WAITING_EXTERNAL`, so WIP limits decide how often this happens.
+  - A pending run holds the release in `WAITING_EXTERNAL`, so WIP limits decide how often this happens, and an alarm fires on hold age.
+  - **No rollback:** if the tested SHA is an ancestor of the last release, the effect does not dispatch, and finishes as "already released".
+  - **No stranding:** a run blocked by a rejected commit takes the `stale` edge back to `qa_auto` under `release_stale`, so it can test a later SHA that contains the revert.
 - **Fix-forward:** request changes after a merge means a new branch, `sto/<run>/<n>`, cut from the new `main`, and a follow-up PR.
 - **Rejection:** a QA rejection opens a revert PR and alerts. So does a rejection of a follow-up at the review gate, through the engine rule in section 6.2, because the
   known-bad code is already on `main`.
@@ -1442,6 +1447,8 @@ SSO through OIDC or SAML, brokered by a Cognito user pool
 | Decide a gate | The role must be in that gate's `eligible_roles`, which is the only authority. Templates default to `reviewer` for review gates and `qa` for QA gates | | | | | |
 | Publish workflow, map team groups, set team budget | No | No | No | Yes | Yes | No |
 | Retry a blocked run, raise run budget | Own | Own | Own | Yes | Yes | No |
+| Attribute a commit, resolve a SoD term | No | No | No | Yes | Yes | No |
+| Extend eligibility on an open gate | No | No | No | No | Yes | No |
 | Set floors, org budgets, kill switch | No | No | No | No | Yes | No |
 | Read audit, export | No | No | No | Team | Org | Scope |
 
@@ -1481,7 +1488,7 @@ A decision is accepted only if **all** hold, checked server-side at decision tim
   `Co-authored-by` only add exclusions, and an admin other than the person concerned can clear a false one, so naming a reviewer as co-author cannot silently
   exclude them for good.
 - Pusher data from a webhook adds exclusions when it arrives, but nothing depends on it, because webhooks can be missed.
-- Setup docs require a ruleset restricting `sto/*` pushes to the App, and the connection test reports if that is absent.
+- Setup docs require a ruleset restricting `sto/*`, `sto-approved/*` and `sto-revert/*` pushes to the App, and the connection test reports if that is absent.
 
 A team where no eligible approver remains gets an immediate, explicit warning, rather than a silent
 wait.
@@ -1662,7 +1669,7 @@ retry contract, since the fast stores may not model it.
 |---|---|---|---|
 | T1 | Prompt injection tries to approve, merge or skip a gate | Agents have no such tools. Transitions validate outcomes from a declared list. Gates are outside the agent plane | G14, red-team fixtures with hostile tickets |
 | T2 | Text corrupts or escapes prompts | One-pass rendering in our code, with no framework substitution. Untrusted text framed, with closing tags neutralised | `test_untrusted_text_cannot_close_tags`, `test_placeholder_in_ticket_stays_literal` |
-| T3 | Injection drives data exfiltration | Sandbox has no SCM credentials and a minimal role, default-deny egress, DNS Firewall and a GET-only proxy. Agents have no general web tool. Browser uses managed policies with `URLBlocklist: ["*"]` plus `URLAllowlist` [S70], because a tool-level check does not stop redirects. Managed policies are fixed at `CreateBrowser` [S70], so each team has **one custom browser with a per-team preview wildcard domain** from `TeamConfig`, rather than one browser per PR or one shared across teams. Code Interpreter is in VPC mode with DNS filtering, because Public mode has internet access and the QA agent reads both untrusted pages and `pr.diff` [S71] | Sandbox egress tests, Policy tests, canary exfiltration in D12-08 and D12-09 |
+| T3 | Injection drives data exfiltration | Sandbox has no SCM credentials and a minimal role, default-deny egress, DNS Firewall and a GET-only proxy. Agents have no general web tool. Browser uses managed policies with `URLBlocklist: ["*"]` plus `URLAllowlist` [S70], because a tool-level check does not stop redirects. Managed policies are fixed at `CreateBrowser` [S70], so each team has **one custom browser allowing that team's `test_domains`** from `TeamConfig`, recreated when they change, rather than one browser per PR or one shared across teams. Code Interpreter is in VPC mode with DNS filtering, because Public mode has internet access and the QA agent reads both untrusted pages and `pr.diff` [S71] | Sandbox egress tests, Policy tests, canary exfiltration in D12-08 and D12-09 |
 | T4 | Secrets in source reach the model or PR | Scan all tool output, **and everything rendered into a prompt, such as ticket text and human comments,** before the model sees it, with redaction. Scan patches before push. Path deny list as a second layer. Findings block the step, with an audited route to the gate for false positives | Canary secrets in fixtures at unusual names and inside source files |
 | T5 | Error text leaks URLs, paths or tokens to reviewers or logs | Redact at one boundary, with stored raw errors restricted to operators | Redaction tests |
 | T6 | Forged webhook or action | Verify signature on raw body, constant time, replay windows, dedupe. Then re-read state | Contract suite |
@@ -1686,7 +1693,7 @@ the control.
 
 **Why T18 defaults to a gate, not a fork:** a fork default could stall. On public repos, by default "all first-time contributors require approval to run workflows", and on private repos an org that disables fork workflows cannot be overridden per repo [S69]. A fork also needs a bot account. So the safe default needs no setup.
 
-**The pre-push gate** is `type: pre_push`, and it is not a review. Its page shows the diff from S3 and says plainly that the person is confirming the patch is safe to run in CI with its secrets, not that it is correct. It does not count as the review gate, and approving it does not bar someone from reviewing. It has its own `pre_push_fix` loop, and every new patch passes it again.
+**The pre-push gate** is `type: pre_push`, and it is not a review. Its page shows the diff from S3 and says plainly that the person is confirming the patch is safe to run in CI with its secrets, not that it is correct. It does not count as the review gate, and approving it does not bar someone from reviewing. The requester cannot approve it, because their ticket may be the hostile one, and `mandatory_gate_roles` sets who can. It has its own `pre_push_fix` loop, and every new patch passes it again.
 
 **Attestation can only ever say `attested` or `unknown`,** and unknown means the gate. It re-checks on each round, and expires after 90 days. `attested` needs all of these:
 
@@ -1697,6 +1704,8 @@ the control.
 | Environments allow only `sto-approved/*` and `main` | Environment rules through the API | Keeps QA secrets away from `sto/*` |
 | Default `GITHUB_TOKEN` is read-only | `default_workflow_permissions` [S76] | A permissive default grants write access |
 | No `pull_request_target` or `workflow_run` workflow, or self-hosted runners for `sto/*` | Workflow files scanned at the base SHA, and the runner settings | They run with the base repo's privileges [S75] |
+| No workflow that runs on `sto/*` declares write `permissions` or `id-token: write` | Workflow files scanned at the base SHA | A workflow can add write access on top of a read-only default [S77] |
+| A ruleset restricts `sto-approved/*` and `sto-revert/*` to the App | Rulesets through the API | Otherwise anyone with write access can create a matching branch and reach an Environment that allows it [S77] |
 | OIDC trust excludes `sto/*` | **A named human attests,** because trust policies live in the cloud account | GitHub cannot read them |
 
 This is still a claim about a customer's repo, which the throwaway repo's canary cannot prove, so the attesting human and date appear on every gate.
@@ -1745,7 +1754,8 @@ own stream ([ADR-0016](adr/0016-web-hosting-and-event-delivery.md)).
 
 `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`, `POST /runs/{id}/cancel`,
 `POST /runs/{id}/retry`, `POST /runs/{id}/answer`, `POST /runs/{id}:migrate`,
-`POST /runs/{id}/commits/{sha}:attribute`, `POST /runs/{id}:route-to-gate`, `GET /gates/mine`, `GET /gates/{id}`,
+`POST /runs/{id}/commits/{sha}:attribute`, `POST /runs/{id}/sod-terms:resolve`, `POST /runs/{id}:route-to-gate`,
+`POST /gates/{id}:extend-eligibility`, `GET /gates/mine`, `GET /gates/{id}`,
 `POST /gates/{id}/decisions`, `GET|POST /teams/{t}/workflows`, `POST /teams/{t}/workflows:dry-run`,
 `POST /teams/{t}/workflows/{name}:publish`, `GET|PUT /teams/{t}/config`, `GET|PUT /teams/{t}/mappings`, `GET|PUT /org/policy`, `GET|PUT /org/resources`, `GET|POST /org/images`,
 `GET /audit`, `POST /audit:export`, `POST /org/kill-switch`, `GET /health`. OpenAPI is generated, with
@@ -1823,7 +1833,7 @@ browser never cancels anything, because runs do not live on a connection. Whethe
   text or code by default.
 - **Metrics:** cycle time, gate wait, loop counts, tokens, estimated cost, cache hit rate, step failures
   by class, effect retries, webhook lag, reconcile drift, cancel latency.
-- **Alarms:** stuck runs, outbox age, DLQ depth, ledger errors, budget burn, signature failures, merges
+- **Alarms:** stuck runs, release hold age, outbox age, DLQ depth, ledger errors, budget burn, signature failures, merges
   outside the platform.
 - **Evals:** AgentCore Evaluations and a local harness, on labelled tickets. Meaningful only after D12.
 - **Logs** are structured and redacted, with no secrets.
@@ -1925,8 +1935,9 @@ the PoC's critical bugs, so these exist to catch that class.
 | G18 | **Reviewer failure is visible** | Required reviewer crashes: gate shows it, or blocks if `fail_closed` |
 | G19 | **Stale or absent identity cannot decide** | On every surface: `as_of` too old, expired link, disabled user, removed group, and a refreshed token or reused session with no federated sign-in. Refused with a sign-in link, and a fresh sign-in with the group removed clears it |
 | G20 | **Nothing reaches CI unseen** | Unattested repo: spy shows no push, branch or PR before the pre-push approval, on the first round and after each of `qa_fix`, `merge_conflict` and `changes_requested`. A patch blocked by policy cannot be routed past the push |
-| G21 | **Routes cannot be edited around** | Risk lowered before the route runs, and between rounds: `change_gate` still runs. A raise applies. A visited routed gate stays required. An audited lowering makes its actor ineligible |
-| G22 | **Release carries nothing unqualified** | Two runs on staging: run B pending, rejected, or cancelled after merge, each blocks run A's release, and acknowledgement cannot override a rejection. B's merged revert in a later tested range clears it. An unknown last release blocks |
+| G21 | **Routes cannot be edited around** | Risk lowered before the route runs, and between rounds: `change_gate` still runs. A raise applies. A value outside `order` blocks. A visited routed gate stays required. An audited lowering makes its actor ineligible |
+| G22 | **Release carries nothing unqualified** | Two runs on staging: run B pending, rejected, or cancelled after merge, each blocks run A's release, and acknowledgement cannot override a rejection. B's merged revert in a later tested range clears it. An unknown last release blocks. A tested SHA that is an ancestor of the last release does not dispatch. A blocked good run takes `stale` back to QA. A long hold raises the alarm |
+| G23 | **The default path merges** | An unattested repo's run goes from `pre_push_gate` through both human gates and a base update to a confirmed merge, on fakes. Kanban's second merge succeeds after a QA `changes_requested`. Guards that refuse are worthless if they refuse everything |
 
 ### 15.4 Other named suites
 
