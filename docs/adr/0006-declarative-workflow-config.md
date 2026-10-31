@@ -11,8 +11,11 @@
   - **Gate dominance (V4):** remove a gate's `approved` edge, and any effect requiring it must become
     unreachable from `start`.
   - **Freshness (V5):** the same from each code-changing stage.
-- Layers: platform floors, org defaults, template, team overlay. Lower layers cannot weaken floors.
-- Published versions are immutable, and every run pins one.
+- **Four documents:** `OrgPolicy` and `TeamConfig` are live, resource bindings are live, and `Workflow` is versioned. Budgets, calendars and floors are not pinned, because a raised budget or a tightened floor must reach runs in flight.
+- **Overlays use JSON Merge Patch on a stage map keyed by ID.** Maps merge, lists replace and `null` removes. Stage order has no meaning, so no `insert_after` is needed. Teams write an overlay, not a copy, which a 100-line fork in YAML would be.
+- **Publishing flattens,** and a run pins a manifest digest over workflow, profiles, effects and prompts.
+- **Teams add their own reviewers** through custom profiles, with no platform PR.
+- A closed `route` stage handles risk routing, with no expressions, so proofs still hold.
 - Teams can dry-run with the fake LLM.
 
 ## Alternatives
@@ -29,4 +32,5 @@
 - New stage kinds or effects need code, which is intended. A team's stages, order, tools, calendars and
   policies do not.
 - Examples in PLAN.md are checked by the validator from D2 onward. For this PR, they were checked by a scratch
-  script implementing V1 to V6.
+  script implementing V1 to V6, V8, V11, V13 and V14 on the flattened overlays.
+- Intake uses closed selectors, because arbitrary JQL cannot be proved disjoint.

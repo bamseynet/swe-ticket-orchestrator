@@ -12,7 +12,8 @@
   block-size trouble (the Strands PoC's 1 KiB read issue).
 - **A session is disposable.** Everything needed to continue is in S3, DynamoDB or the branch. A lost session
   means retry the attempt. Session storage (preview) is not used for anything critical.
-- Session credentials use context keys, so a session can only reach its own S3 prefix [S8], [S15].
+- Session credentials use context keys, so a session can only reach its own S3 prefix [S8], [S15]. The keys are only present in clients built inside the handler, and a resume is a new session, so the dispatcher copies the snapshot forward. The keys do not prove a call came from inside the microVM [S15], so they scope access rather than prove origin.
+- Agent roles reach ledger and flags only through brokers keyed by a signed step token, and results are signed with a per-attempt secret.
 - Inner boto clients use `total_max_attempts=1`, because a retried invoke starts a second billable run.
 
 ## Alternatives
@@ -27,4 +28,5 @@
 ## Consequences
 
 - 2 vCPU, 8 GB and a 2 GB image limit apply [S14], which is why heavy builds stay in team CI.
-- The real arm64 image on real AgentCore is unproven until D12.
+- The real arm64 image on real AgentCore is unproven until D12, and this design is provisional until the spike (D12-18).
+- A heartbeat gap can leave an earlier attempt running, so retry stops it first, and a stopped session restarts on its next invocation, so the tool layer refuses calls for a dead step.

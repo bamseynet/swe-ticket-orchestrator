@@ -18,7 +18,7 @@ decision gets a new record that supersedes the old one.
 | [0009](0009-integration-spi-webhooks-as-nudges.md) | Narrow adapter SPI, webhooks as nudges, shared conformance suite |
 | [0010](0010-autonomous-merge-github-app.md) | Autonomous merge through a GitHub App with a read-back merge guard |
 | [0011](0011-effect-outbox-with-read-back-receipts.md) | Effects through an outbox, with idempotency keys and read-back receipts |
-| [0012](0012-sandboxed-workspaces-and-repo-access.md) | Credential-free sandboxes, and private repo access through a broker |
+| [0012](0012-sandboxed-workspaces-and-repo-access.md) | Sandboxes with no SCM credentials and a minimal role, and private repo access through a broker |
 | [0013](0013-tools-via-gateway-policy-and-injection-posture.md) | Read-only tools through Gateway and Policy, assuming injection succeeds |
 | [0014](0014-model-catalog-and-tiers.md) | Model catalog and tiers, with IDs as verified data |
 | [0015](0015-budgets-cancellation-kill-switch.md) | Fail-closed budgets, first-class cancel, layered kill switch |
@@ -27,3 +27,4 @@ decision gets a new record that supersedes the old one.
 | [0018](0018-observability-otel.md) | OpenTelemetry through ADOT to CloudWatch |
 | [0019](0019-offline-first-testing-and-live-milestone.md) | Offline-first testing, with a credential-blocked live milestone |
 | [0020](0020-stack-and-repo-layout.md) | Python, TypeScript, one repo, and layout built for parallel PRs |
+| [0021](0021-ci-trust-for-unreviewed-code.md) | Model-written code gets no CI secrets before the first human gate |

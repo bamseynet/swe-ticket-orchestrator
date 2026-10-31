@@ -12,9 +12,12 @@ mapping from IdP groups.
   the same validation, so another broker can replace Cognito by configuration.
 - **Groups:** an attribute mapping passes IdP groups to the pool, and a pre token generation trigger normalises
   them with `groupOverrideDetails` [S54]. The platform's own mapping table then gives team and role, on every
-  request. The token supplies the fact of membership, and the platform decides what it means.
-- **Lifetimes:** access token 15 minutes, refresh 8 hours, as defaults. Gate decisions re-check mappings and
-  `auth_time`, and can require recent authentication.
+  request, keyed on immutable group IDs.
+- **Removal is handled explicitly.** Cognito "doesn't remove attributes from users when the source attribute is no longer sent" [S66], so an Inbound federation trigger rewrites the attribute on each sign-in, with Pre authentication as a fallback [S67].
+- **Surfaces with no token:** a Slack or GitHub decision carries no `auth_time`. So each identity has a membership snapshot with `as_of`, and every decision on every surface needs it within `identity_max_age`. Otherwise it deep-links to sign in (G19). A port allows a directory or SCIM refresh.
+- **Hardening:** no local users, admin-create-only, no `aws.cognito.signin.user.admin` scope.
+- **Step-up:** UI decisions can use `prompt=login` and `max_age`, on managed login [S68].
+- **Lifetimes:** access token 15 minutes, refresh 8 hours, as defaults.
 
 ## Why Cognito
 
@@ -34,15 +37,11 @@ mapping from IdP groups.
 
 ## What we have not verified
 
-Tracked in D3-01 and D12, and the design tolerates each going badly:
+Tracked in D12-10, and the design tolerates each going badly:
 
-- **Large group lists:** custom attribute size limits, and some IdPs' group overage behaviour. Fallback: map only
-  app-relevant groups at the IdP, or look up groups in a trigger.
-- **Step-up through a broker:** forcing re-authentication at the IdP. Fallback: a recent `auth_time`, enforced by
-  a shorter session for decisions, or relying on the IdP's policy.
-- **Refresh and SCIM:** assumed that a refresh may not re-query the IdP, and that SCIM is unavailable, so a removed person may keep
-  a group claim for up to the session life. Decisions therefore need a recent `auth_time`, and an admin can disable a user with
-  immediate effect, which the API checks on every request.
+- **Whether a federated user can overwrite a mapped attribute** with self-service scopes. We remove the scope anyway.
+- **Large group lists at real IdPs.** A value over 2,048 characters makes sign-in fail [S66]. Fallback: send only app-relevant groups, or look up in a trigger.
+- **Whether a refresh re-queries the IdP.** We assume not, so the snapshot's `as_of` and an immediate admin disable are the controls.
 
-Slack and GitHub accounts link to an SSO identity through a signed flow, and email matching alone is never
+Slack, GitHub and Jira accounts link to an SSO identity by completing that vendor's OAuth flow, and email matching alone is never
 accepted.

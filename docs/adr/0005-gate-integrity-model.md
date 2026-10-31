@@ -26,6 +26,11 @@ ticket. The rules are in PLAN.md section 4.3. This record gives the reasons for 
 6. **No `auto_approve` exists in the schema,** so it cannot be misconfigured.
 7. **All surfaces call one decision function.** A second path is a second place for rules to differ (G16).
 
+8. **Any non-approved close invalidates earlier approvals of that gate,** and only the most recent closed instance can be cited. Otherwise an old approval of the same patch could override a person's later request for changes, the bug class this ADR exists to stop (found by the adversarial review, P0-5).
+9. **The claim is atomic.** An effect is claimed in a transaction checking run, gate and switches, so Stop and a claim cannot both win. A read-then-act check would leave a window.
+10. **A hold follows approval** on merge, release and a done transition, so "use Stop" is a real option.
+11. **Org floors are read live,** so a tightened rule reaches runs in flight.
+
 ## Alternatives
 
 | Option | Why not |

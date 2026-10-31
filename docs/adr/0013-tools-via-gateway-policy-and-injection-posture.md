@@ -9,6 +9,9 @@
 - **Agents have no outward write tools at all.** All writes are engine effects. Gates, tokens, merges and config are
   unreachable from the agent plane, by IAM and by absence.
 - **Allowlist twice:** at agent construction, and as Cedar policy at the Gateway, evaluated outside agent code [S23].
+- **Step identity:** there is one execution role, so IAM cannot tell Cedar which stage is calling [S64]. The dispatcher mints a short-lived signed token per step, with team, run, stage, tools, repo and SHA, and Gateway's OAuth principal exposes the claims. Whether it accepts such a token is unverified, so the spike (D12-18) tests it first, and the fallback is a Gateway interceptor or a role per stage.
+- **Tool arguments never choose the target.** Repo and SHA come from the signed step context, so a model cannot be a confused deputy.
+- **CI is outside this boundary:** see ADR-0021.
 - **Rendering:** prompts rendered once in our code, untrusted text in tags with closing tags neutralised, and no
   framework substitution (CrewAI lesson).
 - **Scan both directions:** tool output before the model, and patches before push.

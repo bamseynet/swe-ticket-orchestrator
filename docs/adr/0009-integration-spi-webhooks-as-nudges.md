@@ -15,6 +15,7 @@ arrive.
   exist, the same tests run against the real API, and a difference is a bug in the fake.
 - Jira and Slack are **production adapters, not stubs.** Only the server under them is fake until D12.
 - Recorded fixtures are scrubbed of anything real, because this repo is public.
+- Connections are org-level where a vendor forces it, one Slack bot and one shared Jira registration, with resource bindings routing to teams. A Jira service account is the default, because 3LO acts as a person [S46].
 
 ## Alternatives
 

@@ -14,6 +14,7 @@
   **The Slack interaction function** also opens modals synchronously, because `trigger_id` expires in 3 seconds [S48], and has
   provisioned concurrency.
 - API requests are short, because all real work is asynchronous.
+- Direct `execute-api` access skips CloudFront and WAF, so D11-13 records how it is closed. HTTP API payloads cap at 10 MB, so larger webhooks are counted and left to the reconciler [S73].
 
 ## Alternatives
 

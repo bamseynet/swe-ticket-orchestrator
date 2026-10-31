@@ -1,4 +1,4 @@
-# ADR-0012: Credential-free sandboxes, and private repo access through a broker
+# ADR-0012: Sandboxes with no SCM credentials and a minimal role, and private repo access through a broker
 
 **Status:** Accepted
 
@@ -11,13 +11,13 @@ including code a model just wrote, which must be assumed hostile.
 
 - **Split agent and code.** Agent logic runs in the agent Runtime, which has Bedrock and Gateway access. Repo code
   runs in a **separate sandbox**, with a minimal role.
-- **Default sandbox:** a second AgentCore Runtime with a team image (up to 2 GB), commanded through
-  `InvokeAgentRuntimeCommand` (up to 64 KB per command, 1 hour timeout) [S14].
+- **Default sandbox:** a Runtime per **registered image** (up to 2 GB, ARM64, meeting the service contract), commanded through
+  `InvokeAgentRuntimeCommand` (up to 64 KB per command, 1 hour timeout) [S14]. Commands can read that Runtime's role [S61], so it has no data access. Images are registered separately, so publishing a workflow still touches no AWS API.
 - **Repo access through a broker** in the control plane, using a narrow App token. It fetches a tarball at a pinned
   SHA (private links expire in 5 minutes [S38]) into a session S3 prefix. The sandbox gets a short presigned URL.
 - **Writing goes back as a patch.** The control plane scans it (secrets, paths, size), then commits to `sto/<run>`. Those commits form
   the push receipts that separation of duties relies on.
-- **Egress is default-deny,** with an allowlist proxy for package registries, in VPC mode.
+- **Egress is default-deny,** with a GET-only allowlist proxy in VPC mode, and **Route 53 Resolver DNS Firewall,** because security groups do not filter Amazon DNS [S65]. A host allowlist alone is not a data control, since `npm publish` goes to an allowed host.
 - **History** comes from `repo.log` and `repo.blame` tools rather than a full clone.
 - **State survives on the branch,** so a dead session loses nothing.
 

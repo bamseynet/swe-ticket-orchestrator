@@ -8,8 +8,11 @@ Details are in PLAN.md section 14.
 
 - **Budgets** at step, stage, run, team and org, enforced by reservation in a Strands hook before each model call. If
   the ledger is unreachable, calls stop.
-- **Budget exhaustion is `BLOCKED`, not failure.** Work is kept, and an admin can raise it.
-- **Cancel** is a run state, with ordered steps, a 60 second target, and tests that count model calls after cancel.
+- **Budget exhaustion is `BLOCKED`, not failure.** Work is kept, and an admin can raise it, because budgets are live.
+- **Compute is budgeted too:** session-seconds and commands per step, because a looping `workspace.exec` costs no tokens.
+- **The hook is in-process,** so it stops ordinary overspend, not a compromised process. Profile metric alarms and break-glass are the backstop.
+- **Cancel** is a run state, with ordered steps, a 60 second target, a timeout and alarm, and tests that count model calls after cancel. The in-stream flag comes before stopping the session, or the abort has no chance to run.
+- **Kill-switch stop has its own path** that keeps gates open and holds effects, so a release resumes rather than needing everything redone.
 - **`AbortableBedrockModel`** carries forward, because Strands clears its cancel signal while unwinding.
 - **Kill switch** levels: pause, stop, merge off, and break-glass explicit-deny IAM that works even if the app is
   broken.

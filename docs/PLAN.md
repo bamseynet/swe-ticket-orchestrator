@@ -23,6 +23,8 @@ D0 to D2.
 | Q2 | **Can a team remove a human gate?** | No. Both gates are a platform floor. An org admin can add gates but not remove these two | If removal is allowed, the floor becomes an org setting, audited, and the validator proof applies only to remaining gates | D2-04 |
 | Q3 | **Who is the first pilot team, and what is their stack?** | None assumed. The default sandbox image covers Python and Node | It sets the first sandbox image, the first real workflow config and the eval set | Before D14 |
 | Q4 | **Which AWS Region and data-residency rule for the first deploy?** | Parameterised. Docs and examples use `us-east-1` with `us.` profiles | Sets model profile prefixes and IAM. Avoid In-Region profiles marked "limited model selection" [S30] | With credentials, D12 |
+| Q5 | **Must two different people pass the gates?** You asked for two human gates, and small teams, including you alone on a throwaway repo, may have one person | Yes: the requester cannot approve review, and one person cannot approve both review and QA. An org admin can waive this in `OrgPolicy`, which is audited and shown on every affected gate | If one person may do it all by default, the floor is weaker and an injected ticket needs only one careless approver | D3-05 |
+| Q6 | **How should CI run on code nobody has reviewed yet?** Model-written code runs in team CI before the review gate, and CI usually holds secrets (section 12, T18) | **Fail closed:** a repo that has not attested a safe mode gets an automatic human gate before CI. Attested modes are bot-owned fork, or secrets restricted away from `sto/*` | Without the extra gate, CI secrets are exposed to model-written code. With it, repos that have not attested get one more click per round | D4-17 |
 
 **Actions needed from you for D4, not questions:**
 
@@ -31,6 +33,7 @@ D0 to D2.
   lists need an organization-owned repo [S42]. If private repos on your plan lack draft PRs or branch protection,
   which D4-02 checks first, the live suite needs a paid plan or a free organization with a public throwaway repo.
 - Live review tests need a **second GitHub user**, because the author cannot approve their own PR.
+- These live on a separate issue (D4-24), so no offline work waits for them.
 
 ### Your decisions, now built in
 
@@ -43,10 +46,12 @@ D0 to D2.
 | Budget | No ceiling. A full-featured product, with issues still one PR each | [STAGES.md](STAGES.md) |
 | Build capacity | Up to 8 workers on one 7.4 GB laptop, so heavy verification is in GitHub Actions. Workers run targeted, hermetic tests | Section 15.1, D0-05, D0-08, D0-09 |
 
+A trial of FF-07 by someone who did not build this needs a person, and you are the only one so far. It moves to the pilot (D14-03).
+
 ### Three interpretations you may want to check
 
 1. **"Merges itself" does not replace the gates.** "Reviewed" means the human review gate approved
-   that exact code. Under the default templates, the merge follows the QA gate with no further click.
+   that exact code. Under the default template, the merge follows the QA gate and a short hold, with no further click.
    A team can move the merge to directly after the review gate and run QA on staging.
 2. **"Nothing written before approval" is about visible, hard-to-undo writes.** A reviewer needs
    something to review, so a bot branch and a draft PR exist before the gate. Everything is classified:
@@ -60,7 +65,7 @@ D0 to D2.
 
 ### Goals
 
-- **Goal 1, Reusable:** a new team onboards by writing configuration, never by forking code.
+- **Goal 1, Reusable:** a new team onboards by writing a short overlay on a template, never by forking code, and can add its own reviewer without a platform PR.
 - **Goal 2, Fully functional:** a real ticket becomes a merged PR, through real GitHub, Jira and Slack
   integrations, with a full UI (section 17).
 - **Goal 3, Trustworthy gates:** a human decision is bound to exact code, recorded atomically and audited.
@@ -111,7 +116,7 @@ flowchart LR
 ```
 
 This is the default template. Teams change stages, order and tools through configuration
-(section 7), within the floors in section 7.5.
+(section 7), within the floors in section 7.5. A repo that has not attested safe CI also gets an automatic human gate before CI, because model-written code must not reach CI secrets unseen (T18, Q6).
 
 ## 4. The two gates
 
@@ -121,12 +126,14 @@ closes exactly once.
 **The subject** is what is being approved:
 
 ```text
-subject = { head_sha, patch_id, evidence_digest, ticket_revision }
+subject = { head_sha, patch_id, evidence_digest, attention_digest, ticket_revision }
 ```
 
 `patch_id` identifies the diff regardless of base. It is `git patch-id --verbatim` over a canonical diff against
 the merge base, because the default mode ignores whitespace, so a re-indent that changes behaviour would keep the
 same ID (checked locally on git). `evidence_digest` hashes the review or QA artifacts shown to the human.
+`ticket_revision` hashes the normalised summary, description and acceptance criteria only, so our own comments and
+transitions never change it. After a merge, the subject also records `merge_sha`.
 An approval carries the subject digest the human saw, and the server refuses it if the subject has moved. A
 negative decision is exempt from the digest match, so an edited ticket can never delay a veto.
 
@@ -202,20 +209,24 @@ visibly.
 
 These are the rules the PoC review bugs came from. Each has a named test in section 15.3.
 
-1. **Gated effects need a live approval:** the effect executor requires a decision ID and re-reads
-   gate, run and subject immediately before acting.
-2. **Approve is exactly as strong as the code it saw:** a merge needs an approved gate instance whose `head_sha` is the
-   SHA being merged. A new SHA therefore always passes through the gate stage again, where section 4.6 may close it
-   without asking when the patch is unchanged.
+1. **Gated effects need a live approval, checked atomically:** the executor claims an effect in a transaction with
+   `ConditionCheck`s on run status, gate instance status and version, and the switches. Stop and a claim therefore cannot
+   both win. If Stop finds the effect already `ATTEMPTING`, it reports "the merge may have landed" and reconciles.
+2. **Approve is exactly as strong as the code it saw:** a merge needs the **latest instance** of each required gate to be
+   approved, at the SHA being merged. A new SHA therefore always passes through the gate stage again, where section 4.6 may
+   close it without asking when the patch is unchanged. Any gate visited in the current code round must also hold, so a
+   stage reached by a `route` cannot be skipped.
 3. **While a gate is open, any negative decision closes it, regardless of earlier approvals.** A quorum gate with one
    approval and then a reject closes as rejected. Order is decided by commit: if the deciding approval commits first,
-   the gate is already closed, and rule 5 applies.
+   the gate is already closed, and rule 5 applies. **Any non-approved close of a gate invalidates all earlier approvals of
+   that gate in the run,** so a person's request for changes can never be overridden by an older approval of the same patch.
 4. **A gate closes exactly once,** by a conditional write. A write conflict while the gate is still open is retried
    internally, and sub-quorum approvals all commit. Only a truly closed gate returns `409 gate_closed`, showing who
    closed it and how.
 5. **After close, the way to stop is Stop.** "A later reject" on a closed gate is refused with a visible message and a
    Stop button, which anyone eligible for that gate can use. Stop beats any approved but unexecuted effect, because
-   executors re-check run state. Merges wait `hold_after_approval` (default 10 minutes) so that this window is real.
+   executors check run state when claiming. `pr.merge`, `release.trigger` and a `done` transition wait
+   `hold_after_approval` (default 10 minutes, with an org minimum) so that this window is real.
 6. **Decision, audit event and outbox entry commit in one transaction.** There is no window where a
    decision exists without its audit record, or the reverse.
 7. **Decisions are never replayed from a framework.** The engine reads the gate record. Neither Strands
@@ -226,6 +237,8 @@ These are the rules the PoC review bugs came from. Each has a named test in sect
    task token.
 10. **What the UI claims is what happened.** "Written", "Merged" and "Commented" appear only from a
     confirmed receipt (section 6.3).
+11. **Org floors apply now.** Floors are read at decision and effect time from current `OrgPolicy`, not from a run's
+    pinned workflow, so tightening a rule after an incident reaches runs in flight.
 
 ### 4.4 Timeouts and escalation
 
@@ -238,8 +251,8 @@ Timers use business time from the team calendar and do nothing while the run is 
 | `expire_after` | Unset, never expires | Gate closes `expired`, following the workflow's `expired` edge |
 
 - Each timer is a one-shot schedule that re-reads the gate before acting, so a late timer is harmless.
-- `expired` can only lead to a non-approving path. A run also has `max_run_age`, default 180 days,
-  well inside the Step Functions 1 year cap.
+- `expired` can only lead to a non-approving path. A run also has `max_run_age`, default 180 days, counted in **wall-clock**
+  time, because the Step Functions 1 year limit is wall-clock and does not pause [S33].
 - There is no reassign that bypasses eligibility: an admin may change who is eligible, audited, but
   cannot approve on behalf of someone.
 
@@ -249,40 +262,52 @@ These rules apply **at any stage**, not only while a gate is open. Reconciliatio
 
 | Event | Behaviour |
 |---|---|
-| New commit on the branch not in the run's own push receipts | Any open gate `superseded`, active step stopped. Treated as a human commit of unknown author (section 9.4). The run returns to the workflow's `on_external_commit` stage, by default its CI stage, using the `external_commit` loop, default cap 3, then `BLOCKED` |
+| New commit on the branch that is not ours (section 9.4) | Any open gate `superseded`, active step stopped. Treated as a human commit of unknown author. The run returns to the workflow's `on_external_commit` stage, by default its CI stage, using the `external_commit` loop, default cap 3, then `BLOCKED`. Classification waits while one of our push or update effects is `ATTEMPTING`, so we never mistake our own commit |
 | Base branch moves | No change until merge. The merge guard handles it (section 6.4) |
 | Ticket edited, gate open | Gate stays open, with a banner and a diff of the ticket. **Earlier votes are dropped**, because they saw another revision. Approving requires acknowledgement |
-| Ticket edited, no gate open | The new revision is recorded, and the next gate shows the change |
+| Ticket edited, no gate open, before the final approval | The new revision is recorded, and the next gate shows the change |
+| Ticket edited after the final approval, before the merge | The subject moved, so the effect is refused with `gate_invalid`, and the run returns to the gate (section 6.3) |
+| Ticket edited by someone who is not a team member | Treated as untrusted: the run pauses for a member to confirm it, and the text is not given to agents until then (T11) |
 | Ticket closed or deleted | Any open gate `superseded`, run `CANCELLED` with reason. If code is already merged, it ends `done_with_incident` |
 | PR closed by a person | Any open gate `superseded`, run `CANCELLED` |
 | PR merged, not by our App | Any open gate `superseded`, run `BLOCKED`, and an outside merge is flagged in audit. Our own merge is recognised from its receipt and merge author, so it never supersedes the Kanban QA gate |
 | Workflow published | No effect. Runs stay on their pinned version (section 7.4) |
 | Approver loses eligibility | A pending vote stops counting, because eligibility is re-checked when the gate closes. Decisions on already closed gates stand, and are audited |
 
-**A gate's subject must be what was tested.** Review and QA evidence each record the SHA they ran on, and a gate cannot
-open when they differ from `head_sha`. After a merge, later gated effects check against the subject frozen in the merge
-receipt, so a ticket edit cannot strand a run after a successful merge.
+**A gate's evidence must cover what is being approved.** Every evidence record stores `tested_sha`, `patch_id` and a declared
+validity. A gate cannot open unless all its evidence is valid for the subject:
+
+| Validity | Used by | Holds when |
+|---|---|---|
+| `exact_sha` | `checks` stages | `tested_sha` equals `head_sha`. CI and QA suites always re-run on a new SHA |
+| `same_patch` | LLM reviews, QA agents | `patch_id` equals the current one. The gate page shows "evidence from an older base" |
+| `contains_sha` | Staging QA after a merge | The tested deployment contains the `merge_sha`. The gate page lists anything else it contains |
+
+After a merge, later gated effects check against the subject frozen in the merge receipt, so a ticket edit cannot strand a run
+after a successful merge.
 
 ### 4.6 Carry-over on unchanged code
 
 When a gate stage is re-entered with `carry_over: patch_id`, it closes `approved` with no human action only if **all**
-of these hold. Otherwise it opens normally.
+of these hold, evaluated by the same code as a human decision. Otherwise it opens normally.
 
-1. An earlier instance of this gate closed `APPROVED`, with full quorum, and has not been invalidated. A partial set of
-   votes on a superseded gate never carries.
+1. The **most recent closed instance** of this gate closed `APPROVED`, with full quorum, and has not been invalidated. A
+   partial set of votes on a superseded gate never carries, and neither does an approval followed by any other close.
 2. Its `patch_id` equals the current one. A change of patch invalidates it permanently, so P1, P2 and back to P1 asks again.
 3. Every approver it cites is still eligible, and separation of duties still holds against the current commits.
 4. The ticket revision is unchanged.
 5. The **attention digest** is unchanged: failed reviewers, findings at or above `block_on`, unverified criteria and red
    checks. Free-form LLM text is excluded, so re-running a reviewer does not by itself force a new decision, but a new
    problem does.
+6. **The base range changed no file in the patch.** `patch_id` ignores position, so the same added line in two places gives
+   the same ID (tested on git). This condition stops a base change from moving what an approved patch means.
 
 This handles a clean base update without a pointless re-approval. The new instance has the new SHA and cites the earlier
 decision in audit. `carry_over: none` is the regulated default and forces a new decision. Carry-over never crosses a QA
 retest.
 
 For the same reason, stages avoid repeated work when the patch is unchanged: a `review_panel` and an `agent` QA stage reuse
-results for the same `patch_id`, while `checks` stages always run at the new SHA.
+results for the same `patch_id` with `same_patch` validity, while `checks` stages always run at the new SHA.
 
 ### 4.7 State machine
 
@@ -297,7 +322,7 @@ stateDiagram-v2
     OPEN --> EXPIRED: expire_after
     OPEN --> SUPERSEDED: code or ticket moved
     OPEN --> CANCELLED: run stopped
-    APPROVED --> INVALIDATED: later code change
+    APPROVED --> INVALIDATED: patch changed or later non-approved close
     APPROVED --> [*]
     CHANGES_REQUESTED --> [*]
     RETEST --> [*]
@@ -330,7 +355,7 @@ sequenceDiagram
         D-->>S: Recorded
         DB-->>O: Stream record
         O->>SF: SendTaskSuccess(token, ids only)
-        Note over O,SF: Retried until delivered. TaskTimedOut means already closed, so reconcile
+        Note over O,SF: Retried until delivered. TaskTimedOut means already closed, so reconcile.<br/>If the token is not stored yet, the step that stores it reads the gate and signals at once
         SF->>D: Advance reads the gate record
     end
 ```
@@ -342,8 +367,16 @@ Every state change writes an append-only audit event, in the same transaction as
 - **Fields:** sequence, time, team, run, actor (verified identity and IdP subject, or a service
   identity), action, subject digest, surface (`ui`, `slack`, `github`), workflow version, previous hash
   and own hash.
-- **Tamper evidence:** events are hash-chained per run. A stream copies them to S3 with Object Lock.
-  DynamoDB deny policies block update and delete from application roles.
+- **Tamper evidence, and its limits:** events are hash-chained per run through a chain head item. Every vote serialises on that
+  head, which is acceptable at human decision rates, and a conflict is retried. A chain alone is not enough, because it is unkeyed
+  and anyone with write access could recompute it or remove a tail. So:
+  - A stream copies events to S3 with Object Lock. **Compliance mode is the default for regulated deployments**, because governance
+    mode can be bypassed with a permission. Streams keep data for 24 hours, so iterator age alarms well under that.
+  - **Periodic KMS-signed checkpoints** per team, over chain heads and counts, go in the locked bucket. The verifier checks
+    against them, so removing a tail or a whole run is detected.
+  - App roles are denied update and delete. They still need `PutItem`, which can replace an item, and a condition expression is the
+    caller's choice, so **DynamoDB alone is not tamper-proof.** Protection starts when an event reaches the locked bucket.
+- **Refused attempts** cannot be written in a transaction that failed, so they go through a separate, best-effort write and metric.
 - **Export:** by team, run or period, with a verification tool that checks the chain.
 - **Redaction:** tokens and secrets are removed before anything is stored. Comment text is kept.
 - **Retention:** default 400 days, configurable upward. Object Lock mode is a deploy setting.
@@ -390,7 +423,7 @@ flowchart TB
     subgraph AgentPlane["Agent plane: AgentCore"]
         RT[Runtime: Strands stage<br/>orchestrator and workers]
         GW[Gateway + Policy<br/>tools via MCP]
-        SBX[Sandbox runtime<br/>team image, no credentials]
+        SBX[Sandbox runtime<br/>registered image, minimal role,<br/>no SCM credentials]
         CI[Code Interpreter]
         BR[Browser]
         MEM[Memory<br/>optional]
@@ -450,7 +483,7 @@ flowchart TB
 | **Stage engine** | What happens next | Deterministic code. No LLM. Source of truth for transitions |
 | **Gates and effects** | Human decisions and outside-world writes | Run only in the control plane, with credentials that agents cannot reach |
 | **Stage orchestrators** | How one stage's work gets done | Strands agents, chosen workers, bounded by budgets and a tool allowlist. Disposable |
-| **Sandboxes** | Running repo and model-written code | No cloud or SCM credentials. Network restricted |
+| **Sandboxes** | Running repo and model-written code | No SCM credentials, a minimal execution role with no data access, and restricted network. A Runtime always has a role, and commands can read it [S61], so the role is what limits harm |
 
 ### One step, end to end
 
@@ -519,6 +552,9 @@ stateDiagram-v2
     RUNNING --> BLOCKED: permanent failure, budget, loop limit
     WAITING_EXTERNAL --> BLOCKED: timed out
     BLOCKED --> RUNNING: human retry or budget raised
+    BLOCKED --> WAITING_HUMAN: kill switch released, gate still open
+    RUNNING --> BLOCKED: kill switch
+    WAITING_HUMAN --> BLOCKED: kill switch
     QUEUED --> CANCELLING: stop
     RUNNING --> CANCELLING: stop
     WAITING_HUMAN --> CANCELLING: stop
@@ -547,8 +583,16 @@ stateDiagram-v2
 
 There is exactly one retry layer per external call: inner clients are set to `total_max_attempts=1`.
 
-**A run that merged code and ends without a QA approval of it ends `done_with_incident`,** with an alert, whichever terminal
-it reaches. `done_with_incident` is `DONE` with an incident flag.
+**A run that merged code and ends without a QA approval of it ends `done_with_incident`,** whichever terminal it reaches. The
+engine alerts, and opens a revert PR for each such merge as an implicit scoped effect. `done_with_incident` is `DONE` with an
+incident flag.
+
+**Retry and spent loops:** Retry resumes the blocked step at a new attempt, after stopping any earlier attempt, and does not reset
+loop counters. A loop at its cap goes to `BLOCKED(loop_exhausted)`, and a team admin can grant extra rounds, which is audited.
+Retrying a step that has hit a persistent false positive does not help, so a person can route it to the gate with the item on the
+attention list instead, audited. Secret scan findings need `team_admin`.
+
+**`CANCELLING` has a timeout,** default 5 minutes. If a stop call keeps failing, an alarm fires and the run reports what is unconfirmed.
 
 ### 6.3 Effects and the outbox
 
@@ -562,10 +606,10 @@ stateDiagram-v2
     ATTEMPTING --> RETRYING: transient failure
     RETRYING --> ATTEMPTING
     ATTEMPTING --> FAILED: permanent failure
-    ATTEMPTING --> QUEUED: merge queue accepted
-    QUEUED --> CONFIRMED: queue merged, verified
-    QUEUED --> FAILED: queue rejected
-    QUEUED --> VOIDED: dequeued on stop
+    ATTEMPTING --> ACCEPTED: async merge or queue accepted
+    ACCEPTED --> CONFIRMED: merged, verified
+    ACCEPTED --> FAILED: rejected or head moved
+    ACCEPTED --> VOIDED: cancelled or dequeued on stop
     PLANNED --> VOIDED: run stopped or gate invalid
     RETRYING --> VOIDED: run stopped or gate invalid
     CONFIRMED --> [*]
@@ -576,19 +620,31 @@ stateDiagram-v2
 | Class | Rule | Examples |
 |---|---|---|
 | `internal` | Free | Artifacts, events |
-| `scoped` | Only if the workflow declares it, only to bot-owned objects | Push to `sto/*` branch, update its base, open or close a draft PR, open a revert PR, publish a check run, progress comment on a ticket, gate notifications |
-| `gated` | The class comes from the effect catalog, not config. Requires a non-empty `requires_gates`, and a valid approval for each. The executor re-checks immediately before acting | Mark PR ready, merge, ticket to Done, trigger release, external announcement |
+| `scoped` | Declared in the workflow, or engine-implicit, and only to bot-owned objects | **Declared:** `branch.push`, `pr.ensure_draft`, `pr.update_branch`, `pr.open_revert`, progress comments. **Engine-implicit, needing no stage:** check runs, gate notifications, `pr.close` on reject, a revert PR for an unqualified merge |
+| `gated` | The class comes from the effect catalog, not config. Requires a non-empty `requires_gates`, and a valid approval for each, checked in the claim transaction | `branch.promote`, `env.deploy_preview`, mark PR ready, merge, ticket to Done, trigger release, external announcement |
+
+Each effect's `with` is typed in the catalog, and unknown keys are refused, so a transition target or a zero hold cannot slip past the
+validator.
 
 **A refused gated effect** does not retry blindly. The effect is `VOIDED` with `gate_invalid`, and the engine returns the run to
 the stage of the first gate whose approval no longer holds, so the path is still through a gate, capped by `max_steps_per_run`.
 
 **Idempotency** uses a key from `(run, stage, visit number, effect type, subject digest)`, so a deliberate retry after a
-`stale` result gets a new record:
+`stale` result gets a new record. An effect that must stay single across rounds declares a narrower scope in the catalog:
+`pr.ensure_draft` is keyed by `(run, branch)`, and finds or creates, so a second round cannot open a second PR.
 
 - GitHub comments carry a hidden marker, and a lookup finds existing ones **only among comments
   written by our own bot identity**. This fixes the PoC finding that a public issue could plant a
   marker to suppress the real comment.
-- GitHub merges use `sha`, and an already merged PR at that SHA counts as success.
+- GitHub merges pass the approved `sha`, and a PR already merged at that SHA counts as success.
+- **Commits are recorded before the ref moves.** With the Git Data API we create the commit object, which returns its SHA, write that
+  SHA as intent, then update the ref without force. A crash leaves a known SHA, and a concurrent push makes the update fail.
+- **Base updates use `POST /repos/{o}/{r}/merges`,** which returns the commit SHA [S62], rather than `update-branch`, which returns 202
+  with no SHA. If a crash loses the response, a commit is recognised as ours only if its parents are the expected head and base tip
+  **and** `patch_id` is unchanged, so a hand-made merge that alters code cannot pass as ours.
+- **A release dispatch has no idempotency key,** and a crash can lose the run ID [S63]. So the effect key is a required workflow input
+  shown in `run-name`. Retry looks it up first, and if the state is ambiguous the run goes to `BLOCKED`. A production deploy is never
+  re-triggered on a guess.
 - Jira comments and transitions read current state first. Transitions are by target status, and
   "already there" is success.
 - Slack messages store `ts` and update in place.
@@ -598,18 +654,22 @@ the stage of the first gate whose approval no longer holds, so the path is still
 
 ### 6.4 Merge guard
 
-The orchestrator merges with these checks, all re-read immediately before the call:
+The orchestrator merges with these checks. The switches and gate conditions are part of the claim transaction (section 4.3, rule 1), and
+the rest are re-read immediately before it:
 
-1. Run is active. Team and fleet merge switches are on. No freeze window applies. `hold_after_approval` has passed.
-2. Every gate in `requires_gates` has an approved instance **whose `head_sha` is the current head**. The carry-over rules
-   in section 4.6 are the only way a new SHA gets such an instance without a person.
+1. Run is active. Team and fleet merge switches are on. No freeze or change window applies. `hold_after_approval` has passed.
+2. The **latest instance** of every gate in `requires_gates`, and any other gate visited in this code round, is approved, with
+   `head_sha` equal to the current head. The carry-over rules in section 4.6 are the only way a new SHA gets that without a person.
 3. Team-required checks are green at this exact SHA. A check that is merely pending means wait, not failure.
 4. Separation of duties still holds, including any commit added since the gate opened.
 5. PR is open, not draft (marked ready by a prior gated effect), and targets the expected base.
-6. **Head contains the current base tip** (`require_up_to_date`, default on), so the tree being merged is the tree that was
-   tested. `sha` only guards the head. Teams may turn this off and use a merge queue instead.
-7. The merge call passes that approved SHA as `sha`. A 409 means the head moved, and a 405 means it cannot merge, and the reason decides the next step.
-8. Read back that the PR is merged, and record the merge SHA and frozen subject.
+6. **Head contains the current base tip** (`require_up_to_date`, default on, with an org floor), so the tree being merged is the tree
+   that was tested. `sha` only guards the head. A merge queue's group result counts as the tested tree.
+7. The merge request goes through GitHub's **async merge API** (`PUT .../merge-async`, then poll), which GitHub now recommends and which is
+   the only one that adds to a merge queue [S60], passing the approved SHA. The sync endpoint "does not support ... merging with a merge
+   queue". A moved head cancels the merge, and the exact error semantics are settled live in D4-23.
+8. Read back that the PR is merged, and record the merge SHA and frozen subject. An `enqueued` result is final for that request and does not
+   mean merged [S60], so the effect stays `ACCEPTED` until read-back.
 
 | Result | Next |
 |---|---|
@@ -617,103 +677,154 @@ The orchestrator merges with these checks, all re-read immediately before the ca
 | Base moved, or head not up to date | `stale` edge to a `pr.update_branch` effect, which commits the base update, and then CI. Reviews and QA agents reuse results if the patch is unchanged, and carry-over decides whether a person is needed |
 | Update or merge conflict | `conflict` edge to `implement`, using the `merge_conflict` loop, so gates apply again |
 | Required check pending | Wait, with no loop used. A timeout takes the `stale` edge |
-| Merge queue configured | Enqueue, wait for the queue outcome, read back. Requires `merge_group` on team CI [S43]. Stop dequeues it, checking the expected head. Enqueue through the API is unverified, and D4-12 settles it |
+| Merge queue configured | Enqueue, wait for the outcome, read back. Requires `merge_group` on team CI [S43]. Stop dequeues it. Queues need an organization-owned repo, and private repos need Enterprise Cloud [S43] |
 | Guard 2 or 4 fails | `gate_invalid`, per section 6.3 |
 | Branch protection blocks the App | `BLOCKED`, with a message saying exactly which rule, and how to fix it |
 
-**GitHub enforcement:** the App publishes `sto/review-gate` and `sto/qa-gate` check runs on `sto/*` heads, and a neutral result
-on all other PRs, so human PRs, dependency PRs and revert PRs are not blocked. A team requires them, pinned to our App ID
-[S41], so an out-of-band merge is blocked by GitHub itself. Each template documents which to require: a Kanban merge happens
-before QA, so it requires only the review check. If a repo also requires a human GitHub review, use `decision_surfaces:
-[github]`, so the reviewer's own GitHub review is the decision ([ADR-0010](adr/0010-autonomous-merge-github-app.md)).
+**Busy repos:** a trunk that merges often will keep moving the base, and each move re-runs CI. A run that exhausts `merge_stale` goes to
+`BLOCKED(loop_exhausted)`. Use a merge queue where available, which is the default recommendation for regulated and busy repos. Where it is
+not, an org can waive `require_up_to_date` for a repo, relying on post-merge checks. D13-07 models this.
+
+**GitHub enforcement raises the bar, and does not close it.** The App publishes `sto/review-gate` and `sto/qa-gate` check runs, which
+teams can require, pinned to our App ID [S41]. Each template documents which to require: a Kanban merge happens before QA, so it requires only
+the review check.
+
+- **A check attaches to a commit, not a PR,** and neutral counts as passing [S59]. So neutral is posted only for a SHA not associated with any
+  active run, and never replaces a pending gate check.
+- **This stops** merging a run's exact SHA before approval, from any branch.
+- **This does not stop** someone with write access pushing different code to another branch and merging it, because that is an ordinary human PR.
+  The reconciler detects a run's content landing outside the platform, and flags it.
+- Revert PRs use a `sto-revert/*` namespace, outside the gate check, so a revert is not stuck in an incident.
+- If a repo also requires a human GitHub review, use `decision_surfaces: [github]`, so the reviewer's own GitHub review is the decision
+  ([ADR-0010](adr/0010-autonomous-merge-github-app.md)).
 
 ## 7. Workflow configuration
 
 ### 7.1 Principles
 
-- **Declarative YAML,** validated by a JSON Schema generated from typed models, then by semantic rules.
-- **Layered:** platform floors, then org defaults, then a template, then team overlay. A lower layer
-  cannot weaken a floor.
-- **Versioned and immutable once published.** Every run pins one version, and a run in flight never
-  changes.
-- **Dry-runnable:** a team can simulate any workflow with the fake LLM before publishing.
+- **Four documents, with different owners and lifetimes:**
+
+| Document | Owner | Lifetime | Holds |
+|---|---|---|---|
+| `OrgPolicy` | Org admin | **Live,** read at decision and effect time | Floors: who can be eligible, surfaces, waivers, minimum holds, identity age |
+| `TeamConfig` | Team admin | **Live** | Calendar, sprint, budgets, WIP limit, change windows, custom profiles |
+| Resource bindings | Org admin | **Live** | Which team owns which repo, Jira project and Slack channel |
+| `Workflow` | Team admin | **Versioned, immutable, pinned per run** | Intake, stages, edges, loop limits |
+
+- **Templates and overlays:** a team writes a short overlay on a template, not a copy of it. Overlays use JSON Merge Patch (RFC 7386) on a stage
+  map keyed by ID: maps merge, lists replace, and `null` removes. The order of stages has no meaning, because edges define the flow, so no
+  `insert_after` is needed.
+- **Publishing flattens.** A workflow pins `extends: template@version`, and publishing resolves it into a full, stored document with a digest. A
+  changed template affects nobody until the team moves to the new version.
+- **Validated statically,** by a JSON Schema generated from typed models, then by semantic rules. Dry-run works with the fake LLM before publishing.
 - **Stored in the platform,** or synced from a repo path with GitOps, where a PR changes the workflow.
+- **One repo per run,** for this release. A workflow may list several repos, and the ticket's component picks one through a resource binding.
+  Cross-repo changes are linked tickets.
 
 ### 7.2 Schema
 
 ```yaml
 apiVersion: sto/v1
-kind: Workflow
-metadata: { name: string, team: string, extends: optional template@version }
+kind: Workflow                # or WorkflowOverlay, with `extends: template@version`
+metadata: { name: string, team: string }
 
-intake:                     # which tickets start a run
+intake:                       # closed selectors, so overlaps can be proved
   source: github | jira | linear | azure_devops
-  filter: string            # label or JQL or equivalent, adapter-specific
-  sprint: { mode: any | active_only }          # optional
-  wip_limit: integer        # optional, per-team running runs
+  project: string             # Jira project, or owner/repo. Must be bound to this team
+  label: string
+  issue_types: [ string ]     # optional
+  extra_filter: string        # optional, adapter-specific, applied after re-reading the ticket
+  sprint: { mode: any | active_only }
 
-repos: [ { url: string, base: string, sandbox_image: string } ]
-
-calendar: { timezone: string, workdays: [mon..sun], hours: "09:00-17:30", holidays: ref }
-sprint:   { cadence: 1w | 2w | 3w | 4w, anchor: date, merge_freeze_before_end: duration }
-
-budgets:
-  run_usd: number
-  team_monthly_usd: number
-  stage_usd: { <stage id>: number }
+repos: [ { repo: owner/name, base: string, sandbox_image: registered image name } ]
 
 limits:
   loops: { <loop name>: integer }   # every cycle in the graph must name one
   max_steps_per_run: integer        # platform maximum 500
-  max_run_age: duration             # platform maximum 300d
+  max_run_age: duration             # wall clock, platform maximum 300d
 
 on_external_commit: <stage id>      # optional, defaults to the workflow's CI stage
 
-definition_of_done:                 # machine-evaluated, stage exit conditions
-  - { stage: <id>, check: ac_present | checks_green | coverage_at_least | no_findings_above | ... }
+definition_of_done:                 # evaluated before a gate opens, or before a stage exits
+  - { stage: <id>, check: ac_present | checks_green | coverage_at_least | no_findings_above }
 
 start: <stage id>
 stages:
-  - id: string
-    kind: agent | review_panel | checks | gate | effect | wait | terminal
+  <stage id>:
+    kind: agent | review_panel | checks | gate | effect | wait | route | terminal
     # kind: agent
-    agent: <agent profile>         # see section 8
-    model_tier: fast | standard | deep    # optional override
+    agent: <profile>               # built-in, or custom from TeamConfig
+    model_tier: fast | standard | deep
     max_attempts: integer
     # kind: review_panel
-    reviewers: [ <agent profile> ]
-    required: [ <agent profile> ]
-    fail_closed: boolean
+    reviewers: [ <profile> ]
+    required: [ <profile> ]        # at least one
+    fail_closed: boolean           # a failed required reviewer blocks, and the degraded edge is then unused
     block_on: low | medium | high | critical
     # kind: checks
     source: ci | qa_suite | post_merge
-    required: [ string ] | team_default
+    required: [ string ] | team_default    # must resolve to at least one check
     timeout: duration
     # kind: gate
     gate:
       type: review | qa | custom
-      eligible_roles: [ role ]
-      approvals_required: integer
+      eligible_roles: [ role ]     # the only authority on who may decide
+      quorum: [ { role: role, count: integer } ]    # default one approval from any eligible role
+      path_owners: none | codeowners               # also require owners of changed paths
       decisions: [ approve, request_changes, reject, retest, waive ]
       decision_surfaces: [ ui, slack, github ]
-      separation_of_duties: { not: [ author, requester, committer, approver_of: gate id ] }
+      separation_of_duties: { not: [ author, requester, committer, { approver_of: <gate id> } ] }
       carry_over: patch_id | none
-      timeouts: { remind_after: duration, escalate_after: duration,
-                  escalate_to: role, expire_after: duration }
+      timeouts: { remind_after: duration, escalate_after: duration, escalate_to: role, expire_after: duration }
     # kind: effect
-    effect: pr.open_draft | pr.close | pr.update_branch | pr.mark_ready | pr.merge | ticket.comment
-            | ticket.transition | release.trigger | pr.open_revert | notify
-    with: { ... }                   # effect parameters
-    requires_gates: [ gate stage id ]
+    effect: branch.push | branch.promote | pr.ensure_draft | pr.update_branch | pr.mark_ready | pr.merge
+            | pr.open_revert | ticket.comment | ticket.transition | env.deploy_preview | release.trigger | notify
+    with: { ... }                  # typed per effect in the catalog, unknown keys refused
+    requires_gates: [ gate id ]    # required and non-empty on every gated effect
     # kind: wait
     wait_for: human_answer | environment_ready
     timeout: duration
+    # kind: route, a closed vocabulary on ticket fields, with no expressions
+    field: risk | issue_type | priority | component | label
     # kind: terminal
     result: done | rejected | closed | expired | done_with_incident
     # every kind but terminal
     next:
       <outcome>: <stage id>                   # or
       <outcome>: { to: <stage id>, loop: <loop name> }
+```
+
+```yaml
+apiVersion: sto/v1
+kind: TeamConfig
+metadata: { team: string }
+calendar: { timezone: string, workdays: [mon..sun], hours: "09:00-17:30", holidays: ref }
+sprint: { cadence: 1w | 2w | 3w | 4w, anchor: date, merge_freeze_before_end: duration }
+wip_limit: integer
+change_windows: { deny: [ { from: datetime, to: datetime, reason: string } ], allow_only: cron }
+budgets:
+  run_usd: number
+  team_monthly_usd: number
+  stage_usd: { <stage id>: number }
+  session_seconds_per_run: integer
+custom_profiles:             # a team's own reviewer, with no platform PR
+  <name>: { base: <built-in profile>, prompt_addendum: string, tools: [ subset of base ] }
+```
+
+```yaml
+apiVersion: sto/v1
+kind: OrgPolicy
+floors:
+  single_human_allowed: false        # true lets one person pass both mandatory gates (Q5)
+  requester_excluded_from: [review]
+  mandatory_gate_roles: { review: [reviewer], qa: [qa, reviewer] }    # never developer
+  decision_surfaces: { review: [ui, slack, github], qa: [ui, slack] }
+  waive_allowed: true
+  hold_after_approval_min: 10m
+  require_up_to_date: true
+  identity_max_age: 8h
+  public_repo_intake: false          # public repos need explicit opt-in
+  ci_without_secrets_waived_for: []  # repos exempt from the floor in T18
 ```
 
 The edge key is `next`, not `on`, because YAML 1.1 parsers such as PyYAML read a bare `on` as boolean true. The loader
@@ -729,12 +840,14 @@ also refuses duplicate keys, and YAML's other implicit booleans in keys.
 | `gate` | `approved`, `changes_requested`, `rejected`, plus `retest` if listed, plus `expired` if `expire_after` is set |
 | `effect` | `done`. `pr.merge` adds `conflict` and `stale`, and `pr.update_branch` adds `conflict` |
 | `wait` | `resumed`, `timeout` |
+| `route` | Each field value used, plus `default` |
 
 Engine-level failures (section 6.2) do not need edges, because they go to `BLOCKED`.
 
 ### 7.3 Validator rules
 
-Each rule has a test, and every bundled template passes all of them in CI.
+Each rule has a test, and every bundled template passes all of them in CI. **Validation runs at publish. Org floors are also enforced at decision and
+effect time, because a floor can tighten after publishing.**
 
 | Rule | Why |
 |---|---|
@@ -743,134 +856,120 @@ Each rule has a test, and every bundled template passes all of them in CI.
 | V3 **Every cycle contains an edge with a named `loop`,** and the limit is at most the platform cap | Review loops need caps, proved statically |
 | V4 **Gate dominance:** every `gated` effect has a non-empty `requires_gates`. For each gate listed, remove its `approved` edge, and the effect must be unreachable from `start` | Nothing gated runs without approval, on every path |
 | V5 **Freshness:** same removal, from every code-changing stage, the effect is unreachable. Code-changing is derived: a profile with `workspace.write`, `pr.update_branch`, and `on_external_commit`'s target | An approval cannot be reused past a code change on any path |
-| V6 **Floors:** `pr.merge` requires a `review` gate. `release.trigger` and a `ticket.transition` to done require a `qa` gate. Terminal `done` is unreachable without a QA approval. After a merge's `done` edge, with QA gates removed and `wait` timeouts ignored, no `done` or `closed` terminal is reachable | The two mandatory gates, in either order |
-| V7 Every gate has a human-only path: `eligible_roles` non-empty, `approvals_required` at least 1, no `auto_approve` key exists in the schema | Timeouts never approve |
+| V6 **Floors:** `pr.merge` requires a `review` gate. `release.trigger` and a `ticket.transition` to done require a `qa` gate. Terminal `done` is unreachable without a QA approval. **If a merge is reachable from `start` with QA approvals removed** (merge before QA), then from its `done` edge, with QA gates removed and `wait` timeouts ignored, no `done` or `closed` terminal is reachable | The two mandatory gates, in either order |
+| V7 Every gate has a human-only path: `eligible_roles` non-empty, quorum at least 1, no `auto_approve` key exists in the schema | Timeouts never approve |
 | V8 `expired` and `rejected` edges cannot lead to a `gated` effect | Non-approval stays non-approval |
-| V9 Budgets and limits within org ceilings. Models in the catalog. Tools in each profile's allowlist | Floors hold |
-| V10 Decision surfaces permitted: regulated orgs may set `slack` off, `github` only on review-type gates, and org policy can forbid `waive` | Compliance |
+| V9 Budgets and limits within org ceilings. Models in the catalog. Tools in each profile's allowlist. Tier available in this deployment's geography | Floors hold |
+| V10 Decision surfaces permitted by `OrgPolicy`, with `github` only on review-type gates. `waive` only if allowed | Compliance |
 | V11 **Review order:** with `review_panel` stages removed, no review-type gate is reachable from a code-changing stage | LLM reviews come before the human review, as Peter asked |
+| V12 **Resource ownership:** every repo, project and channel named is bound to this team. Intake project and label pairs do not overlap with another published workflow | One team cannot name another's repo (T19) |
+| V13 **No empty floors:** a `review_panel` has at least one required reviewer. A `checks` stage has at least one required check, and `team_default` is re-checked at run time and blocks if empty | A floor cannot be met by an empty stage |
+| V14 **QA evidence dominates:** with QA evidence stages removed (`qa_suite` checks, a QA agent), no `qa` gate is reachable from a code-changing stage | A QA gate must have something to judge |
+| V15 Mandatory gates only list roles in `mandatory_gate_roles`. Sandbox images are registered. `with` is typed | Floors hold |
 
 V4, V5 and V6 are the runtime-independent generalisation of the PoC's topology test. The checks on the examples below were run by a
 scratch script for this PR, and become real code in D2-03 and D2-04.
 
+**Overlapping intake:** arbitrary JQL cannot be proved disjoint, so intake uses closed selectors, and `extra_filter` can only narrow. If a ticket still
+matches two workflows at run time, no run starts, and the team is told.
+
 ### 7.4 Pinning and change
 
-- Publishing creates version N+1. A run stores `workflow_version` and the exact config digest.
-- Runs in flight stay on their version. Admins can migrate a run only if the target is valid at its
-  current stage, and the migration is audited.
+- A run pins a **manifest digest** covering the flattened workflow, agent profiles, effect catalog and prompts. Old versions stay addressable by content
+  hash, so a later change to a profile's outcomes cannot strand a run with no edge.
+- **Budgets, calendars and org floors are live.** Only the shape of the workflow is pinned, so raising a budget or tightening a floor reaches runs in flight.
+- `apiVersion` changes come with a migration rule.
+- Admins can migrate a run through `POST /runs/{id}:migrate` and the Run page, only if the target is valid at its current stage, and it is audited.
 - Dry-run replays recent runs against a draft to show routing differences.
 
 ### 7.5 Platform floors
 
-Teams cannot weaken these:
+Teams cannot weaken these. Org admins can change only those marked as `OrgPolicy` settings.
 
 - A review gate and a QA gate exist on every path to `done` (Q2). LLM reviews precede the review gate.
 - Merge requires a valid review approval for that code.
-- Separation of duties has a minimum: an identity that authored commits in the PR cannot approve its
-  review gate.
+- **Separation of duties** (section 9.4): an identity that authored commits in the PR cannot approve its review gate. By default the requester cannot approve
+  review, and no single person can approve both review and QA (`single_human_allowed`, Q5). Terms that cannot be resolved fail closed.
+- **Model-written code gets no secrets before the first human gate** (T18).
+- `hold_after_approval` and `require_up_to_date` have org minimums.
 - Timeouts never approve. Every cycle is capped. Every run has a budget.
 - Secret scanning cannot be turned off. Agents never hold SCM credentials.
 
-### 7.6 Example: Scrum team, 2-week sprints
+### 7.6 The `standard` template, and a Scrum team
+
+The template is bundled and versioned. Teams do not edit it.
 
 ```yaml
 apiVersion: sto/v1
 kind: Workflow
-metadata: { name: payments-scrum, team: payments }
-intake:
-  source: jira
-  filter: 'project = PAY AND labels = agent-ready'
-  sprint: { mode: active_only }
-repos:
-  - { url: https://github.com/example/payments, base: main, sandbox_image: sto/java21:1 }
-calendar: { timezone: Europe/London, workdays: [mon, tue, wed, thu, fri], hours: "09:00-17:30" }
-sprint: { cadence: 2w, anchor: 2026-11-02, merge_freeze_before_end: 1d }
-budgets:
-  run_usd: 40            # placeholder until D12 measures real costs
-  team_monthly_usd: 3000
-  stage_usd: { implement: 20, qa_agentic: 6 }
+metadata: { name: standard, team: _template }
 limits:
   loops: { info: 2, ci_fix: 3, llm_fix: 2, human_review: 3, qa_fix: 2, retest: 2, merge_conflict: 2, merge_stale: 3 }
   max_steps_per_run: 120
-  max_run_age: 45d
+  max_run_age: 60d
 definition_of_done:
   - { stage: refine, check: ac_present }
   - { stage: review_gate, check: checks_green }
-  - { stage: review_gate, check: coverage_at_least, value: 80 }
 start: triage
 stages:
-  - id: triage
-    kind: agent
-    agent: triage
-    next: { ready: refine, needs_info: await_info, not_actionable: closed }
-  - id: await_info
+  triage: { kind: agent, agent: triage, next: { ready: refine, needs_info: await_info, not_actionable: closed } }
+  await_info:
     kind: wait
     wait_for: human_answer
     timeout: 10d
     next: { resumed: { to: triage, loop: info }, timeout: closed }
-  - id: refine
-    kind: agent
-    agent: refiner
-    next: { ready: plan, needs_info: await_info }
-  - id: plan
-    kind: agent
-    agent: planner
-    model_tier: deep
-    next: { ready: implement, needs_info: await_info }
-  - id: implement
-    kind: agent
-    agent: implementer
-    next: { ready: open_pr, blocked: await_info }
-  - id: open_pr
-    kind: effect
-    effect: pr.open_draft
-    next: { done: ci }
-  - id: ci
+  refine: { kind: agent, agent: refiner, next: { ready: plan, needs_info: await_info } }
+  plan: { kind: agent, agent: planner, model_tier: deep, next: { ready: implement, needs_info: await_info } }
+  implement: { kind: agent, agent: implementer, next: { ready: push, blocked: await_info } }
+  push: { kind: effect, effect: branch.push, next: { done: open_pr } }
+  open_pr: { kind: effect, effect: pr.ensure_draft, next: { done: ci } }
+  ci:
     kind: checks
     source: ci
     required: team_default
     timeout: 2h
     next: { green: llm_review, red: { to: implement, loop: ci_fix } }
-  - id: llm_review
+  llm_review:
     kind: review_panel
     reviewers: [correctness_reviewer, security_reviewer, test_reviewer]
     required: [correctness_reviewer, security_reviewer]
     block_on: high
     next: { clean: review_gate, findings: { to: implement, loop: llm_fix }, degraded: review_gate }
-  - id: review_gate
+  review_gate:
     kind: gate
     gate:
       type: review
       eligible_roles: [reviewer]
-      approvals_required: 1
       decisions: [approve, request_changes, reject]
       decision_surfaces: [ui, slack]
-      separation_of_duties: { not: [committer] }
       carry_over: patch_id
       timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: team_admin }
     next:
-      approved: qa_auto
+      approved: qa_env
       changes_requested: { to: implement, loop: human_review }
       rejected: closed_rejected
-  - id: qa_auto
+  qa_env:
+    kind: effect
+    effect: env.deploy_preview
+    requires_gates: [review_gate]
+    next: { done: qa_auto }
+  qa_auto:
     kind: checks
     source: qa_suite
     required: [integration, e2e]
     timeout: 3h
     next: { green: qa_agentic, red: { to: implement, loop: qa_fix } }
-  - id: qa_agentic
+  qa_agentic:
     kind: agent
     agent: qa_agent
     next: { pass: qa_gate, fail: qa_gate, inconclusive: qa_gate }
-  - id: qa_gate
+  qa_gate:
     kind: gate
     gate:
       type: qa
       eligible_roles: [qa]
-      approvals_required: 1
       decisions: [approve, request_changes, retest, reject]
       decision_surfaces: [ui, slack]
-      separation_of_duties: { not: [committer] }
       carry_over: patch_id
       timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: team_admin }
     next:
@@ -878,206 +977,146 @@ stages:
       changes_requested: { to: implement, loop: qa_fix }
       retest: { to: qa_auto, loop: retest }
       rejected: closed_rejected
-  - id: mark_ready
+  mark_ready:
     kind: effect
     effect: pr.mark_ready
     requires_gates: [review_gate, qa_gate]
     next: { done: merge }
-  - id: merge
+  merge:
     kind: effect
     effect: pr.merge
     with: { method: squash }
     requires_gates: [review_gate, qa_gate]
     next: { done: post_merge, conflict: { to: implement, loop: merge_conflict }, stale: { to: update_branch, loop: merge_stale } }
-  - id: update_branch
+  update_branch:
     kind: effect
     effect: pr.update_branch
     next: { done: ci, conflict: { to: implement, loop: merge_conflict } }
-  - id: post_merge
+  post_merge:
     kind: checks
     source: post_merge
     required: team_default
     timeout: 1h
     next: { green: ticket_done, red: revert_pr }
-  - id: ticket_done
+  ticket_done:
     kind: effect
     effect: ticket.transition
     with: { to_status_category: done }
     requires_gates: [review_gate, qa_gate]
     next: { done: done }
-  - id: revert_pr
-    kind: effect
-    effect: pr.open_revert
-    next: { done: incident }
-  - { id: done, kind: terminal, result: done }
-  - { id: incident, kind: terminal, result: done_with_incident }
-  - { id: closed, kind: terminal, result: closed }
-  - { id: closed_rejected, kind: terminal, result: rejected }
+  revert_pr: { kind: effect, effect: pr.open_revert, next: { done: incident } }
+  done: { kind: terminal, result: done }
+  incident: { kind: terminal, result: done_with_incident }
+  closed: { kind: terminal, result: closed }
+  closed_rejected: { kind: terminal, result: rejected }
 ```
 
-Sprint behaviour: only tickets in the active sprint start. Merge pauses before sprint end, holding the
-run in `WAITING_EXTERNAL`. Sprint reports appear on the Insights page.
-
-Merging after QA means any other merge to `main` moves the base. So both gates use `carry_over: patch_id`: on a clean update, CI and
-the QA suite run again at the new SHA, reviews and QA agents reuse their results, and no person is asked unless something changed.
-
-### 7.7 Example: Kanban team, trunk-based, QA on staging after merge
+A Scrum team on 2-week sprints needs only this. Its `TeamConfig` holds the sprint, calendar and budgets.
 
 ```yaml
 apiVersion: sto/v1
-kind: Workflow
-metadata: { name: platform-kanban, team: platform }
-intake:
-  source: github
-  filter: 'label:agent-ready'
-  wip_limit: 5
+kind: WorkflowOverlay
+metadata: { name: payments-scrum, team: payments }
+extends: standard@1
+intake: { source: jira, project: PAY, label: agent-ready, sprint: { mode: active_only } }
 repos:
-  - { url: https://github.com/example/platform, base: main, sandbox_image: sto/go1:1 }
-calendar: { timezone: America/New_York, workdays: [mon, tue, wed, thu, fri], hours: "08:00-18:00" }
-budgets: { run_usd: 25, team_monthly_usd: 2000, stage_usd: { implement: 15 } }
+  - { repo: example/payments, base: main, sandbox_image: java21 }
+definition_of_done:
+  - { stage: refine, check: ac_present }
+  - { stage: review_gate, check: checks_green }
+  - { stage: review_gate, check: coverage_at_least, value: 80 }
+stages:
+  llm_review: { reviewers: [correctness_reviewer, security_reviewer, test_reviewer, pci_reviewer] }
+```
+
+```yaml
+apiVersion: sto/v1
+kind: TeamConfig
+metadata: { team: payments }
+calendar: { timezone: Europe/London, workdays: [mon, tue, wed, thu, fri], hours: "09:00-17:30" }
+sprint: { cadence: 2w, anchor: 2026-11-02, merge_freeze_before_end: 1d }
+budgets:                     # placeholders until D12 measures real costs
+  run_usd: 40
+  team_monthly_usd: 3000
+  stage_usd: { implement: 20, qa_agentic: 6 }
+  session_seconds_per_run: 14400
+custom_profiles:
+  pci_reviewer: { base: security_reviewer, prompt_addendum: "Check card data handling against our PCI rules." }
+```
+
+Sprint behaviour: only tickets in the active sprint start. Merge pauses before sprint end, holding the run in `WAITING_EXTERNAL`. Sprint reports appear on the
+Insights page.
+
+Merging after QA means any other merge to `main` moves the base. So both gates use `carry_over: patch_id`: on a clean update, CI and the QA suite run again at
+the new SHA, reviews and QA agents reuse their results, and no person is asked unless something changed.
+
+### 7.7 Kanban team, trunk-based, QA on staging after merge
+
+```yaml
+apiVersion: sto/v1
+kind: WorkflowOverlay
+metadata: { name: platform-kanban, team: platform }
+extends: standard@1
+intake: { source: github, project: example/platform, label: agent-ready }
+repos:
+  - { repo: example/platform, base: main, sandbox_image: go1 }
 limits:
-  loops: { ci_fix: 3, llm_fix: 2, human_review: 3, qa_fix: 2, retest: 2, merge_conflict: 2, merge_stale: 3, info: 2 }
   max_steps_per_run: 100
   max_run_age: 30d
-start: triage
+definition_of_done: null
 stages:
-  - id: triage
-    kind: agent
-    agent: triage
-    model_tier: fast
-    next: { ready: implement, needs_info: await_info, not_actionable: closed }
-  - id: await_info
-    kind: wait
-    wait_for: human_answer
-    timeout: 7d
-    next: { resumed: { to: triage, loop: info }, timeout: closed }
-  - id: implement
-    kind: agent
-    agent: implementer
-    next: { ready: open_pr, blocked: await_implementer }
-  - id: await_implementer
+  refine: null
+  plan: null
+  qa_env: null
+  post_merge: null
+  triage: { model_tier: fast, next: { ready: implement } }
+  implement: { next: { blocked: await_implementer } }
+  await_implementer:
     kind: wait
     wait_for: human_answer
     timeout: 7d
     next: { resumed: { to: implement, loop: info }, timeout: closed }
-  - id: open_pr
-    kind: effect
-    effect: pr.open_draft
-    next: { done: ci }
-  - id: ci
-    kind: checks
-    source: ci
-    required: team_default
-    timeout: 45m
-    next: { green: llm_review, red: { to: implement, loop: ci_fix } }
-  - id: llm_review
-    kind: review_panel
-    reviewers: [correctness_reviewer, security_reviewer]
-    required: [correctness_reviewer]
-    block_on: high
-    next: { clean: review_gate, findings: { to: implement, loop: llm_fix }, degraded: review_gate }
-  - id: review_gate
-    kind: gate
-    gate:
-      type: review
-      eligible_roles: [reviewer]
-      approvals_required: 1
-      decisions: [approve, request_changes, reject]
-      decision_surfaces: [ui, slack, github]
-      separation_of_duties: { not: [committer] }
-      carry_over: patch_id
-      timeouts: { remind_after: 4h, escalate_after: 1d, escalate_to: team_admin }
-    next:
-      approved: mark_ready
-      changes_requested: { to: implement, loop: human_review }
-      rejected: closed_rejected
-  - id: mark_ready
-    kind: effect
-    effect: pr.mark_ready
-    requires_gates: [review_gate]
-    next: { done: merge }
-  - id: merge
-    kind: effect
-    effect: pr.merge
-    with: { method: squash }
-    requires_gates: [review_gate]
-    next: { done: qa_auto, conflict: { to: implement, loop: merge_conflict }, stale: { to: update_branch, loop: merge_stale } }
-  - id: update_branch
-    kind: effect
-    effect: pr.update_branch
-    next: { done: ci, conflict: { to: implement, loop: merge_conflict } }
-  - id: qa_auto
-    kind: checks
-    source: qa_suite
-    required: [staging-smoke]
-    timeout: 1h
-    next: { green: qa_agentic, red: { to: implement, loop: qa_fix } }
-  - id: qa_agentic
-    kind: agent
-    agent: qa_agent
-    next: { pass: qa_gate, fail: qa_gate, inconclusive: qa_gate }
-  - id: qa_gate
-    kind: gate
-    gate:
-      type: qa
-      eligible_roles: [qa, reviewer]
-      approvals_required: 1
-      decisions: [approve, request_changes, retest, reject]
-      decision_surfaces: [ui, slack]
-      separation_of_duties: { not: [committer] }
-      carry_over: none
-      timeouts: { remind_after: 4h, escalate_after: 1d, escalate_to: team_admin }
-    next:
-      approved: release
-      changes_requested: { to: implement, loop: qa_fix }
-      retest: { to: qa_auto, loop: retest }
-      rejected: revert_pr
-  - id: revert_pr
-    kind: effect
-    effect: pr.open_revert
-    next: { done: incident }
-  - id: release
+  ci: { timeout: 45m }
+  llm_review: { reviewers: [correctness_reviewer, security_reviewer], required: [correctness_reviewer] }
+  review_gate:
+    gate: { timeouts: { remind_after: 4h, escalate_after: 1d } }
+    next: { approved: mark_ready }
+  mark_ready: { requires_gates: [review_gate] }
+  merge: { requires_gates: [review_gate], next: { done: qa_auto } }
+  qa_auto: { required: [staging-smoke], timeout: 1h }
+  qa_gate:
+    gate: { eligible_roles: [qa, reviewer], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
+    next: { approved: release, rejected: revert_pr }
+  release:
     kind: effect
     effect: release.trigger
     with: { workflow: deploy-prod.yml, sha_input: release_sha }
     requires_gates: [qa_gate]
     next: { done: ticket_done }
-  - id: ticket_done
-    kind: effect
-    effect: ticket.transition
-    with: { to_status_category: done }
-    requires_gates: [qa_gate]
-    next: { done: done }
-  - { id: done, kind: terminal, result: done }
-  - { id: incident, kind: terminal, result: done_with_incident }
-  - { id: closed, kind: terminal, result: closed }
-  - { id: closed_rejected, kind: terminal, result: rejected }
+  ticket_done: { requires_gates: [qa_gate] }
 ```
 
-Notes on merging before QA:
+**Rules for merging before QA:**
 
-- Request changes after a merge means fixing forward. `implement` works on a new branch, `sto/<run>/<n>`, cut from the new `main`,
-  and opens a follow-up PR. A QA rejection opens a revert PR and alerts, because the code is already on `main`. Teams that
-  cannot accept that use the Scrum order.
-- QA tests a staging environment that contains the merge SHA, even if later merges have landed since.
-- Release passes the approved merge SHA as a workflow input, so production gets what QA saw, not whatever `main` holds by then.
-  The team's deploy workflow must accept that input, and the effect reads back the triggered run.
-- Branch protection requires only `sto/review-gate`, since the QA check cannot pass before this merge.
+- **Which code QA tests:** the staging deployment that contains the merge SHA, with `contains_sha` validity. The gate page lists anything else staging contained.
+- **Which code releases:** the **tested staging SHA**, because that is the tree QA saw, not the bare merge SHA. Before release, a guard checks that every commit between
+  the last released SHA and the tested SHA came through a gated run, or was acknowledged at the QA gate. After a fix-forward, the latest tested SHA releases.
+- **Fix-forward:** request changes after a merge means a new branch, `sto/<run>/<n>`, cut from the new `main`, and a follow-up PR.
+- **Rejection:** a QA rejection opens a revert PR and alerts. So does a rejection of a follow-up at the review gate, through the engine rule in section 6.2, because the
+  known-bad code is already on `main`.
+- **Branch protection** requires only `sto/review-gate`, since the QA check cannot pass before this merge.
+- Teams that cannot accept any of this use the standard order.
 
-### 7.8 Example: regulated team with extra gates
+### 7.8 Regulated team with extra gates
 
 ```yaml
 apiVersion: sto/v1
-kind: Workflow
+kind: WorkflowOverlay
 metadata: { name: ledger-regulated, team: ledger }
-intake:
-  source: jira
-  filter: 'project = LED AND labels = agent-ready AND "Risk" is not EMPTY'
+extends: standard@1
+intake: { source: jira, project: LED, label: agent-ready, extra_filter: '"Risk" is not EMPTY' }
 repos:
-  - { url: https://github.com/example/ledger, base: main, sandbox_image: sto/java21:1 }
-calendar: { timezone: Europe/London, workdays: [mon, tue, wed, thu, fri], hours: "09:00-17:00" }
-sprint: { cadence: 3w, anchor: 2026-11-02, merge_freeze_before_end: 2d }
-budgets: { run_usd: 80, team_monthly_usd: 5000, stage_usd: { implement: 30, llm_review: 15 } }
+  - { repo: example/ledger, base: main, sandbox_image: java21 }
 limits:
   loops: { info: 2, ci_fix: 2, llm_fix: 2, human_review: 2, security_fix: 2, qa_fix: 2, retest: 1, change_fix: 1, merge_conflict: 1, merge_stale: 2 }
   max_steps_per_run: 150
@@ -1086,112 +1125,53 @@ definition_of_done:
   - { stage: refine, check: ac_present }
   - { stage: review_gate, check: checks_green }
   - { stage: review_gate, check: no_findings_above, value: low }
-start: triage
 stages:
-  - id: triage
-    kind: agent
-    agent: triage
-    next: { ready: refine, needs_info: await_info, not_actionable: closed }
-  - id: await_info
-    kind: wait
-    wait_for: human_answer
-    timeout: 15d
-    next: { resumed: { to: triage, loop: info }, timeout: closed }
-  - id: refine
-    kind: agent
-    agent: refiner
-    next: { ready: plan, needs_info: await_info }
-  - id: plan
-    kind: agent
-    agent: planner
-    model_tier: deep
-    next: { ready: implement, needs_info: await_info }
-  - id: implement
-    kind: agent
-    agent: implementer
-    next: { ready: open_pr, blocked: await_info }
-  - id: open_pr
-    kind: effect
-    effect: pr.open_draft
-    next: { done: ci }
-  - id: ci
-    kind: checks
-    source: ci
-    required: team_default
-    timeout: 3h
-    next: { green: llm_review, red: { to: implement, loop: ci_fix } }
-  - id: llm_review
-    kind: review_panel
+  llm_review:
     reviewers: [correctness_reviewer, security_reviewer, test_reviewer, compliance_reviewer]
     required: [correctness_reviewer, security_reviewer, test_reviewer, compliance_reviewer]
     fail_closed: true
     block_on: medium
-    next: { clean: review_gate, findings: { to: implement, loop: llm_fix }, degraded: review_gate }
-  - id: review_gate
-    kind: gate
+  review_gate:
     gate:
-      type: review
-      eligible_roles: [reviewer]
-      approvals_required: 2
-      decisions: [approve, request_changes, reject]
+      quorum: [ { role: reviewer, count: 2 } ]
       decision_surfaces: [ui]
       separation_of_duties: { not: [author, requester, committer] }
       carry_over: none
-      timeouts: { remind_after: 1d, escalate_after: 3d, escalate_to: team_admin, expire_after: 20d }
-    next:
-      approved: security_gate
-      changes_requested: { to: implement, loop: human_review }
-      rejected: closed_rejected
-      expired: closed_expired
-  - id: security_gate
+      timeouts: { expire_after: 20d }
+    next: { approved: security_gate, expired: closed_expired }
+  security_gate:
     kind: gate
     gate:
       type: custom
       eligible_roles: [security_officer]
-      approvals_required: 1
       decisions: [approve, request_changes, reject]
       decision_surfaces: [ui]
       separation_of_duties: { not: [author, requester, committer, { approver_of: review_gate }] }
       carry_over: none
       timeouts: { remind_after: 2d, escalate_after: 4d, escalate_to: org_admin, expire_after: 20d }
     next:
-      approved: qa_auto
+      approved: qa_env
       changes_requested: { to: implement, loop: security_fix }
       rejected: closed_rejected
       expired: closed_expired
-  - id: qa_auto
-    kind: checks
-    source: qa_suite
-    required: [integration, e2e, performance]
-    timeout: 6h
-    next: { green: qa_agentic, red: { to: implement, loop: qa_fix } }
-  - id: qa_agentic
-    kind: agent
-    agent: qa_agent
-    next: { pass: qa_gate, fail: qa_gate, inconclusive: qa_gate }
-  - id: qa_gate
-    kind: gate
+  qa_env: { requires_gates: [review_gate, security_gate] }
+  qa_auto: { required: [integration, e2e, performance], timeout: 6h }
+  qa_gate:
     gate:
-      type: qa
-      eligible_roles: [qa]
-      approvals_required: 1
-      decisions: [approve, request_changes, retest, reject]
       decision_surfaces: [ui]
       separation_of_duties: { not: [author, requester, committer, { approver_of: review_gate }, { approver_of: security_gate }] }
       carry_over: none
-      timeouts: { remind_after: 1d, escalate_after: 3d, escalate_to: team_admin, expire_after: 20d }
-    next:
-      approved: change_gate
-      changes_requested: { to: implement, loop: qa_fix }
-      retest: { to: qa_auto, loop: retest }
-      rejected: closed_rejected
-      expired: closed_expired
-  - id: change_gate
+      timeouts: { expire_after: 20d }
+    next: { approved: change_route, expired: closed_expired }
+  change_route:
+    kind: route
+    field: risk
+    next: { high: change_gate, default: mark_ready }
+  change_gate:
     kind: gate
     gate:
       type: custom
       eligible_roles: [change_manager]
-      approvals_required: 1
       decisions: [approve, request_changes, reject]
       decision_surfaces: [ui]
       separation_of_duties: { not: [author, requester, committer] }
@@ -1202,52 +1182,23 @@ stages:
       changes_requested: { to: implement, loop: change_fix }
       rejected: closed_rejected
       expired: closed_expired
-  - id: mark_ready
-    kind: effect
-    effect: pr.mark_ready
-    requires_gates: [review_gate, security_gate, qa_gate, change_gate]
-    next: { done: merge }
-  - id: merge
-    kind: effect
-    effect: pr.merge
-    with: { method: merge }
-    requires_gates: [review_gate, security_gate, qa_gate, change_gate]
-    next: { done: post_merge, conflict: { to: implement, loop: merge_conflict }, stale: { to: update_branch, loop: merge_stale } }
-  - id: update_branch
-    kind: effect
-    effect: pr.update_branch
-    next: { done: ci, conflict: { to: implement, loop: merge_conflict } }
-  - id: post_merge
-    kind: checks
-    source: post_merge
-    required: team_default
-    timeout: 2h
-    next: { green: evidence, red: revert_pr }
-  - id: evidence
+  mark_ready: { requires_gates: [review_gate, security_gate, qa_gate] }
+  merge: { with: { method: merge }, requires_gates: [review_gate, security_gate, qa_gate] }
+  post_merge: { timeout: 2h, next: { green: evidence } }
+  evidence:
     kind: effect
     effect: ticket.comment
     with: { template: evidence_pack_link }
     next: { done: ticket_done }
-  - id: ticket_done
-    kind: effect
-    effect: ticket.transition
-    with: { to_status_category: done }
-    requires_gates: [review_gate, security_gate, qa_gate, change_gate]
-    next: { done: done }
-  - id: revert_pr
-    kind: effect
-    effect: pr.open_revert
-    next: { done: incident }
-  - { id: done, kind: terminal, result: done }
-  - { id: incident, kind: terminal, result: done_with_incident }
-  - { id: closed, kind: terminal, result: closed }
-  - { id: closed_rejected, kind: terminal, result: rejected }
-  - { id: closed_expired, kind: terminal, result: expired }
+  ticket_done: { requires_gates: [review_gate, security_gate, qa_gate] }
+  closed_expired: { kind: terminal, result: expired }
 ```
 
-Notes: `merge_stale` updates the branch and returns to CI and, with `carry_over: none`, every human gate is asked again.
-Org policy for this team also forbids `waive` and Slack decisions, and enables the evidence pack
-(section 13.4).
+Notes:
+
+- High-risk tickets go through `change_gate`. Guard 2 requires every gate visited in this code round, so the route cannot be skipped at merge.
+- With `carry_over: none`, every base move asks all the humans again, so this team should use a merge queue (section 6.4). Queues need an organization-owned repo.
+- `OrgPolicy` for this org forbids `waive` and enables the evidence pack (section 13.4).
 
 ## 8. Agents and tool permissions
 
@@ -1266,7 +1217,7 @@ Rules carried from the PoCs:
   in thinking blocks on Opus.
 - A worker's finish is read from its own stream, and refusals are checked by stop reason.
 - `max_tokens` as a stop reason is a **failure**, never a usable result (lesson: a truncated draft went
-  undetected).
+  undetected). Thinking counts toward the same limit, so `max_tokens` per tier is set by policy (section 14.1).
 - Code computes `degraded` from the run record: a worker failed, a required worker was never called, a
   synthesis credits a worker that never ran. The LLM does not mark its own homework.
 - Reviewers run in **fresh sessions**, seeing the diff, plan and acceptance criteria but not the
@@ -1276,13 +1227,15 @@ Rules carried from the PoCs:
 
 ### 8.2 Model tiers
 
-Model IDs live in a catalog, not code. Defaults use US profiles, and a deployment swaps the prefix.
+Model IDs live in a catalog, not code, resolved per tier and geography. Geographies differ: Sonnet 5.5 has no `jp.` or `ca.` profile,
+and Opus 5.5 has no `ca.` [S26], [S27]. So a deployment chooses a geography, and validation fails if a tier has no profile there. Defaults
+use US profiles.
 
 | Tier | Default profile | Used for |
 |---|---|---|
 | `fast` | `us.anthropic.claude-haiku-5-5` | Triage, summaries, notification drafts |
-| `standard` | `us.anthropic.claude-sonnet-5-5` | Implementer workers, QA agent, test reviewer |
-| `deep` | `us.anthropic.claude-opus-5-5` | Stage orchestrators, planner, correctness and security reviewers |
+| `standard` | `us.anthropic.claude-sonnet-5-5` | Refine orchestrator, implementer workers, QA agent, test reviewer |
+| `deep` | `us.anthropic.claude-opus-5-5` | Plan and implement orchestrators, correctness and security reviewers |
 
 IDs are checked against the model cards in [RESEARCH.md](RESEARCH.md) section 3, and proved live in
 D12. At deploy, each team gets an application inference profile per tier, tagged for cost allocation.
@@ -1292,6 +1245,14 @@ D12. At deploy, each team gets an application inference profile per tier, tagged
 All tools come through the tool broker: Gateway in AWS, an in-process registry locally. Every stage's
 allowlist is enforced **twice**: when the agent is built, and by Cedar policy at the Gateway. No agent
 has a write tool to GitHub, Jira or Slack. Writes are engine effects.
+
+**Step identity:** Cedar needs a principal that says which stage is calling. The Runtime has one execution role, so IAM cannot say that
+[S64]. So the dispatcher mints a **short-lived signed token per step** (`team`, `run`, `stage`, tools, repo, SHA), and the harness presents it to
+the Gateway, whose OAuth principal exposes those claims to Cedar [S64]. Whether Gateway accepts a platform-minted token is unverified, so it is in the
+first AWS spike (D12-18).
+
+**Tool arguments never choose the target.** Repo and SHA come from that signed step context, never from model output, so a model cannot be talked into
+reading another repo.
 
 | Stage | Orchestrator | Workers | Tools | Sandbox |
 |---|---|---|---|---|
@@ -1306,8 +1267,12 @@ has a write tool to GitHub, Jira or Slack. Writes are engine effects.
 **Never available to any agent:** gate decisions, task tokens, merge, ticket transitions, credentials,
 config writes, other runs' data.
 
-**Teams extend** with their own MCP tools registered as Gateway targets, per-team and read-only by
-default. A team tool with write access requires an org admin and an in-stage approval (section 8.5).
+**Teams extend** in two ways, with no platform PR:
+
+- **Custom profiles** in `TeamConfig`: a built-in base, a prompt addendum, and a subset of its tools. Outcomes come from the base. This covers a team's own PCI
+  or style reviewer.
+- **Their own MCP tools** registered as Gateway targets, per-team and read-only by default. A team tool with write access requires an org admin and an
+  in-stage approval (section 8.5).
 
 ### 8.4 Workspaces and private repos
 
@@ -1328,13 +1293,15 @@ flowchart LR
 
 - Private repos work because a **broker** in the control plane mints a narrowly scoped GitHub App
   token, one repo and one hour at most [S37], and fetches a snapshot at a pinned SHA.
-- **The sandbox never holds an SCM or cloud credential.** The model cannot exfiltrate a token that is
-  not there.
+- **The sandbox never holds an SCM credential, and its execution role has no data access.** A Runtime always has a role, and commands can read
+  it [S61], so that role is the limit of the harm.
 - The agent returns a patch. The control plane scans it, checks path policy and size, and commits to a
   `sto/<run>` branch, or `sto/<run>/<n>` for a follow-up. Force-push and other branches are impossible, because the executor
-  does not offer them. A patch touching `.github/workflows` is refused by default path policy.
+  does not offer them. Default path policy refuses `.github/**`, CI config files, `CODEOWNERS` and the GitOps workflow path. **A deny list cannot close the CI hole**, because
+  CI also runs `package.json` scripts, `Makefile`s and tests, which a change must be able to touch. Section 12's T18 is the real control.
 - Agents read history through `repo.log` and `repo.blame`, so a full clone is unnecessary.
-- Workspace state lives on the branch and in S3, so losing a session loses nothing. Session storage
+- Workspace state lives on the branch and in S3, so losing a session loses at most the work since its last checkpoint. The harness checkpoints a
+  patch to S3 at each worker turn, and sets `idleRuntimeSessionTimeout` explicitly, because idle time counts while a long model turn runs. Session storage
   (preview) is not required.
 
 Provider port, with three implementations ([ADR-0012](adr/0012-sandboxed-workspaces-and-repo-access.md)):
@@ -1342,8 +1309,19 @@ Provider port, with three implementations ([ADR-0012](adr/0012-sandboxed-workspa
 | Provider | Where | Used for |
 |---|---|---|
 | `local_docker` | Local machine, container with no network | Dev and tests |
-| `agentcore_sandbox` | Second AgentCore Runtime, team image up to 2 GB, `InvokeAgentRuntimeCommand` | Default in AWS |
-| `code_interpreter` | AgentCore Code Interpreter | QA scripts. Python, JS and TS only, so not a general build environment |
+| `agentcore_sandbox` | A Runtime **per registered image**, up to 2 GB, ARM64, with `InvokeAgentRuntimeCommand` | Default in AWS |
+| `code_interpreter` | AgentCore Code Interpreter, in VPC mode with DNS filtering | QA scripts. Python, JS and TS only, so not a general build environment |
+
+**Team images:** an image belongs to a Runtime, and creating one is an AWS call [S61], with a quota of 1,000 per account [S14]. So images are **registered**, by a separate, audited
+operation that scans the image and provisions its Runtime. Publishing a workflow only names a registered image, and still touches no AWS API. Images must be ARM64 and meet the service
+contract, including `/ping`, so we ship an entrypoint shim. A team building x86 in CI may see different test results, which is one more reason CI stays the authority.
+
+**Egress:**
+
+- Security groups do not filter traffic to Amazon DNS [S65], so VPC sandboxes also use **Route 53 Resolver DNS Firewall**, or DNS is an exfiltration channel for private source.
+- A host allowlist is not a data control, because `npm publish` goes to an allowed host. The proxy allows **GET and HEAD only**, and an internal mirror is the preferred route.
+- Dependency install scripts run hostile code. That is contained by the role and network limits above.
+- Canary exfiltration tests run in D12-08 and D12-09.
 
 ### 8.5 In-stage interrupts
 
@@ -1357,7 +1335,11 @@ Strands interrupts handle pauses **inside** a stage, not the two gates:
 
 The docs warn that session state is trusted input [S5], so sessions load only from our own bucket
 prefix, never from a repo, and only the orchestrator agent has a session manager, because managers are
-not thread-safe and take no lock [S6].
+not thread-safe and take no lock [S6]. A worker made with `Agent.as_tool` stores its interrupted turn with the orchestrator only when
+`preserve_context=False`, which is the default (Strands 1.63 source), and D5-14 pins that.
+
+**Resume and session isolation:** session credentials are limited to their own prefix through `aws:AgentCoreRuntimeSourceSid` [S15], but a resume is a new session. So the dispatcher copies the saved
+snapshot into the new session's prefix, rather than broadening the policy.
 
 ### 8.6 Memory
 
@@ -1370,12 +1352,16 @@ from content a human approved at a gate, and read as untrusted framed text.
 ### 9.1 Tenancy
 
 - **Unit:** one deployment holds one org with many teams (Q1). All tables and prefixes are keyed by
-  team. All data access goes through repository functions taking a verified `TeamScope`, and a test
-  fails if a query lacks one.
-- **Agent isolation:** one microVM per session [S15], session credentials restricted to that session's
-  S3 prefix through session context keys [S8], [S15], and one inference profile per team and tier.
+  team. `TeamScope` is part of the store port from D1-01, so no query can be written without one.
+- **Resource bindings are the tenancy boundary for outside systems.** A GitHub App installation normally covers a whole org, so "connections are per team" would not stop team A naming team B's repo. An
+  org admin owns `(github-repo | jira-project | slack-channel) -> team`. It is enforced in three places: at publish (V12), in the credential broker, which refuses to mint a token otherwise, and in the tool
+  layer, which reads targets from the signed step context.
+- **Connections are org-level where the vendor forces it.** One Slack workspace has one bot token, and one Jira site has one shared webhook registration, both routed by binding.
+- **Agent isolation:** one microVM per session [S15], session credentials restricted to that session's S3 prefix through session context keys [S8], [S15], and one inference profile per team and tier. Those keys "do
+  not prove that a request was made from inside the corresponding microVM", and SDK clients created at module scope lack them [S15], so clients are built inside the handler, with a test.
+- **Agent roles do not touch the store.** Ledger reads, flags and results go through narrow brokers keyed by the step token, so a compromised session cannot reach another team's ledger. Step results are signed with a
+  per-attempt secret delivered at invoke, because `(step, attempt)` is guessable.
 - **Noisy neighbours:** team concurrency and budget caps, plus Gateway rate limits per team [S8].
-- **Connections** to GitHub, Jira and Slack are per team, and one team can never use another's.
 
 ### 9.2 Identity
 
@@ -1383,16 +1369,19 @@ SSO through OIDC or SAML, brokered by a Cognito user pool
 ([ADR-0008](adr/0008-sso-cognito-as-federation-broker.md)):
 
 - The API trusts **an issuer plus a JWKS,** not Cognito specifically, so another broker can replace it.
-- **Group mapping** is data held by the platform: `(idp, group) -> (team, role)`. Authorization happens
-  server-side on every request against current mappings.
-- **Freshness:** access tokens last 15 minutes and refresh tokens 8 hours by default. A token refresh may not re-query a
-  federated IdP (unverified until D12-10), so assume a removed person keeps their group claim for up to the session life. Gate
-  decisions therefore also require a recent `auth_time`, and an admin can disable a user with immediate effect, which the API
-  checks on every request.
-- **Linking:** Slack and GitHub accounts are linked to an SSO identity by the user, through a signed
-  flow while signed in. An unlinked account can never decide a gate. Matching on email alone is not
-  accepted.
+- **Group mapping** is data held by the platform: `(idp, group ID) -> (team, role)`. It uses **immutable group IDs,** because display names can be spoofed wherever users can create groups. Authorization happens
+  server-side on every request.
+- **Membership snapshot:** each identity stores the groups last proved by a sign-in, with `as_of`. **Every decision on every surface requires `as_of` within `identity_max_age`,** otherwise it deep-links to the UI for sign-in. A Slack or GitHub
+  action carries no token, so this is what "currently authenticated" means there. A port allows an optional directory lookup or SCIM source to refresh it sooner.
+- **Removal does not propagate by itself.** Cognito "doesn't remove attributes from users when the source attribute is no longer sent" [S66], so someone removed from their last group can keep the old value through a fresh sign-in. The **Inbound
+  federation trigger** rewrites the groups attribute on every federated sign-in, including to blank, with Pre authentication as the fallback, since it also fires on later federated sign-ins [S67]. A value over 2,048 characters makes sign-in fail [S66], so only
+  app-relevant groups are sent.
+- **No self-escalation:** the app client has no write access to the mapped attribute beyond what mapping needs, the `aws.cognito.signin.user.admin` scope is dropped, local users are disabled and it is admin-create-only. Whether a federated user could overwrite a mapped attribute is unverified, so template tests and D12-10 cover it.
+- **Step-up:** UI decisions can use `prompt=login` and `max_age`, which Cognito forwards to IdPs on managed login [S68].
+- **Lifetimes:** access tokens last 15 minutes and refresh tokens 8 hours by default. An admin can disable a user with immediate effect, which the API checks on every request.
+- **Linking** must prove control of the account: the user completes that vendor's OAuth flow while signed in, for Slack, GitHub and **Jira**. Links expire. An unlinked account can never decide. Matching on email alone is not accepted.
 - **Service identities** are distinct and can never be eligible for a gate.
+- **First org admin:** the deployment names one bootstrap IdP group as a parameter, because mappings are data and something must write the first one.
 
 ### 9.3 Roles
 
@@ -1410,6 +1399,8 @@ SSO through OIDC or SAML, brokered by a Cognito user pool
 
 - Admins do not approve by default. Being admin is not eligibility, so admin rights alone cannot pass
   a gate. An admin who also holds `reviewer` can, subject to separation of duties.
+- **Admin self-service is closed off.** An admin who changes a mapping, publishes `eligible_roles`, attributes a commit or clears an exclusion is ineligible for the gate rounds that action affects. Mapping changes do not apply to gates already open: a gate
+  snapshots eligibility when it opens, and a decision needs someone eligible **then and now**.
 - `security_officer`, `change_manager` and other custom gate roles are declared per team, and mapped
   from groups.
 
@@ -1425,16 +1416,20 @@ A decision is accepted only if **all** hold, checked server-side at decision tim
 | Term | Means |
 |---|---|
 | `committer` | Any linked human who authored or pushed any commit in the PR. **Always applied: this is the floor** |
-| `author` | The person the ticket says owns the change (assignee), or who wrote its plan by hand |
-| `requester` | The person who started the run |
+| `author` | The union of every assignee seen during the run, frozen as it grows, so reassigning just before approving does not help |
+| `requester` | The actor who started the run: the person who issued a command, or the actor on the audited intake event (who added the label), re-read through the API |
 | `approver_of: <gate>` | Anyone who approved that gate in this run |
+
+**Floors beyond `committer`** (`OrgPolicy`, Q5): the requester cannot approve review, and nobody can approve both a review gate and a QA gate, so a run needs at least two distinct humans.
+
+**Terms that cannot be resolved fail closed.** If a Jira reporter has no linked identity, or an intake actor cannot be determined, the gate shows that and refuses all approvals until a team admin resolves it. Negative decisions are still accepted.
 
 **Commit metadata can be forged,** because git author fields are free text, so identity rests on the run's own records:
 
-- A commit in the run's **push receipts** was made by the platform, and has no human author.
-- **Any other commit is human and unattributed.** The gate blocks until a team admin attributes it, which is audited. GitHub's
+- A commit in the run's **push receipts** was made by the platform, and has no human author. Intent is written before the ref moves (section 6.3), so a crash leaves it recognisable.
+- **Any other commit is human and unattributed.** The gate page shows the block, and it stays until a team admin attributes it through `POST /runs/{id}/commits/{sha}:attribute`, which is audited. GitHub's
   linked account for the commit is offered as a suggestion, and email alone is never accepted. Trailers such as
-  `Co-authored-by` only add exclusions, and an admin can clear a false one, so naming a reviewer as co-author cannot silently
+  `Co-authored-by` only add exclusions, and an admin other than the person concerned can clear a false one, so naming a reviewer as co-author cannot silently
   exclude them for good.
 - Pusher data from a webhook adds exclusions when it arrives, but nothing depends on it, because webhooks can be missed.
 - Setup docs require a ruleset restricting `sto/*` pushes to the App, and the connection test reports if that is absent.
@@ -1465,15 +1460,21 @@ class TicketSource(Protocol):
 class ScmProvider(Protocol):
     capabilities: ScmCapabilities
     def snapshot(self, repo: RepoRef, sha: str) -> SnapshotLocation: ...
-    def push_patch(self, repo: RepoRef, branch: str, patch: PatchRef, key: IdempotencyKey) -> Receipt: ...
-    def open_draft_pr(self, spec: PrSpec, key: IdempotencyKey) -> Receipt: ...
+    def create_commit(self, repo: RepoRef, patch: PatchRef, parent: str) -> CommitIntent: ...  # SHA known before the ref moves
+    def move_ref(self, repo: RepoRef, branch: str, intent: CommitIntent, expected_head: str) -> Receipt: ...
+    def promote(self, repo: RepoRef, sha: str, branch: str, key: IdempotencyKey) -> Receipt: ...  # fork to same-repo
+    def ensure_draft_pr(self, spec: PrSpec, key: IdempotencyKey) -> Receipt: ...
     def mark_ready(self, pr: PrRef, key: IdempotencyKey) -> Receipt: ...
     def close_pr(self, pr: PrRef, key: IdempotencyKey) -> Receipt: ...
-    def update_branch(self, pr: PrRef, key: IdempotencyKey) -> UpdateResult: ...
-    def trigger_release(self, repo: RepoRef, spec: ReleaseSpec, key: IdempotencyKey) -> Receipt: ...
+    def merge_base_into(self, pr: PrRef, expected_head: str, key: IdempotencyKey) -> UpdateResult: ...
+    def open_revert_pr(self, merge_sha: str, key: IdempotencyKey) -> Receipt: ...
+    def request_merge(self, pr: PrRef, expected_sha: str, method: MergeMethod, key: IdempotencyKey) -> MergeHandle: ...
+    def poll_merge(self, handle: MergeHandle) -> MergeResult: ...
+    def dequeue(self, pr: PrRef, expected_head: str) -> Receipt: ...
+    def trigger_workflow(self, repo: RepoRef, spec: DispatchSpec, key: IdempotencyKey) -> Receipt: ...
+    def ci_trust(self, repo: RepoRef) -> CiTrustReport: ...  # for T18
     def checks(self, repo: RepoRef, sha: str) -> list[CheckResult]: ...
     def publish_check(self, spec: CheckSpec, key: IdempotencyKey) -> Receipt: ...
-    def merge(self, pr: PrRef, expected_sha: str, method: MergeMethod, key: IdempotencyKey) -> MergeResult: ...
     def parse_event(self, raw: RawWebhook) -> list[ExternalChange]: ...
 
 class Notifier(Protocol):
@@ -1507,8 +1508,8 @@ A new adapter passes a shared **contract test suite** against a recorded or fake
 - **GitHub App,** because only Apps can write check runs [S36]. A KMS-held key signs the App JWT, and
   the broker mints tokens per repo, per need, for up to one hour [S37].
 - **Permissions:** contents, pull requests, checks, issues and metadata for writing. Also actions and deployments for QA and
-  release, statuses read for CI that reports commit statuses, and administration read to explain protection failures. Not
-  `workflows`. D4-02 records the reason for each, and these come from our knowledge of GitHub Apps, so D4-15 proves them live.
+  release, statuses read for CI that reports commit statuses, secrets read for the T18 attestation, and administration read to explain protection failures. Not
+  `workflows`. A base update that brings in a workflow change may be refused without it, which is unverified, and D4-23 tests that case. D4-02 records the reason for each permission, and these come from our knowledge of GitHub Apps, so D4-15 proves them live.
   Webhooks for issues, comments, PRs, reviews, pushes, check suites and runs, merge groups, installations.
 - **Intake:** issues by label, command comments such as `/sto run`. Commands are accepted only from
   users with a linked identity and role.
@@ -1516,15 +1517,15 @@ A new adapter passes a shared **contract test suite** against a recorded or fake
   commit is refused as stale.
 - **Limits:** webhook response within 10 seconds, so ingest only verifies, dedupes on
   `X-GitHub-Delivery` and enqueues. Rate limits use conditional requests and backoff.
-- **Live test:** the throwaway repo runs a tagged suite with the real App.
+- **Reviews as decisions** are accepted only with `submitted_at` after the gate opened, `commit_id` equal to `head_sha`, a review ID not yet consumed, and state re-read at decision time, so an old or dismissed review cannot decide. A linked account's PAT looks human and never touches SSO, which is why this surface is not in the default templates.
+- **Live test:** the throwaway repo runs a tagged suite with the real App. Its secrets are in a GitHub Environment with Peter as required reviewer, because "not on fork PRs" does not stop a same-repo branch editing the workflow.
 
 ### 10.4 Jira Cloud
 
-- **Auth:** OAuth 2.0 (3LO) app through AgentCore Identity in AWS, through a fake in tests. API token
-  for a service account as an alternative for admins who forbid 3LO.
+- **Auth:** a **service account with an API token is the default.** 3LO acts on the consenting person's behalf [S46], so our "bot identity" would be a person, their leaving breaks the integration, and refresh tokens lapse after 90 days of inactivity. OAuth 2.0 (3LO) through AgentCore Identity is the alternative.
 - **Webhooks:** REST-registered, refreshed by a scheduled job well inside the 30-day expiry [S45],
   dedupe by `X-Atlassian-Webhook-Identifier`. Because the limit is 5 per OAuth 2.0 app, per user, per tenant, teams on one Jira site
-  share one registration, routed by project. Admin webhooks with `X-Hub-Signature` are the alternative.
+  share one registration, routed by project binding. Webhook JQL supports only a few clauses [S45], so `labels` and custom fields cannot be server-side filters, and the adapter filters after its re-read. Admin webhooks with `X-Hub-Signature` are the alternative.
 - **Transitions:** resolve per issue through Get Transitions, targeting a status category, since IDs
   differ across workflows [S46]. Required fields on a transition screen are reported as a clear
   `BLOCKED` reason.
@@ -1540,7 +1541,8 @@ A new adapter passes a shared **contract test suite** against a recorded or fake
   window, so this handler opens it synchronously in a small function with provisioned concurrency, separate from the main API.
   Approve confirms in a modal, and shows the subject summary and SHA. Retest, waive and approvals needing acknowledgement
   deep-link to the UI.
-- **Identity:** the Slack user must be linked. Otherwise the reply is a private link to sign in.
+- **Identity:** the Slack user must be linked, with a membership snapshot within `identity_max_age`. Otherwise the reply is a private link to sign in.
+- **One workspace, one bot token,** installed at org level, with channels bound to teams.
 - **Security:** a message's buttons carry only IDs. Decisions go through the same function, with the
   same checks. A channel member without eligibility is refused in an ephemeral reply.
 - **Other notifications:** run blocked, budget at 80%, reminders, escalations, run finished. Grouped
@@ -1561,14 +1563,22 @@ IDs only, never payloads, so the 256 KiB limit does not apply.
 |---|---|---|---|
 | Team | `TEAM#t` | `META` | Name, floors overlay, status, switches |
 | Group mapping | `ORG` | `GROUPMAP#idp#group` | Team, role |
-| Member link | `USER#u` | `LINK#surface#id` | Verified identity, linked at |
-| Connection | `TEAM#t` | `CONN#kind#id` | Provider reference, never the secret |
+| Member link | `USER#u` | `LINK#surface#id` | Verified identity, linked at, expires at |
+| Membership snapshot | `USER#u` | `MEMBERSHIP` | Group IDs, `as_of`, disabled flag |
+| Resource binding | `ORG` | `RESOURCE#kind#id` | Owning team, set by org admin. Reverse index in `GSI5` |
+| Connection | `ORG` or `TEAM#t` | `CONN#kind#id` | Provider reference, never the secret |
+| Policy | `ORG` | `POLICY` | Current `OrgPolicy`, read live |
+| Team config | `TEAM#t` | `CONFIG` | Current `TeamConfig`, read live |
+| Manifest | `MANIFEST#digest` | `META` | Profiles, effects and prompts, addressable by hash |
+| Sandbox image | `ORG` or `TEAM#t` | `IMAGE#name` | Digest, Runtime ARN, scan result |
+| Chain head | `TEAM#t#RUN#r` | `CHAIN` | Latest audit hash and sequence |
 | Workflow version | `TEAM#t` | `WF#name#v` | YAML, digest, published by. Immutable |
 | Run | `TEAM#t#RUN#r` | `META` | Status, stage, workflow version, version counter, budget state |
 | Step | `TEAM#t#RUN#r` | `STEP#n#a` | Stage, attempt, fence, session ID, status, usage, artifact refs |
 | Gate instance | `TEAM#t#RUN#r` | `GATE#g#round` | Type, subject, status, eligible snapshot, closed by, timer IDs |
 | Decision | `TEAM#t#RUN#r` | `DEC#g#round#ulid` | Actor, surface, decision, digest, comment. Append only |
-| Effect | `TEAM#t#RUN#r` | `FX#key` | Class, status, attempts, receipt, frozen subject after a merge |
+| Effect | `TEAM#t#RUN#r` | `FX#key` | Class, status, attempts, intent, receipt, frozen subject after a merge |
+| Evidence | `TEAM#t#RUN#r` | `EV#stage#ulid` | `tested_sha`, `patch_id`, validity, artifact refs |
 | Outbox | `TEAM#t#RUN#r` | `OUT#ulid` | Signal to deliver |
 | Event | `TEAM#t#RUN#r` | `EVT#seq` | Typed run event for the timeline |
 | Task token | `TEAM#t#RUN#r` | `TOK#step` | Token. Readable only by result and relay roles. TTL |
@@ -1583,9 +1593,10 @@ IDs only, never payloads, so the 256 KiB limit does not apply.
 - `GSI2` run lists by team, status and update time, so listing never reads every run.
 - `GSI3` ticket lookup: `TICKET#source#ref`, to prevent duplicate active runs.
 - `GSI4` PR lookup: `PR#repo#n`, for webhook routing.
+- `GSI5` resource lookup by owning team.
 
 **S3:** `artifacts/<team>/<run>/<session>/...` (session credentials restricted to their own prefix),
-`sessions/<team>/<run>/...` (Strands), `snapshots/...` (expiring) and `audit/...` (Object Lock). All
+`sessions/<team>/<run>/<session>/...` (Strands, copied forward by the dispatcher on resume), `snapshots/...` (expiring) and `audit/...` (Object Lock). All
 KMS-encrypted, with lifecycle rules by class.
 
 Atomicity uses `TransactWriteItems` with conditions on the version counter or gate status. Dedupe uses
@@ -1602,27 +1613,32 @@ retry contract, since the fast stores may not model it.
 |---|---|---|---|
 | T1 | Prompt injection tries to approve, merge or skip a gate | Agents have no such tools. Transitions validate outcomes from a declared list. Gates are outside the agent plane | G14, red-team fixtures with hostile tickets |
 | T2 | Text corrupts or escapes prompts | One-pass rendering in our code, with no framework substitution. Untrusted text framed, with closing tags neutralised | `test_untrusted_text_cannot_close_tags`, `test_placeholder_in_ticket_stays_literal` |
-| T3 | Injection drives data exfiltration | Sandbox has no credentials and a default-deny egress allowlist. Agents have no general web tool. Browser allowlisted to test hosts | Sandbox egress tests, Policy tests |
-| T4 | Secrets in source reach the model or PR | Scan all tool output before the model sees it, with redaction. Scan patches before push. Path deny list as a second layer. Findings block the step | Canary secrets in fixtures at unusual names and inside source files |
+| T3 | Injection drives data exfiltration | Sandbox has no SCM credentials and a minimal role, default-deny egress, DNS Firewall and a GET-only proxy. Agents have no general web tool. Browser uses managed `URLAllowlist` policies [S70], because a tool-level check does not stop redirects. Code Interpreter is in VPC mode with DNS filtering, because Public mode has internet access and the QA agent reads both untrusted pages and `pr.diff` [S71] | Sandbox egress tests, Policy tests, canary exfiltration in D12-08 and D12-09 |
+| T4 | Secrets in source reach the model or PR | Scan all tool output, **and everything rendered into a prompt, such as ticket text and human comments,** before the model sees it, with redaction. Scan patches before push. Path deny list as a second layer. Findings block the step, with an audited route to the gate for false positives | Canary secrets in fixtures at unusual names and inside source files |
 | T5 | Error text leaks URLs, paths or tokens to reviewers or logs | Redact at one boundary, with stored raw errors restricted to operators | Redaction tests |
 | T6 | Forged webhook or action | Verify signature on raw body, constant time, replay windows, dedupe. Then re-read state | Contract suite |
-| T7 | Stolen or replayed decision | SSO, CSRF-safe API, short tokens, digest binding, decisions refused when stale. Slack buttons hold only IDs and need a linked identity | G4, G5, G7 |
-| T8 | Approver ineligible or colluding bot | SoD at decision time, service identities excluded, commit authorship checked | G7 |
-| T9 | Cross-team access | `TeamScope` required on every query, session-scoped credentials, per-team connections and profiles | Tenancy test suite, IAM template tests |
+| T7 | Stolen or replayed decision | SSO, CSRF-safe API, short tokens, digest binding, decisions refused when stale. Slack buttons hold only IDs and need a linked identity | G4, G5, G7, G19 |
+| T8 | Approver ineligible or colluding bot, or an admin granting themselves | SoD at decision time, service identities excluded, commit authorship from receipts, admin self-service closed off | G7 |
+| T9 | Cross-team access | `TeamScope` required on every query, session-scoped credentials, resource bindings, per-team profiles | Tenancy test suite, IAM template tests |
 | T10 | Compromised dependency or team image | Pinned, hashed dependencies, image digests, SBOM, scan in CI, minimal sandbox role | CI checks |
-| T11 | Cost attack from public issues | Commands and intake need linked roles or filters. Budgets and concurrency caps | Intake tests |
+| T11 | Cost or injection attack through tickets | Commands need linked roles. Intake records its actor and ticket revision, and an edit by a non-member pauses the run for a member to confirm. Public repos need explicit opt-in. Budgets and concurrency caps | Intake tests |
 | T12 | Poisoned memory or session | Memory written only from approved content and read as untrusted. Sessions only from own prefix | Memory and session tests |
 | T13 | Malicious rendering in UI | Everything rendered as text. Strict CSP. Diff viewer escapes. Links allowlisted | XSS fixtures |
-| T14 | Tampered audit | Hash chain, Object Lock, IAM denies mutation | Chain verifier test |
+| T14 | Tampered audit | Hash chain, Object Lock, signed checkpoints, IAM denies mutation. Tampering before the copy reaches S3 is not prevented, only detected against checkpoints | Chain verifier test, tail-removal test |
 | T15 | Over-privileged App or role | Least privilege, tested on the synthesized template, tokens narrowed per call. cdk-nag with no unjustified suppressions | Template tests |
 | T16 | Reviewer rubber-stamps | Attention list, required comments on negative decisions, acknowledgement of unverified rows, metrics on time to decide and approval rate | Metrics (section 14) |
-| T17 | Model invocation logs hold source code | Invocation logging off by default, or to a KMS bucket restricted like source | Infra test |
+| T17 | Model invocation logs hold source code. `InvokeAgentRuntimeCommand` also logs the input command to CloudWatch [S61] | Invocation logging off by default, or to a KMS bucket restricted like source. Sandbox log groups are restricted the same way | Infra test |
+| T18 | **Model-written code gets CI secrets.** Code pushed before the review gate runs in the team's CI. An injected implementer can change `package.json`, `Makefile`, tests or actions, and read every secret and OIDC role the job has, with open egress, before any human has looked | **Floor: a `checks` stage before the first human gate must run without secrets.** Modes in order of what a repo attests: `fork` (bot-owned fork, `pull_request` gets no secrets), `no_secrets` (secrets only in GitHub Environments, OIDC trust excludes `sto/*`, no self-hosted runners), else **an automatic human gate before CI**. After the review gate, `branch.promote` moves the approved SHA to the same repo for secret-bearing QA | D4-17, hostile test and live canary in D4-15 |
+| T19 | Team A names team B's repo, project or channel | Resource bindings, checked at publish, by the credential broker and by the tool layer | V12, tenancy suite |
+| T20 | Stale or forged identity on a surface with no token | Membership snapshot with `as_of`, expiring links proved by OAuth, inbound federation trigger clears removed groups, immutable group IDs, no self-write scope | G19, D12-10 |
 
 Bedrock Guardrails can add a prompt-attack filter on `bedrock-runtime` [S26], as an extra layer, never
 the control.
 
+**Why T18 defaults to a gate, not a fork:** a fork-only default would stall. By default "all first-time contributors require approval to run workflows", and an org that disables fork workflows on private repos cannot be overridden per repo [S69]. A fork also needs a bot account. So the safe default needs no setup, and a repo earns the faster path by attesting. Attestation reads secret names and Environment rules through the API, and is best effort, so the live canary is what proves it.
+
 **Secrets:** App key in KMS, tokens in the Identity vault or Secrets Manager, none in env vars,
-templates or prompts. This repo is **public**, so no account IDs, internal URLs or real tenant data
+templates or prompts. Keys and webhook secrets have a rotation runbook. This repo is **public**, so no account IDs, internal URLs or real tenant data
 are ever committed. Fixtures are synthetic or scrubbed.
 
 **Prompt rule for maintainers:** never give an agent a tool that acts on the outside world. Add an
@@ -1645,7 +1661,7 @@ React, TypeScript and Vite, served from S3 through CloudFront.
 | Team settings | Team admin | Members, group mappings, connections, budgets, notification routes, linking |
 | Spend | Admins | Team and run costs, estimate vs billed, budget burn |
 | Insights | Team | Cycle time per stage, gate wait, approve/change/reject rates, loop counts, LLM finding agreement |
-| Audit | Auditor | Filter, hash-chain check, export, evidence pack |
+| Audit | Auditor | Filter, hash-chain check, checkpoints, export, evidence pack |
 | Org | Org admin | Floors, kill switch, model catalog, fleet health |
 
 **Accessibility:** WCAG 2.2 AA, keyboard-driven gate decisions, tested with an automated audit.
@@ -1662,9 +1678,10 @@ own stream ([ADR-0016](adr/0016-web-hosting-and-event-delivery.md)).
 ### 13.3 API
 
 `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`, `POST /runs/{id}/cancel`,
-`POST /runs/{id}/retry`, `POST /runs/{id}/answer`, `GET /gates/mine`, `GET /gates/{id}`,
+`POST /runs/{id}/retry`, `POST /runs/{id}/answer`, `POST /runs/{id}:migrate`,
+`POST /runs/{id}/commits/{sha}:attribute`, `POST /runs/{id}:route-to-gate`, `GET /gates/mine`, `GET /gates/{id}`,
 `POST /gates/{id}/decisions`, `GET|POST /teams/{t}/workflows`, `POST /teams/{t}/workflows:dry-run`,
-`POST /teams/{t}/workflows/{name}:publish`, `GET|PUT /teams/{t}/budgets`, `GET|PUT /teams/{t}/mappings`,
+`POST /teams/{t}/workflows/{name}:publish`, `GET|PUT /teams/{t}/config`, `GET|PUT /teams/{t}/mappings`, `GET|PUT /org/policy`, `GET|PUT /org/resources`, `GET|POST /org/images`,
 `GET /audit`, `POST /audit:export`, `POST /org/kill-switch`, `GET /health`. OpenAPI is generated, with
 a generated TypeScript client, and a test fails on drift. `POST` routes accept an `Idempotency-Key`.
 
@@ -1680,11 +1697,15 @@ chain and config version, for regulated teams and audits.
 ### 14.1 Budgets
 
 Levels: step, stage, run, team per month, org per month. Peter's "no ceiling" applies to this project's
-scope. The product still needs cost controls, because customers will.
+scope. The product still needs cost controls, because customers will. Values are live from `TeamConfig`, so a raised budget applies to a blocked run.
+
+**Tokens are not the only cost.** Runtime memory is billed while a session runs [S19], and a looping `workspace.exec` has no token cost at all. So budgets also cover **session-seconds per run and per stage**, and `max_commands_per_step`. Browser and Code Interpreter time count too. Team CI minutes stay with the team, and are reported, not limited.
 
 - **Reservation before each model call:** a Strands hook reserves `estimated input + max_tokens`, and
   settles to actual usage after. Count tokens is unavailable on `bedrock-runtime` for these models
-  [S26], so the estimate is deliberately conservative, and calibrated in D12.
+  [S26], so the estimate is deliberately conservative, and calibrated in D12-05, including thinking against output.
+- **A written reservation policy per tier:** max output is 128K [S26], so naive reservations by parallel workers could exhaust a stage budget with nothing spent, while a low `max_tokens` risks truncation, which A3 treats as failure. D10-13 sets `max_tokens` and a concurrency-aware rule, with a test, before D10-03.
+- **The hook is in-process.** It stops ordinary overspend, not a compromised process holding the role. Alarms on the team's inference profile metrics, and break-glass, are the backstop.
 - **Atomic ledger:** conditional DynamoDB updates. **If the ledger cannot be reached, calls stop**
   (fails closed).
 - **At 80%:** notify. **At 100%:** the step ends cleanly and the run goes to `BLOCKED(budget)`, keeping
@@ -1695,6 +1716,7 @@ scope. The product still needs cost controls, because customers will.
   inference profile tags, and flags drift.
 - **Efficiency:** prompt caching on system prompts and tool definitions, narrow tool sets, per-stage
   tiers. Gates cost nothing: no session is alive during a human wait.
+- **Throttling:** a per-team client rate limiter on model calls keeps ordinary quota pressure from failing steps, and `sto doctor --aws` reports quotas.
 
 ### 14.2 Concurrency
 
@@ -1705,24 +1727,24 @@ brake** (lesson: it counted every request and throttled unrelated endpoints).
 
 Cancel is a first-class state with these steps, in order:
 
-1. Commit `CANCELLING`, and void `PLANNED` effects.
-2. The budget hook refuses any new model call, because it reads the run state.
-3. `StopRuntimeSession` for active sessions, stop sandboxes and Browser and Code Interpreter sessions, and dequeue a queued merge
-   with its expected head.
-4. `AbortableBedrockModel` closes a live stream at the next chunk. Its cancel signal stays set (the
-   PoC's finding).
+1. Commit `CANCELLING`, and void `PLANNED` effects. An effect already `ATTEMPTING` is reconciled and reported. An async merge is cancelled or dequeued if possible.
+2. The budget hook refuses any new model call, and the harness polls a run-status flag inside the stream loop, so `AbortableBedrockModel` closes a live stream at the next chunk. Its cancel signal stays set (the PoC's finding). This must come before stopping the session, or the abort has no chance to run.
+3. The tool layer refuses sandbox calls for a step that is no longer live. A stopped session goes back to Active on its next invocation, with new compute [S15], so a late `workspace.exec` would otherwise recreate an empty sandbox.
+4. `StopRuntimeSession` for active sessions, stop sandboxes and Browser and Code Interpreter sessions.
 5. `StopExecution`, close gates, delete timers.
 6. Confirm and report `CANCELLED`, including what was already written, since writes cannot be undone.
 
 **Target:** no new model call after step 1, and all sessions stopped within 60 seconds. Closing a
-browser never cancels anything, because runs do not live on a connection.
+browser never cancels anything, because runs do not live on a connection. Whether Bedrock keeps generating and billing after a disconnect or a session stop is unverified, and D12-13 measures it.
+
+**Retry stops first:** a heartbeat gap can be an SQS or Lambda hiccup, with attempt 1 still running and billing. So retry always stops the previous attempt's session before starting the next.
 
 ### 14.4 Kill switch
 
 | Level | Mechanism | Effect |
 |---|---|---|
 | Pause | Flag read before dispatch and each model call | No new work, in-flight steps finish. Per team, per org, or per model |
-| Stop | Own path, sharing session stopping with 14.3. It does not close gates, void effects or stop executions | All sessions stopped, planned effects held, runs `BLOCKED(kill_switch)`. On release, interrupted steps retry and held effects re-run their guards |
+| Stop | Own path, sharing session stopping with 14.3. It does not close gates, void effects or stop executions. A timeout checks the kill flag before charging an attempt | All sessions stopped, planned effects held, runs `BLOCKED(kill_switch)`. Decisions can still be recorded. On release, interrupted steps retry, runs with an open gate return to waiting, and held effects re-run their guards |
 | Merge off | Team or org flag | Runs continue up to merge, then wait |
 | Break glass | Runbook attaches explicit-deny IAM to agent roles | Bedrock calls fail even if app code is broken |
 
@@ -1761,6 +1783,7 @@ in CI, and must be green before merge.
 
 **Rules for keeping local runs fast and hermetic:**
 
+- **CI is in place before everything else:** the first job and the ruleset on `main` land straight after the repo skeleton, so no later PR merges without them. At GitHub Free's 20 concurrent jobs [S72], 8 PRs of 11 jobs will queue, which costs only time.
 - **Unit, contract and gate tests need no Docker, network, AWS credentials or browser.** Fakes run in process
   (ASGI transport for vendor APIs, the in-memory store, the scripted model, and botocore's `before-send` hook for
   Bedrock and AgentCore wire tests). Sockets stay blocked.
@@ -1821,19 +1844,20 @@ the PoC's critical bugs, so these exist to catch that class.
 | G3 | **Reject beats approve while open** | Quorum of 2: approve then reject is rejected. Any reject committed before quorum closes the gate negative. A reject after the deciding approval commits gets `409` and a Stop option, and Stop then voids the effect. Tested by commit order, and concurrently |
 | G4 | **Approval bound to subject** | Approve with an old digest: refused, nothing changes. A reject with an old digest is accepted |
 | G5 | **Exactly one close** | 50 concurrent decisions on a quorum gate. Sub-quorum approvals all commit, one transition closes, one audit close, and only a truly closed gate returns `409` |
-| G6 | **Crash safety, no replay** | Inject a crash after each write in `decide` and in the relay. On recovery, decision applied once. An earlier approval never resurrects after a later rejection, and audit failure rolls back the decision |
-| G7 | **Separation of duties** | Matrix of committer, co-author, requester, prior approver, bot, unlinked, revoked mapping |
+| G6 | **Crash safety, no replay** | Inject a crash after each write in `decide` and in the relay. On recovery, decision applied once. An earlier approval never resurrects after a later rejection, and audit failure rolls back the decision. A decision committing before the task token is stored still wakes the run |
+| G7 | **Separation of duties** | Matrix of committer, co-author, requester, prior approver, bot, unlinked, revoked mapping, same person on both gates, Jira-sourced requester, unresolved term, assignee changed before approving, admin who self-granted, attributed or cleared an exclusion |
 | G8 | **Truthful status** | Adapter returns success but read-back disagrees: UI and API must not say written |
-| G9 | **Idempotent write** | Crash after the external write, before confirm. Re-run produces one comment and one merge. A planted marker from another user does not suppress the real comment |
-| G10 | **Stop beats approval** | Cancel after approval, before the effect. Effect is `VOIDED`, the writer not called |
+| G9 | **Idempotent write** | Crash after the external write, before confirm. Re-run produces one comment, one merge and one commit, and a release is not re-triggered. A planted marker from another user does not suppress the real comment. A crash around a push or base update never classifies our own commit as human, and a push webhook arriving before the receipt does not either |
+| G10 | **Stop beats approval** | Cancel after approval, before the effect. Effect is `VOIDED`, the writer not called. Run concurrently with the claim: exactly one wins, and if the claim wins, Stop reports that the merge may have landed |
 | G11 | **Moving ticket or PR** | Closed ticket supersedes. Edited ticket demands acknowledgement. New commit invalidates |
 | G12 | **Timeout never approves** | Fire every timer in any order, late and repeated. Never approved. Validator rejects config attempts |
-| G13 | **Approval does not outlive code** | New SHA with a different patch: merge refused. A whitespace-only change is a different patch. Same patch with `carry_over: patch_id` re-enters the gate and closes with a citation. With `none`: new decision required. P1, P2, P1 asks again. Partial votes, ineligible approvers, an edited ticket or a new attention item never carry |
+| G13 | **Approval does not outlive code** | New SHA with a different patch: merge refused. A whitespace-only change is a different patch. Same patch with `carry_over: patch_id` re-enters the gate and closes with a citation. With `none`: new decision required. P1, P2, P1 asks again. **Approve, request changes, same patch asks again. Approve, superseded, same patch asks again.** Partial votes, ineligible approvers, an edited ticket, a new attention item or a base range touching the patch's files never carry. Guard 2 reads only the latest instance |
 | G14 | **Model cannot decide** | Hostile ticket instructing approval, across all stages. Assert tool lists lack such tools, Cedar forbids them, and gate stays open |
 | G15 | **Merge guard** | Each guard failing alone blocks the merge. 409 and 405 handled. Reads back merged state |
-| G16 | **Surface parity** | Same matrix through UI, Slack, GitHub and CLI gives the same result, or the documented refusal and deep link |
+| G16 | **Surface parity** | Same matrix through UI, Slack, GitHub and CLI gives the same result, or the documented refusal and deep link. A GitHub review submitted before the gate opened, from an earlier round at the same SHA, dismissed or already consumed cannot decide |
 | G17 | **Late results are discarded** | Stale attempt reports success after a newer attempt started: ignored |
 | G18 | **Reviewer failure is visible** | Required reviewer crashes: gate shows it, or blocks if `fail_closed` |
+| G19 | **Stale or absent identity cannot decide** | On every surface: `as_of` too old, expired link, disabled user, removed group. Refused with a sign-in link, and a fresh sign-in with the group removed clears it |
 
 ### 15.4 Other named suites
 
@@ -1843,20 +1867,23 @@ the PoC's critical bugs, so these exist to catch that class.
 | C2 | A live Bedrock stream closes at the next chunk after cancel, using the abort wrapper |
 | C3 | Cancel during each state ends in `CANCELLED`, sessions stopped, no leaks |
 | C4 | Closing a browser or Slack changes nothing |
-| C5 | Kill switch at each level stops the right things |
+| C5 | Kill switch at each level stops the right things, and does not spend `max_attempts` |
+| C6 | A late sandbox call after cancel is refused, and retry stops the previous attempt first |
 | R1 | A permanent failure is not retried by restart, redrive or reconciliation, and its token spend stays flat |
 | R2 | One retry layer per call, counted at the stub |
 | R3 | Restart during every run state resumes correctly |
 | R4 | Late or duplicate webhooks change nothing |
+| R5 | Old ASL calling new handlers, and the reverse on rollback, works through the versioned command envelope |
 | B1 | Budget reservation races cannot overspend beyond one call's reservation |
 | B2 | Ledger outage stops model calls |
+| B3 | Session-second and command caps stop a looping `workspace.exec` with no token cost |
 | A1 | Agents only get allowlisted tools |
 | A2 | Refusal stop reason fails the step |
 | A3 | `max_tokens` stop reason fails the step |
 | A4 | A round with an unchanged patch or findings blocks the run |
 | A5 | Code computes `degraded` correctly, for every structural failure |
 | A6 | Structured outcomes outside the declared list fail the step |
-| H1 | CloudFront template forwards `Authorization`. An integration test confirms a stripped header gives a clear 401 on GET rather than empty data |
+| H1 | CloudFront template forwards `Authorization`, disables caching on API paths, and does not forward `Host` [S55]. An integration test confirms a stripped header gives a clear 401 on GET rather than empty data |
 | H2 | No user-visible progress path depends on `InvokeAgentRuntime` streaming |
 | H3 | No Lambda reserved concurrency is used as a spending brake (template test) |
 | H4 | No client code needs `crypto.subtle`, and no function URL with OAC in the template |
@@ -1874,7 +1901,7 @@ real IdP, Jira and Slack real APIs, real costs.
 ### 16.1 CDK
 
 TypeScript CDK, using stable `aws-cdk-lib` AgentCore L2 constructs (from v2.255.0) and L1 for Policy,
-whose L2 is alpha [S8]. Template tests, with cdk-nag, run offline.
+whose L2 is alpha [S8]. Template tests, with cdk-nag, run in CI with no account.
 
 | Stack | Contains |
 |---|---|
@@ -1899,8 +1926,12 @@ before synth. No account IDs are in the repo.
 | `prod` | Separate account recommended | Teams |
 
 Promotion is by digest, and agent images pin digests. Rollback: redeploy the previous digest. In-flight
-runs are safe because of pinned workflows, and because the reducer stays backward compatible with
-stored state, enforced by a replay test over stored fixtures.
+runs are safe because of pinned manifests, and because the reducer stays backward compatible with
+stored state, enforced by a replay test over stored fixtures (D2-20).
+
+**A running execution keeps the state machine definition it started with, and may live for 300 days.** So old ASL calling new Lambdas, and the reverse on rollback, is a real contract. The command JSON is a versioned envelope, and D11-02 tests old ASL against new handlers.
+
+**Direct access to the API:** a client calling `execute-api` directly skips CloudFront and WAF. The default endpoint is disabled behind a custom domain where that works, and D11-13 settles it. HTTP API payloads are capped at 10 MB, while GitHub webhooks can reach 25 MB [S73], so larger ones are rejected at the edge, counted by a metric, and caught by the reconciler.
 
 ### 16.3 Local development
 
@@ -1916,7 +1947,7 @@ Lessons: Node and uv prerequisites, port collisions, LAN access.
 
 ### 16.4 First deployment
 
-D12 is the first real deploy, blocked only on credentials. See [STAGES.md](STAGES.md). Until it is done,
+D12 is the first real deploy, blocked only on credentials. **The first thing to run when credentials arrive is a one-day spike (D12-18), before D11 hardens,** on the designs no fake can prove: sandbox on a second Runtime, per-step Gateway identity, session keys and resume, VPC egress with DNS Firewall, and Identity for bot tokens. If one fails, D5, D8 and D11 designs change. See [STAGES.md](STAGES.md). Until D12 is done,
 the README states plainly that this has never been deployed, as the PoCs did.
 
 ## 17. What "fully functional" means
@@ -1939,8 +1970,7 @@ D12.
 ### Reuse
 
 - FF-06 **[O]** The three example teams run on one deployment with no code differences.
-- FF-07 **[O]** A new team is onboarded in under an hour, using only docs, UI and config, tried by
-  someone who did not build it (a written trial, not a CI job), and a new workflow can be dry-run before publishing.
+- FF-07 **[O]** A new workflow can be written as an overlay and dry-run before publishing, using only docs, UI and config, walked through by a fresh agent session. **[A]** A real team onboards in under an hour with no help from the builders, proved in the pilot (D14-03), because there is nobody else to try it sooner.
 - FF-08 **[O]** Team A cannot see or affect team B in any test of the tenancy suite.
 
 ### Integrations
@@ -1974,19 +2004,20 @@ D12.
   of billed costs.
 - FF-24 **[A]** Evals pass agreed thresholds on a labelled ticket set.
 
-**Offline-complete** (everything marked [O] or [GH]) is the target before credentials arrive. The product is
+**Offline-complete** (everything marked [O] or [GH]) is the target before credentials arrive. Each item names its proving issue in the traceability table in [STAGES.md](STAGES.md). The product is
 **fully functional** only when [A] items are done too.
 
 ## 18. Risks
 
 | Risk | Likelihood | Impact | Response |
 |---|---|---|---|
-| First deploy finds things stubs could not | **Certain** | Medium | D12 is scheduled, with a hypothesis list. Offline-first design contains the blast radius |
-| Agent quality is unproven until D12, and may need prompt and workflow rework | High | High | Prompts are versioned data, evals ready at D12. The gates hold regardless |
+| First deploy finds things stubs could not | **Certain** | **High:** the sandbox, step identity, session keys, egress and Identity designs depend on each other, and about 180 PRs land first | The AWS spike (D12-18) runs first when credentials arrive. D5-13 and D11 issues are provisional until it has. Ports contain the code, but designs may change |
+| Agent quality is unproven until D12, and may need prompt and workflow rework | High | High | Prompts are versioned data, the eval harness is ready at D12, and D14-01 builds the labelled set. The gates hold regardless |
 | Fakes drift from real Jira and Slack | Medium | Medium | Fakes are built from docs, contract suite re-run live at D12 |
 | Sandbox toolchain limits per team | Medium | Medium | Team images, CI remains the test authority |
 | AgentCore and Strands change quickly (release notes show monthly change) | High | Low | Pinned versions, ports around each service, weekly dependency PRs, and this doc's sources dated |
 | Reviewers rubber-stamp, so the gate becomes theatre | Medium | High | Attention-first UI, insights metrics, per-team review |
 | A large merge volume overloads reviewers | Medium | Medium | WIP limits and intake filters |
-| Autonomous merge misfires | Low | High | Guards, read-back, GitHub-enforced check runs, merge switch, revert PR path |
-| Cognito limits at enterprise scale (group list size, step-up) | Medium | Medium | Issuer-based API lets a different broker replace it, and spike in D3 |
+| Autonomous merge misfires | Low | High | Atomic claim, guards, read-back, hold after approval, check runs, merge switch, revert PR path |
+| A busy trunk starves merges | Medium | Medium | Merge queue where available, `merge_stale` cap with an explicit block and grant, modelled in D13-07 |
+| Cognito limits at enterprise scale (group list size, attribute retention) | Medium | Medium | Inbound federation trigger, IDs only for relevant groups. Issuer-based API lets a different broker replace it |

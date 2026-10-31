@@ -17,6 +17,8 @@ one 7.4 GB laptop, so heavy verification lives in GitHub Actions.
   fake vendor APIs. Only the far end is fake.
 - **D12 is a single, explicit, blocked milestone,** listing every hypothesis offline tests cannot prove. Nothing else in the
   plan depends on it, except D14.
+- **A one-day spike (D12-18) is the first thing to run when credentials arrive,** with no dependency on D11, on the designs no fake can prove. About 180 PRs land before first contact with AWS, so issues resting on those designs are marked provisional.
+- **CI lands straight after the skeleton,** with a ruleset on `main`, so every later issue has it as an ancestor, and a script checks that. No offline issue depends on a human step.
 - The README states "never deployed" until D12 closes.
 - GitHub is the exception: it is tested live on a throwaway repo from D4, under a tagged suite.
 - D12 begins with cost protection: AWS Budgets alarm, kill switch verified, fake LLM deployment first, then one small real

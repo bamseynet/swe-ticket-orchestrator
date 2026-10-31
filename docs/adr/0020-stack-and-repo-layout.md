@@ -13,12 +13,14 @@
 src/sto/
   domain/         models, IDs, errors
   config/         schema, loader, validator
-  engine/         reducer, commands, drivers/
+  engine/         reducer, commands, handlers/, drivers/
   gates/          decisions, SoD, timers
   effects/        outbox, executor
   budget/         ledger, hooks, kill switch
   identity/       OIDC validation, mapping, linking
-  store/          ports, memory, dynamodb
+  store/          ports, memory, sqlite, dynamodb
+  tenancy/        resource bindings
+  audit/          chain, checkpoints, evidence pack
   adapters/       github/ jira/ slack/ linear/ azure_devops/ fake/
   agents/         harness, profiles/, prompts/, tools/, models/
   workspace/      local_docker, agentcore_sandbox, code_interpreter
@@ -35,6 +37,7 @@ tests/            mirrors src, plus gates/ e2e/ contract/ security/
 
 - **Registries by discovery,** using entry points and glob imports for routers, adapters and pages, so parallel PRs do not all
   edit one file.
+- **Seams for parallel work:** a reducer handler registry, gate hook points and an `AuditWriter`, so later rules add files. A list of serial areas names what remains shared, and a CI check compares each PR with its declared files. The first plan's file lists omitted integration points, so "parallel" was not true.
 - **Ruff, mypy strict, pytest, Hypothesis, ESLint, tsc, Vitest, Playwright, cdk-nag.** CI runs all of them. Local hooks run
   only fast checks on changed files, to respect the shared laptop (ADR-0019).
 

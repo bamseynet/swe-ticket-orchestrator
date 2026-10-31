@@ -8,7 +8,7 @@ Sources are referenced as `[S1]`, `[S2]` and so on. The list is at the end.
 
 ## 1. Strands Agents
 
-The latest Python release is **1.63.0**, requiring Python `>=3.10`, with `otel` and `a2a` extras [S1].
+The latest Python release we could confirm is **1.63.0**, the version the PoC has installed, requiring Python `>=3.10`, with `otel` and `a2a` extras [S1].
 `poc-strands-orchestrator` pins `strands-agents[otel]~=1.63` and `bedrock-agentcore~=1.25`.
 
 | Option | Who decides what runs | Cycles | Parallel | Fit for this product |
@@ -103,6 +103,10 @@ Sources: [S14], [S15], [S16], [S17], [S18].
   October 2026) add `runtimeSessionId` and `runtimeArn` to the vended credentials, so a single role
   can restrict each session to its own data [S8], [S15]. AgentCore does not map sessions to users, so
   the backend must do that [S15].
+- **Commands and images:** commands run in the same container as the agent code and have full access inside the VM, including its credentials, and the input command is logged to CloudWatch [S61]. An image belongs to a Runtime, and team images must be ARM64 and meet the service contract, so each image needs a provisioned Runtime.
+- **Session traps:** session context keys "do not prove that a request was made from inside the corresponding microVM", SDK clients created at module scope lack them, and a stopped session returns to Active on its next invocation with new compute [S15].
+- **Policy principals** are an IAM entity or an OAuth user with JWT claims, so a single execution role cannot say which stage is calling [S64].
+- **Network:** security groups do not filter traffic to Amazon DNS [S65]. Code Interpreter has Sandbox, Public and VPC modes [S71]. Browser supports managed Chromium policies [S70].
 - **Identity:** built-in providers include GitHub, Atlassian, Slack and Microsoft [S20]. The documented
   GitHub setup is an **OAuth App user flow** [S21]. Nothing in the docs we read covers GitHub App
   installation tokens, so we broker those ourselves
@@ -188,9 +192,14 @@ could complete a gate.
 - Webhooks: `X-Hub-Signature-256` is HMAC-SHA256 and must be compared in constant time [S39]. Respond
   within 10 seconds. `X-GitHub-Delivery` is unique per event and retained on redelivery, and the docs
   read as though redelivery is manual, so we reconcile on a schedule [S40].
+- **The async merge API is GA and recommended,** and it can add to a merge queue. The sync endpoint "does not support ... merging with a merge queue". An `enqueued` result is final for that request and does not mean merged [S60].
+- `update-branch` returns 202 with no SHA, while `POST /merges` returns the commit [S62], from the review of this plan and our knowledge of the API. D4-12 keeps tests on it.
+- A workflow dispatch can return a run ID with `return_run_details`, but only in the response, which a crash loses [S63].
+- A check attaches to a commit, and neutral counts as passing [S59].
+- Forks: by default "all first-time contributors require approval to run workflows", and an org disabling fork workflows on private repos cannot be overridden per repo [S69].
 - Required checks can be pinned to a specific app with `app_id` [S41]. Rulesets can let a GitHub App
   bypass rules, and bypass lists need an organization-owned repository [S42].
-- Merge queues need `merge_group` triggers or required checks never report [S43]. A workflow skipped by a path
+- Merge queues need `merge_group` triggers or required checks never report, and are available only in organization-owned public repos, or private repos under Enterprise Cloud [S43]. A workflow skipped by a path
   or branch filter can leave a required check pending and block merging, so required workflows should not be
   skippable [S59].
 - The merge endpoint takes `sha`, the "SHA that pull request head must match to allow merge". It returns 409 if the head
@@ -227,9 +236,8 @@ could complete a gate.
 - Cognito user pools federate OIDC and SAML, map IdP claims to pool attributes, and can override
   groups in tokens with a pre token generation trigger using `groupOverrideDetails` [S51], [S52],
   [S53], [S54].
-- **Unverified, to prove in D3-01 or D12:** step-up re-authentication through a broker, custom
-  attribute size for large group lists, and SCIM absence. The design does not rely on any of them
-  ([ADR-0008](adr/0008-sso-cognito-as-federation-broker.md)).
+- Cognito "doesn't remove attributes from users when the source attribute is no longer sent", and a value over the 2,048 character limit makes sign-in fail [S66]. Federated sign-ins invoke Pre authentication on later sign-ins, and an Inbound federation trigger exists [S67]. `prompt=login` and `max_age` are supported on managed login [S68].
+- **Unverified, to prove in D12-10:** whether a federated user can overwrite a mapped attribute, and how large group lists behave at real IdPs ([ADR-0008](adr/0008-sso-cognito-as-federation-broker.md)).
 - CloudFront removes `Authorization` from GET and HEAD requests before forwarding, unless configured
   to forward it [S55].
 - Lambda function URLs with origin access control need `x-amz-content-sha256` on POST and PUT, computed
@@ -278,12 +286,20 @@ could complete a gate.
 | `Agent.as_tool`, `ConcurrentToolExecutor` | `poc-strands-orchestrator` code, against `strands-agents~=1.63` | D5-02 pins with tests |
 | Text between tool calls can be hidden on Opus | `poc-strands-orchestrator/README.md`, never run live | D12-05 |
 | Runtime VPC mode can support default-deny egress | Release notes record VPC egress support [S8]. Details not read | D12-08 |
-| Browser host allowlisting, including redirects | Proxy domain patterns exist in quotas [S14]. The allowlist's strength is **unverified** | D8-03, D12-09 |
+| Browser host allowlisting, including redirects | Managed Chromium policies exist [S70]. Whether `URLAllowlist` stops every redirect and fetch is **unverified** | D8-03, D12-09 |
 | Enqueueing a merge queue entry through the API | **Unverified** | D4-12 |
 | App permission set beyond checks | Our knowledge of GitHub Apps, not checked on docs | D4-02, D4-15 |
 | Reviews on draft PRs | **Unverified** | D4-10, D4-15 |
 | Whether the personal account's plan allows draft PRs and branch protection on private repos | **Unverified** | D4-02 |
-| A Cognito token refresh does not re-query the IdP, and step-up behaviour | Our knowledge, **unverified** | D12-10 |
+| A Cognito token refresh does not re-query the IdP | Our knowledge, **unverified** | D12-10 |
+| Gateway accepts a platform-minted per-step JWT, and which claims Cedar sees | **Unverified** | D12-18 |
+| AgentCore Identity can hold a Slack bot token and serve control-plane Lambdas | **Unverified** | D12-18 |
+| Bedrock keeps billing after a disconnect or session stop | **Unverified** | D12-13 |
+| Async merge details: permissions, error codes, what a moved head does | Changelog and REST summary only | D4-23 |
+| Bot-owned forks with first-time-contributor settings and required checks | Docs suggest friction, **unverified** live | D4-17 |
+| Code Interpreter Sandbox mode allows DNS | Secondary press report, AWS says "limited external network access" [S71] | D12-09 |
+| New account Bedrock quotas | **Unverified** | D12-02 |
+| WAF cannot attach to an HTTP API | Our knowledge | D11-13 |
 | `workflow_dispatch` runs on a ref, with inputs | Our knowledge, not checked on docs | D8-11 |
 | DynamoDB `TransactionConflict` is not modelled by fast stores | Our knowledge, not checked | D3-09 |
 
@@ -334,7 +350,7 @@ could complete a gate.
 - [S43] [GitHub: managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 - [S44] [GitHub: merge a pull request](https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request)
 - [S45] [Jira Cloud: webhooks](https://developer.atlassian.com/cloud/jira/platform/webhooks/)
-- [S46] [Jira Cloud REST v3: issues](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/), [developer community: transitions](https://community.developer.atlassian.com/t/how-should-i-get-the-correct-jira-transitions/67082)
+- [S46] [Jira: OAuth 2.0 3LO apps](https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/), [Jira Cloud REST v3: issues](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/), [developer community: transitions](https://community.developer.atlassian.com/t/how-should-i-get-the-correct-jira-transitions/67082)
 - [S47] [Slack: verifying requests](https://docs.slack.dev/authentication/verifying-requests-from-slack/)
 - [S48] [Slack: handling user interaction](https://docs.slack.dev/interactivity/handling-user-interaction/)
 - [S49] [Linear: webhooks](https://linear.app/developers/webhooks)
@@ -347,4 +363,18 @@ could complete a gate.
 - [S56] [CloudFront: restrict access to a Lambda function URL](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-lambda.html)
 - [S57] [EventBridge Scheduler: schedule types](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html)
 - [S58] [AppSync Events](https://docs.aws.amazon.com/appsync/latest/eventapi/event-api-welcome.html)
+- [S60] [GitHub: async merge API GA, 2026-10-01](https://github.blog/changelog/2026-10-01-github-async-merge-api-generally-available), [REST: pull requests](https://docs.github.com/en/rest/pulls/pulls?apiVersion=2026-03-10)
+- [S61] [AgentCore: execute shell commands in Runtime sessions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-execute-command.html)
+- [S62] [GitHub: REST branches, merge a branch](https://docs.github.com/en/rest/branches/branches?apiVersion=2022-11-28)
+- [S63] [GitHub: workflow dispatch returns run IDs, 2026-02-19](https://github.blog/changelog/2026-02-19-workflow-dispatch-api-now-returns-run-ids)
+- [S64] [AgentCore Policy: core concepts](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-core-concepts.html)
+- [S65] [VPC: security groups](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html)
+- [S66] [Cognito: attribute mapping](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-specifying-attribute-mapping.html)
+- [S67] [Cognito: Lambda triggers, including federated users and inbound federation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools-working-with-aws-lambda-triggers.html)
+- [S68] [Cognito: authorization endpoint](https://docs.aws.amazon.com/cognito/latest/developerguide/authorization-endpoint.html)
+- [S69] [GitHub: Actions settings for a repository, fork workflows](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository), [approving runs from forks](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks), [secure use](https://docs.github.com/en/actions/reference/security/secure-use)
+- [S70] [AgentCore Browser: enterprise policies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-enterprise-policies.html)
+- [S71] [AgentCore Code Interpreter: network modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-management.html)
+- [S72] [GitHub Actions: limits](https://docs.github.com/en/actions/reference/limits)
+- [S73] [GitHub: webhook payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [API Gateway: HTTP API quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html)
 - [S59] [GitHub: troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)

@@ -30,6 +30,10 @@ A run can wait days or weeks for a human, must survive restarts and deployments,
 | **One compiled state machine per workflow version** | `CreateStateMachine` refills at 1 per second. Publishing would need AWS. Logic in ASL is hard to test offline, and the whole engine would need rebuilding for local dev |
 | **AgentCore harness via Step Functions** | Request Response only, 15 minute limit, no callback, and stopping the execution does not stop the harness [S24] |
 
+## Compatibility
+
+An execution keeps the definition it started with, for up to 300 days. So the command JSON between ASL and Lambdas is a versioned envelope, and D11-02 tests old ASL against new handlers, and the reverse (R5). Reducer state has its own replay test, from D2-20.
+
 ## Consequences
 
 - Runs need two systems, with a relay between them. The outbox relay and a reconciler cover the gap, and G6
