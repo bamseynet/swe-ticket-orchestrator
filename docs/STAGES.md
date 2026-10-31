@@ -27,6 +27,7 @@ flowchart LR
     D7 --> D8
     D5 --> D9
     D8 --> D9
+    D8 --> D6
     D8 --> D10[D10 Cost and observability]
     D10 --> D9
     D5 --> D10
@@ -38,7 +39,8 @@ flowchart LR
     D10 --> D11
     D11 -.-> D13
     D11 --> D12[D12 First real deploy]
-    CRED((AWS credentials<br/>from Peter)) -.->|blocks| SPIKE[D12-18 AWS spike]
+    CRED((AWS credentials<br/>from Peter)) -.->|blocks| GUARD[D12-00 Cost guard]
+    GUARD --> SPIKE[D12-18 AWS spike]
     SPIKE --> D12
     SPIKE -.->|may change designs in| D11
     CRED -.->|blocks| D12
@@ -68,7 +70,7 @@ flowchart LR
 
 **Dependency rules, checked by script on every change to this file:**
 
-- Every issue after D0-05 has D0-05 as an ancestor, so CI exists before it.
+- Every issue after D0-05 has D0-05 as an ancestor, so CI exists before it, and every issue outside D0 has D0-10, so the declared-files check does too.
 - No offline issue depends on a human step (D4-24), and no issue before D12 depends on D12.
 - D11-18, and so D12, does not depend on optional adapters in D13 or on a live run. Everything up to that point is reachable with no AWS
 account.
@@ -137,8 +139,9 @@ GitHub Free allows 20 concurrent jobs, so 8 PRs at 11 jobs will queue. Path filt
 |---|---|---|
 | 1 | - | D0-01 |
 | 2 | - | D0-05 |
-| 3 | D0-02, D0-06 | D0-03, D0-04, D0-07, D0-08 |
+| 3 | D0-02, D0-06 | D0-03, D0-04, D0-08 |
 | 4 | - | D0-09, D0-10 |
+| 5 | - | D0-07 |
 
 #### D0-01: Python project skeleton
 Create `src/sto`, `pyproject.toml`, uv lock, ruff, mypy strict and pytest with a socket-blocking fixture.
@@ -177,10 +180,10 @@ The PR template requires a "what stays unverified until D12" section and a link 
 **Deps:** D0-05. **Size:** S. **Run:** parallel. **Files:** `CONTRIBUTING.md`, `CLAUDE.md`, `.github/PULL_REQUEST_TEMPLATE.md`, `.github/ISSUE_TEMPLATE/`.
 
 #### D0-07: Domain types
-Define IDs (ULID-based), run, step, gate, decision, effect and event types, plus the error classes.
+Define IDs (ULID-based), base types for run, step, gate, decision and effect, and the error classes. **Event, command and `BLOCKED` reason types register from the modules that use them,** so later issues add types without editing `domain/`.
 These are frozen typed models with no I/O, and everything later imports them.
-**AC:** invalid transitions cannot be represented in types where practical; error classes are `transient`, `permanent` or `degraded`; mypy strict passes in CI.
-**Deps:** D0-05. **Size:** M. **Run:** serial. **Files:** `src/sto/domain/`, `tests/domain/`.
+**AC:** invalid transitions cannot be represented in types where practical; error classes are `transient`, `permanent` or `degraded`; a new event type in another module needs no edit here; mypy strict passes in CI.
+**Deps:** D0-10. **Size:** M. **Run:** serial. **Files:** `src/sto/domain/`, `tests/domain/`.
 
 #### D0-08: Test tiers, targeted runs and core jobs
 Pytest markers for `unit`, `contract`, `gate`, `integration`, `ui_browser` and `live`, `make test-changed`, and CI jobs for contract, gate-integrity and coverage.
@@ -195,9 +198,9 @@ They start with smoke tests, so issues in later stages have somewhere to put hea
 **Deps:** D0-03, D0-08. **Size:** S. **Run:** serial. **Files:** `.github/workflows/ci.yml`, `tests/integration/test_smoke.py`, `docker-compose.yml`.
 
 #### D0-10: Declared-files check
-A CI job reads a PR's issue ID, and compares touched files with that issue's `Files` here, plus an allow-list of lockfiles and docs.
+A CI job reads a PR's issue ID, and compares touched files with that issue's `Files` here, plus an allow-list of lockfiles, `pyproject.toml`, `Makefile`, `web/package.json` and docs. It feeds `ci-required`.
 This is what keeps "parallel" honest, because file lists were the weak point of the first plan.
-**AC:** an undeclared file fails with a message naming the issue; an override label is possible and recorded; touching a serial area needs that issue to be marked serial.
+**AC:** an undeclared file fails with a message naming the issue; an override needs a label set by a human reviewer, and a worker's own label is ignored; touching a serial area needs that issue to be marked serial.
 **Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `scripts/check_scope.py`, `tests/scripts/test_check_scope.py`, `.github/workflows/ci.yml`.
 
 ---
@@ -216,7 +219,7 @@ Stopping the process and restarting keeps a waiting gate. The first gate tests a
 <!-- waves:D1 -->
 | Wave | Parallel | Serial, one at a time |
 |---|---|---|
-| 1 | D1-01, D1-04, D1-05 | D1-02 |
+| 1 | D1-01, D1-04, D1-05, D1-13 | D1-02 |
 | 2 | D1-07, D1-12 | D1-06 |
 | 3 | - | D1-03 |
 | 4 | D1-11 | D1-08 |
@@ -236,9 +239,9 @@ SQLite implementation of the store port, passing the same contract suite, with n
 **Deps:** D1-01. **Size:** S. **Run:** parallel. **Files:** `src/sto/store/sqlite.py`, `tests/store/test_sqlite.py`.
 
 #### D1-02: Reducer v0
-Pure `next(state, event, workflow)` over a hard-coded linear workflow with two gates, with a **registry of handlers per event and stage kind**, so later issues add files rather than edit one function.
+Pure `next(state, event, workflow)` over a hard-coded linear workflow with two gates, with **registries of handlers, events and commands**, so later issues add files rather than edit shared ones.
 It has no I/O, clock or randomness, and emits commands rather than doing anything.
-**AC:** same input always gives same output; an out-of-order event is rejected; a new handler needs no edit to `reducer.py`; every outcome is covered by a test.
+**AC:** same input always gives same output; an out-of-order event is rejected; a new handler, event or command needs no edit to `reducer.py`, `commands.py` or `domain/`; every outcome is covered by a test.
 **Deps:** D0-07. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/commands.py`, `src/sto/engine/handlers/core.py`, `tests/engine/test_reducer.py`.
 
 #### D1-03: Local driver
@@ -295,6 +298,12 @@ Each test name carries its invariant ID, so a failure explains itself.
 **AC:** each invariant has a test that fails when the code is deliberately broken, shown in the PR; CI requires the suite.
 **Deps:** D1-06, D1-07, D1-03. **Size:** M. **Run:** parallel. **Files:** `tests/gates/test_integrity.py`.
 
+#### D1-13: Signer port
+A single signer port with a local implementation, used by audit checkpoints, step tokens and GitHub App JWTs, with KMS implementations later.
+It exists early so that two workers do not invent two ports.
+**AC:** sign and verify round-trip; a key ID is part of the result, for rotation; no private key is logged.
+**Deps:** D0-07. **Size:** S. **Run:** parallel. **Files:** `src/sto/signing/`, `tests/signing/`.
+
 ---
 
 ## D2: Workflow engine
@@ -314,8 +323,8 @@ Property tests pass over all templates, with crash injection.
 | 2 | D2-18, D2-24 | - |
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
-| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-14, D2-15, D2-16, D2-17, D2-21, D2-23 | - |
-| 6 | D2-09, D2-19, D2-20 | - |
+| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-14, D2-15, D2-16, D2-17, D2-21 | - |
+| 6 | D2-09, D2-19, D2-20, D2-23, D2-25 | - |
 
 #### D2-01: Workflow schema
 Typed models for the whole schema in PLAN.md section 7.2, generating a JSON Schema for editors.
@@ -378,16 +387,16 @@ This is the most dangerous logic in the product, and it implements invariant G13
 **Deps:** D2-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/gates/carry_over.py`, `tests/gates/test_carry_over.py`.
 
 #### D2-10: Failure classes and retry
-Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, add an audited human retry that stops the earlier attempt, an admin grant for a spent loop, and an audited route-to-gate for false positives.
-This fixes the PoC's re-spending on restart.
-**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters; route-to-gate puts the item on the attention list; all are audited.
+Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt.
+This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
+**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited.
 **Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
 
 #### D2-11: Cancel v1
-Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps.
+Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert.
 Stopping model calls mid-step and session stopping arrive in D10-06.
-**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm.
-**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `tests/engine/test_cancel.py`.
+**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`.
+**Deps:** D2-06, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `tests/engine/test_cancel.py`.
 
 #### D2-12: Timers and business calendar
 Timer port, a local implementation, and business-time maths from `TeamConfig` calendars.
@@ -420,15 +429,15 @@ Checks are a registry of named evaluators, with no free-form expressions.
 **Deps:** D2-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/dod.py`, `tests/engine/test_dod.py`.
 
 #### D2-17: Intake, sprints, WIP and windows
-Start runs from closed intake selectors, honour active-sprint filtering, WIP limits and freeze and change windows, and record the intake actor and ticket revision.
+Start runs from closed intake selectors, honour active-sprint filtering, WIP limits and freeze and change windows, and record the intake actor, ticket revision and frozen route inputs.
 Duplicate active runs and tickets matching two workflows start nothing, and a non-member's edit pauses the run for a member to confirm.
-**AC:** a ticket outside the active sprint does not start; WIP holds runs queued; a freeze holds merge in `WAITING_EXTERNAL`; overlapping selectors are refused at publish (V12); T11: public repos need opt-in, and an edit by a non-member does not reach agents.
+**AC:** a ticket outside the active sprint does not start; WIP holds runs queued; a freeze holds merge in `WAITING_EXTERNAL`; overlapping selectors are refused at publish (V12); T11: public repos need opt-in, and an edit by a non-member or unknown editor pauses the run.
 **Deps:** D2-06, D2-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/intake.py`, `tests/engine/test_intake.py`.
 
 #### D2-19: Run migration
-Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage, and it is audited.
+Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage and meets `OrgPolicy.teams`, and it is audited.
 An `apiVersion` change comes with a migration rule, tested here.
-**AC:** migration to an invalid position is refused; `POST /runs/{id}:migrate` is enforced by role; a stored older run migrates in a test.
+**AC:** migration to an invalid position is refused; migration onto a version lacking an org-required gate is refused; `POST /runs/{id}:migrate` is enforced by role; a stored older run migrates in a test.
 **Deps:** D2-07, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/config/migrate.py`, `src/sto/api/routers/migrate.py`, `tests/config/test_migrate.py`.
 
 #### D2-20: State compatibility
@@ -450,16 +459,22 @@ This settles the rule that D2-08 and D2-21 both depend on.
 **Deps:** D0-07, D1-01. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/evidence.py`, `tests/gates/test_evidence.py`.
 
 #### D2-23: Route stages
-A `route` stage picks an edge from a closed vocabulary of ticket fields, with no expressions, and a required `default`.
-The validator treats every edge as possible, so proofs still hold.
-**AC:** unknown values take `default`; a risk route changing mid-run is recorded; guard data records gates visited, so a routed gate cannot be skipped at merge.
-**Deps:** D2-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/route.py`, `tests/engine/test_route.py`.
+A `route` stage picks an edge from a closed vocabulary, with no expressions, and a required `default`. Ticket-field inputs are frozen at intake, with a ratchet: raises apply, and lowering needs a named role, whose audited actor becomes ineligible for that run's gates.
+A routed gate once visited stays required, and the validator treats every edge as possible, so proofs still hold.
+**AC:** G21: risk lowered before the route runs, and between rounds, does not skip the gate; unknown values take `default`; route inputs are part of `ticket_revision`; `repo_ci_trust` is evaluated fresh each pass.
+**Deps:** D2-06, D2-08, D2-17. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/route.py`, `tests/engine/test_route.py`.
 
 #### D2-24: Team and org documents
-Typed `TeamConfig` and `OrgPolicy`, stored live, read at decision and effect time, including a typed effect catalog for `with`.
-Floors apply to runs in flight, which is the point of separating them from the pinned workflow.
-**AC:** a tightened floor changes the next decision on a pinned run; only org admins can write `OrgPolicy`, at the role seam; all floors in PLAN.md section 7.2 are enforced by name.
+Typed `TeamConfig` and `OrgPolicy`, stored live, with a typed read API used at decision and effect time, plus V17 for org-required gates at publish.
+Each floor's enforcement lands in a later issue, so a tracking test lists every floor, and fills up as they arrive.
+**AC:** a tightened floor changes the next read on a pinned run; only org admins can write `OrgPolicy`, at the role seam; V17 refuses a workflow missing a required gate, quorum or carry-over setting; the tracking test names the issue for each floor still open.
 **Deps:** D2-01, D1-01. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/team_config.py`, `src/sto/config/org_policy.py`, `tests/config/test_policy.py`.
+
+#### D2-25: Loop grants and route-to-gate
+A team admin can grant extra rounds to a run at a spent loop, and, under `route_to_gate_allowed`, send a run with a `review_panel` false positive to the next gate in the proved graph.
+Both are engine actions, so they are limited to what the graph allows. A patch blocked by path policy or a secret scan is never routed past `branch.push`.
+**AC:** route-to-gate puts the item on the attention list and makes the actor ineligible for that round; it is refused by default, from a non-review stage, and for a policy-blocked patch (G20); both are audited.
+**Deps:** D2-10, D2-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/grants.py`, `tests/engine/test_grants.py`.
 
 ---
 
@@ -479,7 +494,7 @@ Floors apply to runs in flight, which is the point of separating them from the p
 | 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
 | 4 | D3-15, D3-19 | D3-06 |
 | 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | - |
-| 6 | D3-07 | - |
+| 6 | D3-07, D3-20 | - |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -519,15 +534,15 @@ Negative decisions are exempt from the digest match, and a moved subject drops e
 
 #### D3-07: Eligibility display and escalation
 Show who can decide, warn when nobody can, and run reminders and escalation through timers.
-Escalation notifies, but grants nothing.
-**AC:** a team with no eligible approver gets a warning immediately; escalation does not change eligibility.
+Escalation notifies, but grants nothing. The way out of a stuck gate is D3-20.
+**AC:** a team with no eligible approver gets a warning immediately, naming D3-20's action; escalation does not change eligibility.
 **Deps:** D3-16, D2-12. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/escalation.py`, `tests/gates/test_escalation.py`.
 
 #### D3-08: Audit chain and checkpoints
-Hash-chain audit events through a chain head item, on the `AuditWriter` seam, with signed checkpoints through a signer port, a verifier and an export.
+Hash-chain audit events through a chain head item, on the `AuditWriter` seam, with signed checkpoints through the signer port, a verifier and an export.
 Secrets are redacted before storing. Refused attempts go through a separate, best-effort path.
 **AC:** every state change produces an audit event, asserted across a template run; editing, reordering or **removing a tail or a whole run** fails verification against a checkpoint; T14 covered; update and delete are unavailable in the port.
-**Deps:** D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/`, `tests/audit/`.
+**Deps:** D1-06, D1-07, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/`, `tests/audit/`.
 
 #### D3-09: DynamoDB store
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
@@ -548,10 +563,10 @@ This is the seam that G6 tests hardest, including a decision committing before t
 **Deps:** D3-06, D1-03. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/relay.py`, `tests/gates/test_outbox_crash.py`.
 
 #### D3-12: Cognito triggers
-An Inbound federation trigger that rewrites groups on every sign-in, a Pre authentication fallback, and a pre token trigger that normalises immutable group IDs.
-Include a configuration guide for Entra ID, Okta and a generic SAML IdP.
-**AC:** fixtures for string, list, missing and removed groups, and refresh; a removed group is cleared at the next sign-in, in fixtures; the guide lists what stays unverified until D12-10.
-**Deps:** D3-15. **Size:** S. **Run:** parallel. **Files:** `src/sto/identity/cognito_trigger.py`, `tests/identity/test_cognito_trigger.py`, `docs/SSO.md`.
+An Inbound federation trigger that rewrites groups on every sign-in, a Pre authentication fallback, a pre token trigger that normalises immutable group IDs, and a configuration guide for Entra ID, Okta and a generic SAML IdP.
+Two traps need fixtures: `{}` is a no-op that keeps every attribute, so no groups needs a non-empty map with an explicit blank, and attributes left out of a non-empty map are dropped.
+**AC:** fixtures for string, list, missing and removed groups, and refresh; the no-groups case returns an explicit blank; attributes to keep are all returned; the guide lists what stays unverified until D12-10.
+**Deps:** D3-15. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/cognito_trigger.py`, `tests/identity/test_cognito_trigger.py`, `docs/SSO.md`.
 
 #### D3-13: Moving ticket and PR
 Handle the events in PLAN.md section 4.5 at any stage, not only at a gate: new commit, edited or closed ticket, closed PR, outside merge.
@@ -566,9 +581,9 @@ This is the tenancy boundary for outside systems, and T19 depends on it.
 **Deps:** D2-24, D3-02. **Size:** M. **Run:** parallel. **Files:** `src/sto/tenancy/bindings.py`, `src/sto/api/routers/resources.py`, `tests/tenancy/test_bindings.py`.
 
 #### D3-15: Membership freshness
-Store a membership snapshot with `as_of` per identity, require it within `identity_max_age` for every decision on every surface, and expire links. A port allows a directory or SCIM refresh.
+Store a membership snapshot with `as_of` per identity, **set to the time the IdP authenticated the person**, require it within `identity_max_age` for every decision on every surface, and expire links. A port allows a directory or SCIM refresh.
 Without this, a Slack or GitHub decision has no meaningful identity.
-**AC:** G19 on all surfaces that exist so far; a stale identity gets a deep link to sign in; the port has a fake; `auth_time` and `prompt=login` flow is covered for the UI.
+**AC:** G19 on all surfaces that exist so far; a refreshed token or reused session does not move `as_of`; a stale identity gets a deep link to sign in; the port has a fake; `auth_time` and `prompt=login` flow is covered for the UI.
 **Deps:** D3-04, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/membership.py`, `tests/identity/test_membership.py`.
 
 #### D3-16: Eligibility and surface checks
@@ -589,11 +604,17 @@ It works once, and is then disabled and audited.
 **AC:** an empty system has one way in; the bootstrap cannot be reused after the first mapping exists.
 **Deps:** D3-02. **Size:** S. **Run:** parallel. **Files:** `src/sto/identity/bootstrap.py`, `tests/identity/test_bootstrap.py`.
 
-#### D3-19: Commit attribution API
-`POST /runs/{id}/commits/{sha}:attribute` lets a team admin attribute an unknown commit, and clear a false exclusion, which unblocks the gate.
-Without it, one stray commit would leave a run stuck forever.
+#### D3-19: Commit attribution and term resolution
+`POST /runs/{id}/commits/{sha}:attribute` and `POST /runs/{id}/sod-terms:resolve` let a team admin attribute an unknown commit, clear a false exclusion, or resolve an unknown requester or author, which unblocks the gate.
+Without them, one stray commit or a Jira automation adding a label would leave a run stuck forever.
 **AC:** the gate reports the block and who can clear it; the actor becomes ineligible for that round; a person cannot clear their own exclusion; it is audited.
 **Deps:** D3-05, D3-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/api/routers/attribution.py`, `tests/api/test_attribution.py`.
+
+#### D3-20: Eligibility extension
+An org admin can extend eligibility on an open gate when its approvers have left or are away, through `POST /gates/{id}:extend-eligibility`. Otherwise "then and now" could deadlock a gate, with Stop the only exit.
+The extender cannot vote in that round, and the added person must pass separation of duties.
+**AC:** G7's extension cases pass; only org admins can do it; it is audited, and shown on the gate; ordinary mapping changes still do not reach open gates.
+**Deps:** D3-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/extension.py`, `src/sto/api/routers/gate_extension.py`, `tests/gates/test_extension.py`.
 
 ---
 
@@ -601,25 +622,26 @@ Without it, one stray commit would leave a run stuck forever.
 
 **Goal:** a real PR is opened, gated and merged by the orchestrator on a live throwaway repo.
 
-**Scope:** credential broker, fake GitHub, webhooks, all SCM operations, CI trust, check runs, PR review surface, merge guard, async merge, reconciler.
+**Scope:** credential broker, fake GitHub, webhooks, all SCM operations, CI trust, the pre-push gate, fork mode, check runs, PR review surface, merge guard, async merge, reconciler.
 
 **Exit criteria:** the conformance suite passes on the fake and on live GitHub. On the throwaway repo, with scripted agents,
-an issue becomes a merged PR, and each merge guard blocks when it should. A hostile test in pre-gate CI cannot read a canary secret. Merging a run's exact SHA before approval is blocked by its pending check, and content landing outside the platform is detected.
+an issue becomes a merged PR, and each merge guard blocks when it should. No branch exists before the pre-push approval, and a hostile test cannot read a canary secret. Merging a run's exact SHA before approval is blocked by its pending check, and content landing outside the platform is detected.
 
 **Needs:** Peter for D4-24 only. Everything else is offline.
 
 <!-- waves:D4 -->
 | Wave | Parallel | Serial, one at a time |
 |---|---|---|
-| 1 | D4-03 | D4-01 |
+| 1 | D4-03, D4-27 | D4-01 |
 | 2 | D4-16 | - |
 | 3 | D4-02, D4-04, D4-19, D4-20 | - |
 | 4 | D4-05, D4-06, D4-10 | D4-24 |
-| 5 | D4-07, D4-09, D4-13, D4-25 | - |
-| 6 | D4-08, D4-17 | D4-11 |
+| 5 | D4-07, D4-09, D4-13, D4-17, D4-25 | - |
+| 6 | D4-08, D4-26 | D4-11 |
 | 7 | - | D4-15, D4-21 |
 | 8 | D4-12, D4-14, D4-22 | - |
-| 9 | - | D4-23 |
+| 9 | D4-28 | - |
+| 10 | - | D4-23 |
 
 #### D4-01: Conformance suite
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
@@ -634,10 +656,10 @@ Each behaviour is documented with its source URL, and the live suite later prove
 **Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`.
 
 #### D4-02: Credential broker and GitHub auth port
-`CredentialBroker` port with a signer port and a local signer for tests. No human step and no real App, so no offline work waits on a person.
+`CredentialBroker` port on the signer port from D1-13. No human step and no real App, so no offline work waits on a person.
 Tokens are narrowed per call, cached under an hour, never logged, and refused for a repo not bound to the team.
-**AC:** a token request names repos and permissions; JWT signing is behind the port; an unbound repo is refused; T15 covered at this layer.
-**Deps:** D4-16, D3-14. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/credentials/`, `src/sto/adapters/github/auth.py`, `tests/adapters/github/test_auth.py`.
+**AC:** a token request names repos and permissions; an unbound repo is refused; T15 covered at this layer.
+**Deps:** D4-16, D3-14, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/credentials/`, `src/sto/adapters/github/auth.py`, `tests/adapters/github/test_auth.py`.
 
 #### D4-03: Webhook ingest core
 Generic ingest: verify on the raw body, dedupe, enqueue, respond inside the vendor's deadline.
@@ -664,15 +686,15 @@ All reads are by SHA, so results do not drift.
 **Deps:** D4-02, D4-19. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/scm_read.py`, `tests/adapters/github/test_scm_read.py`.
 
 #### D4-07: SCM writes
-Create a commit object and record its SHA as intent, then move the ref without force, on `sto/<run>`, `sto/<run>/<n>` or `sto-revert/*`. Ensure, close or mark ready a draft PR, all idempotently.
+Create a commit object and record its SHA as intent, then move the ref without force, on `sto/<run>`, `sto/<run>/<n>`, `sto-approved/<run>` or `sto-revert/*`. Ensure, close or mark ready a draft PR, all idempotently.
 Only those branches can be written, and these receipts are what SoD relies on.
 **AC:** a crash after each step gives one commit and one PR; a concurrent human push makes the move fail cleanly; other branch names are refused in code; a second round does not open a second PR; each receipt is read back.
 **Deps:** D4-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/scm_write.py`, `tests/adapters/github/test_scm_write.py`.
 
 #### D4-08: Gate check runs
-Publish `sto/review-gate` and `sto/qa-gate` as gates change. Post neutral only for a SHA with no active run, never replacing a pending gate check.
+Publish `sto/review-gate` and `sto/qa-gate` as gates change. Post neutral only for a SHA no run has ever produced, using a tombstone, and never replace a pending gate check.
 Docs state plainly what this stops and what it does not, and which to require per template.
-**AC:** a new SHA starts pending; only a valid approval, direct or carried over, sets success; the same SHA on another branch stays pending until approved; a human PR is not blocked; a failed publish does not change gate state.
+**AC:** a new SHA starts pending; only a valid approval, direct or carried over, sets success; the same SHA on another branch stays pending until approved; a rejected run's SHA never goes neutral after the run ends; a human PR is not blocked; a failed publish does not change gate state.
 **Deps:** D4-07, D4-20, D3-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/adapters/github/checks.py`, `tests/adapters/github/test_checks.py`.
 
 #### D4-09: CI checks stage
@@ -694,9 +716,9 @@ A switches port is read here, and D10-07 controls it.
 **Deps:** D4-07, D4-09, D2-09, D3-05, D2-17. **Size:** M. **Run:** serial. **Files:** `src/sto/effects/merge.py`, `tests/gates/test_merge_guard.py`.
 
 #### D4-12: Base update
-The `pr.update_branch` path from a `stale` merge through `POST /merges`, which returns the SHA, passing the expected head.
+The `pr.update_branch` path from a `stale` merge through `POST /merges`, which returns the SHA. It cannot carry an expected head, so we check the head before, and read back that the first parent equals it.
 A commit from a lost response is recognised only by parents and an unchanged `patch_id`, and carry-over decides on re-approval.
-**AC:** a clean update with `carry_over: patch_id` proceeds with no person asked; with `none` it asks again; conflict goes to the `merge_conflict` loop; a crash never classifies our commit as human (G9); a hand-made merge that alters code is not treated as ours.
+**AC:** a clean update with `carry_over: patch_id` proceeds with no person asked; with `none` it asks again; conflict goes to the `merge_conflict` loop; a human push between check and merge is detected by the first parent; a crash never classifies our commit as human (G9); a hand-made merge that alters code is not treated as ours.
 **Deps:** D4-21. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/base_update.py`, `tests/effects/test_base_update.py`.
 
 #### D4-13: Reconciler
@@ -706,22 +728,22 @@ A missed webhook adds only delay.
 **Deps:** D4-06, D3-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/reconcile.py`, `tests/engine/test_reconcile.py`.
 
 #### D4-14: Post-merge and revert
-Run post-merge checks at the merge SHA, and on failure open a revert PR on `sto-revert/*`, outside the gate check, without merging it. The engine rule for an unqualified merge uses the same path.
+Run post-merge checks at the merge SHA, and on failure open a revert PR on `sto-revert/*`, outside the gate check, without merging it. The engine rule for an unqualified merge uses the same path, keyed by `(run, merge_sha)`.
 The revert goes through normal review, and the run ends `done_with_incident`.
-**AC:** a red post-merge opens one revert PR idempotently; the revert is not held pending by a gate check; notification sent; the revert is not merged automatically.
+**AC:** a red post-merge opens one revert PR idempotently; a declared revert and the implicit one open one PR; the revert is not held pending by a gate check; notification sent; the revert is not merged automatically.
 **Deps:** D4-21. **Size:** S. **Run:** parallel. **Files:** `src/sto/effects/revert.py`, `tests/effects/test_revert.py`.
 
 #### D4-15: Live GitHub conformance
-Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** from pre-gate CI.
+Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** before a human approves it.
 It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow.
-**AC:** conformance passes live; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself.
-**Deps:** D4-24, D4-05, D4-08, D4-17. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
+**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself.
+**Deps:** D4-24, D4-05, D4-08, D4-26, D4-27. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
 
-#### D4-17: CI trust and pre-CI gate
-Report a repo's `ci_trust`, floor pre-gate CI as secret-free, and open an **automatic human gate before CI** unless the repo attests `fork` or `no_secrets`. Add `branch.promote` for secret-bearing QA, and the wider path deny list.
-This is the T18 control. It defaults to a gate because fork approval and policy settings can stall an autonomous bot.
-**AC:** an unattested repo gets a gate before CI; a repo with a repo-level secret does not pass `no_secrets`; a floor waiver is org-only and audited; the deny list refuses `.github/**`, CI config, `CODEOWNERS` and the GitOps path; fork mode settles first-time-contributor behaviour, against the fake now and in D4-23 live.
-**Deps:** D4-07, D2-06, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/ci_trust.py`, `src/sto/engine/handlers/ci_trust.py`, `tests/engine/test_ci_trust.py`.
+#### D4-17: CI trust report
+Report a repo's `ci_trust`, which can only be `attested` or `unknown`, re-checked per round and expiring after 90 days. It reads secrets, Environment rules and `default_workflow_permissions`, scans workflow files for `pull_request_target` and `workflow_run`, and records a named human's statements on CI systems and OIDC trust.
+Anything it cannot prove stays `unknown`, because attestation fails closed. Fork mode is never `attested` here until D4-28 and D4-23 pass.
+**AC:** each condition in PLAN.md section 12's table flips `attested` to `unknown` in a test; a repo with a repo-level secret, a read-write default token, or a `pull_request_target` workflow is `unknown`; the human statements are audited, with name and date.
+**Deps:** D4-06, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/ci_trust.py`, `tests/adapters/github/test_ci_trust.py`.
 
 #### D4-19: Fake GitHub: PRs and merges
 Fake pull requests, draft state, async merge with polling and `sha`, base updates through `POST /merges`, commit and ref APIs, and merge queue responses.
@@ -748,10 +770,10 @@ Queues need an organization-owned repo, so the live part waits for one. D13-07 m
 **Deps:** D4-21. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/merge_queue.py`, `tests/effects/test_merge_queue.py`.
 
 #### D4-23: Live merge behaviour
-With scripted agents on the throwaway repo: issue to merged PR, request changes and reject, every guard, async merge errors, a base update that brings in a workflow change, draft PR reviews, and fork mode.
+With scripted agents on the throwaway repo: issue to merged PR, request changes and reject, every guard, async merge errors, a base update that brings in a workflow change, draft PR reviews, and fork mode, whose result decides if D4-28 is switched on.
 This settles the items marked unverified in the GitHub sections of RESEARCH.md.
 **AC:** issue to merged PR works live; no gated event appears before approval in the repo's event log (FF-05); each guard blocks live; each unverified item has an answer, and the fake and docs are updated.
-**Deps:** D4-15, D4-10, D4-12, D4-13, D4-14. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_merge.py`.
+**Deps:** D4-15, D4-10, D4-12, D4-13, D4-14, D4-28. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_merge.py`.
 
 #### D4-24: GitHub App setup by Peter
 **A human step, off the critical path.** Peter confirms the App manifest, arranges a throwaway repo and a second GitHub user, and checks what the plan allows on private repos.
@@ -760,10 +782,28 @@ Only live suites depend on this. A doc lists each permission and why.
 **Deps:** D4-02. **Size:** S. **Run:** serial. **Files:** `deploy/github-app-manifest.json`, `docs/GITHUB_APP.md`.
 
 #### D4-25: Path owners
-A gate with `path_owners: codeowners` also requires an owner of each changed path, read from `CODEOWNERS` at the base SHA.
+A gate with `path_owners: codeowners` also requires an owner of each changed path, read from `CODEOWNERS` at the base SHA. CODEOWNERS teams need org `members` read.
 Unknown owners or no owner for a path fail closed.
-**AC:** a change touching two owners' paths needs both; a change to `CODEOWNERS` itself uses the base's version; a linked identity is required.
+**AC:** a change touching two owners' paths needs both; a change to `CODEOWNERS` itself uses the base's version; a team owner resolves through members read; a linked identity is required.
 **Deps:** D3-16, D4-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/path_owners.py`, `tests/gates/test_path_owners.py`.
+
+#### D4-26: Pre-push gate
+The `exposing` class for `branch.push`, V16, and a `pre_push` gate holding the patch in S3, with no branch or PR until a person approves, on every round. It is not a review, and its rules are in PLAN.md section 12.
+`branch.push`'s claim checks for a human approval at this `patch_id` or a current attestation, so V16's proof holds at run time too.
+**AC:** G20: spy shows no push before approval, on the first round and after `qa_fix`, `merge_conflict` and `changes_requested`; approval does not count as the review gate; mutation: bypassing the gate fails V16; a waiver is org-only and audited.
+**Deps:** D4-17, D4-07, D2-23, D2-04. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/pre_push.py`, `src/sto/config/validate_exposure.py`, `tests/engine/test_pre_push.py`.
+
+#### D4-27: Path deny list
+Default path policy refusing `.github/**`, CI config files, `CODEOWNERS` and the GitOps workflow path, configurable upward.
+It is a second layer only, because CI also runs files a change must touch, and the docs say so.
+**AC:** each default path is refused, and so is a rename into one; a refused patch can only be corrected or waived by org, and is never routed past the push.
+**Deps:** D5-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/workspace/path_policy.py`, `tests/workspace/test_path_policy.py`.
+
+#### D4-28: Fork mode
+The fork design from PLAN.md section 12: App on a bot-owned fork, commits and refs targeting it, `merge-upstream` before base updates, the reconciler reading the PR's head repo, and the `promote` stage pushing the approved SHA upstream.
+It stays unsupported, and is not accepted as `attested`, until D4-23 passes, so the gate remains the default.
+**AC:** the flow works on the fake; a config flag holds it off until D4-23's result is recorded; what re-promotes after a fix round is tested.
+**Deps:** D4-17, D4-07, D4-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/fork.py`, `tests/adapters/github/test_fork.py`.
 
 ---
 
@@ -811,9 +851,9 @@ Scanning covers known formats and entropy, including inside source files.
 **Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/safety/`, `tests/agents/test_safety.py`.
 
 #### D5-05: Tool broker and read tools
-Registry that enforces a stage's allowlist, plus `ticket.*`, `repo.*`, `pr.diff`, `checks.read` and record tools. **Repo and SHA come from the signed step context, never from model arguments.**
+Registry that enforces a stage's allowlist, plus `ticket.*`, `repo.*`, `pr.diff`, `checks.read` and record tools. **Repo and SHA come from the signed step context, never from model arguments.** `ticket.read` serves a confirmed snapshot and member comments, with others withheld.
 All output passes through the scanner, and is framed as untrusted.
-**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; every result is scanned; SHA-pinned reads.
+**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; G11: a non-member's comment or a later edit never reaches an agent; every result is scanned; SHA-pinned reads.
 **Deps:** D5-01, D5-04, D4-06, D5-19, D3-14. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/tools/registry.py`, `src/sto/agents/tools/read.py`, `tests/agents/test_tools.py`.
 
 #### D5-06: Workspace port and local Docker
@@ -823,10 +863,10 @@ It matches the AgentCore command model, so tests stay meaningful.
 **Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/ports.py`, `src/sto/workspace/local_docker.py`, `tests/workspace/test_local_docker.py`.
 
 #### D5-07: Patch flow
-Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then commit by effect. The harness checkpoints a patch at each worker turn, and caps commands per step.
+Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then hand-off to `branch.push` by effect, held in S3 until allowed. The harness checkpoints a patch at each worker turn, and caps commands per step.
 The sandbox never sees an SCM token.
 **AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint.
-**Deps:** D5-06, D5-05, D4-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/patch.py`, `src/sto/agents/tools/workspace.py`, `tests/workspace/test_patch.py`.
+**Deps:** D5-06, D5-05, D4-07, D4-27. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/patch.py`, `src/sto/agents/tools/workspace.py`, `tests/workspace/test_patch.py`.
 
 #### D5-08: Triage, refine and plan profiles
 Profiles and prompts for the three early stages, with workers, each with declared outcomes.
@@ -895,15 +935,15 @@ Real scores come only with D14, and the report says which it used.
 **Deps:** D5-08, D5-10. **Size:** M. **Run:** parallel. **Files:** `evals/`, `tests/evals/`.
 
 #### D5-19: Signed step context
-The dispatcher mints a short-lived signed token per step, with team, run, stage, tools, repo and SHA, through the signer port. Agent-side ledger and flag calls go through a broker keyed by it.
+The dispatcher mints a short-lived signed token per step, with team, run, stage, tools, repo and SHA, on the signer port. Agent-side ledger and flag calls go through a broker keyed by it, and refreshes go through that broker using the per-attempt secret.
 Cedar and the tool layer both read it. The AWS issuer comes in D11-23.
-**AC:** expired, wrong-stage and tampered tokens are refused; a session's token cannot read another team's ledger; verifying uses a JWKS-style public key.
-**Deps:** D0-07, D1-01. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/step_token.py`, `src/sto/budget/broker.py`, `tests/agents/test_step_token.py`.
+**AC:** expired, wrong-stage and tampered tokens are refused; a long step can refresh, and a dead step cannot; a session's token cannot read another team's ledger; verifying uses a JWKS-style public key.
+**Deps:** D1-13, D1-01. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/step_token.py`, `src/sto/budget/broker.py`, `tests/agents/test_step_token.py`.
 
 #### D5-20: Custom profiles
-A team declares its own reviewer or agent in `TeamConfig`: a built-in base, a prompt addendum, and a subset of tools. Outcomes come from the base.
+A team declares its own reviewer or agent in `TeamConfig`: a built-in base, a prompt addendum, and a subset of tools. Outcomes come from the base. A run pins them in its manifest at start, so edits affect only new runs.
 This delivers "config, not forks" for team-specific review.
-**AC:** a custom reviewer runs in a panel with no platform PR; a tool outside the base's set is refused; the addendum is rendered as trusted team config but is size-limited; manifests pin it.
+**AC:** a custom reviewer runs in a panel with no platform PR; a tool outside the base's set is refused; the addendum is rendered as trusted team config but is size-limited; editing a profile does not change a run in flight.
 **Deps:** D5-10, D2-24. **Size:** S. **Run:** parallel. **Files:** `src/sto/agents/profiles/custom.py`, `tests/agents/test_custom_profiles.py`.
 
 ---
@@ -964,10 +1004,10 @@ Team-managed and company-managed differences are handled by capability.
 **Deps:** D6-03, D2-17, D6-09. **Size:** S. **Run:** parallel. **Files:** `src/sto/adapters/jira/sprints.py`, `tests/adapters/jira/test_sprints.py`.
 
 #### D6-07: Jira end to end
-Run the conformance suite, and the Scrum template from intake to Done on fake Jira and GitHub.
+Run the conformance suite, and the Scrum overlay from intake to Done on fake Jira and GitHub, including the pre-push gate, preview environment and QA agent.
 Includes a stale ticket during a gate.
 **AC:** all conformance tests pass; the ticket reaches Done only through gates; G11 works on Jira events.
-**Deps:** D6-03, D6-04, D6-05, D6-06, D4-21. **Size:** M. **Run:** parallel. **Files:** `tests/contract/test_jira.py`, `tests/e2e/test_jira_scrum.py`.
+**Deps:** D6-03, D6-04, D6-05, D6-06, D4-21, D4-26, D8-05, D8-13. **Size:** M. **Run:** parallel. **Files:** `tests/contract/test_jira.py`, `tests/e2e/test_jira_scrum.py`.
 
 #### D6-08: Jira live suite, ready to run
 Tag the same tests for a real site, with a setup guide and a cleanup step.
@@ -1079,13 +1119,13 @@ Flaky retries are detected and reported.
 #### D8-02: Environment port
 Find the test URL from config or GitHub Deployments, and wait for readiness at a deployment containing the required SHA, recording `tested_sha`.
 An environment that never becomes ready ends in a defined timeout.
-**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; hosts feed the Browser allowlist.
-**Deps:** D4-06, D2-13. **Size:** S. **Run:** parallel. **Files:** `src/sto/qa/environment.py`, `tests/qa/test_environment.py`.
+**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; a host outside the team's preview domain is refused.
+**Deps:** D4-06, D2-13, D2-24. **Size:** S. **Run:** parallel. **Files:** `src/sto/qa/environment.py`, `tests/qa/test_environment.py`.
 
 #### D8-03: Browser port
-Port with a local Playwright provider and an AgentCore provider using managed `URLAllowlist` policies, with screenshots and recordings. The AgentCore side is tested by stubs until D12-09.
-A tool-level check alone does not stop page-driven redirects, so tests include them.
-**AC:** navigation and redirects outside the allowlist are refused; artifacts land in the session prefix and are scanned, including screenshots flagged for review; page content is framed; real browser tests run only in CI, with a fake provider locally.
+Port with a local Playwright provider and an AgentCore provider using **one custom browser per team**, with managed `URLBlocklist: ["*"]` and `URLAllowlist` for that team's preview wildcard domain, screenshots and recordings. Managed policies are fixed at `CreateBrowser`, so per-PR browsers or a shared one would not work.
+The AgentCore side is tested by stubs until D12-09. A tool-level check alone does not stop page-driven redirects, so tests include them.
+**AC:** navigation and redirects outside the allowlist are refused; a team's browser cannot reach another team's domain; artifacts land in the session prefix and are scanned, including screenshots flagged for review; page content is framed; real browser tests run only in CI, with a fake provider locally.
 **Deps:** D5-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/qa/browser/`, `src/sto/agents/tools/browser.py`, `tests/qa/test_browser.py`.
 
 #### D8-04: Code Interpreter port
@@ -1116,7 +1156,7 @@ Waive needs its own permission and a reason per criterion, and org policy can fo
 A small web app with deliberate defects and a test suite, as the target for QA and full demos.
 It is synthetic and stays in `examples/`.
 **AC:** runs on a dedicated port; defects are documented; used by the D8-09 test in CI.
-**Deps:** D0-02. **Size:** S. **Run:** parallel. **Files:** `examples/demo-target/`.
+**Deps:** D0-02, D0-07. **Size:** S. **Run:** parallel. **Files:** `examples/demo-target/`.
 
 #### D8-09: QA end to end
 Full flow on the local stack, through the review gate, QA suite, agentic QA and QA gate, in all decisions.
@@ -1125,15 +1165,15 @@ Code change after QA failure goes back through review.
 **Deps:** D8-07, D8-08, D4-21, D8-13. **Size:** M. **Run:** serial. **Files:** `tests/e2e/test_qa_flow.py`.
 
 #### D8-10: Merge-before-QA end to end
-Run the Kanban order: merge, QA on staging, fix forward on a new branch, reject with a revert PR, and reject a follow-up at review.
+Run the Kanban order: merge, QA on staging, fix forward on a new branch, reject with a revert PR, and reject a follow-up at review, with **two runs sharing staging**.
 Our own merge must not supersede the QA gate.
-**AC:** a follow-up PR holds only the new change; a rejection at QA or on a follow-up opens a revert PR and alerts; release takes the tested SHA after the range check; a run closing unapproved ends `done_with_incident`.
+**AC:** G22 passes with run B pending, rejected and cancelled after merge; a follow-up PR holds only the new change; a rejection at QA or on a follow-up opens a revert PR and alerts; a run closing unapproved ends `done_with_incident`.
 **Deps:** D8-09, D8-11, D3-13, D4-14. **Size:** M. **Run:** serial. **Files:** `tests/e2e/test_kanban_order.py`.
 
 #### D8-11: Release effect
-`release.trigger` dispatches the team's deploy workflow with the release SHA and the effect key as required inputs, shows the key in `run-name`, and reads back the run. The range check confirms every commit since the last release came through a gated run or was acknowledged.
+`release.trigger` dispatches the team's deploy workflow with the release SHA and the effect key as required inputs, shows the key in `run-name`, and reads back the run. The range check requires a QA approval for each run-merged commit since the last release, read from the deploy workflow's run history.
 A crash can lose the run ID, so retry looks up by key, and ambiguity means `BLOCKED`, never a second deploy.
-**AC:** G9: a crash after dispatch does not deploy twice; a missing input fails clearly; requires a QA approval and honours the hold; an ungated commit in range blocks; supported in the fake.
+**AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake.
 **Deps:** D4-11, D4-20. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/release.py`, `tests/effects/test_release.py`.
 
 #### D8-12: Live GitHub re-run
@@ -1143,9 +1183,9 @@ This closes the [GH] parts of FF-01, FF-03, FF-04, FF-05 and FF-09, which D4-23 
 **Deps:** D4-23, D8-10. **Size:** S. **Run:** serial. **Files:** `tests/live/github/test_full_flow.py`.
 
 #### D8-13: Preview environments
-`env.deploy_preview`, a gated effect that triggers the team's preview deployment after the review gate, so agentic QA has somewhere to run on unmerged code.
+`env.deploy_preview`, a gated effect that triggers the team's preview deployment after the review gate, on the team's preview wildcard domain, so agentic QA has somewhere to run on unmerged code.
 It uses the same keyed dispatch as release.
-**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; preview hosts feed the Browser allowlist.
+**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; a preview URL outside the team's domain is refused.
 **Deps:** D8-02, D8-11, D4-17. **Size:** S. **Run:** parallel. **Files:** `src/sto/effects/preview.py`, `tests/effects/test_preview.py`.
 
 #### D8-14: Surface parity
@@ -1170,7 +1210,7 @@ AA. Keyboard-only gate decisions work. XSS fixtures do nothing.
 |---|---|---|
 | 1 | D9-02, D9-03, D9-19, D9-20 | D9-01 |
 | 2 | D9-04, D9-09, D9-10, D9-12, D9-13, D9-14, D9-15, D9-16, D9-21 | - |
-| 3 | D9-05, D9-06, D9-07, D9-08, D9-11 | - |
+| 3 | D9-05, D9-06, D9-07, D9-08, D9-11, D9-23 | - |
 | 4 | D9-18, D9-22 | - |
 | 5 | - | D9-17 |
 
@@ -1237,8 +1277,8 @@ Text is inert, and a blocked gate says why and who can clear it.
 #### D9-09: QA gate page and evidence viewer
 Layout from PLAN.md section 4.2: matrix with three states, results, screenshots, recordings and notes.
 `not verified` is unmissable and needs acknowledgement.
-**AC:** retest and waive appear only when permitted; recordings play; missing evidence is shown as missing.
-**Deps:** D9-01, D8-07. **Size:** L. **Run:** parallel. **Files:** `web/src/pages/qa-gate/`, `web/src/components/evidence/`.
+**AC:** retest and waive appear only when permitted; recordings play; missing evidence is shown as missing; in merge-before-QA, every commit in the release range is listed with its run's QA status.
+**Deps:** D9-01, D8-07, D8-11. **Size:** L. **Run:** parallel. **Files:** `web/src/pages/qa-gate/`, `web/src/components/evidence/`.
 
 #### D9-10: Workflow editor
 YAML editor with schema help, live validation from the server, and a generated stage graph.
@@ -1304,7 +1344,13 @@ It is split out because a review diff is its own hard problem.
 UI for commit attribution, route-to-gate, a loop grant, and run migration, on the Run and gate pages.
 Each shows who it makes ineligible, because these are the actions admins could misuse.
 **AC:** an unknown commit's block can be cleared from the gate page; the warning names the affected round; all actions need the right role and are audited.
-**Deps:** D9-07, D3-19, D2-19. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/run-actions/`.
+**Deps:** D9-07, D3-19, D2-19, D2-25. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/run-actions/`.
+
+#### D9-23: Pre-push gate page
+The page for `pre_push` gates: the diff from S3, since no PR exists yet, and a plain statement that the person is confirming the patch is safe to run in CI with its secrets, not that it is correct.
+It reuses the diff component, and shows the repo's CI trust status and why.
+**AC:** the diff renders with no branch or PR; decisions work with a keyboard; the page never reads as a review; the unknown attestation conditions are listed.
+**Deps:** D9-21, D4-26. **Size:** S. **Run:** parallel. **Files:** `web/src/pages/pre-push-gate/`.
 
 ---
 
@@ -1451,15 +1497,15 @@ Record what stays unproven for `TestState` in D12-07.
 **Deps:** D11-02. **Size:** M. **Run:** parallel. **Files:** `tests/asl/test_offline.py`, `docs/findings/asl-offline.md`.
 
 #### D11-04: Lambda entrypoints
-Thin handlers for API, ingest, Slack ack, advance, dispatch, results, effects, relay, timers and reconcile, with packaging.
+Thin handlers for API, ingest, Slack ack, advance, dispatch, results, effects, relay, timers, reconcile and the **agent broker** for ledger, flags and token refresh, with packaging.
 The Slack function stays small, and each role's imports are bounded.
-**AC:** each handler has a local invocation test; package size is checked; no handler holds business logic.
-**Deps:** D5-15, D4-13, D7-02. **Size:** M. **Run:** serial. **Files:** `src/sto/lambdas/`, `tests/lambdas/`.
+**AC:** each handler has a local invocation test; package size is checked; no handler holds business logic; the broker checks the step token on every call.
+**Deps:** D5-15, D4-13, D7-02, D5-19. **Size:** M. **Run:** serial. **Files:** `src/sto/lambdas/`, `tests/lambdas/`.
 
 #### D11-05: Control plane stack
-API Gateway, Lambdas, SQS with DLQs, the state machine and least-privilege roles.
+API Gateway, Lambdas including the agent broker, SQS with DLQs, the state machine and least-privilege roles.
 Only named roles can use `states:SendTask*` or read tokens.
-**AC:** H3 template test; agent roles cannot reach task tokens or decision routes; alarms attach to DLQs; provisioned concurrency only on the Slack function.
+**AC:** H3 template test; agent roles cannot reach task tokens or decision routes; the broker has a route the agent role can call; alarms attach to DLQs; provisioned concurrency only on the Slack function.
 **Deps:** D11-01, D11-22, D11-04. **Size:** L. **Run:** serial. **Files:** `infra/lib/control-plane-stack.ts`, `infra/test/control-plane.test.ts`.
 
 #### D11-06: Identity stack
@@ -1470,8 +1516,8 @@ No IdP details are in the repo.
 
 #### D11-07: Agent plane stack
 AgentCore Runtime with arm64 image, lifecycle settings, session-scoped IAM, and team inference profiles.
-IAM allows the profile and its routed foundation models only.
-**AC:** template asserts model scope and session context key conditions; idle and max lifetime set; image digest pinned.
+IAM allows the profile and its routed foundation models only, and **the agent role has no DynamoDB access**: it reaches ledger and flags through the broker.
+**AC:** template asserts model scope, session context key conditions and no DynamoDB actions on the agent role; idle and max lifetime set; image digest pinned.
 **Deps:** D11-01, D5-13. **Size:** M. **Run:** parallel. **Files:** `infra/lib/agent-plane-stack.ts`, `infra/lib/inference-profiles.ts`, `infra/test/agent-plane.test.ts`.
 
 #### D11-08: Sandbox stack
@@ -1550,7 +1596,7 @@ Typed `deployment.yaml`, `make synth` and `make deploy`, and a step-by-step guid
 Run the three example teams together on the local stack in CI, and check every [O] and [GH] item in PLAN.md section 17 against evidence.
 This is the point where the product waits for credentials, and it does not gate D12, which can start sooner.
 **AC:** each [O] and [GH] item links to a passing CI job, test or walkthrough; gaps become issues; the README lists what stays unproven.
-**Deps:** D0-06, D0-10, D1-10, D2-16, D2-20, D2-21, D2-23, D3-17, D3-18, D4-25, D5-17, D5-20, D8-12, D8-14, D9-17, D9-22, D10-04, D10-05, D10-08, D10-12, D10-14, D11-11, D11-14, D11-16, D11-17, D13-04, D13-06, D13-07, D13-08, D13-09, D13-11, D13-12, D13-14, D13-15, D13-16. **Size:** M. **Run:** serial. **Files:** `docs/findings/offline-complete.md`.
+**Deps:** D0-06, D2-16, D2-20, D2-21, D3-17, D3-18, D3-20, D4-25, D5-17, D5-20, D8-12, D8-14, D9-17, D9-22, D9-23, D10-04, D10-05, D10-08, D10-12, D10-14, D11-11, D11-14, D11-16, D11-17, D13-04, D13-06, D13-07, D13-08, D13-09, D13-11, D13-12, D13-14, D13-15, D13-16. **Size:** M. **Run:** serial. **Files:** `docs/findings/offline-complete.md`.
 
 #### D11-21: Sandbox image registry
 Register a team image: scan it, check it is ARM64 and meets the service contract, provision its Runtime, and record it. We ship an entrypoint shim for `/ping`.
@@ -1574,7 +1620,7 @@ If it does not, the alternative is a Gateway interceptor or a per-stage role, de
 
 ## D12: First real deploy and live Bedrock verification
 
-**Status: BLOCKED on AWS credentials from Peter.** Nothing else depends on D12 except D14. **When credentials arrive, start with D12-18,** whatever else is in progress. Its result may change D5, D8 and D11 designs.
+**Status: BLOCKED on AWS credentials from Peter.** Nothing else depends on D12 except D14. **When credentials arrive, start with D12-00, then D12-18,** whatever else is in progress. Its result may change D5, D8 and D11 designs. D12-01 and every deploy wait for the spike.
 
 **Goal:** turn "should work" into "does work", in a controlled order, stopping cost surprises first.
 
@@ -1610,19 +1656,21 @@ in which Region. Findings are written up in `docs/findings/first-deploy.md`.
 <!-- waves:D12 -->
 | Wave | Parallel | Serial, one at a time |
 |---|---|---|
-| 1 | - | D12-01, D12-18 |
-| 2 | - | D12-02, D12-03 |
-| 3 | D12-10, D12-15 | D12-04 |
-| 4 | D12-07, D12-08 | D12-05 |
-| 5 | - | D12-06 |
-| 6 | D12-09, D12-11, D12-12, D12-13, D12-14, D12-16 | - |
-| 7 | - | D12-17 |
+| 1 | - | D12-00 |
+| 2 | - | D12-18 |
+| 3 | - | D12-01 |
+| 4 | - | D12-02, D12-03 |
+| 5 | D12-10, D12-15 | D12-04 |
+| 6 | D12-07, D12-08 | D12-05 |
+| 7 | - | D12-06 |
+| 8 | D12-09, D12-11, D12-12, D12-13, D12-14, D12-16 | - |
+| 9 | - | D12-17 |
 
-#### D12-01: Account bootstrap and cost guard
-Set up AWS Budgets alarms first, CDK bootstrap, Transaction Search, the Anthropic first-time-use form, and a one-time subscribing invocation from a separate identity.
-Confirm the Region and residency choice (Q4).
-**AC:** budget alarm fires on a test threshold; deployed roles have no Marketplace permissions; a checklist is committed with no account details.
-**Deps:** D11-18. **Size:** S. **Run:** serial. **Files:** `docs/findings/first-deploy.md`.
+#### D12-01: Account readiness for the stacks
+Turn on Transaction Search, confirm the spike's results are reflected in D5, D8 and D11, and record any design changes made.
+Deploying waits for this, so a failed spike cannot be skipped.
+**AC:** the checklist links the spike's result for each design; Transaction Search is on; no account details are committed.
+**Deps:** D11-18, D12-18. **Size:** S. **Run:** serial. **Files:** `docs/findings/first-deploy.md`.
 
 #### D12-02: Model verification
 `sto doctor --aws` calls `GetInferenceProfile` for each catalog entry from the source Region, one small `Converse` per model, and reports Bedrock quotas.
@@ -1667,15 +1715,15 @@ Measure startup and build times.
 **Deps:** D12-04, D11-21. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_sandbox.py`, `docs/findings/sandbox.md`.
 
 #### D12-09: Verify QA tools
-Real Browser against a test site, with recording and live view, redirects outside the allowlist, and real Code Interpreter in VPC mode, with a canary exfiltration test.
+Real Browser against a test site, with recording and live view, proving the block-all rule and the team preview domain, redirects outside the allowlist, and real Code Interpreter in VPC mode, with a canary exfiltration test.
 Confirm artifacts arrive, and allowlists hold.
-**AC:** L10 confirmed or fixed; a QA gate shows real evidence; Sandbox mode's DNS behaviour is answered; costs recorded.
+**AC:** L10 confirmed or fixed; `URLBlocklist` plus `URLAllowlist` behaviour is answered; a QA gate shows real evidence; Sandbox mode's DNS behaviour is answered; costs recorded.
 **Deps:** D12-06, D11-12. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_qa_tools.py`, `docs/findings/qa-tools.md`.
 
 #### D12-10: Verify SSO
-Real OIDC and SAML sign-in, with group mapping, a large group list, `prompt=login`, removal of a group, and an attempt by a federated user to overwrite a mapped attribute.
+Real OIDC and SAML sign-in, with group mapping, a large group list, `prompt=login`, removal of a group, a reused session cookie, a blank attribute from the trigger, and an attempt by a federated user to overwrite a mapped attribute.
 Update ADR-0008 with what is proved.
-**AC:** L11 answered; FF-13 holds; a removed group really is cleared; a self-write attempt fails; unverified items in the ADR closed or given a fallback.
+**AC:** L11 answered; FF-13 holds; a removed group really is cleared; `as_of` and `auth_time` behave as designed on a reused session; a self-write attempt fails; unverified items in the ADR closed or given a fallback.
 **Deps:** D12-03. **Size:** M. **Run:** parallel. **Files:** `docs/SSO.md`, `docs/adr/0008-sso-cognito-as-federation-broker.md`, `docs/findings/sso.md`.
 
 #### D12-11: Jira live
@@ -1721,10 +1769,16 @@ Write the first-deploy report, with what surprised us.
 **Deps:** D12-07, D12-08, D12-09, D12-10, D12-11, D12-12, D12-13, D12-14, D12-15, D12-16, D1-10. **Size:** S. **Run:** serial. **Files:** `README.md`, `docs/findings/first-deploy.md`, `docs/DEPLOY.md`.
 
 #### D12-18: AWS spike
-**The first thing to run when credentials arrive, with no dependency on D11.** One day of throwaway code on the five designs no fake can prove: a sandbox on a second Runtime, Gateway accepting a per-step JWT with claims reaching Cedar, session keys across resume, VPC egress with DNS Firewall, and Identity holding a bot token.
+**The first work on a guarded account, with no dependency on D11.** One day of throwaway code on the five designs no fake can prove: a sandbox on a second Runtime, Gateway accepting a per-step JWT with claims reaching Cedar, session keys across resume, VPC egress with DNS Firewall, and Identity holding a bot token.
 A failure changes D5, D8 and D11 before they harden, so this is deliberately early, and D5-13, D11-08, D11-09 and D11-23 stay provisional until it runs.
 **AC:** each design has a written yes or no, with the alternative named on a no; affected issues are updated; spike code is not kept.
-**Deps:** D0-05. **Size:** M. **Run:** serial. **Files:** `docs/findings/aws-spike.md`.
+**Deps:** D12-00. **Size:** M. **Run:** serial. **Files:** `docs/findings/aws-spike.md`.
+
+#### D12-00: Cost guard and bootstrap
+Before anything else on a new account: AWS Budgets alarms, CDK bootstrap, the Anthropic first-time-use form, and a one-time subscribing invocation from a separate identity. Confirm the Region and residency choice (Q4).
+This has no dependency on D11, so the spike never runs unguarded.
+**AC:** a budget alarm fires on a test threshold; deployed roles have no Marketplace permissions; a checklist is committed with no account details.
+**Deps:** D0-05. **Size:** S. **Run:** serial. **Files:** `docs/findings/bootstrap.md`.
 
 ---
 
@@ -1781,7 +1835,7 @@ Find hot paths and missing indexes.
 Pin and hash dependencies, generate an SBOM, scan images and code, and raise weekly dependency PRs.
 Agent and sandbox images pin digests.
 **AC:** CI fails on known critical issues; a Strands upgrade PR runs the pinned-behaviour tests; T10 proved.
-**Deps:** D0-05. **Size:** S. **Run:** parallel. **Files:** `.github/workflows/supply-chain.yml`, `.github/dependabot.yml`.
+**Deps:** D0-05, D0-10. **Size:** S. **Run:** parallel. **Files:** `.github/workflows/supply-chain.yml`, `.github/dependabot.yml`.
 
 #### D13-09: Independent threat review
 A fresh reviewer tests PLAN.md section 12 against the code, trying to get past a gate, read across teams, or leak a canary.
@@ -1888,7 +1942,7 @@ Which issue proves each item, so nothing relies on the final rehearsal to be not
 | FF-02 | R3 in D2-15, D12-14 |
 | FF-03 | D3-06, D8-09, D4-23 |
 | FF-04 | D4-11, D4-21, D4-23 |
-| FF-05 | D1-11, D2-04, D4-23 |
+| FF-05 | D1-11, D2-04, D4-26, D4-23 |
 | FF-06 | D2-05, D11-19 |
 | FF-07 | D13-10, D14-03 |
 | FF-08 | D3-03, D3-14 |
@@ -1913,7 +1967,7 @@ Which issue proves each item, so nothing relies on the final rehearsal to be not
 |---|---|---|
 | T1 | D5-05, D5-15 | D5-16 |
 | T2 | D5-03 | D5-03 |
-| T3 | D5-06, D8-03, D8-04, D11-08 | D5-16, D12-08, D12-09 |
+| T3 | D5-06, D8-03, D8-04, D8-13, D11-08 | D5-16, D12-08, D12-09 |
 | T4 | D5-04, D5-07 | D5-04 |
 | T5 | D5-04 | D5-04 |
 | T6 | D4-03, D4-04, D6-05, D7-02 | D4-01 |
@@ -1921,13 +1975,13 @@ Which issue proves each item, so nothing relies on the final rehearsal to be not
 | T8 | D3-05, D3-19 | D3-05 |
 | T9 | D1-01, D3-03, D3-14 | D3-03, D12-07 |
 | T10 | D13-08 | D13-08 |
-| T11 | D2-17, D4-05 | D2-17 |
+| T11 | D2-17, D4-05, D5-05 | D2-17, D5-05 |
 | T12 | D5-14, D5-17 | D5-16 |
 | T13 | D9-18 | D9-18 |
 | T14 | D3-08, D11-17 | D3-08 |
 | T15 | D4-02, D11-05, D11-07, D11-08 | D11-05, D11-07, D12-07 |
 | T16 | D9-08, D9-09, D9-14 | D14-03 |
 | T17 | D11-08, D11-15 | D11-15 |
-| T18 | D4-17, D4-07 | D4-15 |
+| T18 | D4-17, D4-26, D4-27 | D4-26, D4-15 |
 | T19 | D3-14, D4-02, D5-05 | D3-14 |
 | T20 | D3-04, D3-12, D3-15, D11-06 | D3-15, D12-10 |

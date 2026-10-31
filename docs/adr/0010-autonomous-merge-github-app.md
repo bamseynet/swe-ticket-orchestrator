@@ -12,9 +12,9 @@
 - **AgentCore Identity is not used for GitHub App tokens,** because the documented GitHub provider is an OAuth App
   user flow [S21]. It is used for Jira OAuth, and for other providers where it fits.
 - **Merge guard:** check everything in or just before an atomic claim (PLAN.md section 6.4), and request the merge through the **async merge API** with the approved SHA. GitHub recommends it, and the sync endpoint "does not support ... merging with a merge queue" [S60]. `sha` does not guard the base, so the head must also contain the base tip, by default. Read back the result, because `enqueued` does not mean merged.
-- **Base updates use `POST /merges`,** which returns a SHA, so a receipt is possible [S62]. `update-branch` returns 202 with no SHA, which would look like a human commit.
+- **Base updates use `POST /merges`,** which returns a SHA, so a receipt is possible [S62]. It cannot carry an expected head, so we check before and read back the first parent. `update-branch` returns 202 with no SHA, which would look like a human commit.
 - **A hold after approval,** default 10 minutes, keeps the Stop window real, on merge, release and a done transition.
-- **Check runs raise the bar, and do not close it.** A check attaches to a commit, and neutral counts as passing [S59]. So neutral is posted only for a SHA with no active run, which stops merging a run's exact SHA before approval. It does not stop someone pushing different code to another branch, which the reconciler detects. An earlier version of this ADR claimed more, and the adversarial review corrected it.
+- **Check runs raise the bar, and do not close it.** A check attaches to a commit, and neutral counts as passing [S59]. So neutral is posted only for a SHA no run has ever produced, with a tombstone, which stops merging a run's exact SHA before approval. It does not stop someone pushing different code to another branch, which the reconciler detects. An earlier version of this ADR claimed more, and the adversarial review corrected it.
 - **Revert PRs use `sto-revert/*`,** outside the gate check, so they are not stuck during an incident.
 - **If branch protection requires a human GitHub review,** the App cannot satisfy that, and should not bypass it by
   default. Use `decision_surfaces: [github]`, so the reviewer's real GitHub review is the decision. A ruleset bypass

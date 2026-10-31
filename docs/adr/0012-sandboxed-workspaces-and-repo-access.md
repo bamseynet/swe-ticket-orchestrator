@@ -33,6 +33,8 @@ Port: `WorkspaceProvider`, implemented by `local_docker`, `agentcore_sandbox` an
 | **CodeBuild** | Good for builds, but batch and slow for edit-run loops. Could be a later provider |
 | **Session storage for the workspace** | Preview, 1 GB, and resets on version update [S12] |
 
+The QA Browser is one custom browser per team, with `URLBlocklist: ["*"]` and an allowlist for that team's preview wildcard domain, because managed policies are fixed at `CreateBrowser` [S70].
+
 ## Consequences
 
 - Teams need an image for their stack. We ship Python, Node, Java and Go base images.

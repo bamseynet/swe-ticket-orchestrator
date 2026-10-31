@@ -30,6 +30,8 @@ ticket. The rules are in PLAN.md section 4.3. This record gives the reasons for 
 9. **The claim is atomic.** An effect is claimed in a transaction checking run, gate and switches, so Stop and a claim cannot both win. A read-then-act check would leave a window.
 10. **A hold follows approval** on merge, release and a done transition, so "use Stop" is a real option.
 11. **Org floors are read live,** so a tightened rule reaches runs in flight.
+12. **A gate once visited stays required, and route inputs are frozen with a ratchet.** Otherwise editing a Jira field could skip the regulated change gate (pass 2, finding B), since a gate not visited would not be required.
+13. **"Then and now" eligibility needs a way out.** Mapping changes do not reach open gates, so an org admin can extend eligibility on one, and cannot vote in that round.
 
 ## Alternatives
 

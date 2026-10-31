@@ -15,7 +15,9 @@
 - **Overlays use JSON Merge Patch on a stage map keyed by ID.** Maps merge, lists replace and `null` removes. Stage order has no meaning, so no `insert_after` is needed. Teams write an overlay, not a copy, which a 100-line fork in YAML would be.
 - **Publishing flattens,** and a run pins a manifest digest over workflow, profiles, effects and prompts.
 - **Teams add their own reviewers** through custom profiles, with no platform PR.
-- A closed `route` stage handles risk routing, with no expressions, so proofs still hold.
+- A closed `route` stage handles risk routing, with no expressions, so proofs still hold. Ticket-field inputs freeze at intake, and only raise without a named role.
+- **Org-required gates:** `OrgPolicy.teams` can require gates, quorum and carry-over rules, enforced at publish, on migrate and live, so a regulated team's own admin cannot remove them.
+- **One repo per workflow,** for this release, which avoids a selection rule.
 - Teams can dry-run with the fake LLM.
 
 ## Alternatives

@@ -193,10 +193,11 @@ could complete a gate.
   within 10 seconds. `X-GitHub-Delivery` is unique per event and retained on redelivery, and the docs
   read as though redelivery is manual, so we reconcile on a schedule [S40].
 - **The async merge API is GA and recommended,** and it can add to a merge queue. The sync endpoint "does not support ... merging with a merge queue". An `enqueued` result is final for that request and does not mean merged [S60].
-- `update-branch` returns 202 with no SHA, while `POST /merges` returns the commit [S62], from the review of this plan and our knowledge of the API. D4-12 keeps tests on it.
+- `update-branch` returns 202 with no SHA, while `POST /merges` returns the commit, and takes only `base`, `head` and `commit_message` [S62]. `merge-upstream` syncs a fork branch [S62]. D4-12 keeps tests on these.
+- An App installation token triggers `push` and `pull_request` workflows, unlike `GITHUB_TOKEN` [S75]. Running untrusted code under `pull_request_target` can grant "unintended access to write privileges or secrets" [S75]. `default_workflow_permissions` is readable through the API [S76].
 - A workflow dispatch can return a run ID with `return_run_details`, but only in the response, which a crash loses [S63].
 - A check attaches to a commit, and neutral counts as passing [S59].
-- Forks: by default "all first-time contributors require approval to run workflows", and an org disabling fork workflows on private repos cannot be overridden per repo [S69].
+- Forks: on public repos, by default "all first-time contributors require approval to run workflows", and on private repos, an org disabling fork workflows cannot be overridden per repo [S69].
 - Required checks can be pinned to a specific app with `app_id` [S41]. Rulesets can let a GitHub App
   bypass rules, and bypass lists need an organization-owned repository [S42].
 - Merge queues need `merge_group` triggers or required checks never report, and are available only in organization-owned public repos, or private repos under Enterprise Cloud [S43]. A workflow skipped by a path
@@ -286,7 +287,10 @@ could complete a gate.
 | `Agent.as_tool`, `ConcurrentToolExecutor` | `poc-strands-orchestrator` code, against `strands-agents~=1.63` | D5-02 pins with tests |
 | Text between tool calls can be hidden on Opus | `poc-strands-orchestrator/README.md`, never run live | D12-05 |
 | Runtime VPC mode can support default-deny egress | Release notes record VPC egress support [S8]. Details not read | D12-08 |
-| Browser host allowlisting, including redirects | Managed Chromium policies exist [S70]. Whether `URLAllowlist` stops every redirect and fetch is **unverified** | D8-03, D12-09 |
+| Browser host allowlisting, including redirects | Managed Chromium policies exist, and are fixed at `CreateBrowser` [S70]. Whether `URLAllowlist` needs `URLBlocklist: ["*"]`, and stops every redirect and fetch, is our knowledge, **unverified** | D8-03, D12-09 |
+| A reused Cognito session cookie gives new tokens with no federated sign-in, and what `auth_time` holds then | **Unverified** | D12-10 |
+| A blank attribute from the Inbound federation trigger clears the stored value | The mapping page says a blank source value does [S66], **not tested** | D12-10 |
+| `POST /merges` on a fork reaching upstream commits, and promoting a fork SHA upstream | **Unverified** | D4-23 |
 | Enqueueing a merge queue entry through the API | **Unverified** | D4-12 |
 | App permission set beyond checks | Our knowledge of GitHub Apps, not checked on docs | D4-02, D4-15 |
 | Reviews on draft PRs | **Unverified** | D4-10, D4-15 |
@@ -377,4 +381,7 @@ could complete a gate.
 - [S71] [AgentCore Code Interpreter: network modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-resource-management.html)
 - [S72] [GitHub Actions: limits](https://docs.github.com/en/actions/reference/limits)
 - [S73] [GitHub: webhook payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [API Gateway: HTTP API quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html)
+- [S74] [Cognito: Inbound federation trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-inbound-federation.html)
+- [S75] [GitHub: events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows), [triggering a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+- [S76] [GitHub: REST Actions permissions](https://docs.github.com/en/rest/actions/permissions?apiVersion=2022-11-28)
 - [S59] [GitHub: troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)

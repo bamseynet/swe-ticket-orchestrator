@@ -27,4 +27,4 @@ decision gets a new record that supersedes the old one.
 | [0018](0018-observability-otel.md) | OpenTelemetry through ADOT to CloudWatch |
 | [0019](0019-offline-first-testing-and-live-milestone.md) | Offline-first testing, with a credential-blocked live milestone |
 | [0020](0020-stack-and-repo-layout.md) | Python, TypeScript, one repo, and layout built for parallel PRs |
-| [0021](0021-ci-trust-for-unreviewed-code.md) | Model-written code gets no CI secrets before the first human gate |
+| [0021](0021-ci-trust-for-unreviewed-code.md) | Code no human has approved runs without CI secrets, on every round |

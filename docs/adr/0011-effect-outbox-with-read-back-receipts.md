@@ -5,7 +5,7 @@
 ## Decision
 
 - State changes plan effects in the same transaction. An executor claims them and acts.
-- Classes: `internal`, `scoped`, `gated` (PLAN.md section 6.3). Gated effects require a decision ID and re-check gate,
+- Classes: `internal`, `scoped`, `exposing` for `branch.push`, and `gated` (PLAN.md section 6.3). Gated effects require a decision ID and re-check gate,
   run and subject immediately before acting.
 - Delivery is at-least-once, so every adapter write takes an idempotency key derived from
   `(run, stage, visit number, effect type, subject digest)`, with narrower scopes declared in the catalog, so `pr.ensure_draft` finds or creates.
