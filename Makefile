@@ -23,8 +23,8 @@ test-changed: ## Run the direct tests of files changed vs main (D0-08 refines se
 	else uv run pytest -q $$targets; fi
 
 lint: ## Ruff lint and format check
-	uv run ruff check .
-	uv run ruff format --check .
+	uv run ruff check src tests
+	uv run ruff format --check src tests
 
 typecheck: ## mypy strict
 	uv run mypy
