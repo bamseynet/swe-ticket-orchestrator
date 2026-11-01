@@ -1,25 +1,52 @@
 """Integration SPI (PLAN 10.1): ``TicketSource``, ``ScmProvider`` and ``Notifier``.
 
 Adapters implement these narrow ports; the engine never imports a vendor. Writes take an
-``IdempotencyKey`` and return a domain ``Receipt``. The value types here are part of the SPI
-and are plain frozen dataclasses so fakes and real adapters share them.
+``IdempotencyKey`` and return a domain ``Receipt``.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from sto.domain.errors import PermanentError
-from sto.domain.models import Receipt
+from sto.domain.errors import FailureClass, PermanentError, StoError
+from sto.domain.models import DecisionKind, Receipt
 
 type IdempotencyKey = str
 
 
-class StaleHeadError(PermanentError):
-    """The head the caller expected is not the head now (``expected_head`` / ``expected_sha``)."""
+class StaleHeadError(StoError):
+    """The head the caller expected is not the head now (``expected_head`` / ``expected_sha``).
+
+    Not a ``PermanentError``, which means BLOCKED at once; PLAN 6.4 sends a moved head down the
+    ``stale`` edge. The effects layer (D1-07) catches this and maps it to that edge. It is
+    ``TRANSIENT`` only so it never BLOCKS; ``retryable`` is off as the head can never match.
+    """
+
+    failure_class = FailureClass.TRANSIENT
+
+    @property
+    def retryable(self) -> bool:
+        return False
+
+
+class UnknownRefError(PermanentError):
+    """A ticket, branch, commit, PR, merge or message the service does not know."""
+
+
+class RefusedError(PermanentError):
+    """The target's state forbids the write (closed PR, non-fast-forward, ...)."""
+
+
+class IdempotencyKeyReuseError(PermanentError):
+    """An idempotency key arrived again with different arguments: a key-derivation bug."""
+
+
+class MalformedWebhookError(PermanentError):
+    """A verified delivery whose body cannot be understood."""
 
 
 # --- shared value types -------------------------------------------------------------------
@@ -37,19 +64,37 @@ class Page[T]:
     next_cursor: str | None = None
 
 
+class ChangeKind(StrEnum):
+    TICKET = "ticket"
+    PR = "pr"
+    PUSH = "push"
+    CHECK = "check"
+    REVIEW = "review"
+    MERGE_GROUP = "merge_group"
+
+
 @dataclass(frozen=True)
 class ExternalChange:
-    """A nudge that something changed; the adapter re-reads state (PLAN 10.1)."""
+    """A nudge that something changed; the adapter re-reads state (PLAN 10.1). Which optional
+    fields are set depends on ``kind`` (ticket, PR, push or check event)."""
 
-    ref: TicketRef
-    kind: str = "updated"
+    kind: ChangeKind
+    ticket: TicketRef | None = None
+    repo: RepoRef | None = None
+    pr: PrRef | None = None
+    sha: str | None = None
+    branch: str | None = None
+    check: str | None = None
 
 
 @dataclass(frozen=True)
 class DecisionRequest:
+    """A decision arriving through a notifier; it goes through the same function as the UI."""
+
     gate_id: str
-    kind: str  # an approve, request_changes or reject action
+    kind: DecisionKind
     actor: str
+    subject_digest: str
     comment: str = ""
 
 
@@ -69,6 +114,20 @@ class Ticket:
     body: str
     status: str
     labels: tuple[str, ...] = ()
+    acceptance_criteria: str = ""
+    route_fields: tuple[tuple[str, str], ...] = ()  # (field, value) pairs read for routing
+
+    @property
+    def revision(self) -> str:
+        """``ticket_revision`` (PLAN 4): the normalised summary, description, acceptance criteria
+        and route input fields only, so our own comments and transitions never change it."""
+
+        def norm(text: str) -> str:
+            return " ".join(text.split())
+
+        parts = [norm(self.title), norm(self.body), norm(self.acceptance_criteria)]
+        parts += [f"{norm(k)}={norm(v)}" for k, v in sorted(self.route_fields)]
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -161,11 +220,15 @@ class MergeMethod(StrEnum):
 
 @dataclass(frozen=True)
 class UpdateResult:
-    """Outcome of merging the base into a PR branch: the new head and the head it replaced."""
+    """Outcome of merging the base into a PR branch: the new head and the head it replaced.
+
+    On a ``conflict`` nothing moved: ``sha`` is the unchanged head and there is no receipt.
+    """
 
     sha: str
     parent_head: str
-    receipt: Receipt
+    receipt: Receipt | None
+    conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +294,8 @@ class GateMessage:
     gate_id: str
     summary: str
     subject_digest: str
+    attention: tuple[str, ...] = ()  # the attention list shown on the gate (PLAN 10.5)
+    deep_link: str = ""
 
 
 @dataclass(frozen=True)
@@ -246,9 +311,7 @@ class TicketSource(Protocol):
     capabilities: TicketCapabilities
 
     def get(self, ref: TicketRef) -> Ticket: ...
-    def search(
-        self, query: IntakeQuery, cursor: str | None, page_size: int = 50
-    ) -> Page[TicketSummary]: ...
+    def search(self, query: IntakeQuery, cursor: str | None) -> Page[TicketSummary]: ...
     def parse_event(self, raw: RawWebhook) -> list[ExternalChange]: ...  # verified before this call
     def comment(self, ref: TicketRef, body: str, key: IdempotencyKey) -> Receipt: ...
     def transition(self, ref: TicketRef, to: StatusIntent, key: IdempotencyKey) -> Receipt: ...
