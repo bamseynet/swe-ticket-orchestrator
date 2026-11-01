@@ -6,8 +6,12 @@ Layout (PLAN 11), all inside a team scope and the ``MAIN`` table:
 * run     ``RUN#r`` / ``META``
 * gate    ``RUN#r`` / ``GATE#<name>#<round>``
 * decision ``RUN#r`` / ``DEC#<name>#<round>#<ulid>``
+* run audit chain head ``RUN#r`` / ``CHAIN`` (moved by every gate open and decision)
 * team switches ``TEAM`` / ``META``, fields ``switch_<name>``; fleet switches
   ``ORG`` / ``SWITCHES`` (platform scope)
+* the effect item holds an envelope: ``{"effect": <domain wire form>, "meta": {...}}``, where
+  ``meta`` keeps what the frozen domain record has no field for (void reason, edge, edge reason,
+  the lease, a blocked marker)
 
 A *handler* does one effect's outside write. It returns an outcome and never decides a status:
 the executor does, from the receipt (ADR-0011: "status comes only from a receipt with
@@ -39,8 +43,9 @@ from sto.store.ports import TEAM_ROOT, Key
 # permanent failure like any other.
 STALE_EDGE_TYPES = frozenset({"pr.merge", "release.trigger"})
 
-# Every effect needs ``effects`` (the kill switch's "planned effects held", PLAN 14.4). The
-# merge and release effects also need their own switch (PLAN 6.4 guard 1).
+# Switches are off flags (PLAN 14.4): absent means not off, and a present value counts as on only
+# if it is exactly ``True``. Every effect checks ``effects`` (the kill switch's "planned effects
+# held"); the merge and release effects also check their own (PLAN 6.4 guard 1).
 ALL_EFFECTS_SWITCH = "effects"
 EXTRA_SWITCHES = {"pr.merge": ("merge",), "release.trigger": ("release",)}
 
@@ -67,6 +72,16 @@ def run_key(run_id: RunId) -> Key:
 
 def effect_item_key(run_id: RunId, idempotency_key: str) -> Key:
     return Key(run_pk(run_id), f"FX#{idempotency_key}")
+
+
+def chain_key(run_id: RunId) -> Key:
+    """The run's audit chain head. The gate service moves it in the same transaction as every
+    gate open and decision (PLAN 4.3 rule 6), so a claim that checks its version sees them."""
+    return Key(run_pk(run_id), "CHAIN")
+
+
+def gate_key(run_id: RunId, name: str, round: int) -> Key:
+    return Key(run_pk(run_id), f"{gate_prefix(name)}{round}")
 
 
 def gate_prefix(name: str) -> str:
@@ -159,6 +174,12 @@ class MergeHandler:
         self._method, self._subject = method, subject
 
     def execute(self, effect: Effect) -> Outcome:
+        # The approval covers exactly this subject and head (PLAN 4.3 rule 2): a handler built for
+        # another commit must not merge it under this effect's approval.
+        if self._subject.digest() != effect.subject_digest:
+            return Failed(None, "subject_mismatch")
+        if self._subject.head_sha != self._sha:
+            return Failed(None, "head_mismatch")
         handle = self._scm.request_merge(self._pr, self._sha, self._method, effect.idempotency_key)
         return Pending(handle.id)
 

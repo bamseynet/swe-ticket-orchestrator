@@ -1,17 +1,24 @@
-"""Effects v0 (D1-07): plan, claim, write, settle (PLAN 6.3, 4.3 rules 1 and 5, ADR-0011).
+"""Effects v0 (D1-07): plan, claim, write, settle (PLAN 6.3, 4.3 rules 1, 2 and 5, ADR-0011).
 
-The claim is one transaction. It writes the effect as ``ATTEMPTING`` and holds ``Check``s on the
-run, on every required gate, and on the team and fleet switches, each at the version the guard
-read. Stop, a gate decision or a switch flip commits a new version, so the claim and any of them
-cannot both win; whichever loses re-reads. Only ``scoped`` and ``gated`` effects exist in v0.
+The claim is one transaction. It writes the effect as ``ATTEMPTING`` (with a lease) at the
+version it read, and holds ``Check``s on everything the decision rested on: the run, the audit
+chain head, every required gate and the round after it, and the team and fleet switches. A Stop,
+a gate open or decision, or a switch flip commits a new version, so it and the claim cannot both
+win; whichever loses re-reads. Only ``scoped`` and ``gated`` effects exist in v0.
 
-Status comes only from a receipt: ``CONFIRMED`` needs one with read-back. A write the service
-accepted but did not apply goes to ``RETRYING`` and is repeated with the same key.
+Status comes only from a receipt: ``CONFIRMED`` needs one with read-back. Every status change is
+saved at the version it was decided on, so a late or slow caller can never overwrite a newer
+state. An attempt of unknown outcome is never voided and never retried past ``max_attempts``: it
+goes to ``blocked`` (ADR-0011: ambiguity is BLOCKED, not a guess).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from sto.adapters.ports import StaleHeadError
 from sto.domain import (
@@ -27,6 +34,7 @@ from sto.domain import (
     Run,
     RunId,
     RunStatus,
+    Subject,
     effect_key,
     from_wire,
     to_wire,
@@ -36,10 +44,12 @@ from sto.store.ports import (
     PLATFORM,
     Absent,
     Check,
+    Condition,
     ConditionFailedError,
     Item,
     Op,
     Put,
+    Scope,
     Store,
     TeamScope,
     VersionIs,
@@ -55,8 +65,10 @@ from .ports import (
     Pending,
     Voided,
     Written,
+    chain_key,
     decision_prefix,
     effect_item_key,
+    gate_key,
     gate_prefix,
     run_key,
     run_pk,
@@ -65,59 +77,137 @@ from .ports import (
 )
 
 _ACTIVE = frozenset({RunStatus.RUNNING, RunStatus.WAITING_EXTERNAL})
-# A run in one of these will never act again, so its unwritten effects are voided. Any other
-# inactive run (waiting, blocked, queued) only holds them: it may come back.
+# A run in one of these will never act again, so its unwritten *gated* effects are voided. Any
+# other inactive run (waiting, blocked, queued) only holds them: it may come back.
 _DEAD = frozenset(
     {RunStatus.CANCELLING, RunStatus.CANCELLED, RunStatus.DONE, RunStatus.REJECTED}
     | {RunStatus.CLOSED, RunStatus.EXPIRED}
 )
 _APPROVING = frozenset({DecisionKind.APPROVE, DecisionKind.WAIVE})
-_CLAIM_TRIES = 8
+_TRIES = 8
+DEFAULT_LEASE_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
 class ExecResult:
     """``effect`` is the stored record after the call. ``edge`` is the workflow edge it took
-    (``done``, ``stale``, ``conflict``), if any. ``reason`` says why nothing was written:
-    ``gate_invalid``, ``run_not_active``, ``held``, ``unconfirmed``, or a failure name."""
+    (``done``, ``stale``, ``conflict``), if any, and is the same on every later replay.
+    ``reason`` says why nothing was written, or why it failed: ``gate_invalid``,
+    ``run_not_active``, ``held``, ``in_flight``, ``lease_lost``, ``unconfirmed``, a failure name.
+    ``blocked`` means the outcome is unknown and a person must decide (ADR-0011)."""
 
     effect: Effect
     edge: str | None = None
     reason: str | None = None
+    blocked: bool = False
 
 
 @dataclass(frozen=True)
 class StopReport:
-    """What Stop found: effects it voided, and effects it could not (ATTEMPTING or ACCEPTED), which
-    may have landed and need reconciling (PLAN 14.3)."""
+    """What Stop found: effects it voided, and effects that were tried (ATTEMPTING, RETRYING,
+    ACCEPTED), which may have landed and need reconciling (PLAN 14.3)."""
 
     voided: tuple[Effect, ...] = ()
     in_flight: tuple[Effect, ...] = ()
 
 
-def enable_switches(store: Store, scope: TeamScope, *names: str) -> None:
-    """Turn team switches on (provisioning). A team's switch that was never written holds."""
-    item = store.get(scope, TEAM_SWITCHES)
-    data = dict(item.data) if item else {}
-    data.update({switch_field(n): True for n in names})
-    store.put(scope, TEAM_SWITCHES, data)
+@dataclass(frozen=True)
+class _Rec:
+    effect: Effect
+    version: int
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _Retry:
+    reason: str
+
+
+@dataclass
 class _Claim:
-    """The result of reading everything a claim depends on."""
+    ops: list[Op] = field(default_factory=list)
+    decisions: tuple[DecisionId, ...] = ()
 
-    def __init__(self, ops: list[Op] | None = None, decisions: tuple[DecisionId, ...] = ()) -> None:
-        self.ops = ops or []
-        self.decisions = decisions
+
+def set_switch(store: Store, scope: TeamScope, name: str, on: bool, *, fleet: bool = False) -> None:
+    """Set a switch, conditional on the item's version, so a concurrent change is never lost."""
+    where, key = (PLATFORM, FLEET_SWITCHES) if fleet else (scope, TEAM_SWITCHES)
+    for _ in range(_TRIES):
+        item = store.get(where, key)
+        data = dict(item.data) if item else {}
+        data[switch_field(name)] = on
+        when: Condition = Absent() if item is None else VersionIs(item.version)
+        try:
+            store.put(where, key, data, when=when)
+        except ConditionFailedError:
+            continue
+        return
+    raise TransientError(f"switch {name!r} kept changing")
 
 
 class EffectExecutor:
-    def __init__(self, store: Store, scope: TeamScope, *, max_attempts: int = 3) -> None:
+    def __init__(
+        self,
+        store: Store,
+        scope: TeamScope,
+        *,
+        max_attempts: int = 3,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         self._store, self._scope, self._max = store, scope, max_attempts
+        self._lease, self._clock = lease_seconds, clock
 
-    # --- plan and read ----------------------------------------------------------------------
+    # --- records ----------------------------------------------------------------------------
+
+    def _pages(self, scope: Scope, pk: str, prefix: str) -> list[Item]:
+        items: list[Item] = []
+        cursor: str | None = None
+        while True:
+            page = self._store.query(scope, pk, sk_prefix=prefix, cursor=cursor)
+            items.extend(page.items)
+            if page.cursor is None:
+                return items
+            cursor = page.cursor
+
+    @staticmethod
+    def _rec(item: Item) -> _Rec:
+        return _Rec(from_wire(Effect, item.data["effect"]), item.version, dict(item.data["meta"]))
+
+    def _load(self, run_id: RunId, idempotency_key: str) -> _Rec:
+        item = self._store.get(self._scope, effect_item_key(run_id, idempotency_key))
+        if item is None:
+            raise KeyError(f"no effect {idempotency_key!r} in run {run_id}")
+        return self._rec(item)
+
+    def _all(self, run_id: RunId) -> list[_Rec]:
+        return [self._rec(i) for i in self._pages(self._scope, run_pk(run_id), "FX#")]
+
+    def get(self, run_id: RunId, idempotency_key: str) -> Effect:
+        return self._load(run_id, idempotency_key).effect
+
+    def _put(self, effect: Effect, meta: dict[str, Any], when: Condition) -> Put:
+        key = effect_item_key(effect.run_id, effect.idempotency_key)
+        return Put(key, {"effect": to_wire(effect), "meta": meta}, when=when)
+
+    def _save(self, rec: _Rec, effect: Effect, meta: dict[str, Any], *extra: Op) -> None:
+        self._store.transact(self._scope, [self._put(effect, meta, VersionIs(rec.version)), *extra])
+
+    @staticmethod
+    def _replay(rec: _Rec, reason: str | None = None) -> ExecResult:
+        meta = rec.meta
+        return ExecResult(
+            rec.effect,
+            meta.get("edge"),
+            reason or meta.get("reason"),
+            bool(meta.get("blocked")),
+        )
+
+    # --- plan -------------------------------------------------------------------------------
 
     def plan(
         self,
@@ -146,145 +236,196 @@ class EffectExecutor:
             requires_gates=requires_gates,
             subject_digest=subject_digest,
         )
-        item_key = effect_item_key(run_id, effect.idempotency_key)
         try:
-            self._store.put(self._scope, item_key, to_wire(effect), when=Absent())
+            self._store.transact(self._scope, [self._put(effect, {}, Absent())])
         except ConditionFailedError:
             existing = self.get(run_id, effect.idempotency_key)
-            if (existing.type, existing.klass, existing.subject_digest) != (
-                type,
-                klass,
-                subject_digest,
-            ):
+            same = (existing.type, existing.klass, existing.subject_digest, existing.requires_gates)
+            if same != (type, klass, subject_digest, effect.requires_gates):
                 raise ValueError(
                     f"idempotency key {effect.idempotency_key!r} is already used by another effect"
                 ) from None
             return existing
         return effect
 
-    def get(self, run_id: RunId, idempotency_key: str) -> Effect:
-        return self._load(run_id, idempotency_key)[0]
-
-    def _load(self, run_id: RunId, idempotency_key: str) -> tuple[Effect, int]:
-        item = self._store.get(self._scope, effect_item_key(run_id, idempotency_key))
-        if item is None:
-            raise KeyError(f"no effect {idempotency_key!r} in run {run_id}")
-        return from_wire(Effect, item.data), item.version
-
-    def _save(self, effect: Effect, version: int, *extra: Op) -> None:
-        key = effect_item_key(effect.run_id, effect.idempotency_key)
-        self._store.transact(
-            self._scope, [Put(key, to_wire(effect), when=VersionIs(version)), *extra]
-        )
-
     # --- execute ----------------------------------------------------------------------------
 
-    def execute(self, run_id: RunId, idempotency_key: str, handler: EffectHandler) -> ExecResult:
-        """Claim and write one effect, then settle it from the outcome. Safe to call again after
-        ``RETRYING`` (or after a crash left it ``ATTEMPTING``): the same key goes to the writer."""
-        for _ in range(_CLAIM_TRIES):
-            effect, version = self._load(run_id, idempotency_key)
+    def execute(
+        self,
+        run_id: RunId,
+        idempotency_key: str,
+        handler: EffectHandler,
+        *,
+        live: Subject | None = None,
+    ) -> ExecResult:
+        """Claim and write one effect, then settle it from the outcome. ``live`` is the subject as
+        it stands now (head, patch, ticket text); a gated effect is refused unless every required
+        gate approved exactly that (PLAN 4.3 rule 2, 273). Once a merge has confirmed, later gated
+        effects check against its frozen subject instead (PLAN 293).
+
+        Safe to call again after ``RETRYING`` or a crash: the same key goes to the writer. A live
+        attempt (unexpired lease) is never taken over."""
+        token = uuid.uuid4().hex
+        for _ in range(_TRIES):
+            rec = self._load(run_id, idempotency_key)
+            effect = rec.effect
+            if effect.status is EffectStatus.ATTEMPTING:
+                if self._clock() < float(rec.meta.get("lease_until", 0.0)):
+                    return ExecResult(effect, reason="in_flight")
+                # The lease lapsed: that worker died or stalled, and may have written.
+                self._step(rec, EffectStatus.RETRYING)
+                continue
             if effect.status not in (EffectStatus.PLANNED, EffectStatus.RETRYING):
-                if effect.status is EffectStatus.ATTEMPTING:  # a crashed worker's attempt
-                    self._save(effect.advance(EffectStatus.RETRYING), version)
-                    continue
-                return ExecResult(effect)  # finished, or ACCEPTED and waiting for a poll
-            verdict = self._guard(effect)
+                return self._replay(rec)  # finished, or ACCEPTED and waiting for a poll
+            if rec.meta.get("blocked"):
+                return self._replay(rec)
+            if effect.status is EffectStatus.RETRYING and effect.attempts >= self._max:
+                return self._block(rec, "attempts_exhausted")
+            verdict = self._guard(effect, live)
             if isinstance(verdict, str):
-                return self._refuse(effect, version, verdict)
+                return self._refuse(rec, verdict)
             claimed = effect.advance(
                 EffectStatus.ATTEMPTING,
                 decision_ids=verdict.decisions if effect.klass is EffectClass.GATED else None,
                 subject_digest=effect.subject_digest,
             )
+            lease = {"lease_owner": token, "lease_until": self._clock() + self._lease}
             try:
-                self._save(claimed, version, *verdict.ops)
+                self._save(rec, claimed, lease, *verdict.ops)
             except ConditionFailedError:
                 continue  # Stop, a decision or a switch won the race: re-read and decide again
-            return self._write(claimed, handler)
+            return self._write(run_id, idempotency_key, token, handler)
         raise TransientError(f"effect {idempotency_key!r} kept changing under the claim")
 
-    def _refuse(self, effect: Effect, version: int, reason: str) -> ExecResult:
+    def _step(self, rec: _Rec, target: EffectStatus, **meta: Any) -> None:
+        """A bookkeeping move (lease lapsed, void). A lost race re-reads in the caller."""
+        try:
+            self._save(rec, rec.effect.advance(target), meta)
+        except ConditionFailedError:
+            return
+
+    def _block(self, rec: _Rec, reason: str) -> ExecResult:
+        meta = {**rec.meta, "blocked": reason, "reason": reason}
+        try:
+            self._save(rec, rec.effect, meta)
+        except ConditionFailedError:
+            return self._replay(self._load(rec.effect.run_id, rec.effect.idempotency_key))
+        return ExecResult(rec.effect, reason=reason, blocked=True)
+
+    def _refuse(self, rec: _Rec, reason: str) -> ExecResult:
+        effect = rec.effect
         if reason == "held":
             return ExecResult(effect, reason="held")
+        if effect.attempts > 0:
+            # Tried before, so it may have landed: voiding would hide that. A person reconciles.
+            return self._block(rec, f"unreconciled:{reason}")
         try:
-            voided = effect.advance(EffectStatus.VOIDED, intent=f"voided:{reason}")
-            self._save(voided, version)
+            voided = effect.advance(EffectStatus.VOIDED)
+            self._save(rec, voided, {"reason": reason})
         except ConditionFailedError:  # lost to a cancel or another executor: report what is there
-            return ExecResult(self.get(effect.run_id, effect.idempotency_key), reason=reason)
+            return self._replay(self._load(effect.run_id, effect.idempotency_key), reason)
         return ExecResult(voided, reason=reason)
 
-    def _guard(self, effect: Effect) -> _Claim | str:
+    # --- the claim's guard ------------------------------------------------------------------
+
+    def _guard(self, effect: Effect, live: Subject | None) -> _Claim | str:
         """Read what the claim depends on. Returns the claim's ``Check``s, or a refusal reason:
         ``run_not_active`` and ``gate_invalid`` void the effect, ``held`` leaves it as it is."""
-        ops: list[Op] = []
+        gated = effect.klass is EffectClass.GATED
+        claim = _Claim()
         run_item = self._store.get(self._scope, run_key(effect.run_id))
         if run_item is None:
             return "run_not_active"
-        run = from_wire(Run, run_item.data)
-        if run.status in _DEAD:
-            return "run_not_active"
-        if run.status not in _ACTIVE:
-            return "held"
-        ops.append(Check(run_key(effect.run_id), VersionIs(run_item.version)))
-        switches = self._switches(effect.type, ops)
-        if switches is not None:
-            return switches
-        if effect.klass is not EffectClass.GATED:
-            return _Claim(ops)
-        decisions = self._approval(effect, ops)
-        return decisions if isinstance(decisions, str) else _Claim(ops, decisions)
-
-    def _switches(self, effect_type: str, ops: list[Op]) -> str | None:
-        team = self._store.get(self._scope, TEAM_SWITCHES)
-        if team is None or any(
-            team.data.get(switch_field(n)) is not True for n in switches_for(effect_type)
-        ):
-            return "held"  # fail closed: a team switch must be written, and on
-        ops.append(Check(TEAM_SWITCHES, VersionIs(team.version)))
-        fleet = self._store.get(PLATFORM, FLEET_SWITCHES)
-        if fleet is None:
-            ops.append(Check(FLEET_SWITCHES, Absent(), PLATFORM))
-        else:
-            if any(fleet.data.get(switch_field(n)) is False for n in switches_for(effect_type)):
+        if gated:
+            # Only gated effects need a live run: a stopped run still closes a PR it opened or
+            # opens the revert PR (PLAN 6.2, 14.3), but it never merges.
+            status = from_wire(Run, run_item.data).status
+            if status in _DEAD:
+                return "run_not_active"
+            if status not in _ACTIVE:
                 return "held"
-            ops.append(Check(FLEET_SWITCHES, VersionIs(fleet.version), PLATFORM))
-        return None
+            claim.ops.append(Check(run_key(effect.run_id), VersionIs(run_item.version)))
+        held = self._switches(effect.type, claim.ops)
+        if held:
+            return "held"
+        if gated:
+            approved = self._approval(effect, live, claim.ops)
+            if isinstance(approved, str):
+                return approved
+            claim.decisions = approved
+        return claim
 
-    def _approval(self, effect: Effect, ops: list[Op]) -> tuple[DecisionId, ...] | str:
-        """PLAN 6.4 guard 2: the latest instance of every required gate is approved at exactly the
-        subject this effect carries, by at least one approving decision."""
-        pk = run_pk(effect.run_id)
-        found: list[DecisionId] = []
+    def _switches(self, effect_type: str, ops: list[Op]) -> bool:
+        """True if a switch is off. Absent is not off; present is on only if exactly ``True``."""
+        names = [switch_field(n) for n in switches_for(effect_type)]
+        for scope, key in ((self._scope, TEAM_SWITCHES), (PLATFORM, FLEET_SWITCHES)):
+            item = self._store.get(scope, key)
+            if item is None:
+                ops.append(Check(key, Absent(), None if scope is self._scope else PLATFORM))
+                continue
+            if any(n in item.data and item.data[n] is not True for n in names):
+                return True
+            ops.append(
+                Check(key, VersionIs(item.version), None if scope is self._scope else PLATFORM)
+            )
+        return False
+
+    def _approval(
+        self, effect: Effect, live: Subject | None, ops: list[Op]
+    ) -> tuple[DecisionId, ...] | str:
+        """PLAN 4.3.2 and 6.4 guard 2: the latest instance of every required gate is approved at
+        the head, patch and ticket text being merged, by an approving decision bound to that
+        gate's own subject digest. Gates differ in evidence, so only those three are compared."""
+        frozen = self._frozen_subject(effect.run_id)
+        if frozen is not None:
+            reference = frozen
+        elif live is None:
+            raise ValueError("a gated effect needs the live subject")
+        elif live.digest() != effect.subject_digest:
+            return "gate_invalid"  # the subject moved since it was approved (ticket edit, ...)
+        else:
+            reference = live
+        pk, found = run_pk(effect.run_id), []
+        chain = self._store.get(self._scope, chain_key(effect.run_id))
+        ops.append(
+            Check(chain_key(effect.run_id), Absent() if chain is None else VersionIs(chain.version))
+        )
         for name in effect.requires_gates:
             latest = self._latest_gate(pk, name)
             if latest is None:
                 return "gate_invalid"
             item, gate = latest
-            if (
-                gate.status is not GateStatus.APPROVED
-                or gate.subject.digest() != effect.subject_digest
-            ):
-                return "gate_invalid"
+            # A round opened after this read commits nothing the item checks, so also require that
+            # the next round is absent (rounds can skip numbers: the chain check covers those).
             ops.append(Check(item.key, VersionIs(item.version)))
-            page = self._store.query(self._scope, pk, sk_prefix=decision_prefix(name, gate.round))
+            ops.append(Check(gate_key(effect.run_id, name, gate.round + 1), Absent()))
+            if gate.status is not GateStatus.APPROVED or not _same_code(gate.subject, reference):
+                return "gate_invalid"
+            own = gate.subject.digest()
             approvals = [
-                d
-                for d in (from_wire(Decision, i.data) for i in page.items)
-                if d.gate_id == gate.id
-                and d.kind in _APPROVING
-                and d.subject_digest == effect.subject_digest
+                d.id
+                for d in (
+                    from_wire(Decision, i.data)
+                    for i in self._pages(self._scope, pk, decision_prefix(name, gate.round))
+                )
+                if d.gate_id == gate.id and d.kind in _APPROVING and d.subject_digest == own
             ]
             if not approvals:
                 return "gate_invalid"
-            found.extend(d.id for d in approvals)
+            found.extend(approvals)
         return tuple(found)
+
+    def _frozen_subject(self, run_id: RunId) -> Subject | None:
+        for rec in self._all(run_id):
+            if rec.effect.status is EffectStatus.CONFIRMED and rec.effect.frozen_subject:
+                return rec.effect.frozen_subject
+        return None
 
     def _latest_gate(self, pk: str, name: str) -> tuple[Item, Gate] | None:
         prefix = gate_prefix(name)
         rounds = [
             (int(i.key.sk[len(prefix) :]), i)
-            for i in self._store.query(self._scope, pk, sk_prefix=prefix).items
+            for i in self._pages(self._scope, pk, prefix)
             if i.key.sk[len(prefix) :].isdigit()  # "GATE#a#" must not match gate "a#b"
         ]
         if not rounds:
@@ -292,78 +433,100 @@ class EffectExecutor:
         item = max(rounds, key=lambda r: r[0])[1]
         return item, from_wire(Gate, item.data)
 
-    def _write(self, claimed: Effect, handler: EffectHandler) -> ExecResult:
+    # --- write and settle -------------------------------------------------------------------
+
+    def _write(
+        self, run_id: RunId, idempotency_key: str, token: str, handler: EffectHandler
+    ) -> ExecResult:
+        rec = self._load(run_id, idempotency_key)
+        if rec.effect.status is not EffectStatus.ATTEMPTING or rec.meta.get("lease_owner") != token:
+            return self._replay(rec, "lease_lost")  # taken over before we wrote anything
+        outcome: Outcome | _Retry
         try:
-            outcome: Outcome = handler.execute(claimed)
+            outcome = handler.execute(rec.effect)
         except TransientError:
-            return self._retry_or_fail(claimed, "transient")
+            outcome = _Retry("transient")
         except StaleHeadError as exc:
-            on_edge = claimed.type in STALE_EDGE_TYPES
+            on_edge = rec.effect.type in STALE_EDGE_TYPES
             outcome = Failed(
                 "stale" if on_edge else None, "stale_head" if on_edge else type(exc).__name__
             )
         except PermanentError as exc:
             outcome = Failed(None, type(exc).__name__)
-        return self._settle(claimed, outcome)
+        return self._settle(run_id, idempotency_key, outcome, EffectStatus.ATTEMPTING, token)
 
-    def _retry_or_fail(self, effect: Effect, reason: str) -> ExecResult:
-        if effect.attempts >= self._max:
-            return self._finish(effect, EffectStatus.FAILED, None, "attempts_exhausted")
-        return self._finish(effect, EffectStatus.RETRYING, None, reason)
-
-    def _finish(
+    def _settle(
         self,
-        effect: Effect,
-        target: EffectStatus,
-        edge: str | None,
-        reason: str | None,
-        **fields: object,
+        run_id: RunId,
+        idempotency_key: str,
+        outcome: Outcome | _Retry,
+        expect: EffectStatus,
+        token: str | None = None,
     ) -> ExecResult:
-        _, version = self._load(effect.run_id, effect.idempotency_key)
-        done = effect.advance(target, **fields)  # type: ignore[arg-type]
-        self._save(done, version)
-        return ExecResult(done, edge, reason)
+        """Apply ``outcome`` at the version it is decided on. If the record moved, re-read: a
+        state that is no longer ``expect`` (or no longer ours) is reported, never overwritten."""
+        for _ in range(_TRIES):
+            rec = self._load(run_id, idempotency_key)
+            if rec.effect.status is not expect or (token and rec.meta.get("lease_owner") != token):
+                return self._replay(rec, "lease_lost" if token else "superseded")
+            try:
+                return self._apply(rec, outcome)
+            except ConditionFailedError:
+                continue
+        raise TransientError(f"effect {idempotency_key!r} kept changing while settling")
 
-    def _settle(self, effect: Effect, outcome: Outcome) -> ExecResult:
-        """Move ``effect`` (ATTEMPTING or ACCEPTED) according to what the writer reported."""
+    def _apply(self, rec: _Rec, outcome: Outcome | _Retry) -> ExecResult:
+        effect = rec.effect
         attempting = effect.status is EffectStatus.ATTEMPTING
+
+        def move(
+            target: EffectStatus, edge: str | None, reason: str | None, **fields: Any
+        ) -> ExecResult:
+            done = effect.advance(target, **fields)
+            self._save(rec, done, {"edge": edge, "reason": reason})
+            return ExecResult(done, edge, reason)
+
         match outcome:
             case Written(receipt, frozen) if receipt.read_back_verified:
-                return self._finish(
-                    effect,
-                    EffectStatus.CONFIRMED,
-                    "done",
-                    None,
-                    receipt=receipt,
-                    frozen_subject=frozen,
+                return move(
+                    EffectStatus.CONFIRMED, "done", None, receipt=receipt, frozen_subject=frozen
                 )
             case Written() | Pending() if not attempting:
                 return ExecResult(effect, reason="unconfirmed")  # still ACCEPTED
             case Written():  # accepted, but read-back did not show it applied
-                return self._retry_or_fail(effect, "read_back_failed")
+                return self._retry(rec, "read_back_failed")
+            case _Retry(reason):
+                return self._retry(rec, reason)
             case Pending(intent, receipt):
-                return self._finish(
-                    effect, EffectStatus.ACCEPTED, None, None, receipt=receipt, intent=intent
-                )
+                return move(EffectStatus.ACCEPTED, None, None, receipt=receipt, intent=intent)
             case Failed(edge, reason):
-                return self._finish(effect, EffectStatus.FAILED, edge, reason)
+                return move(EffectStatus.FAILED, edge, reason)
             case Voided(reason) if not attempting:
-                return self._finish(
-                    effect, EffectStatus.VOIDED, None, reason, intent=f"voided:{reason}"
-                )
+                return move(EffectStatus.VOIDED, None, reason)  # keeps the merge handle as intent
         raise ValueError(f"an {effect.status.value} effect cannot take {outcome!r}")
+
+    def _retry(self, rec: _Rec, reason: str) -> ExecResult:
+        """Another try with the same key; after ``max_attempts`` the outcome is unknown, which
+        blocks the run rather than guessing (ADR-0011)."""
+        effect = rec.effect.advance(EffectStatus.RETRYING)
+        if effect.attempts >= self._max:
+            meta = {"reason": "attempts_exhausted", "blocked": f"attempts_exhausted:{reason}"}
+            self._save(rec, effect, meta)
+            return ExecResult(effect, reason="attempts_exhausted", blocked=True)
+        self._save(rec, effect, {"reason": reason})
+        return ExecResult(effect, reason=reason)
 
     # --- ACCEPTED: poll and stop ------------------------------------------------------------
 
     def poll(self, run_id: RunId, idempotency_key: str, handler: EffectHandler) -> ExecResult:
         effect = self._accepted(run_id, idempotency_key)
-        return self._settle(effect, handler.poll(effect))
+        return self._settle(run_id, idempotency_key, handler.poll(effect), EffectStatus.ACCEPTED)
 
     def stop(self, run_id: RunId, idempotency_key: str, handler: EffectHandler) -> ExecResult:
         """Stop for an ACCEPTED effect: cancel it if possible, then reconcile with what the
         service says. It never blocks over a merge that is already dead or landed."""
         effect = self._accepted(run_id, idempotency_key)
-        return self._settle(effect, handler.stop(effect))
+        return self._settle(run_id, idempotency_key, handler.stop(effect), EffectStatus.ACCEPTED)
 
     def _accepted(self, run_id: RunId, idempotency_key: str) -> Effect:
         effect = self.get(run_id, idempotency_key)
@@ -376,23 +539,37 @@ class EffectExecutor:
     # --- cancel -----------------------------------------------------------------------------
 
     def void_planned(self, run_id: RunId) -> StopReport:
-        """PLAN 14.3 step 1: void every PLANNED or RETRYING effect of the run. An effect that is
-        ATTEMPTING or ACCEPTED is reported instead: it may have landed. Each void is conditional
-        on the effect's version, so against a concurrent claim exactly one wins."""
+        """PLAN 14.3 step 1: void every PLANNED effect of the run. Anything already tried
+        (ATTEMPTING, RETRYING, ACCEPTED) may have landed, so it is reported instead, never voided.
+        Each void is conditional on the effect's version, so against a concurrent claim exactly
+        one wins."""
         voided: list[Effect] = []
         in_flight: list[Effect] = []
-        for item in self._store.query(self._scope, run_pk(run_id), sk_prefix="FX#").items:
-            key = from_wire(Effect, item.data).idempotency_key
-            for _ in range(_CLAIM_TRIES):
-                effect, version = self._load(run_id, key)
-                if effect.status in (EffectStatus.PLANNED, EffectStatus.RETRYING):
+        for first in self._all(run_id):
+            key = first.effect.idempotency_key
+            for _ in range(_TRIES):
+                rec = self._load(run_id, key)
+                if rec.effect.status is EffectStatus.PLANNED:
+                    done = rec.effect.advance(EffectStatus.VOIDED)
                     try:
-                        done = effect.advance(EffectStatus.VOIDED, intent="voided:cancelled")
-                        self._save(done, version)
+                        self._save(rec, done, {"reason": "cancelled"})
                     except ConditionFailedError:
                         continue  # a claim won; re-read and report it as in flight
                     voided.append(done)
-                elif effect.status in (EffectStatus.ATTEMPTING, EffectStatus.ACCEPTED):
-                    in_flight.append(effect)
+                elif rec.effect.status in (
+                    EffectStatus.ATTEMPTING,
+                    EffectStatus.RETRYING,
+                    EffectStatus.ACCEPTED,
+                ):
+                    in_flight.append(rec.effect)
                 break
         return StopReport(tuple(voided), tuple(in_flight))
+
+
+def _same_code(gate: Subject, reference: Subject) -> bool:
+    """PLAN 4.3.2: compare the head, not the whole subject: gates see different evidence."""
+    return gate.head_sha is not None and (
+        gate.head_sha == reference.head_sha
+        and gate.patch_id == reference.patch_id
+        and gate.ticket_revision == reference.ticket_revision
+    )
