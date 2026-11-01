@@ -75,8 +75,9 @@ def effect_item_key(run_id: RunId, idempotency_key: str) -> Key:
 
 
 def chain_key(run_id: RunId) -> Key:
-    """The run's audit chain head. The gate service moves it in the same transaction as every
-    gate open and decision (PLAN 4.3 rule 6), so a claim that checks its version sees them."""
+    """The run's audit chain head. The gate service moves it, through its ``AuditWriter``, in the
+    same transaction as every gate open and decision (PLAN 4.3 rule 6), so a claim that checks its
+    version sees them. This is a requirement on every ``AuditWriter`` (see ``EffectExecutor``)."""
     return Key(run_pk(run_id), "CHAIN")
 
 

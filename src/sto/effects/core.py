@@ -386,6 +386,12 @@ class EffectExecutor:
         else:
             reference = live
         pk, found = run_pk(effect.run_id), []
+        # REQUIREMENT ON THE AuditWriter PORT (src/sto/gates/hooks.py): every AuditWriter must move
+        # ``RUN#r/CHAIN`` in the same transaction as the gate open or decision it records. This
+        # claim relies on that to notice a gate round that skips numbers (``GATE#g#3`` after an
+        # approved round 1), which no per-key check can see. The next-round ``Absent`` check below
+        # covers only the immediate successor. Later audit work (D3) must keep this property, or
+        # supply another version the gate service bumps on every open and decision.
         chain = self._store.get(self._scope, chain_key(effect.run_id))
         ops.append(
             Check(chain_key(effect.run_id), Absent() if chain is None else VersionIs(chain.version))

@@ -52,9 +52,10 @@ from sto.domain import (
 )
 from sto.effects.core import EffectExecutor, ExecResult, StopReport, set_switch
 from sto.effects.ports import CallHandler, Failed, MergeHandler, effect_item_key
-from sto.engine.commands import RunEffect
+from sto.engine.commands import OpenGate, RunEffect
 from sto.engine.handlers.core import GateClosed, RunStarted, StepSucceeded
 from sto.engine.reducer import LINEAR_V0, RunState, load_handlers, next
+from sto.gates.service import Decided, GateService
 from sto.store.memory import MemoryStore
 from sto.store.ports import (
     MAIN,
@@ -91,7 +92,7 @@ class HookStore:
 
     def __init__(self, inner: Store, page_limit: int | None = None) -> None:
         self.inner, self.page_limit = inner, page_limit
-        self.hooks: list[Callable[[Sequence[Op]], None]] = []
+        self.hooks: list[Callable[[Sequence[Op]], object]] = []
 
     def get(self, scope: Scope, key: Key) -> Item | None:
         return self.inner.get(scope, key)
@@ -125,7 +126,7 @@ class HookStore:
     def delete(self, scope: Scope, key: Key, *, when: Condition | None = None) -> None:
         self.inner.delete(scope, key, when=when)
 
-    def before_next_transaction(self, hook: Callable[[], None]) -> None:
+    def before_next_transaction(self, hook: Callable[[], object]) -> None:
         self.hooks.append(lambda _ops: hook())
 
 
@@ -155,6 +156,7 @@ class World:
     run: Run
     pr: PrRef
     clock: Clock
+    svc: GateService
 
     def run_key(self) -> Key:
         return Key(f"RUN#{self.run.id}", "META")
@@ -165,43 +167,53 @@ class World:
         )
         self.store.put(SCOPE, self.run_key(), to_wire(self.run))
 
-    def put_gate(
+    def gate(
         self,
-        status: GateStatus,
-        *,
-        subject: Subject = SUBJECT,
-        round: int = 1,
         name: str = "review",
+        round: int = 1,
+        subject: Subject = SUBJECT,
+        close: DecisionKind | None = None,
+        gate_type: GateType = GateType.REVIEW,
     ) -> Gate:
-        gate = Gate(GateId.new(), self.run.id, name, GateType.REVIEW, round, subject, status)
-        self.store.put(SCOPE, Key(f"RUN#{self.run.id}", f"GATE#{name}#{round}"), to_wire(gate))
+        """Open a gate through the real ``GateService`` (and close it with ``close``, if given),
+        so the keys, the decision ledger and the audit chain are what #273 really writes."""
+        opened = self.svc.open_gate(SCOPE, OpenGate(self.run.id, name, gate_type, round, subject))
+        if close is None:
+            return opened
+        return self.close(opened, close).gate
+
+    def close(self, gate: Gate, kind: DecisionKind) -> Decided:
+        return self.svc.decide(
+            SCOPE,
+            run_id=self.run.id,
+            gate=gate.name,
+            round=gate.round,
+            kind=kind,
+            actor="alice",
+            surface=Surface.UI,
+            subject_digest=gate.subject.digest(),
+            comment="" if kind is DecisionKind.APPROVE else "no",
+        )
+
+    def approve(self, **kw: Any) -> tuple[Gate, Decision]:
+        decided = self.close(self.gate(**kw), DecisionKind.APPROVE)
+        return decided.gate, decided.decision
+
+    def raw_gate(self, status: GateStatus, subject: Subject = SUBJECT) -> Gate:
+        """A gate the service cannot produce (defence in depth against bad data)."""
+        gate = Gate(GateId.new(), self.run.id, "review", GateType.REVIEW, 1, subject, status)
+        self.store.put(SCOPE, Key(f"RUN#{self.run.id}", "GATE#review#1"), to_wire(gate))
         return gate
 
-    def put_decision(self, gate: Gate, kind: DecisionKind, digest: str | None = None) -> Decision:
+    def raw_decision(
+        self, gate: Gate, kind: DecisionKind, digest: str, id_: DecisionId | None = None
+    ) -> Decision:
         d = Decision(
-            DecisionId.new(),
-            gate.id,
-            gate.round,
-            "alice",
-            Surface.UI,
-            kind,
-            digest or gate.subject.digest(),
-            "ok",
+            id_ or DecisionId.new(), gate.id, gate.round, "alice", Surface.UI, kind, digest, "ok"
         )
         key = Key(f"RUN#{self.run.id}", f"DEC#{gate.name}#{gate.round}#{d.id}")
         self.store.put(SCOPE, key, to_wire(d))
         return d
-
-    def approve(self, **kw: Any) -> tuple[Gate, Decision]:
-        gate = self.put_gate(GateStatus.APPROVED, **kw)
-        return gate, self.put_decision(gate, DecisionKind.APPROVE)
-
-    def bump_chain(self) -> None:
-        """What the gate service does with every open and decision: move the audit chain head."""
-        key = Key(f"RUN#{self.run.id}", "CHAIN")
-        item = self.store.get(SCOPE, key)
-        seq = int(item.data["seq"]) + 1 if item else 1
-        self.store.put(SCOPE, key, {"seq": seq, "hash": f"h{seq}"})
 
     def plan(self, type_: str = "pr.mark_ready", klass: EffectClass = EffectClass.GATED) -> Effect:
         gates = ("review",) if klass is EffectClass.GATED else ()
@@ -243,7 +255,7 @@ def world(inner: Store) -> World:
     scm.seed_branch(REPO, "sto/x", "h1", parent="b0")
     receipt = scm.ensure_draft_pr(PrSpec(REPO, "sto/x", "main", "t", "b"), "k-pr")
     fx = EffectExecutor(store, SCOPE, clock=clock)
-    w = World(store, fx, scm, run, PrRef.of(REPO, receipt), clock)
+    w = World(store, fx, scm, run, PrRef.of(REPO, receipt), clock, GateService(store))
     store.put(SCOPE, w.run_key(), to_wire(run))
     scm.spy.clear()
     return w
@@ -266,18 +278,28 @@ def test_gated_effect_with_no_gate_never_calls_writer(world: World) -> None:
     assert world.scm.pr_state(world.pr) == "draft"
 
 
-@pytest.mark.parametrize(
-    "status",
-    [GateStatus.OPEN, GateStatus.REJECTED, GateStatus.CHANGES_REQUESTED, GateStatus.INVALIDATED],
-)
+@pytest.mark.parametrize("close", [None, DecisionKind.REJECT, DecisionKind.REQUEST_CHANGES])
 def test_gated_effect_with_gate_not_approved_never_calls_writer(
-    world: World, status: GateStatus
+    world: World, close: DecisionKind | None
 ) -> None:
-    world.put_gate(status)
+    world.gate(close=close)
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
     assert world.effect(e).status is EffectStatus.VOIDED
+
+
+def test_a_veto_in_a_newer_round_voids_the_earlier_approval(world: World) -> None:
+    """PLAN 4.3.3: the service invalidates round 1 when round 2 closes negative."""
+    first, _ = world.approve()
+    world.close(world.gate(round=2), DecisionKind.REJECT)
+    item = world.store.get(SCOPE, Key(f"RUN#{world.run.id}", "GATE#review#1"))
+    assert item is not None
+    assert item.data["status"] == GateStatus.INVALIDATED.value  # the service did the voiding
+    assert first.status is GateStatus.APPROVED
+    e = world.plan()
+    world.go(e)
+    assert world.scm.spy.calls == ()
 
 
 def test_approval_of_another_head_does_not_count(world: World) -> None:
@@ -290,16 +312,16 @@ def test_approval_of_another_head_does_not_count(world: World) -> None:
 
 
 def test_a_decision_bound_to_another_digest_does_not_count(world: World) -> None:
-    gate = world.put_gate(GateStatus.APPROVED)
-    world.put_decision(gate, DecisionKind.APPROVE, digest="not-this-subject")
+    gate = world.raw_gate(GateStatus.APPROVED)  # the service refuses such a decision
+    world.raw_decision(gate, DecisionKind.APPROVE, "not-this-subject")
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
 
 
 def test_approved_gate_without_an_approving_decision_does_not_count(world: World) -> None:
-    gate = world.put_gate(GateStatus.APPROVED)
-    world.put_decision(gate, DecisionKind.REJECT)
+    gate = world.raw_gate(GateStatus.APPROVED)  # the service cannot approve without one
+    world.raw_decision(gate, DecisionKind.REJECT, gate.subject.digest())
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
@@ -307,15 +329,15 @@ def test_approved_gate_without_an_approving_decision_does_not_count(world: World
 
 def test_only_the_latest_gate_instance_counts(world: World) -> None:
     world.approve()
-    world.put_gate(GateStatus.OPEN, round=2)  # a newer round re-opened the gate
+    world.gate(round=2)  # a newer round re-opened the gate
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
 
 
 def test_round_ten_is_later_than_round_nine(world: World) -> None:
-    world.put_gate(GateStatus.APPROVED, round=9)
-    world.put_gate(GateStatus.OPEN, round=10)
+    world.approve(round=9)
+    world.gate(round=10)
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
@@ -357,49 +379,58 @@ def test_a_gated_effect_cannot_run_without_the_live_subject(world: World) -> Non
 
 
 def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Store) -> None:
+    """The reducer decides the commands and the real ``GateService`` carries them out."""
     load_handlers()
     rid = RunId.new()
     review = dataclasses.replace(SUBJECT, evidence_digest="review-evidence")
     qa = dataclasses.replace(SUBJECT, evidence_digest="qa-evidence")
     assert review.digest() != qa.digest()
-    ids = iter(range(1, 100))
-
-    def closed(gate: str, subject: Subject) -> GateClosed:
-        did = DecisionId.from_parts(next_id(), bytes(10))
-        return GateClosed(rid, gate, 1, DecisionKind.APPROVE, "alice", did, subject)
-
-    def next_id() -> int:
-        return ids.__next__()
-
-    events: list[Any] = [
-        RunStarted(rid),
-        StepSucceeded(StepKey(rid, "implement", 1, 1), review),
-        closed("review_gate", review),
-        StepSucceeded(StepKey(rid, "qa", 1, 1), qa),
-        closed("qa_gate", qa),
-    ]
+    store = HookStore(inner)
+    store.put(
+        SCOPE,
+        Key(f"RUN#{rid}", "META"),
+        to_wire(Run(rid, "acme", RunStatus.RUNNING, version=1, stage="merge")),
+    )
+    svc = GateService(store)
     state = RunState(Run(id=rid, team="acme"))
-    commands: tuple[object, ...] = ()
-    for event in events:
+    approvals: dict[str, Decided] = {}
+
+    def feed(event: Any) -> tuple[object, ...]:
+        nonlocal state
         t = next(state, event, LINEAR_V0)
-        state, commands = t.state, t.commands
-    (cmd,) = commands
+        state = t.state
+        return t.commands
+
+    def approve(cmd: OpenGate) -> GateClosed:
+        svc.open_gate(SCOPE, cmd)
+        d = svc.decide(
+            SCOPE,
+            run_id=rid,
+            gate=cmd.name,
+            round=cmd.round,
+            kind=DecisionKind.APPROVE,
+            actor="alice",
+            surface=Surface.UI,
+            subject_digest=cmd.subject.digest(),
+        )
+        approvals[cmd.name] = d
+        return GateClosed(
+            rid, cmd.name, cmd.round, DecisionKind.APPROVE, "alice", d.decision.id, cmd.subject
+        )
+
+    feed(RunStarted(rid))
+    (open_review,) = feed(StepSucceeded(StepKey(rid, "implement", 1, 1), review))
+    assert isinstance(open_review, OpenGate)
+    feed(approve(open_review))
+    (open_qa,) = feed(StepSucceeded(StepKey(rid, "qa", 1, 1), qa))
+    assert isinstance(open_qa, OpenGate)
+    (cmd,) = feed(approve(open_qa))
     assert isinstance(cmd, RunEffect)
     assert cmd.subject_digest == qa.digest()
-
-    store = HookStore(inner)
-    run = Run(rid, "acme", RunStatus.RUNNING, version=1, stage="merge")
-    store.put(SCOPE, Key(f"RUN#{rid}", "META"), to_wire(run))
-    for name, kind, subject, decision_id in [
-        ("review_gate", GateType.REVIEW, review, cmd.decision_ids[0]),
-        ("qa_gate", GateType.QA, qa, cmd.decision_ids[1]),
-    ]:
-        gate = Gate(GateId.new(), rid, name, kind, 1, subject, GateStatus.APPROVED)
-        store.put(SCOPE, Key(f"RUN#{rid}", f"GATE#{name}#1"), to_wire(gate))
-        d = Decision(
-            decision_id, gate.id, 1, "alice", Surface.UI, DecisionKind.APPROVE, subject.digest()
-        )
-        store.put(SCOPE, Key(f"RUN#{rid}", f"DEC#{name}#1#{decision_id}"), to_wire(d))
+    assert cmd.decision_ids == (
+        approvals["review_gate"].decision.id,
+        approvals["qa_gate"].decision.id,
+    )
 
     scm = FakeScm()
     scm.seed_branch(REPO, "main", "b0")
@@ -704,6 +735,21 @@ def test_stop_between_the_read_and_the_claim_aborts_a_gated_claim(world: World) 
 
 
 def test_a_gate_invalidated_between_the_read_and_the_claim_aborts_the_claim(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.store.before_next_transaction(
+        lambda: world.close(world.gate(round=2), DecisionKind.REJECT)  # invalidates round 1
+    )
+    result = world.go(e)
+    assert world.scm.spy.calls == ()
+    assert result.reason == "gate_invalid"
+
+
+def test_a_gate_item_changed_without_moving_the_chain_still_aborts_the_claim(
+    world: World,
+) -> None:
+    """Defence in depth: the service always moves the chain, but the claim also holds the gate
+    item's own version, so a write that bypasses the service is caught too."""
     gate, _ = world.approve()
     e = world.plan()
     invalid = gate.advance(GateStatus.INVALIDATED)
@@ -717,34 +763,43 @@ def test_a_gate_invalidated_between_the_read_and_the_claim_aborts_the_claim(worl
     assert result.reason == "gate_invalid"
 
 
-@pytest.mark.parametrize(
-    ("round", "bump_chain"),
-    [(2, False), (2, True), (3, True)],  # the next round with no chain move; a skipped number
-)
-def test_a_newer_gate_round_opened_before_the_claim_aborts_it(
-    world: World, round: int, bump_chain: bool
-) -> None:
-    """PLAN 4.3.2: the latest instance counts. Opening round 2 commits nothing the claim read, so
-    the claim must check the next round is absent, and the audit chain head (which every gate open
-    moves) for rounds that skip numbers."""
+class NoChainAudit:
+    """An ``AuditWriter`` that records nothing and so never moves ``RUN#r/CHAIN``. It shows the
+    claim's second line of defence (the next round's key) works without the chain."""
+
+    def ops(self, reader: object, scope: object, entry: object) -> list[Op]:
+        return []
+
+
+@pytest.mark.parametrize("round", [2, 3])  # the next round, and a skipped number
+def test_a_newer_gate_round_opened_before_the_claim_aborts_it(world: World, round: int) -> None:
+    """PLAN 4.3.2: the latest instance counts. The real service opens the round, and its
+    ``ChainedAuditWriter`` moves ``CHAIN``, which the claim checks (this alone covers skipped
+    numbers)."""
     world.approve()
     e = world.plan()
-
-    def open_newer() -> None:
-        world.put_gate(GateStatus.OPEN, round=round)
-        if bump_chain:
-            world.bump_chain()
-
-    world.store.before_next_transaction(open_newer)
+    world.store.before_next_transaction(lambda: world.gate(round=round))
     result = world.go(e)
     assert world.scm.spy.calls == ()
     assert result.reason == "gate_invalid"
 
 
-def test_a_gate_decision_between_the_read_and_the_claim_aborts_it(world: World) -> None:
+def test_the_next_round_is_checked_even_if_the_audit_writer_never_moves_the_chain(
+    world: World,
+) -> None:
+    world.svc = GateService(world.store, audit=NoChainAudit())
     world.approve()
     e = world.plan()
-    world.store.before_next_transaction(world.bump_chain)  # any gate activity moves the head
+    world.store.before_next_transaction(lambda: world.gate(round=2))
+    result = world.go(e)
+    assert world.scm.spy.calls == ()
+    assert result.reason == "gate_invalid"
+
+
+def test_other_gate_activity_moves_the_chain_and_the_claim_simply_retries(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.store.before_next_transaction(lambda: world.gate(name="qa"))  # moves CHAIN
     world.go(e)
     # the first claim aborted, then the loop re-read and the approval still held
     assert world.effect(e).status is EffectStatus.CONFIRMED
@@ -840,15 +895,11 @@ def test_transient_failures_block_after_max_attempts(world: World) -> None:
 
 
 def test_a_retry_checks_the_approval_again(world: World) -> None:
-    gate, _ = world.approve()
+    world.approve()
     e = world.plan()
     world.scm.fail_next("mark_ready")
     world.go(e)
-    world.store.put(
-        SCOPE,
-        Key(f"RUN#{world.run.id}", "GATE#review#1"),
-        to_wire(gate.advance(GateStatus.INVALIDATED)),
-    )
+    world.close(world.gate(round=2), DecisionKind.REJECT)  # invalidates the round-1 approval
     result = world.go(e)
     assert len(world.scm.spy.calls_for("mark_ready")) == 1
     # it was tried once, so it may have landed: blocked for a person, never VOIDED
@@ -1157,8 +1208,8 @@ def test_the_frozen_subject_is_found_across_pages(world: World) -> None:
 def test_a_stale_gate_round_is_not_missed_when_pages_hold_one_item(world: World) -> None:
     world.store.page_limit = 1
     world.approve()
-    world.put_gate(GateStatus.OPEN, round=2)
-    world.put_gate(GateStatus.OPEN, round=3)
+    world.approve(round=2)
+    world.gate(round=3)
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()
@@ -1166,10 +1217,10 @@ def test_a_stale_gate_round_is_not_missed_when_pages_hold_one_item(world: World)
 
 def test_an_approval_on_a_later_page_is_found(world: World) -> None:
     world.store.page_limit = 1
-    gate = world.put_gate(GateStatus.APPROVED)
-    world.put_decision(gate, DecisionKind.REJECT)
-    world.put_decision(gate, DecisionKind.REQUEST_CHANGES)
-    approve = world.put_decision(gate, DecisionKind.APPROVE)
+    gate = world.gate()
+    for n in (1, 2):  # ledger noise that sorts before the real decision
+        world.raw_decision(gate, DecisionKind.REJECT, "x", DecisionId.from_parts(n, bytes(10)))
+    approve = world.close(gate, DecisionKind.APPROVE).decision
     e = world.plan()
     world.go(e)
     assert world.effect(e).decision_ids == (approve.id,)
