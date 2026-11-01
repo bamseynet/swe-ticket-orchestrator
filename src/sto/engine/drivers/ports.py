@@ -49,7 +49,17 @@ class StillRunning:
             raise ValueError("retry_after must be a finite, non-negative number of seconds")
 
 
-Outcome = Done | StillRunning
+@dataclass(frozen=True)
+class Held:
+    """The command cannot proceed until something outside the run changes (a kill switch, a
+    freeze). The driver does not poll: ``run_until_idle`` returns, the command stays at the head
+    of the queue, and ``LocalDriver.held(run_id)`` reports ``reason``. Calling ``run_until_idle``
+    or ``resume_all`` again retries it."""
+
+    reason: str = "held"
+
+
+Outcome = Done | StillRunning | Held
 
 
 class CommandExecutor(Protocol):
@@ -60,6 +70,22 @@ class CommandExecutor(Protocol):
     makes it call again with the same key. The work must not happen twice, and the second call
     must report the same events as the first: an empty answer on replay would leave the run
     RUNNING with nothing queued, which the driver reports as ``RunWedgedError``.
+
+    **Mapping the effects service's ``ExecResult`` (D1-08 owns the adapter).** Check ``blocked``
+    first, because a blocked effect also has status ``RETRYING``:
+
+    * ``blocked=True`` (outcome unknown, a person must decide): ``Done([EffectFailed(...)])``.
+      Returning ``StillRunning`` here would spin forever.
+    * finished (``done``/``stale``/``conflict`` edge, or a replay of one): ``Done`` with the
+      original ``EffectConfirmed`` or ``EffectFailed``.
+    * ``reason == "held"``: ``Held("held")``.
+    * ``in_flight``, ``RETRYING`` (not blocked), or ``unconfirmed``: ``StillRunning(n)``.
+    * ``ACCEPTED``: ``execute`` of the effects service only replays, so the adapter must call
+      its ``poll`` (and ``stop`` instead while the run is CANCELLING), then map the result as
+      above, ``StillRunning`` while it is still unconfirmed.
+
+    The driver runs a queued ``StopRun`` ahead of a command that is not finished, and applies
+    queued events before every call, so none of these can hold a Stop behind a pending merge.
 
     Do not poll or sleep inside ``execute``: return ``StillRunning`` instead, so queued events
     (Stop) can be applied between calls. Raising ends the driver loop; it is for faults.

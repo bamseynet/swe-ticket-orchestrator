@@ -19,7 +19,7 @@ import sys
 import textwrap
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,7 @@ from sto.engine.drivers.local import (
     decode,
     encode,
 )
-from sto.engine.drivers.ports import Done, Outcome, StillRunning, command_key
+from sto.engine.drivers.ports import Done, Held, Outcome, StillRunning, command_key
 from sto.engine.handlers.core import (
     CancelCompleted,
     CancelRequested,
@@ -82,6 +82,11 @@ SUBJECT = Subject(
 )
 THIS = Path(__file__).resolve()
 Override = Callable[[str, object], Outcome | None]
+
+
+def run[T](coro: Coroutine[Any, Any, T], timeout: float = 30) -> T:
+    """``asyncio.run`` with a deadline: a driver that loops forever fails the test, not CI."""
+    return asyncio.run(asyncio.wait_for(coro, timeout))
 
 
 def new_run(rid: RunId = RID) -> Run:
@@ -198,7 +203,7 @@ def drive(store: Store, worker: Worker, *, start: bool = True, **kw: Any) -> Run
             await d.start(new_run())
         return await d.run_until_idle(RID)
 
-    return asyncio.run(go())
+    return run(go())
 
 
 # --- the happy path ---------------------------------------------------------------------------
@@ -277,7 +282,7 @@ def test_gate_decision_resumes_a_waiting_run(tmp_path: Path) -> None:
         await d.submit(RID, approve(_gate_cmd()))
         return await d.run_until_idle(RID)
 
-    rs = asyncio.run(go())
+    rs = run(go())
     assert rs.run.stage == "qa_gate"
     assert rs.run.status is RunStatus.WAITING_HUMAN
 
@@ -302,7 +307,7 @@ def test_late_event_is_discarded_and_recorded(tmp_path: Path) -> None:
         await d.submit(RID, late)
         return await d.run_until_idle(RID)
 
-    assert asyncio.run(go()) == waiting
+    assert run(go()) == waiting
     assert [r["reason"] for r in d.rejected(RID)] == ["out_of_order"]
     assert d.timeline(RID)[-1]["outcome"] == "out_of_order"
 
@@ -320,7 +325,10 @@ def test_malformed_event_is_quarantined_and_does_not_block_the_queue(tmp_path: P
         await d.submit(RID, approve(cmd))
         return await d.run_until_idle(RID)
 
-    rs = asyncio.run(go())
+    try:
+        rs = run(go())
+    except Exception as e:  # a bad event must be quarantined, not stop the driver
+        pytest.fail(f"a malformed event blocked the queue: {e!r}")
     assert rs.run.stage == "qa_gate"  # the good decision behind the bad one was applied
     assert [r["reason"] for r in d.rejected(RID)] == ["malformed"]
     outcomes = [e["outcome"] for e in d.timeline(RID)]
@@ -340,7 +348,7 @@ def test_no_handler_is_not_discarded_as_late(tmp_path: Path) -> None:
         await d.run_until_idle(RID)
 
     with pytest.raises(NoHandlerError):
-        asyncio.run(go())
+        run(go())
     assert d.rejected(RID) == []
     assert d.pending_events(RID) == 1
 
@@ -412,15 +420,15 @@ def test_still_running_keeps_the_head_and_is_called_again_with_the_same_key(
     assert w.done().count(first) == 1
 
 
-def test_stop_is_applied_between_polls_not_after_the_command(tmp_path: Path) -> None:
+def test_stop_runs_ahead_of_a_command_that_is_not_finished(tmp_path: Path) -> None:
+    """A queued Stop is applied between polls, and its command runs before the stuck head."""
     store = MemoryStore()
-    box: dict[str, Any] = {"status_at_call": []}
+    box: dict[str, Any] = {"order": []}
 
-    def busy_until_cancelled(key: str, command: object) -> Outcome | None:
+    def busy_until_stopped(key: str, command: object) -> Outcome | None:
+        box["order"].append(type(command).__name__)
         if isinstance(command, RunStep):
-            status = box["driver"].state(RID).run.status
-            box["status_at_call"].append(status)
-            return StillRunning(1.0) if status is RunStatus.RUNNING else Done()
+            return Done() if "StopRun" in box["order"] else StillRunning(1.0)
         return None
 
     async def stop_during_first_wait(_: float) -> None:
@@ -428,17 +436,43 @@ def test_stop_is_applied_between_polls_not_after_the_command(tmp_path: Path) -> 
             box["sent"] = True
             await box["driver"].submit(RID, CancelRequested(RID))
 
-    w = Worker(tmp_path / "ledger", override=busy_until_cancelled)
+    w = Worker(tmp_path / "ledger", override=busy_until_stopped)
     d = box["driver"] = make(store, w, sleep=stop_during_first_wait)
 
     async def go() -> RunState:
         await d.start(new_run())
         return await d.run_until_idle(RID)
 
-    rs = asyncio.run(go())
-    # the second call to the busy command happened only after the queued Stop was applied
-    assert box["status_at_call"] == [RunStatus.RUNNING, RunStatus.CANCELLING]
+    rs = run(go())
+    assert box["order"][:3] == ["RunStep", "StopRun", "RunStep"]  # Stop jumped the stuck head
     assert rs.run.status is RunStatus.CANCELLED
+
+
+def test_held_command_returns_instead_of_spinning_and_retries_when_released(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore()
+    released = {"on": False}
+
+    def held_until_released(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunStep) and command.stage == "implement" and not released["on"]:
+            return Held("held")
+        return None
+
+    w = Worker(tmp_path / "ledger", override=held_until_released)
+    d = make(store, w)
+
+    async def first() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = run(first(), timeout=5)
+    assert rs.run.status is RunStatus.RUNNING  # not wedged, not done: held
+    assert d.held(RID) == "held"
+    assert len(w.calls()) == 1  # asked once, not polled
+    released["on"] = True
+    assert run(d.run_until_idle(RID)).run.status is RunStatus.DONE
+    assert d.held(RID) is None
 
 
 def test_still_running_rejects_bad_delays() -> None:
@@ -492,7 +526,7 @@ def test_lost_version_race_reloads_retries_and_backs_off(tmp_path: Path) -> None
 
     def api_writes_first(n: int, phase: str) -> None:
         if n == 2 and phase == "before":  # our first event commit
-            asyncio.run(other.submit(RID, CancelRequested(RID)))
+            run(other.submit(RID, CancelRequested(RID)))
 
     async def fake_sleep(s: float) -> None:
         sleeps.append(s)
@@ -518,7 +552,7 @@ def test_done_is_recorded_once_even_if_someone_else_recorded_it(tmp_path: Path) 
             rec = helper._load(RID)
             step = StepSucceeded(StepKey(RID, "implement", 1), SUBJECT)
             theirs = dataclasses.replace(rec, pending=(), inbox=(encode(step, "event"),))
-            asyncio.run(helper._write(theirs))
+            run(helper._write(theirs))
 
     store = CountingStore(inner, ghost_records_the_command)
     rs = drive(store, w)
@@ -528,7 +562,7 @@ def test_done_is_recorded_once_even_if_someone_else_recorded_it(tmp_path: Path) 
 
 def test_apply_with_an_empty_inbox_is_a_no_op() -> None:
     d = make(MemoryStore(), object())
-    asyncio.run(d.start(new_run()))
+    run(d.start(new_run()))
     rec = d._load(RID)
     emptied = dataclasses.replace(rec, inbox=())
     assert d._apply(emptied) == (emptied, ())
@@ -544,7 +578,7 @@ def test_store_calls_do_not_run_on_the_event_loop_thread(tmp_path: Path) -> None
         await d.start(new_run())
         await d.run_until_idle(RID)
 
-    asyncio.run(go())
+    run(go())
     assert store.threads
     assert loop_thread[0] not in store.threads
 
@@ -566,7 +600,7 @@ def test_a_non_suspending_executor_does_not_starve_other_tasks(tmp_path: Path) -
         stop.set()
         await t
 
-    asyncio.run(go())
+    run(go())
     assert len(ticks) > 12  # at least one tick per durable step
 
 
@@ -593,7 +627,7 @@ def test_second_driver_cannot_run_a_leased_run_and_never_calls_execute(tmp_path:
         with pytest.raises(LeaseHeldError):
             await b.run_until_idle(RID)
 
-    asyncio.run(go())
+    run(go())
     assert wb.calls() == []
 
 
@@ -608,7 +642,7 @@ def test_resume_all_reports_a_leased_run_without_stopping(tmp_path: Path) -> Non
         await a.step(RID)  # a holds only the first run
         return await b.resume_all()
 
-    out = asyncio.run(go())
+    out = run(go())
     assert isinstance(out[RID], LeaseHeldError)
     assert isinstance(out[RID2], RunState)
     assert out[RID2].run.status is RunStatus.DONE
@@ -638,7 +672,7 @@ def test_expired_lease_is_taken_over_and_the_old_owner_stops_writing(tmp_path: P
             await a.step(RID)  # executes RunStep; the lease is b's when it tries to commit
         return await b.run_until_idle(RID)
 
-    assert asyncio.run(go()).run.status is RunStatus.DONE
+    assert run(go()).run.status is RunStatus.DONE
     assert len(wa.calls()) == 1
     assert wb.calls()[0] == wa.calls()[0]  # the new owner replays a's unfinished command
 
@@ -667,7 +701,7 @@ def test_lease_wait_sleeps_until_expiry_then_takes_over(tmp_path: Path) -> None:
         await a.step(RID)
         return await b.run_until_idle(RID)
 
-    assert asyncio.run(go()).run.status is RunStatus.DONE
+    assert run(go()).run.status is RunStatus.DONE
     assert naps
     assert sum(naps) == pytest.approx(10)
 
@@ -688,7 +722,7 @@ def test_active_runs_lists_unfinished_runs_and_resume_all_drives_them(tmp_path: 
         await d.run_until_idle(RID2)
         return before, await make(store, w, owner="p2").resume_all()
 
-    before, resumed = asyncio.run(go())
+    before, resumed = run(go())
     assert before == [RID, RID2]
     assert set(resumed) == {RID, RID2}
     assert all(s.run.status is RunStatus.WAITING_HUMAN for s in resumed.values())
@@ -704,7 +738,7 @@ def test_finished_run_leaves_the_index(tmp_path: Path) -> None:
         await d.run_until_idle(RID)
         return await d.active_runs()
 
-    assert asyncio.run(go()) == []
+    assert run(go()) == []
 
 
 # --- real process kill on SQLite --------------------------------------------------------------
@@ -736,7 +770,7 @@ def _child_run(db: str, ledger: str, kill_at: int, phase: str, auto: bool) -> No
         await d.start(new_run())
         return await d.run_until_idle(RID)
 
-    rs = asyncio.run(go())
+    rs = run(go())
     print(json.dumps({"status": rs.run.status.value, "stage": rs.run.stage}), flush=True)
     if not auto:
         os.kill(os.getpid(), signal.SIGKILL)  # die while the gate waits
@@ -744,7 +778,7 @@ def _child_run(db: str, ledger: str, kill_at: int, phase: str, auto: bool) -> No
 
 def _child_resume(db: str, ledger: str, auto: bool) -> None:
     """A fresh process that knows no run ID: it finds unfinished runs in the store."""
-    out = asyncio.run(_child_driver(db, ledger, auto).resume_all())
+    out = run(_child_driver(db, ledger, auto).resume_all())
     print(json.dumps({str(k): [v.run.status.value, v.run.stage] for k, v in out.items()}))  # type: ignore[union-attr]
 
 
@@ -753,7 +787,7 @@ def _spawn(*args: object) -> Any:
         [sys.executable, str(THIS), "child", *map(str, args)],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=60,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )
 
@@ -811,7 +845,7 @@ def test_kill_at_every_commit_finishes_with_no_duplicated_work(
     d = make(SqliteStore(db), Worker(ledger))
     assert d.state(RID) == final
     assert d.timeline(RID) == timeline  # every event once, in order, none lost
-    assert asyncio.run(d.active_runs()) == []
+    assert run(d.active_runs()) == []
 
 
 def test_restart_with_no_run_id_known_finishes_the_run(tmp_path: Path) -> None:

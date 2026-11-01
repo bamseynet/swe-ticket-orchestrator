@@ -53,6 +53,7 @@ from sto.domain import (
 from sto.engine.drivers.ports import (
     CommandExecutor,
     Done,
+    Held,
     StillRunning,
     command_key,
 )
@@ -111,7 +112,7 @@ class Waiting:
     retry_after: float
 
 
-StepResult = Literal["worked", "idle"] | Waiting
+StepResult = Literal["worked", "idle"] | Waiting | Held
 
 
 def encode(obj: object, kind: Kind) -> dict[str, Any]:
@@ -172,6 +173,7 @@ class LocalDriver:
         self._owner, self._clock = owner, clock
         self._ttl, self._lease_wait = lease_seconds, lease_wait
         self._sleep, self._backoff = sleep, backoff
+        self._held: dict[RunId, str] = {}
 
     # --- storage ------------------------------------------------------------------------------
 
@@ -347,10 +349,14 @@ class LocalDriver:
             return "worked"
         if not rec.pending:  # another writer finished the work while we claimed
             return "idle"
-        head = rec.pending[0]
+        # A Stop must not wait behind a command that is not finished: run it first.
+        stops = [c for c in rec.pending if c["cmd"]["type"] == "stop_run"]
+        head = stops[0] if stops else rec.pending[0]
         outcome = await self._executor.execute(head["key"], decode(head["cmd"], "command"))
         if isinstance(outcome, StillRunning):
             return Waiting(outcome.retry_after)
+        if isinstance(outcome, Held):
+            return outcome
         assert isinstance(outcome, Done)
         wires = tuple(encode(e, "event") for e in outcome.events)
         await self._commit(run_id, lambda r: self._done(r, head["key"], wires))
@@ -358,9 +364,14 @@ class LocalDriver:
 
     async def run_until_idle(self, run_id: RunId) -> RunState:
         """Drive until there is nothing to do. Returns with the run waiting for a person,
-        BLOCKED or finished; raises ``RunWedgedError`` if it is idle in any other status."""
+        BLOCKED, finished or held (see ``held``); raises ``RunWedgedError`` if it is idle in
+        any other status."""
+        self._held.pop(run_id, None)
         while True:
             result = await self.step(run_id)
+            if isinstance(result, Held):
+                self._held[run_id] = result.reason
+                break
             if result == "worked":
                 await asyncio.sleep(0)  # an executor that never suspends must not starve the loop
             elif isinstance(result, Waiting):
@@ -371,13 +382,17 @@ class LocalDriver:
         await self._release(run_id)
         rs = rec.state
         status = rs.run.status
-        if status not in _IDLE_OK and not status.is_terminal:
+        if run_id not in self._held and status not in _IDLE_OK and not status.is_terminal:
             refused = [r["reason"] for r in rec.rejected]
             raise RunWedgedError(
                 f"run {run_id} is idle in {status.value} at {rs.run.stage!r} with nothing queued"
                 f" (refused events: {refused})"
             )
         return rs
+
+    def held(self, run_id: RunId) -> str | None:
+        """Why the last ``run_until_idle`` of this run stopped on a held command, if it did."""
+        return self._held.get(run_id)
 
     async def resume_all(self) -> dict[RunId, RunState | RunWedgedError | LeaseHeldError]:
         """After a restart: drive every unfinished run found in the store. A run that is
@@ -447,7 +462,8 @@ class LocalDriver:
     def _done(
         rec: _Rec, key: str, events: tuple[dict[str, Any], ...]
     ) -> tuple[_Rec, tuple[Put, ...]]:
-        if not rec.pending or rec.pending[0]["key"] != key:
+        if all(c["key"] != key for c in rec.pending):
             return rec, ()  # someone else already recorded it
-        nxt = dataclasses.replace(rec, pending=rec.pending[1:], inbox=(*rec.inbox, *events))
+        rest = tuple(c for c in rec.pending if c["key"] != key)
+        nxt = dataclasses.replace(rec, pending=rest, inbox=(*rec.inbox, *events))
         return nxt, ()
