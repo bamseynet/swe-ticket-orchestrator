@@ -81,8 +81,10 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                socket.create_connection(("127.0.0.1", web_port), 1).close()
-                socket.create_connection(("127.0.0.1", api_port), 1).close()
+                for port in (web_port, api_port):  # a raw socket: name lookup is blocked
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(1)
+                        probe.connect(("127.0.0.1", port))
                 break
             except OSError:
                 time.sleep(0.2)
