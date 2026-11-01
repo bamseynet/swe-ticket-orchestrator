@@ -35,13 +35,28 @@ from sto.engine.drivers.ports import Done, Outcome, StillRunning
 from sto.engine.handlers.core import StepSucceeded
 from sto.gates.service import GateService
 from sto.store.memory import MemoryStore
-from sto.store.ports import Key, Store, TeamScope, TransactionConflictError
+from sto.store.ports import (
+    ConditionFailedError,
+    Key,
+    Store,
+    TeamScope,
+    TransactionConflictError,
+)
 from sto.store.sqlite import SqliteStore
 
 SCOPE = TeamScope("t1")
 TOKEN = "dev-token"
 REPO = RepoRef("acme", "app")
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def code_of(r: httpx.Response) -> object:
+    """The error code of a response, or its status and text when it is not one of ours (a 500
+    from an escaped exception then fails the assertion that compares it)."""
+    try:
+        return r.json()["error"]["code"]
+    except (ValueError, KeyError, TypeError):
+        return f"HTTP {r.status_code}: {r.text[:80]}"
 
 
 def run[T](coro: Coroutine[Any, Any, T], timeout: float = 30) -> T:
@@ -73,6 +88,9 @@ class Steps:
         self.slow: set[str] = set()
         self.boom: Exception | None = None
         self.calls: list[str] = []
+        self.queue: list[str] = []  # modes handed to new runs in order: "fail", "hold", "poll"
+        self.modes: dict[RunId, str] = {}
+        self.released = asyncio.Event()
         self.trace: list[tuple[str, str]] = []
 
     async def execute(self, key: str, command: object) -> Outcome:
@@ -80,6 +98,13 @@ class Steps:
             raise AssertionError(f"unexpected command {command!r}")
         self.calls.append(command.stage)
         self.trace.append((str(command.run_id)[-4:], command.stage))
+        mode = self.modes.setdefault(command.run_id, self.queue.pop(0) if self.queue else "")
+        if mode == "fail":
+            raise RuntimeError("this run's step is broken")
+        if mode == "poll":
+            return StillRunning(3600.0, "poll")
+        if mode == "hold":
+            await self.released.wait()
         if self.boom is not None:
             raise self.boom
         if command.stage in self.slow:
@@ -160,7 +185,7 @@ class World:
         rt = rt or self.runtime()
         app = create_app(rt, token=TOKEN, mode="local")
         async with app.router.lifespan_context(app):
-            transport = httpx.ASGITransport(app=app)
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
                 yield Api(self, rt, app, c)
 
@@ -369,7 +394,7 @@ def test_a_decision_returns_409_when_the_gate_is_closed() -> None:
             assert err["gate"] == "review_gate"
             assert err["round"] == 1
             # PLAN 4.3 rule 5 / G3: after close the way to stop is Stop
-            assert err["stop"] == {"method": "POST", "href": f"/runs/{run_id}/cancel"}
+            assert err.get("stop") == {"method": "POST", "href": f"/runs/{run_id}/cancel"}
 
     run(body())
 
@@ -382,15 +407,15 @@ def test_decision_refusals_have_their_own_status() -> None:
             base = f"/runs/{run_id}/gates"
             ok = {"kind": "approve", "subject_digest": g["subject_digest"]}
             missing = await api.call("POST", f"{base}/nope/1/decisions", json=ok)
-            assert (missing.status_code, missing.json()["error"]["code"]) == (404, "gate_not_found")
+            assert (missing.status_code, code_of(missing)) == (404, "gate_not_found")
             stale = await api.decide(run_id, "review_gate", digest="0" * 64)
-            assert (stale.status_code, stale.json()["error"]["code"]) == (409, "stale_subject")
+            assert (stale.status_code, code_of(stale)) == (409, "stale_subject")
             bad = await api.call(
                 "POST", f"{base}/review_gate/1/decisions", json={**ok, "kind": "x"}
             )
             assert bad.status_code == 422
             retest = await api.decide(run_id, "review_gate", "retest")
-            assert (retest.status_code, retest.json()["error"]["code"]) == (
+            assert (retest.status_code, code_of(retest)) == (
                 422,
                 "decision_not_allowed",
             )
@@ -436,7 +461,7 @@ def test_a_bad_runs_cursor_is_a_422_and_validation_errors_use_the_documented_sha
     async def body() -> None:
         async with World(MemoryStore()).up() as api:
             r = await api.call("GET", "/runs", params={"cursor": "junk"})
-            assert (r.status_code, r.json()["error"]["code"]) == (422, "bad_cursor")
+            assert (r.status_code, code_of(r)) == (422, "bad_cursor")
             bad = await api.call("POST", "/runs", json={"ticket": ["not", "text"]})
             assert bad.status_code == 422
             err = bad.json()["error"]
@@ -455,7 +480,7 @@ def test_cancel_is_refused_for_a_finished_or_stopping_run_and_unknown_run() -> N
             ).status_code == 202
             await api.wait_for(run_id, "REJECTED")
             r = await api.call("POST", f"/runs/{run_id}/cancel")
-            assert (r.status_code, r.json()["error"]["code"]) == (409, "run_finished")
+            assert (r.status_code, code_of(r)) == (409, "run_finished")
             assert (await api.call("POST", "/runs/x/cancel")).status_code == 404
 
     run(body())
@@ -692,7 +717,7 @@ def test_a_failed_submit_is_reported_and_a_retry_delivers_the_decision() -> None
             api.rt.driver.submit = flaky  # type: ignore[method-assign,assignment]
             first = await api.decide(run_id, "review_gate")
             assert first.status_code == 503
-            assert first.json()["error"]["code"] == "delivery_failed"
+            assert code_of(first) == "delivery_failed"
             assert first.json()["error"]["decision_recorded"] is True
             assert (await api.gate(run_id, "review_gate"))["status"] == "APPROVED"
             assert (await api.run(run_id))["stage"] == "review_gate"
@@ -744,7 +769,10 @@ def test_build_local_uses_a_sqlite_file_and_resumes_at_startup(tmp_path: Path) -
         assert isinstance(rt.store, SqliteStore)
         async with (
             app.router.lifespan_context(app),
-            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://t",
+            ) as c,
         ):
             h = {"Authorization": "Bearer tok"}
             made = await c.post("/runs", json={"ticket": "DEMO-1"}, headers=h)
@@ -779,7 +807,7 @@ def test_the_local_stack_runs_the_demo_through_both_gates_with_a_simulated_merge
         }
         app = build_local(env)
         async with app.router.lifespan_context(app):
-            transport = httpx.ASGITransport(app=app)
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
                 h = {"Authorization": "Bearer tok"}
 
@@ -932,7 +960,7 @@ def test_transaction_conflicts_are_retried_with_backoff(conflicts: int, status: 
                 assert len(sleeps) == 2
                 assert sleeps[1] > sleeps[0] > 0, "retries must back off"
             else:
-                assert r.json()["error"]["code"] == "store_conflict"
+                assert code_of(r) == "store_conflict"
                 assert r.headers["retry-after"]
                 assert 1 < len(sleeps) <= 10
 
@@ -983,7 +1011,7 @@ def test_a_veto_without_a_comment_is_a_422_and_the_gate_stays_open(kind: str, co
         async with World(MemoryStore()).up() as api:
             run_id = await api.to_review_gate()
             r = await api.decide(run_id, "review_gate", kind, comment=comment)
-            assert (r.status_code, r.json()["error"]["code"]) == (422, "comment_required")
+            assert (r.status_code, code_of(r)) == (422, "comment_required")
             assert (await api.gate(run_id, "review_gate"))["status"] == "OPEN"
             ok = await api.decide(run_id, "review_gate", kind, comment="because")
             assert ok.status_code == 202  # the veto itself is never delayed
@@ -1020,6 +1048,7 @@ class Faulty:
         self.inner = inner
         self.allow: int | None = None
         self.burst: int | None = None  # None: fail for good; n: fail n writes, then recover
+        self.exc: Callable[[], Exception] = lambda: TransactionConflictError("busy")
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
@@ -1031,10 +1060,10 @@ class Faulty:
             if self.allow > 0:
                 self.allow -= 1
             elif self.burst is None:
-                raise TransactionConflictError("busy")
+                raise self.exc()
             elif self.burst > 0:
                 self.burst -= 1
-                raise TransactionConflictError("busy")
+                raise self.exc()
         self.inner.transact(scope, ops)
 
 
@@ -1076,47 +1105,68 @@ def test_a_stop_whose_drive_dies_is_driven_again_when_it_is_repeated() -> None:
             assert (await api.run(run_id))["status"] == "CANCELLING"
             store.allow = None
             again = await api.call("POST", f"/runs/{run_id}/cancel")
-            assert (again.status_code, again.json()["error"]["code"]) == (409, "run_finished")
+            assert (again.status_code, code_of(again)) == (409, "run_finished")
             await api.wait_for(run_id, "CANCELLED")
 
     run(body())
 
 
-def test_a_transient_drive_error_is_retried_inside_the_drive() -> None:
+@pytest.mark.parametrize(
+    "exc", [lambda: TransactionConflictError("busy"), lambda: ConditionFailedError([0])]
+)
+def test_a_transient_drive_error_is_retried_with_backoff_inside_the_drive(
+    exc: Callable[[], Exception],
+) -> None:
     async def body() -> None:
+        sleeps: list[float] = []
+
+        async def nap(s: float) -> None:
+            sleeps.append(s)
+
         store = Faulty(MemoryStore())
+        store.exc = exc
         w = World(store)
-        async with w.up() as api:
+        async with w.up(w.runtime(api_sleep=nap)) as api:
             run_id = await api.to_review_gate()
             rid = RunId.parse(run_id)
             await api.quiet()
-            store.allow, store.burst = 1, 8  # the driver's own 8 retries are used up by one claim
+            sleeps.clear()
+            # the driver's own 8 retries are used up by one claim, twice over
+            store.allow, store.burst = 1, 16
             assert (await api.decide(run_id, "review_gate")).status_code == 202
             await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
             await until("the report to clear", lambda: api.rt.driver_error(rid) is None)
+            assert len(sleeps) == 2, sleeps
+            assert 0 < sleeps[0] < sleeps[1], "the retries must back off"
 
     run(body())
 
 
-def test_store_conflicts_on_start_cancel_and_decide_are_503_not_500() -> None:
+@pytest.mark.parametrize(
+    "exc", [lambda: TransactionConflictError("busy"), lambda: ConditionFailedError([0])]
+)
+def test_store_conflicts_on_start_cancel_and_decide_are_503_not_500(
+    exc: Callable[[], Exception],
+) -> None:
     async def body() -> None:
         store = Faulty(MemoryStore())
+        store.exc = exc
         w = World(store)
         async with w.up() as api:
             store.allow = 0
-            made = await api.call("POST", "/runs", json={"ticket": "T"})
-            assert (made.status_code, made.json()["error"]["code"]) == (503, "store_conflict")
-            assert made.headers["retry-after"]
+            if isinstance(exc(), TransactionConflictError):  # a lost race on start means "exists"
+                made = await api.call("POST", "/runs", json={"ticket": "T"})
+                assert (made.status_code, code_of(made)) == (503, "store_conflict")
+                assert made.headers["retry-after"]
             store.allow = None
             run_id = await api.to_review_gate()
             store.allow = 0
             stop = await api.call("POST", f"/runs/{run_id}/cancel")
-            assert (stop.status_code, stop.json()["error"]["code"]) == (503, "store_conflict")
+            assert (stop.status_code, code_of(stop)) == (503, "store_conflict")
             assert stop.headers["retry-after"]
             dec = await api.decide(run_id, "review_gate")
-            err = dec.json()["error"]
-            assert (dec.status_code, err["code"]) == (503, "delivery_failed")
-            assert err["decision_recorded"] is True
+            assert (dec.status_code, code_of(dec)) == (503, "delivery_failed")
+            assert dec.json()["error"]["decision_recorded"] is True
             store.allow = None
 
     run(body())
@@ -1155,7 +1205,7 @@ def test_gate_contention_is_a_503_with_its_own_code() -> None:
 
                 w.gates.decide = boom  # type: ignore[method-assign]
                 r = await api.decide(run_id, "review_gate")
-                assert (r.status_code, r.json()["error"]["code"]) == (503, "gate_contention")
+                assert (r.status_code, code_of(r)) == (503, "gate_contention")
                 assert r.headers["retry-after"]
 
     run(body())
@@ -1173,7 +1223,7 @@ def test_delivery_failed_is_reported_on_every_attempt_not_only_the_first() -> No
             api.rt.driver.submit = down  # type: ignore[method-assign,assignment]
             for _ in range(2):
                 r = await api.decide(run_id, "review_gate")
-                assert (r.status_code, r.json()["error"]["code"]) == (503, "delivery_failed")
+                assert (r.status_code, code_of(r)) == (503, "delivery_failed")
 
     run(body())
 
@@ -1297,7 +1347,7 @@ def test_a_dead_service_is_logged_and_shown_by_health(caplog: pytest.LogCaptureF
         app = create_app(rt, token=TOKEN, mode="local", services=[merge_queue, fine])
         with caplog.at_level(logging.ERROR, logger="sto.api"):
             async with app.router.lifespan_context(app):
-                transport = httpx.ASGITransport(app=app)
+                transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
                 async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
                     got = await until(
                         "health to report the service",
@@ -1354,22 +1404,18 @@ def test_one_run_that_cannot_be_redelivered_does_not_stop_the_api(
 
         rt.redeliver = picky  # type: ignore[method-assign]
         with caplog.at_level(logging.ERROR, logger="sto.api"):
-            async with w.up(rt) as api2:  # starting must not raise
+            try:
+                await rt.start()
+            except Exception as e:
+                raise AssertionError(f"one bad run stopped start-up: {e!r}") from e
+            async with w.up(rt) as api2:
                 await api2.wait_for(good, "WAITING_HUMAN", "qa_gate")
                 assert any("unreadable" in r.getMessage() for r in caplog.records)
-
-    run(body())
-
-
-def test_a_resume_that_succeeds_clears_the_runs_error() -> None:
-    async def body() -> None:
-        w = World(MemoryStore())
-        async with w.up() as api:
-            run_id = await api.to_review_gate()
-            rid = RunId.parse(run_id)
-            api.rt._errors[rid] = "OSError: stale"
-            await api.rt._resume_all()
-            assert api.rt.driver_error(rid) is None
+                # and the bad run says so itself, not only the log
+                await until(
+                    "the error on the run",
+                    lambda: "unreadable" in (api2.rt.driver_error(RunId.parse(bad)) or ""),
+                )
 
     run(body())
 
@@ -1387,6 +1433,387 @@ def test_closing_the_runtime_releases_the_leases(tmp_path: Path) -> None:
         item = w.store.get(SCOPE, Key(f"RUN#{run_id}", "DRIVER"))
         assert item is not None
         assert item.data["lease"] is None, "a graceful shutdown must give the run up"
+
+    run(body())
+
+
+# --- review pass 2 ------------------------------------------------------------------------------
+
+
+async def _qa_pending_with_dead_drive(w: World, store: Faulty, api: Api) -> str:
+    """Approve the review gate so the decision is applied (the run is RUNNING at qa with its
+    step queued), and make the drive die before the step runs."""
+    run_id = await api.to_review_gate()
+    await api.quiet()
+    store.allow = 3  # submit, claim and apply land; nothing after them can write
+    assert (await api.decide(run_id, "review_gate")).status_code == 202
+    await until("the drive to give up", lambda: api.rt.driver_error(RunId.parse(run_id)))
+    got = await api.run(run_id)
+    assert (got["status"], got["stage"]) == ("RUNNING", "qa")
+    return run_id
+
+
+def test_a_repeated_decision_drives_a_run_that_is_already_past_the_gate() -> None:
+    async def body() -> None:
+        store = Faulty(MemoryStore())
+        w = World(store)
+        async with w.up() as api:
+            run_id = await _qa_pending_with_dead_drive(w, store, api)
+            before = len(w.steps.calls)
+            store.allow = None  # the store recovers; the person presses Approve again
+            again = await api.decide(run_id, "review_gate")
+            assert (again.status_code, code_of(again)) == (409, "gate_closed")
+            await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+            assert len(w.steps.calls) > before
+
+    run(body())
+
+
+def test_a_repeated_decision_drives_a_run_whose_step_was_broken_and_is_fixed() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+            w.steps.boom = RuntimeError("qa step broke")
+            assert (await api.decide(run_id, "review_gate")).status_code == 202
+            rid = RunId.parse(run_id)
+            await until(
+                "the step fault", lambda: "qa step broke" in (api.rt.driver_error(rid) or "")
+            )
+            before = len(w.steps.calls)
+            w.steps.boom = None
+            again = await api.decide(run_id, "review_gate")
+            assert (again.status_code, code_of(again)) == (409, "gate_closed")
+            await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+            assert len(w.steps.calls) > before
+
+    run(body())
+
+
+def test_a_run_left_with_queued_work_is_finished_after_a_restart() -> None:
+    async def body() -> None:
+        store = Faulty(MemoryStore())
+        w = World(store)
+        async with w.up() as api:
+            run_id = await _qa_pending_with_dead_drive(w, store, api)
+            store.allow = None
+        async with w.up(w.runtime(owner="second")) as api2:
+            await api2.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+
+    run(body())
+
+
+def test_a_repeated_stop_drives_a_run_that_has_nothing_else_to_say() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.new_run()
+            await api.wait_for(run_id, "WAITING_HUMAN", "review_gate")
+            rid = RunId.parse(run_id)
+            real = api.rt.driver.run_until_idle
+            calls: list[int] = []
+
+            async def counting(r: RunId) -> Any:
+                calls.append(1)
+                return await real(r)
+
+            api.rt.driver.run_until_idle = counting  # type: ignore[method-assign,assignment]
+            await api.quiet()
+            await api.call("POST", f"/runs/{run_id}/cancel")
+            await api.wait_for(run_id, "CANCELLED")
+            calls.clear()
+            again = await api.call("POST", f"/runs/{run_id}/cancel")
+            assert (again.status_code, code_of(again)) == (409, "run_finished")
+            await until("the repeat to drive the run", lambda: calls)
+            assert rid
+
+    run(body())
+
+
+def test_a_resume_failure_is_reported_while_another_run_is_still_polling() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        w.steps.queue = ["hold", "hold"]
+        async with w.up() as api:
+            a = await api.new_run("A")
+            b = await api.new_run("B")
+            await until("both steps to start", lambda: len(w.steps.calls) == 2)
+        w.steps.modes.clear()
+        w.steps.queue = ["fail", "poll"]  # the same two runs, in the same order, after a restart
+        w.steps.modes.update({})
+        async with w.up(w.runtime(owner="second")) as api2:
+            ra, rb = RunId.parse(a), RunId.parse(b)
+            w.steps.modes[ra], w.steps.modes[rb] = "fail", "poll"
+            await until("A's failure", lambda: api2.rt.driver_error(ra))
+            polling = [t.get_name() for t in api2.rt.background_tasks()]
+            assert f"drive:{rb}" in polling, "B must still be polling when A's failure shows"
+            assert api2.rt.driver_error(rb) is None
+
+    run(body())
+
+
+def test_an_error_on_one_run_is_not_erased_when_another_run_finishes() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            a, b = await api.new_run("A"), await api.new_run("B")
+            ra, rb = RunId.parse(a), RunId.parse(b)
+            await api.wait_for(a, "WAITING_HUMAN", "review_gate")
+            await api.wait_for(b, "WAITING_HUMAN", "review_gate")
+            w.steps.modes[ra] = "fail"
+            w.steps.modes[rb] = "hold"
+            assert (await api.decide(a, "review_gate")).status_code == 202
+            await until("A's error", lambda: api.rt.driver_error(ra))
+            assert (await api.decide(b, "review_gate")).status_code == 202
+            await until("B to be in its held step", lambda: f"drive:{rb}" in _names(api))
+            w.steps.released.set()
+            await api.wait_for(b, "WAITING_HUMAN", "qa_gate")
+            await api.quiet()
+            assert api.rt.driver_error(ra), "B finishing must not clear A's error"
+            assert api.rt.driver_error(rb) is None
+
+    def _names(api: Api) -> list[str]:
+        return [t.get_name() for t in api.rt.background_tasks()]
+
+    run(body())
+
+
+def test_a_transient_error_while_resuming_is_retried() -> None:
+    async def body() -> None:
+        store = Faulty(MemoryStore())
+        w = World(store)
+        w.steps.queue = ["hold"]
+        async with w.up() as api:
+            run_id = await api.new_run()
+            await until("the step to start", lambda: w.steps.calls)
+        w.steps.modes.clear()
+        store.allow, store.burst = 0, 8  # the first claim after the restart loses all 8 tries
+        async with w.up(w.runtime(owner="second")) as api2:
+            await api2.wait_for(run_id, "WAITING_HUMAN", "review_gate")
+            assert api2.rt.driver_error(RunId.parse(run_id)) is None
+
+    run(body())
+
+
+def test_a_run_leased_by_a_dead_driver_is_waited_for_on_restart() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        w.steps.queue = ["hold"]
+        async with w.up() as api:
+            run_id = await api.new_run()
+            await until("the step to start", lambda: w.steps.calls)
+            for t in list(api.rt._tasks.values()):  # the process dies: no release
+                t.cancel()
+            await asyncio.gather(*api.rt._tasks.values(), return_exceptions=True)
+            w.steps.modes.clear()
+            async with w.up(w.runtime(owner="second")) as api2:
+                await api2.wait_for(run_id, "WAITING_HUMAN", "review_gate")
+
+    run(body())
+
+
+def test_a_failed_startup_redelivery_stays_on_the_run_and_is_retried() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+            _close_directly(w, run_id, await api.gate(run_id, "review_gate"), DecisionKind.APPROVE)
+        rt = w.runtime(owner="second")
+        real = rt.redeliver
+        broken = True
+
+        async def flaky(r: RunId) -> bool:
+            if broken:
+                raise OSError("unreadable")
+            return await real(r)
+
+        rt.redeliver = flaky  # type: ignore[method-assign,assignment]
+        async with w.up(rt) as api2:
+            rid = RunId.parse(run_id)
+            await until(
+                "the error on the run", lambda: "unreadable" in (rt.driver_error(rid) or "")
+            )
+            # the resume drive of this run is long over, yet the error stays: the decision is not in
+            await until(
+                "the drives to end",
+                lambda: not [t for t in rt.background_tasks() if t.get_name().startswith("drive:")],
+            )
+            got = await api2.run(run_id)
+            assert "unreadable" in got["driver_error"]
+            assert (got["status"], got["stage"]) == ("WAITING_HUMAN", "review_gate")
+            health = (await api2.c.get("/healthz")).json()
+            assert (health["ok"], health["degraded"]) == (True, True)
+            broken = False  # retried without anyone repeating the decision
+            await api2.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+            await until("the error to clear", lambda: rt.driver_error(rid) is None)
+
+    run(body())
+
+
+def test_a_blank_subject_digest_is_a_422_and_so_is_every_other_refused_field() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+            base = f"/runs/{run_id}/gates"
+            g = await api.gate(run_id, "review_gate")
+            for body_ in (
+                {"kind": "approve", "subject_digest": "   "},
+                {"kind": "approve", "subject_digest": "\t"},
+            ):
+                r = await api.call("POST", f"{base}/review_gate/1/decisions", json=body_)
+                assert (r.status_code, code_of(r)) == (422, "subject_digest_required")
+            waive = {"kind": "waive", "subject_digest": g["subject_digest"], "comment": "x"}
+            r = await api.call("POST", f"{base}/review_gate/1/decisions", json=waive)
+            assert (r.status_code, code_of(r)) == (422, "decision_not_allowed")
+            long_name = "g" * 300
+            r = await api.call("POST", f"{base}/{long_name}/1/decisions", json=waive)
+            assert r.status_code == 422, r.text
+            r = await api.call("POST", f"{base}/review_gate/0/decisions", json=waive)
+            assert r.status_code == 422, r.text
+            veto = {"kind": "reject", "subject_digest": "", "comment": "no"}
+            r = await api.call("POST", f"{base}/review_gate/1/decisions", json=veto)
+            assert r.status_code == 202, r.text  # a veto needs no digest
+
+            def boom(*a: Any, **k: Any) -> Any:
+                raise ValueError("a field this route did not foresee")
+
+            w.gates.decide = boom  # type: ignore[method-assign]
+            r = await api.call("POST", f"{base}/qa_gate/1/decisions", json={**veto, "comment": "x"})
+            assert (r.status_code, code_of(r)) == (422, "invalid_decision")
+
+    run(body())
+
+
+def test_a_run_read_under_a_store_conflict_is_503() -> None:
+    class ReadFlaky:
+        def __init__(self, inner: Store) -> None:
+            self.inner, self.on = inner, False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+        def get(self, scope: Any, key: Key) -> Any:
+            if self.on and key.pk == "RUNS_API":
+                raise TransactionConflictError("busy")
+            return self.inner.get(scope, key)
+
+    async def body() -> None:
+        store = ReadFlaky(MemoryStore())
+        w = World(store)
+        async with w.up() as api:
+            run_id = await api.new_run()
+            store.on = True
+            r = await api.call("GET", f"/runs/{run_id}")
+            assert (r.status_code, code_of(r)) == (503, "store_conflict")
+            assert r.headers["retry-after"]
+            store.on = False
+
+    run(body())
+
+
+def test_health_says_degraded_when_a_run_carries_an_error() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            ok = (await api.c.get("/healthz")).json()
+            assert (ok["ok"], ok["degraded"], ok["runs_with_errors"]) == (True, False, 0)
+            w.steps.boom = RuntimeError("broken")
+            run_id = await api.new_run()
+            await until("the error", lambda: api.rt.driver_error(RunId.parse(run_id)))
+            r = await api.c.get("/healthz")
+            assert r.status_code == 200  # liveness is unchanged
+            assert (r.json()["ok"], r.json()["degraded"], r.json()["runs_with_errors"]) == (
+                True,
+                True,
+                1,
+            )
+            spec = (await api.c.get("/openapi.json")).json()
+            assert "degraded" in spec["components"]["schemas"]["Health"]["properties"]
+
+    run(body())
+
+
+def test_stop_is_offered_only_while_there_is_something_to_stop() -> None:
+    async def body() -> None:
+        async with World(MemoryStore()).up() as api:
+            run_id = await api.to_review_gate()
+            first = await api.decide(run_id, "review_gate", "reject", comment="no")
+            assert first.status_code == 202
+            await api.wait_for(run_id, "REJECTED")
+            again = await api.decide(run_id, "review_gate", "reject", comment="no")
+            assert (again.status_code, code_of(again)) == (409, "gate_closed")
+            assert "stop" not in again.json()["error"]
+            live = await api.to_review_gate()
+            await api.decide(live, "review_gate")
+            await api.wait_for(live, "WAITING_HUMAN", "qa_gate")
+            closed = await api.decide(live, "review_gate")
+            assert closed.json()["error"]["stop"]["href"] == f"/runs/{live}/cancel"
+
+    run(body())
+
+
+def test_closing_survives_a_store_that_cannot_list_the_runs() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        rt = w.runtime()
+        await rt.start()
+
+        async def down() -> Any:
+            raise TransactionConflictError("busy")
+
+        rt.driver.active_runs = down  # type: ignore[method-assign]
+        await rt.close()  # must not raise
+
+    run(body())
+
+
+def test_the_local_state_directory_ignores_itself(tmp_path: Path) -> None:
+    env = {"STO_MODE": "local", "STO_DB": str(tmp_path / ".sto" / "dev.db")}
+    build_local(env)
+    assert (tmp_path / ".sto" / ".gitignore").read_text() == "*\n"
+    (tmp_path / ".sto" / ".gitignore").write_text("*\n!keep\n")
+    build_local(env)  # an existing file is left alone
+    assert (tmp_path / ".sto" / ".gitignore").read_text() == "*\n!keep\n"
+
+
+def test_no_store_call_runs_on_the_event_loop_while_a_run_is_driven() -> None:
+    import threading
+
+    class Spy:
+        def __init__(self, inner: Store) -> None:
+            self.inner = inner
+            self.threads: list[int] = []
+
+        def __getattr__(self, name: str) -> Any:
+            attr = getattr(self.inner, name)
+            if name in ("get", "query", "transact", "put", "delete"):
+
+                def spied(*a: Any, **k: Any) -> Any:
+                    self.threads.append(threading.get_ident())
+                    return attr(*a, **k)
+
+                return spied
+            return attr
+
+    async def body() -> None:
+        spy = Spy(MemoryStore())
+        w = World(spy)
+        loop_thread = threading.get_ident()
+        async with w.up() as api:
+            lander = asyncio.ensure_future(w.land_merges())
+            try:
+                run_id = await api.to_review_gate()
+                await api.decide(run_id, "review_gate")
+                await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+                await api.decide(run_id, "qa_gate")
+                await api.wait_for(run_id, "DONE")
+                await api.call("GET", "/runs")
+                await api.call("GET", f"/runs/{run_id}/events")
+            finally:
+                lander.cancel()
+        assert spy.threads
+        assert loop_thread not in spy.threads, "a store call ran on the event loop"
 
     run(body())
 

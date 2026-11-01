@@ -159,12 +159,19 @@ async def list_runs(
     return {"runs": runs, "cursor": nxt}
 
 
-@router.get("/runs/{run_id}", response_model=RunOut, responses=NOT_FOUND, summary="One run")
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunOut,
+    responses={**NOT_FOUND, 503: {"model": ErrorResponse}},
+    summary="One run",
+)
 async def get_run(run_id: str, rt: RuntimeDep) -> dict[str, Any]:
     try:
         return await rt.get_run(parse_run_id(run_id))
     except RunNotFoundError as e:
         raise ApiError(404, "run_not_found", str(e)) from e
+    except StoreConflictError as e:
+        raise _busy(e) from e
 
 
 _CURSOR = re.compile(r"e(0|[1-9][0-9]{0,11})")

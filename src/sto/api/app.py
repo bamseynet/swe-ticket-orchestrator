@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
@@ -52,7 +52,11 @@ Service = Callable[[], Coroutine[None, None, None]]
 
 
 class Health(BaseModel):
-    ok: bool
+    ok: bool = Field(description="Liveness: false only when a background service has died.")
+    degraded: bool = Field(
+        description="True when a run carries an error (a drive or a redelivery that failed) or "
+        "start-up could not list the runs: the API is up but something needs a person."
+    )
     failed_services: list[str]
     runs_with_errors: int
 
@@ -147,7 +151,12 @@ def create_app(
         broken = sorted(failed)
         if broken:
             response.status_code = 503
-        return {"ok": not broken, "failed_services": broken, "runs_with_errors": runtime.errors()}
+        return {
+            "ok": not broken,
+            "degraded": runtime.degraded(),
+            "failed_services": broken,
+            "runs_with_errors": runtime.errors(),
+        }
 
     protected = [Depends(authorize)]
     shared: dict[int | str, dict[str, Any]] = {
@@ -179,6 +188,14 @@ class SimulatedSteps:
         return Done([StepSucceeded(key_, subject)])
 
 
+def keep_out_of_git(directory: Path) -> None:
+    """A directory made for local state ignores itself (``*``), so the dev database is never
+    committed and no one has to edit the repository's ``.gitignore``."""
+    marker = directory / ".gitignore"
+    if not marker.exists():
+        marker.write_text("*\n")
+
+
 def land_pending(scm: FakeScm, landed: int) -> int:
     """Land the merges requested since the last call; a merge a Stop already dequeued is
     skipped, not an error. Returns how many have been handled."""
@@ -202,6 +219,7 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
         )
     path = Path(env.get("STO_DB", ".sto/dev.db"))
     path.parent.mkdir(parents=True, exist_ok=True)
+    keep_out_of_git(path.parent)
     scope = TeamScope("local")
     store = SqliteStore(path)  # a waiting gate survives a restart
     scm = FakeScm()

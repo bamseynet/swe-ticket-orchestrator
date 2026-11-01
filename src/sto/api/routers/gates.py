@@ -3,9 +3,9 @@ service (ADR-0005 #7); this file only maps its answers to HTTP."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Path
 from pydantic import BaseModel, Field
 
 from sto.api.routers.runs import (
@@ -53,7 +53,11 @@ class GateList(BaseModel):
 
 class DecisionIn(BaseModel):
     kind: DecisionKind
-    subject_digest: str = Field(min_length=1, max_length=200)
+    subject_digest: str = Field(
+        default="",
+        max_length=200,
+        description="The subject seen. Required for `approve`; a veto does not need it.",
+    )
     comment: str = Field(
         default="",
         max_length=10_000,
@@ -135,9 +139,19 @@ _REFUSALS: list[tuple[type[GateError], int]] = [
         "stopped closes the gate but changes nothing else (closing gates on Stop is D2-11)."
     ),
 )
-async def decide(run_id: str, name: str, round: int, body: DecisionIn, rt: RuntimeDep) -> Any:
+async def decide(
+    run_id: str,
+    name: Annotated[str, Path(min_length=1, max_length=200)],
+    round: Annotated[int, Path(ge=1, le=1000)],
+    body: DecisionIn,
+    rt: RuntimeDep,
+) -> Any:
     if body.kind is not DecisionKind.APPROVE and not body.comment.strip():
         raise ApiError(422, "comment_required", f"a {body.kind.value} decision needs a comment")
+    if not body.kind.is_negative and not body.subject_digest.strip():
+        raise ApiError(
+            422, "subject_digest_required", f"a {body.kind.value} decision needs the subject seen"
+        )
     try:
         decided = await rt.decide(
             parse_run_id(run_id),
@@ -160,23 +174,27 @@ async def decide(run_id: str, name: str, round: int, body: DecisionIn, rt: Runti
     except StoreConflictError as e:
         raise _busy(e) from e
     except GateClosedError as e:
+        extra: dict[str, Any] = {
+            "gate": e.gate_name,
+            "round": e.round,
+            "status": e.status.value,
+            "closed_by": e.closed_by,
+        }
+        if await rt.can_stop(parse_run_id(run_id)):
+            extra["stop"] = {"method": "POST", "href": f"/runs/{run_id}/cancel"}
         raise ApiError(
             409,
             e.code,
             str(e),
-            extra={
-                "gate": e.gate_name,
-                "round": e.round,
-                "status": e.status.value,
-                "closed_by": e.closed_by,
-                "stop": {"method": "POST", "href": f"/runs/{run_id}/cancel"},
-            },
+            extra=extra,
         ) from e
     except GateError as e:
         for kind, status in _REFUSALS:
             if isinstance(e, kind):
                 raise ApiError(status, e.code, str(e)) from e
         raise ApiError(400, e.code, str(e)) from e
+    except ValueError as e:  # a field the domain refuses and this route did not foresee
+        raise ApiError(422, "invalid_decision", str(e)) from e
     except ConditionFailedError as e:
         # The gate service ran out of retries on a gate that is still open (D3-06 reworks this).
         raise ApiError(
