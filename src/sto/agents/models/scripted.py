@@ -17,19 +17,33 @@ from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolSpec
 
+from sto.agents.harness import OUTCOME_TOOL
+
 T = TypeVar("T", bound=BaseModel)
 
-OUTCOME_TOOL = "StageOutcome"  # name of the pydantic model the harness asks Strands to fill
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    input: dict[str, Any]
+
+    @classmethod
+    def outcome(cls, outcome: str, summary: str) -> ToolCall:
+        return cls(OUTCOME_TOOL, {"outcome": outcome, "summary": summary})
 
 
 @dataclass(frozen=True)
 class Turn:
-    """One model response: text and/or one tool call, ended with ``stop_reason``."""
+    """One model response: optional text, any number of tool calls, a stop reason.
+
+    ``error`` makes the model call itself raise (throttling, an engine error), for tests of the
+    harness's failure mapping.
+    """
 
     reply: str = ""
-    tool_name: str | None = None
-    tool_input: dict[str, Any] | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
     stop_reason: str = "end_turn"
+    error: BaseException | None = None
 
     @classmethod
     def text(cls, text: str) -> Turn:
@@ -37,11 +51,16 @@ class Turn:
 
     @classmethod
     def tool_call(cls, name: str, tool_input: dict[str, Any]) -> Turn:
-        return cls(tool_name=name, tool_input=tool_input, stop_reason="tool_use")
+        return cls.tools(ToolCall(name, tool_input))
+
+    @classmethod
+    def tools(cls, *calls: ToolCall) -> Turn:
+        """Several tool calls in one model response (parallel tool use)."""
+        return cls(tool_calls=calls, stop_reason="tool_use")
 
     @classmethod
     def outcome(cls, outcome: str, summary: str) -> Turn:
-        return cls.tool_call(OUTCOME_TOOL, {"outcome": outcome, "summary": summary})
+        return cls.tools(ToolCall.outcome(outcome, summary))
 
     @classmethod
     def refusal(cls, text: str = "I can't help with that.") -> Turn:
@@ -50,6 +69,10 @@ class Turn:
     @classmethod
     def truncated(cls, text: str) -> Turn:
         return cls(reply=text, stop_reason="max_tokens")
+
+    @classmethod
+    def raising(cls, error: BaseException) -> Turn:
+        return cls(error=error)
 
 
 class ScriptExhaustedError(RuntimeError):
@@ -75,6 +98,19 @@ class ScriptedModel(Model):
     def get_config(self) -> Any:
         return self._config
 
+    @property
+    def calls(self) -> int:
+        return self._n_calls
+
+    @property
+    def unconsumed(self) -> int:
+        return max(0, len(self._turns) - self._n_calls) if self._responder is None else 0
+
+    def assert_consumed(self) -> None:
+        """Fail if the script has turns the agent never asked for."""
+        if self.unconsumed:
+            raise AssertionError(f"{self.unconsumed} scripted turn(s) were never consumed")
+
     def _next(self, messages: Messages, tool_specs: list[ToolSpec] | None) -> Turn:
         if self._responder is not None:
             return self._responder(messages, tool_specs)
@@ -94,24 +130,21 @@ class ScriptedModel(Model):
         self.seen_messages.append(list(messages))
         turn = self._next(messages, tool_specs)
         self._n_calls += 1
+        if turn.error is not None:
+            raise turn.error
         yield {"messageStart": {"role": "assistant"}}
         if turn.reply:
             yield {"contentBlockStart": {"start": {}}}
             yield {"contentBlockDelta": {"delta": {"text": turn.reply}}}
             yield {"contentBlockStop": {}}
-        if turn.tool_name is not None:
+        for i, call in enumerate(turn.tool_calls):
+            tool_use_id = f"scripted-{self._n_calls}-{i}"
             yield {
                 "contentBlockStart": {
-                    "start": {
-                        "toolUse": {
-                            "name": turn.tool_name,
-                            "toolUseId": f"scripted-{self._n_calls}",
-                        }
-                    }
+                    "start": {"toolUse": {"name": call.name, "toolUseId": tool_use_id}}
                 }
             }
-            payload = json.dumps(turn.tool_input or {})
-            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": payload}}}}
+            yield {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(call.input)}}}}
             yield {"contentBlockStop": {}}
         yield {"messageStop": {"stopReason": turn.stop_reason}}  # type: ignore[typeddict-item]
         yield {
