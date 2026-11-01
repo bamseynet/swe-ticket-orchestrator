@@ -43,9 +43,11 @@ MAX_TRANSACTION_BYTES = 4 * 1024 * 1024
 MAX_PK_BYTES = 2048
 MAX_SK_BYTES = 1024
 _MAX_NUMBER = 10**38
-# DynamoDB allows 32 levels of nesting. Numbers beyond its range or precision (e.g. 1e-200) are
-# not rejected here yet; D3-09 decides how its store maps them.
+# DynamoDB allows 32 levels of nesting.
 _MAX_DEPTH = 32
+# DynamoDB's smallest non-zero magnitude (1E-130). Memory and SQLite could hold less, so every
+# store refuses it: a run that works locally must not fail in production.
+_MIN_NUMBER = 1e-130
 
 # The team's own bare partition (PLAN 11: Team META and switches, CONFIG, WF#, BUD#, SLOT#, CONN#,
 # IMAGE# live under exactly ``TEAM#<t>``). ``Key(TEAM_ROOT, "META")`` addresses it, so every caller
@@ -72,6 +74,16 @@ class TransactionConflictError(TransientError):
     ``TransactionCanceled`` for a conflict, not for a failed condition). Retry with backoff.
     A DynamoDB store raises it, and so does the SQLite store when its busy wait expires. The
     in-memory store never does."""
+
+
+class TransactionOutcomeUnknownError(TransactionConflictError):
+    """A write may or may not have been applied: the request was sent but the answer was lost
+    (a read timeout, a closed connection, a 5xx). It is a ``TransactionConflictError``, so
+    existing retry loops still work, but a caller that cares must re-read and reconcile before it
+    retries: a retry of a version- or status-guarded write can lose to its own earlier success
+    and report a lost condition. ``TransactionConflictError`` itself means nothing was applied by
+    that call (a conflict or throttling); a *read* that fails to connect raises it too, as a
+    read has nothing to reconcile. Reads never raise this subclass."""
 
 
 # --- scopes -----------------------------------------------------------------------------------
@@ -242,6 +254,8 @@ def _validate(value: object, depth: int = 0) -> None:
     elif isinstance(value, float):
         if value != value or abs(value) >= _MAX_NUMBER:  # NaN, inf, out of range
             raise TypeError("data must be plain JSON: number out of range")
+        if value != 0 and abs(value) < _MIN_NUMBER:
+            raise TypeError("data must be plain JSON: number out of range (below 1e-130)")
     elif isinstance(value, list | tuple):
         for v in value:
             _validate(v, depth + 1)
@@ -249,6 +263,8 @@ def _validate(value: object, depth: int = 0) -> None:
         for k, v in value.items():
             if not isinstance(k, str):
                 raise TypeError("data must be plain JSON: object keys must be strings")
+            if not k:
+                raise TypeError("data must be plain JSON: object keys must not be empty")
             _validate(v, depth + 1)
     else:
         raise TypeError(f"data must be plain JSON, not {type(value).__name__}")

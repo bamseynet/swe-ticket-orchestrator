@@ -35,6 +35,7 @@ ALLOWED = {
     "sto/gates/hooks.py",
     "sto/gates/service.py",
     "sto/store/ports.py",
+    "sto/store/dynamodb.py",  # picks the native Put for the audit table; writes no entries
 }
 
 

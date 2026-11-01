@@ -762,3 +762,16 @@ class StoreContract:
         store.query(A, "P", sk_prefix="s" * 1024)
         with pytest.raises(ValueError, match="sk_prefix"):
             store.query(A, "P", sk_prefix="s" * 1025)
+
+    def test_numbers_and_keys_dynamodb_cannot_hold_are_refused_by_every_store(
+        self, store: Store
+    ) -> None:
+        for bad in (1e-200, -1e-131, 5e-324):
+            with pytest.raises(TypeError, match="out of range"):
+                store.put(A, RUN, {"x": [{"y": bad}]})
+            with pytest.raises(TypeError, match="out of range"):
+                FieldEquals("x", bad)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="must not be empty"):
+            store.put(A, RUN, {"outer": {"": 1}})
+        assert store.get(A, RUN) is None
+        store.put(A, RUN, {"smallest": 1e-130, "zero": 0.0, "negative": -1e-130})  # still fine
