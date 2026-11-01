@@ -1150,7 +1150,8 @@ def test_v17_does_not_let_a_second_merge_inherit_the_earlier_answer() -> None:
 def test_v17_a_merge_before_a_qa_gate_that_ends_in_a_rejected_terminal_with_no_gate_passes() -> (
     None
 ):
-    # Known gap, accepted (V6 tolerates it): merge -> terminal `rejected` on a path with no QA gate.
+    # Accepted gap, by ruling (V6 tolerates it): merge -> terminal `rejected` with no QA gate on
+    # that path passes. This pins the ruling; it is not a bug.
     stages = _qa_after_merge()
     stages["merge_it"]["next"]["done"] = "rejected_t"
     assert _qa_check(stages) == []
@@ -1415,6 +1416,99 @@ def test_the_kanban_qa_gate_as_written_is_refused_only_for_the_extra_role() -> N
     assert _paths(issues) == ["stages.qa_gate.gate.eligible_roles"]
 
 
+def _with_hotfix(doc: dict[str, Any], via: str) -> dict[str, Any]:
+    """A second review, QA and merge after merge.<via>; the new merge does not list security."""
+    doc = copy.deepcopy(doc)
+    st = doc["stages"]
+    doc["on_external_commit"] = "ci"
+    st["impl2"] = {"kind": "agent", "agent": "implementer", "next": {"ready": "review2"}}
+    st["review2"] = copy.deepcopy(st["review_gate"])
+    st["review2"]["next"] = {
+        "approved": "qa2",
+        "changes_requested": {"to": "impl2", "loop": "human_review"},
+        "rejected": "closed_rejected",
+        "expired": "closed_expired",
+    }
+    st["qa2"] = copy.deepcopy(st["qa_gate"])
+    st["qa2"]["next"] = {
+        "approved": "merge_hotfix",
+        "changes_requested": {"to": "impl2", "loop": "qa_fix"},
+        "retest": {"to": "impl2", "loop": "retest"},
+        "rejected": "closed_rejected",
+        "expired": "closed_expired",
+    }
+    st["merge_hotfix"] = {
+        "kind": "effect",
+        "effect": "pr.merge",
+        "requires_gates": ["review2", "qa2"],
+        "next": {
+            "done": "ticket_done2",
+            "conflict": {"to": "impl2", "loop": "merge_conflict"},
+            "stale": {"to": "impl2", "loop": "merge_stale"},
+        },
+    }
+    st["ticket_done2"] = {
+        "kind": "effect",
+        "effect": "ticket.transition",
+        "with": {"to_status_category": "done"},
+        "requires_gates": ["review2", "qa2"],
+        "next": {"done": "done"},
+    }
+    st["merge"]["next"][via] = {
+        "to": "impl2",
+        "loop": "merge_conflict" if via == "conflict" else "merge_stale",
+    }
+    return doc
+
+
+@pytest.mark.parametrize("via", ["conflict", "stale"])
+def test_v17_follows_a_failed_merge_into_a_second_merge_that_skips_the_gate(via: str) -> None:
+    doc = _with_hotfix(_flatten("ledger-regulated"), via)
+    assert "stages.merge_hotfix.requires_gates" in _paths(_check(_load_wf(doc), LEDGER))
+
+
+def test_v17_follows_a_red_post_merge_check_into_another_merge() -> None:
+    doc = _flatten("ledger-regulated")
+    st = doc["stages"]
+    doc["on_external_commit"] = "ci"
+    st["post_merge"]["next"] = {"green": "evidence", "red": "fix2"}
+    st["fix2"] = {"kind": "agent", "agent": "implementer", "next": {"ready": "merge_followup"}}
+    st["merge_followup"] = {
+        "kind": "effect",
+        "effect": "pr.merge",
+        "requires_gates": ["review_gate", "qa_gate"],
+        "next": {"done": "done", "conflict": "closed", "stale": "closed"},
+    }
+    st["done"] = {"kind": "terminal", "result": "done"}
+    paths = _paths(_check(_load_wf(doc), LEDGER))
+    assert "stages.merge_followup.requires_gates" in paths
+
+
+def test_v17_follows_a_stale_kanban_release_into_another_merge() -> None:
+    doc = _kanban(["qa"])
+    st = doc["stages"]
+    doc["on_external_commit"] = "ci"
+    st["release"]["next"]["stale"] = "fix3"
+    st["fix3"] = {"kind": "agent", "agent": "implementer", "next": {"ready": "merge3"}}
+    st["merge3"] = {
+        "kind": "effect",
+        "effect": "pr.merge",
+        "requires_gates": ["review_gate"],
+        "next": {"done": "ticket_done", "conflict": "closed", "stale": "closed"},
+    }
+    # the exemption covers what the removed-approval search reaches; merge3 is reached only past
+    # the QA approval, so it must list the gate
+    assert "stages.merge3.requires_gates" in _paths(
+        _check(_load_wf(doc), _team_policy("ledger", QA))
+    )
+
+
+def test_the_kanban_qa_gate_with_a_quorum_for_qa_passes_with_both_roles_eligible() -> None:
+    doc = _kanban(["qa", "reviewer"])
+    doc["stages"]["qa_gate"]["gate"]["quorum"] = [{"role": "qa", "count": 1}]
+    assert _check(_load_wf(doc), _team_policy("ledger", QA)) == []
+
+
 @pytest.mark.parametrize(
     ("label", "edit"),
     [
@@ -1441,6 +1535,180 @@ def test_the_kanban_qa_gate_reaches_release_only_through_its_approval() -> None:
     doc["stages"]["release"]["requires_gates"] = ["review_gate"]
     paths = _paths(_check(_load_wf(doc), _team_policy("ledger", QA)))
     assert paths == ["stages.release.requires_gates"]
+
+
+# --- pass 3 ---------------------------------------------------------------------------------
+
+
+def test_v17_refuses_a_revert_that_no_gate_answer_led_to() -> None:
+    stages = _qa_after_merge()
+    stages["merge_it"]["next"]["done"] = "revert"  # merge -> revert -> incident, gate never asked
+    stages["revert"]["next"] = {"done": "closed"}
+    assert "stages.qa_gate" in _paths(_qa_check(stages))
+
+
+def test_v17_follows_a_wait_timeout_before_any_merge() -> None:
+    stages = _security_flow(
+        wait={
+            "kind": "wait",
+            "wait_for": "human_answer",
+            "timeout": "1d",
+            "next": {"resumed": "review_gate", "timeout": "done"},
+        }
+    )
+    stages["impl"]["next"] = {"ready": "wait"}
+    assert "stages.security_gate" in _paths(_check(_flow(stages), _only(SECURITY)))
+
+
+def _typed_behind_a_merge(role: str, gate_type: str, gate_id: str) -> Workflow:
+    """The team writes the type: a gate of ``gate_type`` behind a merge, required as ``role``."""
+    return _flow(
+        {
+            "peer": _gate("review", ["reviewer"], {"approved": "merge_it", "rejected": "closed"}),
+            "merge_it": _merge(
+                {"done": gate_id, "conflict": "closed", "stale": "closed"}, ("peer",)
+            ),
+            gate_id: _gate(gate_type, [role], {"approved": "done", "rejected": "rejected_t"}),
+        },
+        start="peer",
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "gate_id"), [("reviewer", "review_gate"), ("security_officer", "security_gate")]
+)
+def test_v17_gives_no_qa_exemption_to_a_role_the_org_did_not_assign_to_qa(
+    role: str, gate_id: str
+) -> None:
+    wf = _typed_behind_a_merge(role, "qa", gate_id)  # written type: qa, behind the merge
+    assert gate_id in [
+        p.removeprefix("stages.") for p in _paths(_check(wf, _only({"id": gate_id, "role": role})))
+    ]
+
+
+def test_v17_gives_the_qa_exemption_to_the_role_the_org_assigned_to_qa() -> None:
+    wf = _typed_behind_a_merge("qa", "qa", "qa_gate")
+    assert _check(wf, _only(QA)) == []
+
+
+def test_v17_the_exemption_does_not_depend_on_the_written_type() -> None:
+    # same role the org assigned to qa, written as a custom gate: still exempt
+    wf = _typed_behind_a_merge("qa", "custom", "qa_gate")
+    assert _check(wf, _only(QA)) == []
+
+
+def _regulated_with_order(order: list[str], **edges: str) -> dict[str, Any]:
+    doc = _flatten("ledger-regulated")
+    route = doc["stages"]["change_route"]
+    route["order"] = order
+    route["next"] = {"high": "change_gate", "default": "mark_ready", **edges}
+    return doc
+
+
+def test_v17_refuses_a_value_ranked_above_the_orgs_that_skips_the_gate() -> None:
+    doc = _regulated_with_order(["low", "medium", "high", "critical"], critical="mark_ready")
+    assert "stages.change_gate" in _paths(_check(_load_wf(doc), LEDGER))
+
+
+def test_v17_refuses_an_order_that_ranks_the_orgs_value_below_the_others() -> None:
+    doc = _regulated_with_order(["high", "medium", "low"])
+    assert "stages.change_gate" in _paths(_check(_load_wf(doc), LEDGER))
+
+
+def test_v17_accepts_values_ranked_above_when_they_take_the_gate_too() -> None:
+    doc = _regulated_with_order(["low", "medium", "high", "critical"], critical="change_gate")
+    assert _check(_load_wf(doc), LEDGER) == []
+
+
+def test_v17_ignores_values_ranked_below_the_orgs() -> None:
+    # low and medium may skip the gate: only high and above are the org's concern
+    doc = _regulated_with_order(["low", "medium", "high"], low="mark_ready")
+    assert _check(_load_wf(doc), LEDGER) == []
+
+
+def _ticket_done(then: str = "closed") -> dict[str, Any]:
+    return {
+        "kind": "effect",
+        "effect": "ticket.transition",
+        "with": {"to_status_category": "done"},
+        "next": {"done": then},
+    }
+
+
+def test_v17_counts_a_ticket_moved_to_done_as_getting_round_a_gate() -> None:
+    stages = _security_flow(ticket_done=_ticket_done())
+    stages["security_gate"]["next"]["changes_requested"] = "ticket_done"
+    assert "stages.security_gate" in _paths(_check(_flow(stages), _only(SECURITY)))
+
+
+@pytest.mark.parametrize("effect", ["branch.promote", "env.deploy_preview", "pr.mark_ready"])
+def test_v17_does_not_count_other_effects_as_an_end(effect: str) -> None:
+    stages = _security_flow(side={"kind": "effect", "effect": effect, "next": {"done": "closed"}})
+    stages["security_gate"]["next"]["changes_requested"] = "side"
+    assert _check(_flow(stages), _only(SECURITY)) == []
+
+
+def test_v17_does_not_count_a_ticket_transition_to_another_category() -> None:
+    other = _ticket_done()
+    other["with"] = {"to_status_category": "in_progress"}
+    stages = _security_flow(ticket_state=other)
+    stages["security_gate"]["next"]["changes_requested"] = "ticket_state"
+    assert _check(_flow(stages), _only(SECURITY)) == []
+
+
+def test_v17_does_not_ask_a_ticket_transition_to_list_the_gate() -> None:
+    stages = _security_flow(ticket_done=_ticket_done("done"))
+    stages["merge_ok"]["next"]["done"] = "ticket_done"
+    assert _check(_flow(stages), _only(SECURITY)) == []
+
+
+def test_v17_asks_every_merge_after_the_gate_not_only_the_first() -> None:
+    stages = _security_flow(
+        again=_merge({"done": "done", "conflict": "closed", "stale": "closed"}, ("review_gate",))
+    )
+    stages["merge_ok"]["next"]["stale"] = "again"
+    assert _paths(_check(_flow(stages), _only(SECURITY))) == ["stages.again.requires_gates"]
+
+
+def test_v17_lets_a_release_after_a_merge_that_listed_the_gate() -> None:
+    stages = _security_flow(
+        rel={
+            "kind": "effect",
+            "effect": "release.trigger",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "done", "stale": "closed"},
+        }
+    )
+    stages["merge_ok"]["next"]["done"] = "rel"
+    assert _check(_flow(stages), _only(SECURITY)) == []
+
+
+def test_v17_does_not_let_a_release_pass_that_follows_an_unlisted_merge() -> None:
+    stages = _security_flow(
+        rel={
+            "kind": "effect",
+            "effect": "release.trigger",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "done", "stale": "closed"},
+        }
+    )
+    stages["merge_ok"]["requires_gates"] = ["review_gate"]  # the merge does not list security
+    stages["merge_ok"]["next"]["done"] = "rel"
+    paths = _paths(_check(_flow(stages), _only(SECURITY)))
+    assert paths == ["stages.merge_ok.requires_gates", "stages.rel.requires_gates"]
+
+
+def test_v17_does_not_let_a_release_pass_that_follows_no_listed_merge() -> None:
+    stages = _security_flow(
+        rel={
+            "kind": "effect",
+            "effect": "release.trigger",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "done", "stale": "closed"},
+        }
+    )
+    stages["merge_ok"]["next"]["conflict"] = "rel"  # the merge did not succeed
+    assert _paths(_check(_flow(stages), _only(SECURITY))) == ["stages.rel.requires_gates"]
 
 
 def test_the_regulated_example_without_order_on_its_route_is_refused() -> None:
