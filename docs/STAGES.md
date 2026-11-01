@@ -324,8 +324,8 @@ It exists early so that two workers do not invent two ports.
 
 #### D1-14: Public driver accessors
 The API runtime reads the local driver's private `_load` and `_release`. Give the driver public accessors for the command log and the lease, and move the runtime to them, so a driver can change without breaking the API.
-**AC:** `src/sto/api/runtime.py` reads no private driver attribute, by a test that scans for it; behaviour is unchanged, by the existing API suite.
-**Deps:** D1-03, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/api/runtime.py`, `tests/api/test_v0.py`.
+**AC:** `src/sto/api/runtime.py` reads no private driver attribute, by a test that scans for it; behaviour is unchanged, by the existing API suite. Housekeeping found in review: coverage sets `include_namespace_packages = true`, so a package with no `__init__.py` cannot vanish from the report, with `fail_under` kept; the integration job runs with `-rA`, so its log names each test; and a test in `tests/test_tiers.py` pins the integration job's command, as one already does for e2e.
+**Deps:** D1-03, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/api/runtime.py`, `tests/api/test_v0.py`, `pyproject.toml`, `.github/workflows/ci.yml`, `tests/test_tiers.py`.
 
 ---
 
@@ -372,8 +372,8 @@ Maps merge, lists replace and `null` removes. A value below a floor gets an erro
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides. A team cannot rank a value below the org's in a route's `order` to skip a `when` gate: `OrgPolicy` gains an org-owned ordering.
-**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `tests/config/test_validate_structure.py`.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides. A team cannot rank a value below the org's in a route's `order` to skip a `when` gate: `OrgPolicy` gains an org-owned ordering. A test keeps `STALE_EDGE_TYPES` and `IMPLICIT_TYPES` in `src/sto/effects/ports.py` in step with the effect catalog: every name is a catalog effect, and each classification agrees with PLAN.md.
+**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `tests/config/test_validate_structure.py`, `tests/effects/test_catalog_sync.py`.
 
 #### D2-04: Gate dominance proof
 Implement V4, V5, V6, V11 and V14 by edge-removal reachability on the stage graph, deriving code-changing stages from the manifest, and V6's clause scoped to merges reachable with QA approvals removed.
@@ -533,13 +533,13 @@ Records a test plan for what only a real IdP can prove: group list size, step-up
 #### D3-02: Group mapping and roles
 Store `(idp, group) -> (team, role)` as data, and resolve roles server-side on each request.
 Custom gate roles are declared per team.
-**AC:** a changed mapping applies on next request; an unmapped user has no access; a disabled user is refused immediately; custom roles work. Mapping a team group to `org_admin` is refused.
+**AC:** a changed mapping applies on next request; an unmapped user has no access; a disabled user is refused immediately; custom roles work. Mapping a team group to `org_admin` is refused. A service identity is recognised explicitly, by a rule stated here: an M2M token, whose `sub` equals its `client_id`, validates under D3-01 with empty groups, and resolves to a service identity, never to a user, and is never eligible for a gate (PLAN.md section 9.2).
 **Deps:** D3-01, D1-01. **Size:** S. **Run:** parallel. **Files:** `src/sto/identity/mapping.py`, `tests/identity/test_mapping.py`.
 
 #### D3-03: Authorization middleware
 Middleware turns a verified identity into a `TeamScope` and enforces the permission matrix from PLAN.md section 9.3. Repositories already require the scope from D1-01.
 A shared suite tries every route as every role from another team.
-**AC:** matrix tests are generated from one table; cross-team access is refused on every route; T9 covered; a new route with no declared permission fails a test.
+**AC:** matrix tests are generated from one table; cross-team access is refused on every route; T9 covered; a new route with no declared permission fails a test. An import-boundary test fails if any module outside its own tests imports `sto/identity/fake_issuer.py`.
 **Deps:** D3-02, D1-08. **Size:** M. **Run:** serial. **Files:** `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
 
 #### D3-04: Account linking
