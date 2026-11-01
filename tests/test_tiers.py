@@ -649,3 +649,23 @@ def test_e2e_directory_wins_over_another_tier_marker(tmp_path: Path) -> None:
     )
     result = run_pytest(tmp_path, "def test_x(): pass\n", "--collect-only", "-m", "e2e")
     assert "test_both" in result.stdout
+
+
+@pytest.mark.parametrize("tier", ["unit", "contract", "gate"])
+def test_hermetic_tier_marker_under_e2e_directory_is_rejected(tmp_path: Path, tier: str) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_bad.py").write_text(
+        f"import pytest\n@pytest.mark.{tier}\ndef test_bad(): pass\n"
+    )
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "-m", tier)
+    assert result.returncode != 0
+    assert "tests/e2e" in result.stdout + result.stderr
+    assert tier in result.stdout + result.stderr
+
+
+def test_e2e_test_may_use_docker(tmp_path: Path) -> None:
+    # PLAN section 18 tier table: the E2E tier runs with Docker.
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_dock.py").write_text(textwrap.dedent(DOCKER_TEST).format(marker=""))
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "-m", "e2e")
+    assert result.returncode == 0, result.stdout

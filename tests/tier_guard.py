@@ -4,13 +4,15 @@
   ``ui_browser``, ``e2e`` and ``live``. A test with no tier marker counts as ``unit``.
 * ``integration``, ``ui_browser``, ``e2e`` and ``live`` tests are deselected unless ``-m`` is
   given, so local runs stay hermetic. CI jobs select them with ``-m``.
-* Docker use without the ``integration`` marker fails, and so does launching a browser without
-  ``ui_browser``. The program of every simple command is inspected (``sh -c``, ``env docker`` and
-  ``shell=True`` strings, ``xargs``, backtick and ``$(...)`` substitutions and
+* Docker use without the ``integration`` or ``e2e`` marker fails, and so does
+  launching a browser without ``ui_browser``. The program of every simple command is inspected
+  (``sh -c``, ``env docker`` and ``shell=True`` strings, ``xargs``, backtick and ``$(...)``
+  substitutions and
   ``Popen(executable=...)`` included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
   ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/``,
   ``contract(s)/`` or ``e2e/`` directory is in that tier even without the marker; under ``e2e/``
-  it is e2e even with another tier marker.
+  it is e2e even with ``integration`` or ``live`` markers, and a ``unit``, ``contract`` or ``gate``
+  marker there is a collection error (PLAN section 18: the E2E tier runs with Docker).
 
 This is a best-effort guard against accidents, not a security boundary. Known limits, left open
 on purpose: shell keywords as the first word (``if docker ps; then``), ``command -v docker``
@@ -46,6 +48,7 @@ TIERS = {
     "e2e": "whole local stack up (Docker); CI only",
     "live": "needs real GitHub or AWS; tagged, on demand",
 }
+HERMETIC = ("unit", "contract", "gate")
 HEAVY = ("integration", "ui_browser", "e2e", "live")
 DOCKER_PROGRAMS = {"docker", "docker-compose", "podman"}
 BROWSER_HINTS = (
@@ -92,6 +95,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         tier = _tier_from_directory(item, root)
         if tier == "e2e":
             # Under tests/e2e/ a test is always e2e, whatever else it is marked (e.g. integration).
+            # A hermetic tier marker there would run it locally, so it is rejected outright.
+            for hermetic in HERMETIC:
+                if item.get_closest_marker(hermetic):
+                    raise pytest.UsageError(
+                        f"{item.nodeid}: @pytest.mark.{hermetic} under tests/e2e/ is not allowed; "
+                        "e2e tests are CI only (drop the marker or move the test)"
+                    )
             if not item.get_closest_marker("e2e"):
                 item.add_marker(pytest.mark.e2e)
         elif not any(item.get_closest_marker(t) for t in TIERS):
@@ -307,14 +317,14 @@ def _is_docker_socket(address: Any) -> bool:
 @pytest.fixture(autouse=True)
 def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     node = request.node
-    docker_ok = node.get_closest_marker("integration") is not None
+    docker_ok = any(node.get_closest_marker(m) for m in ("integration", "e2e"))
     browser_ok = node.get_closest_marker("ui_browser") is not None
 
     def check(command: Any, *, shell_string: bool = False) -> None:
         kind = _program_kind(command, shell_string=shell_string)
         if kind == "docker" and not docker_ok:
             raise TierViolationError(
-                "this test uses Docker without @pytest.mark.integration; "
+                "this test uses Docker without @pytest.mark.integration or e2e; "
                 "Docker tests run in CI only"
             )
         if kind == "browser" and not browser_ok:
