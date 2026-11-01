@@ -308,7 +308,7 @@ It shows simulated writes as simulated, and renders all model and ticket text as
 `make dev` starts the whole local stack with demo tickets and no Docker, and CI's e2e job drives it through both gates.
 The README states the status plainly, including "never deployed".
 **AC:** works from a fresh clone with no credentials or Docker; the e2e covers approve-approve and reject at each gate; README is accurate. `make dev` starts only the API today, and the landing page has no route to `/runs`. CI's `ui-browser` job sets up Node in `ci.yml`, so the browser test stops building inside the test.
-**Deps:** D1-05, D1-08, D1-09, D0-09. **Size:** M. **Run:** serial. **Files:** `README.md`, `tests/e2e/test_skeleton.py`, `scripts/dev.py`, `web/src/pages/home/index.tsx`.
+**Deps:** D1-05, D1-08, D1-09, D0-09. **Size:** M. **Run:** serial. **Files:** `README.md`, `tests/e2e/test_skeleton.py`, `scripts/dev.py`, `web/src/pages/home/index.tsx`, `web/src/pages/home/home.test.tsx`, `.github/workflows/ci.yml`, `tests/ui/test_ui_v0.py`.
 
 #### D1-11: Gate suite v1
 Create `tests/gates/` integrity suite with G1, G4, G10 and the single-approver cases of G3 and G5, in the gate-integrity job that feeds `ci-required`. Quorum cases come with D3-06.
@@ -528,7 +528,7 @@ Both are engine actions, so they are limited to what the graph allows. A patch b
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
 Records a test plan for what only a real IdP can prove: group list size, step-up and revocation.
 **AC:** bad signature, audience, expiry and issuer are refused; the Cognito-specific part is config only; the D12 test plan is written.
-**Deps:** D0-07, D1-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/oidc.py`, `src/sto/identity/fake_issuer.py`, `tests/identity/test_oidc.py`.
+**Deps:** D0-07, D1-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/__init__.py`, `tests/identity/__init__.py`, `src/sto/identity/oidc.py`, `src/sto/identity/fake_issuer.py`, `tests/identity/test_oidc.py`.
 
 #### D3-02: Group mapping and roles
 Store `(idp, group) -> (team, role)` as data, and resolve roles server-side on each request.
@@ -587,8 +587,8 @@ Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLA
 #### D3-09: DynamoDB store
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
 Atomicity uses `TransactWriteItems` with conditions.
-**AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction. The read that decides the head moved is strongly consistent.
-**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`.
+**AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction. The port refuses numbers below 1E-130 and empty object keys for every store, so a run cannot work locally and fail in production. The read that decides the head moved is strongly consistent.
+**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`, `tests/store/store_contract.py`, `tests/audit/test_writer_conformance.py`.
 
 #### D3-10: Indexed queries
 "My approvals", run lists, ticket lookup and PR lookup, all through indexes with pagination.
@@ -1748,7 +1748,7 @@ Record quality problems as issues for D14.
 #### D12-07: Verify engine and enforcement
 Run `TestState` and real callbacks on the interpreter. Try forbidden actions for real with session keys, Gateway auth and Cedar, including reaching another session's prefix and another team's data.
 The cross-team tests also try a real Slack and Jira resource binding once those are connected.
-**AC:** L7 and L8 confirmed or fixed; G14 live; D11-03 gaps closed.
+**AC:** L7 and L8 confirmed or fixed; G14 live; D11-03 gaps closed. A real `TransactionConflict` from live DynamoDB proves the retry contract in PLAN section 11: DynamoDB Local produced none at 32 threads by 150 iterations.
 **Deps:** D12-04, D11-03, D11-10. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_enforcement.py`, `docs/findings/enforcement.md`.
 
 #### D12-08: Verify sandbox
