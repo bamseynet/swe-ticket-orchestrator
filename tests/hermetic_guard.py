@@ -77,6 +77,17 @@ def _install_network_guard() -> None:
                 check_address(self.family, address)
                 return super().connect_ex(address)
 
+            def sendto(self, data: Any, *args: Any) -> Any:
+                # sendto(data, address) or sendto(data, flags, address)
+                check_address(self.family, args[-1] if args else None)
+                return super().sendto(data, *args)
+
+            def sendmsg(self, buffers: Any, *args: Any) -> Any:
+                # sendmsg(buffers[, ancdata[, flags[, address]]]); no address means connected
+                if len(args) > 2 and args[2] is not None:
+                    check_address(self.family, args[2])
+                return super().sendmsg(buffers, *args)
+
         return Guarded
 
     for module in (_socket, socket):
@@ -151,6 +162,9 @@ configure_calls = 0
 def pytest_configure(config: pytest.Config) -> None:
     global configure_calls  # noqa: PLW0603
     configure_calls += 1
+    # An exported variable must not open loopback for the whole session, including through an
+    # outer sitecustomize guard; only ``allow_loopback_bind`` may.
+    os.environ.pop("STO_TEST_ALLOW_LOOPBACK", None)
     root = Path(tempfile.mkdtemp(prefix="sto-hermetic-"))
     (root / "home").mkdir()
     (root / "site").mkdir()
@@ -161,6 +175,7 @@ def pytest_configure(config: pytest.Config) -> None:
         sockets=(socket.__dict__.copy(), _socket.__dict__.copy()),
     )
     _install_network_guard()
+    _socket.__dict__["_sto_guard_state"]["loopback"] = False
     for name in [n for n in os.environ if n.startswith("AWS_")]:
         del os.environ[name]
     os.environ.update(_sandbox_env(root))

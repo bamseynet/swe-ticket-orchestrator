@@ -270,3 +270,49 @@ def test_allow_loopback_bind_reaches_guarded_subprocesses(guarded: pytest.Pytest
         """
     )
     guarded.runpytest_subprocess().assert_outcomes(passed=1)
+
+
+def test_allow_loopback_bind_blocks_datagram_sends_off_loopback(guarded: pytest.Pytester) -> None:
+    guarded.makepyfile(
+        """
+        import socket
+        import pytest
+        from hermetic_guard import SocketBlockedError, allow_loopback_bind
+
+        def test_udp():
+            with allow_loopback_bind():
+                receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                receiver.bind(("127.0.0.1", 0))
+                sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sender.sendto(b"x", receiver.getsockname())
+                sender.sendmsg([b"y"], [], 0, receiver.getsockname())
+                with pytest.raises(SocketBlockedError):
+                    sender.sendto(b"x", ("1.1.1.1", 53))
+                with pytest.raises(SocketBlockedError):
+                    sender.sendto(b"x", 0, ("1.1.1.1", 53))
+                with pytest.raises(SocketBlockedError):
+                    sender.sendmsg([b"x"], [], 0, ("1.1.1.1", 53))
+                receiver.close()
+                sender.close()
+        """
+    )
+    guarded.runpytest_subprocess().assert_outcomes(passed=1)
+
+
+def test_exported_loopback_variable_does_not_open_the_session(
+    guarded: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guarded.makepyfile(
+        """
+        import os, socket
+        import pytest
+        from hermetic_guard import SocketBlockedError
+
+        def test_still_blocked():
+            assert "STO_TEST_ALLOW_LOOPBACK" not in os.environ
+            with pytest.raises(SocketBlockedError):
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """
+    )
+    monkeypatch.setenv("STO_TEST_ALLOW_LOOPBACK", "1")
+    guarded.runpytest_subprocess().assert_outcomes(passed=1)
