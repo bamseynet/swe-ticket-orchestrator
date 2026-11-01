@@ -142,6 +142,8 @@ GitHub Free allows 20 concurrent jobs, so 8 PRs at 11 jobs will queue. Path filt
 | 3 | D0-02, D0-06 | D0-03, D0-04, D0-08 |
 | 4 | - | D0-09, D0-10 |
 | 5 | - | D0-07 |
+| 6 | - | D0-08a, D0-09a |
+| 7 | - | D0-02a |
 
 #### D0-01: Python project skeleton
 Create `src/sto`, `pyproject.toml`, uv lock, ruff, mypy strict and pytest with a socket-blocking fixture.
@@ -202,6 +204,22 @@ A CI job reads a PR's issue ID, and compares touched files with that issue's `Fi
 This is what keeps "parallel" honest, because file lists were the weak point of the first plan.
 **AC:** an undeclared file fails with a message naming the issue; an override needs a label whose event actor is on a named list of humans, and a worker's own label is ignored; touching a serial area needs that issue to be marked serial.
 **Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `scripts/check_scope.py`, `tests/scripts/test_check_scope.py`, `.github/workflows/ci.yml`.
+
+#### D0-02a: make dev-lan
+`make dev-lan` binds the dev servers to the LAN, printing a warning first; `make dev` stays on loopback. Split out of D0-02 because no server existed yet.
+It reuses the ports and overrides from `scripts/doctor.py` (8710 API, 5710 web; `STO_API_PORT`, `STO_WEB_PORT`).
+**AC:** `make dev-lan` binds to 0.0.0.0 and warns first; `make dev` stays on loopback; port overrides apply.
+**Deps:** D1-08. **Size:** S. **Run:** serial. **Files:** `Makefile`, `scripts/dev.py`, `tests/scripts/test_dev.py`.
+
+#### D0-08a: Tier guard, remaining Docker launch gaps
+Close three gaps left after D0-08's review: a backtick or `$(docker ...)` inside a `shell=True` string, `Popen(..., executable="docker")`, and `xargs` as a wrapper.
+**AC:** each form raises `TierViolationError`, with one test each; the harmless commands from D0-08's review (`grep -r docker`, `echo "fix firefox"` and so on) stay allowed.
+**Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `tests/tier_guard.py`, `tests/test_tiers.py`.
+
+#### D0-09a: e2e tier
+Add an `e2e` marker and a `tests/e2e/` directory tier to the tier guard (CI only, deselected locally), and switch the e2e job from a path selection to `-m e2e`.
+**AC:** an unmarked test under `tests/e2e/` is in the e2e tier; e2e tests are deselected locally; the CI e2e job selects by marker and still runs its smoke test.
+**Deps:** D0-09, D0-08a. **Size:** S. **Run:** serial. **Files:** `tests/tier_guard.py`, `tests/test_tiers.py`, `.github/workflows/ci.yml`.
 
 ---
 

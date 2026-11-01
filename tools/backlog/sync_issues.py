@@ -33,7 +33,7 @@ SIZES = ("S", "M", "L")
 RUNS = ("parallel", "serial")
 NEEDS_PETER_IDS = {"D0-05", "D4-24"}
 LIVE_STAGES = {"D12", "D14"}
-ID_RE = r"D\d+-\d+"
+ID_RE = r"D\d+-\d+[a-z]?(?![a-z0-9])"
 TYPES = ("feature", "test", "infra", "docs", "security")
 SLEEP_AFTER_WRITE = 1.0
 
@@ -527,8 +527,15 @@ def list_issues(gh: GH, repo: str) -> dict[str, dict]:
     return found
 
 
+def _order_key(i: Issue) -> tuple[int, int, str]:
+    """Sort D0-08 before D0-08a before D0-09."""
+    m = re.fullmatch(r"D\d+-(\d+)([a-z]?)", i.id)
+    assert m, i.id
+    return (int(i.stage[1:]), int(m.group(1)), m.group(2))
+
+
 def ordered(doc: Doc) -> list[Issue]:
-    return sorted(doc.issues, key=lambda i: (int(i.stage[1:]), int(i.id.split("-")[1])))
+    return sorted(doc.issues, key=_order_key)
 
 
 def sync_issues(
