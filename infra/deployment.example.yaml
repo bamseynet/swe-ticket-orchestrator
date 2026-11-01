@@ -1,0 +1,5 @@
+# Typed deployment config (PLAN 16.1). Names, Regions and profiles are parameters.
+# No account IDs live in the repo: the account comes from the CDK environment.
+name: sto
+region: eu-west-1
+profile: dev
