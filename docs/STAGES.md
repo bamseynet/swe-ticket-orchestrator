@@ -372,8 +372,8 @@ Maps merge, lists replace and `null` removes. A value below a floor gets an erro
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`.
-**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `tests/config/test_validate_structure.py`.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them.
+**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `tests/config/test_validate_structure.py`.
 
 #### D2-04: Gate dominance proof
 Implement V4, V5, V6, V11 and V14 by edge-removal reachability on the stage graph, deriving code-changing stages from the manifest, and V6's clause scoped to merges reachable with QA approvals removed.
@@ -384,7 +384,7 @@ This is the static generalisation of the LangGraph PoC's topology test, and it a
 #### D2-05: Bundled templates
 Ship `standard` as the template, and Kanban and regulated as overlays on it, each with a README.
 All later suites run against all of them.
-**AC:** all validate; each has a README on when to use it, and which checks to require; PLAN.md examples match, or a test explains why not.
+**AC:** all validate; each has a README on when to use it, and which checks to require; PLAN.md examples match, or a test explains why not. The bundled policy names the `pre_push` and custom surfaces.
 **Deps:** D2-02, D2-03, D2-04. **Size:** S. **Run:** parallel. **Files:** `templates/`, `tests/config/test_templates.py`.
 
 #### D2-06: Reducer v1
@@ -396,7 +396,7 @@ It replaces the hard-coded path, with no behaviour change to the gate suite. `wa
 #### D2-07: Publishing and pinning
 Publishing stores a flattened, immutable version with a manifest digest over workflow, profiles, effects and prompts, and a run pins that digest at start.
 Old manifests stay addressable by hash, so a changed profile cannot strand a run.
-**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too. Publish has a document size limit, because the loader has none.
+**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too. Publish has a document size limit, because the loader has none. Publish calls V17 with the team of the scope being published to, never a team named in the file.
 **Deps:** D2-02, D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/publish.py`, `tests/config/test_publish.py`.
 
 #### D2-08: Subject and rounds
@@ -465,7 +465,7 @@ Duplicate active runs and tickets matching two workflows start nothing, and a no
 #### D2-19: Run migration
 Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage and meets `OrgPolicy.teams`, and it is audited.
 An `apiVersion` change comes with a migration rule, tested here.
-**AC:** migration to an invalid position is refused; migration onto a version lacking an org-required gate is refused; `POST /runs/{id}:migrate` is enforced by role; a stored older run migrates in a test.
+**AC:** migration to an invalid position is refused; migration onto a version lacking an org-required gate is refused; `POST /runs/{id}:migrate` is enforced by role; a stored older run migrates in a test. Migration re-runs V17 and the `min_quorum` check against the live `OrgPolicy`.
 **Deps:** D2-07, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/config/migrate.py`, `src/sto/api/routers/migrate.py`, `tests/config/test_migrate.py`.
 
 #### D2-20: State compatibility
@@ -533,7 +533,7 @@ Records a test plan for what only a real IdP can prove: group list size, step-up
 #### D3-02: Group mapping and roles
 Store `(idp, group) -> (team, role)` as data, and resolve roles server-side on each request.
 Custom gate roles are declared per team.
-**AC:** a changed mapping applies on next request; an unmapped user has no access; a disabled user is refused immediately; custom roles work.
+**AC:** a changed mapping applies on next request; an unmapped user has no access; a disabled user is refused immediately; custom roles work. Mapping a team group to `org_admin` is refused.
 **Deps:** D3-01, D1-01. **Size:** S. **Run:** parallel. **Files:** `src/sto/identity/mapping.py`, `tests/identity/test_mapping.py`.
 
 #### D3-03: Authorization middleware
@@ -557,7 +557,7 @@ An admin who changed a mapping, attributed a commit or cleared an exclusion is i
 #### D3-06: Quorum and veto
 Quorum per role, one vote per person, and veto by any negative decision, replacing the v0 decision path. All surfaces use it.
 Negative decisions are exempt from the digest match, and a moved subject drops earlier votes.
-**AC:** G3 by every commit order; a per-role quorum needs each role; votes drop on a ticket edit; required comments are enforced. Contention in `service.py:308-309` and `open_gate` raises `GateContentionError`, not `ConditionFailedError`.
+**AC:** G3 by every commit order; a per-role quorum needs each role; votes drop on a ticket edit; required comments are enforced. Duplicate roles in a quorum are refused, so one role cannot count twice. Contention in `service.py:308-309` and `open_gate` raises `GateContentionError`, not `ConditionFailedError`.
 **Deps:** D3-05, D2-08. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_decisions.py`.
 
 #### D3-07: Eligibility display and escalation
@@ -587,7 +587,7 @@ Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLA
 #### D3-09: DynamoDB store
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
 Atomicity uses `TransactWriteItems` with conditions.
-**AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction.
+**AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction. The read that decides the head moved is strongly consistent.
 **Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`.
 
 #### D3-10: Indexed queries
@@ -629,7 +629,7 @@ Without this, a Slack or GitHub decision has no meaningful identity.
 #### D3-16: Eligibility and surface checks
 At decision time: a role in `eligible_roles` then and now, the surface permitted by the gate and `OrgPolicy`, and a fresh identity. A gate snapshots eligibility when it opens.
 This plugs into the D1-06 hook points.
-**AC:** a mapping change does not apply to an open gate; an approver who loses eligibility is refused, and their vote stops counting; a forbidden surface is refused live on a pinned run.
+**AC:** a mapping change does not apply to an open gate; an approver who loses eligibility is refused, and their vote stops counting; a forbidden surface is refused live on a pinned run. V17 and `min_quorum` are re-checked live, so a floor tightened after publish refuses a decision on a pinned run that no longer meets it.
 **Deps:** D3-06, D3-15. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/eligibility.py`, `tests/gates/test_eligibility.py`.
 
 #### D3-17: Write conflicts and concurrency
@@ -694,7 +694,7 @@ It is written once, and every adapter in every later stage runs it.
 First part of an in-process fake: App auth, tokens, signatures, deliveries, pagination, rate limits and errors.
 Each behaviour is documented with its source URL, and the live suite later proves it.
 **AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every fake then passes its port's sections. Checks in `tests/contract/suite.py`, which this issue may change: the running adapter must be a class really defined under `sto.`, and an adapter with no port exposes none of the ports' write methods (naming a different real class stays a known limit); `forge()` is consistent across kinds, so signatures differ, the truncated MAC is a prefix of the genuine one and the blank one is empty; harness self-checks catch a no-op `restart()` or `plant_foreign_marker`; a silent page cap of 34 or more fails, seeding deeper as needed; a declared vendor must match the adapter's module path. Dedupe does not expire for this fake, as D4-03 rules.
-**Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
+**Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`, `tests/fakes/__init__.py`, `tests/fakes/github/__init__.py`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-02: Credential broker and GitHub auth port
 `CredentialBroker` port on the signer port from D1-13. No human step and no real App, so no offline work waits on a person.
@@ -1271,7 +1271,7 @@ Everything in `web/` uses it, and no page writes its own fetch.
 #### D9-03: Team APIs
 Routers for teams, members, mappings, connections and notification routes.
 Each is enforced by the D3-03 matrix, and secrets are write-only.
-**AC:** tenancy tests pass on new routes; inputs are validated; every change is audited.
+**AC:** tenancy tests pass on new routes; inputs are validated; every change is audited, `TeamConfig` writes included. This router keeps the registry of teams and their tags that `OrgPolicy.teams` resolves against.
 **Deps:** D3-03. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/teams.py`, `tests/api/test_teams.py`.
 
 #### D9-19: Workflow and spend APIs
@@ -1283,8 +1283,8 @@ Validation here returns the same errors as the CLI.
 #### D9-20: Audit, org and resource APIs
 Routers for audit search and export, org policy, resource bindings, sandbox images, model catalog and kill switch.
 Only auditors and org admins can reach them, by role.
-**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier; a complete export does not depend on a run list the caller chose.
-**Deps:** D3-03, D3-08, D10-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/audit.py`, `src/sto/api/routers/org.py`, `tests/api/test_audit_org.py`.
+**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier; a complete export does not depend on a run list the caller chose. Every `OrgPolicy` write is audited. `OrgPolicy.teams` is keyed by team or tag (PLAN.md), so reads resolve a team's tags as well as its name, and a write naming a team or tag that is not in the D9-03 registry is refused: a typo there would otherwise enforce nothing, silently.
+**Deps:** D3-03, D3-08, D9-03, D10-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/audit.py`, `src/sto/api/routers/org.py`, `src/sto/config/org_policy.py`, `tests/api/test_audit_org.py`.
 
 #### D9-04: Live updates hook
 Cursor-based event reading with backoff, and an optional nudge channel port.
