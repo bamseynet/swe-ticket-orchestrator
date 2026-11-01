@@ -15,7 +15,6 @@ from .ports import (
     MAIN,
     Absent,
     Addr,
-    Check,
     Condition,
     ConditionFailedError,
     Delete,
@@ -25,6 +24,7 @@ from .ports import (
     Key,
     Op,
     Page,
+    Prepared,
     Put,
     Scope,
     VersionIs,
@@ -77,9 +77,9 @@ class MemoryStore:
         cursor: str | None = None,
     ) -> Page:
         require_scope(scope)
-        check_query_args(pk, limit, table)
-        after = None if cursor is None else decode_cursor(cursor)
+        check_query_args(pk, limit, table, sk_prefix)
         partition = resolve(scope, Key(pk, "-", table)).partition
+        after = None if cursor is None else decode_cursor(cursor, partition, table, pk, sk_prefix)
         with self._lock:
             matching = sorted(
                 (
@@ -95,33 +95,30 @@ class MemoryStore:
             if limit is not None:
                 matching = matching[:limit]
             items = tuple(c for i in matching if (c := self._copy(i)) is not None)
-        return Page(items, encode_cursor(items[-1].key.sk) if more else None)
+        return Page(
+            items,
+            encode_cursor(partition, table, pk, sk_prefix, items[-1].key.sk) if more else None,
+        )
 
     def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
         require_scope(scope)
         ops = tuple(ops)
-        addrs = validate_ops(scope, ops)
+        prepared = validate_ops(scope, ops)
         with self._lock:
             failed = [
-                i
-                for i, (op, addr) in enumerate(zip(ops, addrs, strict=True))
-                if not _holds(op.when, self._items.get(addr))
+                i for i, p in enumerate(prepared) if not _holds(p.op.when, self._items.get(p.addr))
             ]
             if failed:
                 raise ConditionFailedError(failed)
             # Build every write first and only then apply, so nothing can fail half way.
             writes: dict[Addr, Item | None] = {}
-            for op, addr in zip(ops, addrs, strict=True):
-                match op:
-                    case Put(key=k, data=d):
+            for p in prepared:
+                match p:
+                    case Prepared(op=Put(key=k), addr=addr, data=d) if d is not None:
                         old = self._items.get(addr)
-                        writes[addr] = Item(
-                            k, copy.deepcopy(d), 1 if old is None else old.version + 1
-                        )
-                    case Delete():
+                        writes[addr] = Item(k, d, 1 if old is None else old.version + 1)
+                    case Prepared(op=Delete(), addr=addr):
                         writes[addr] = None
-                    case Check():
-                        pass
             for addr, new in writes.items():
                 if new is None:
                     self._items.pop(addr, None)

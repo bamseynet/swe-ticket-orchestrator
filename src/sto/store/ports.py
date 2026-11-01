@@ -16,7 +16,8 @@ with conditions on the version counter or a status field. One contract suite
   explicit ``PlatformScope``, so reaching one is visible and grep-able at the call site. A store
   addresses items only inside the scope's partition, so no call can cross teams.
 * Items live in a ``table`` (``MAIN`` or ``AUDIT``; ADR-0017), so a decision, its audit event
-  and the outbox entry can commit in one transaction (PLAN 4.3 rule 6).
+  and the outbox entry can commit in one transaction (PLAN 4.3 rule 6). The audit table is
+  append-only: only ``Put`` with ``Absent()`` (and ``Check``) are allowed on it.
 * A transaction is all or nothing. Any failed condition raises ``ConditionFailedError`` and
   nothing is applied.
 """
@@ -26,10 +27,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from sto.domain.errors import PermanentError, TransientError
 
@@ -41,6 +43,7 @@ MAX_TRANSACTION_BYTES = 4 * 1024 * 1024
 MAX_PK_BYTES = 2048
 MAX_SK_BYTES = 1024
 _MAX_NUMBER = 10**38
+_MAX_DEPTH = 64
 
 MAIN = "main"
 AUDIT = "audit"
@@ -79,6 +82,8 @@ class TeamScope:
             raise ValueError("team must not be blank")
         if self.team != self.team.strip():
             raise ValueError("team must not have surrounding whitespace")
+        if any(unicodedata.category(c).startswith("C") for c in self.team):
+            raise ValueError("team must not contain control characters")
         if "#" in self.team:
             # PLAN 11 keys are TEAM#t#pk: a '#' in t would let team "a" with pk "b#x" read
             # the items of team "a#b".
@@ -87,11 +92,14 @@ class TeamScope:
 
 @dataclass(frozen=True)
 class PlatformScope:
-    """Partitions that belong to no team (ORG, REPO#r, MANIFEST#digest, HOOK#...). Using it is a
-    deliberate, visible choice; team data never goes through it."""
+    """Partitions that belong to no team: ORG, USER#u, MANIFEST#digest, REPO#r and HOOK#...
+    (``PLATFORM_PREFIXES``). Using it is a deliberate, visible choice, and a key outside that
+    list is refused, so team data cannot go through it. Restricting who may write these from a
+    team's transaction is the auth layer's job (D3)."""
 
 
 PLATFORM = PlatformScope()
+PLATFORM_PREFIXES = ("ORG", "USER#", "MANIFEST#", "REPO#", "HOOK#")
 Scope = TeamScope | PlatformScope
 
 
@@ -165,9 +173,19 @@ def resolve(scope: Scope, key: Key, override: PlatformScope | None = None) -> Ad
     if override is not None:
         scope = require_scope(override)
     if isinstance(scope, TeamScope):
+        # A shared table stores the pk as TEAM#<team>#<pk>, so the prefix counts against the limit.
+        if len(f"TEAM#{scope.team}#".encode()) + len(key.pk.encode()) > MAX_PK_BYTES:
+            raise ValueError(
+                f"key pk is longer than {MAX_PK_BYTES} bytes once prefixed with the team"
+            )
         return Addr(f"TEAM#{scope.team}", key.table, key.pk, key.sk)
-    if key.pk.startswith("TEAM#"):  # would collide with a team's partition on a shared table
-        raise ValueError("platform partition keys must not start with 'TEAM#'")
+    if not any(
+        key.pk == p or key.pk.startswith(p if p.endswith("#") else p + "#")
+        for p in PLATFORM_PREFIXES
+    ):
+        raise ValueError(
+            f"platform key must start with one of {PLATFORM_PREFIXES}; team data needs a TeamScope"
+        )
     return Addr("PLATFORM", key.table, key.pk, key.sk)
 
 
@@ -177,21 +195,36 @@ def require_key(key: object) -> Key:
     return key
 
 
-def encode_cursor(sk: str) -> str:
-    return base64.urlsafe_b64encode(sk.encode("utf-8")).decode("ascii")
+def encode_cursor(partition: str, table: str, pk: str, sk_prefix: str, last_sk: str) -> str:
+    """Opaque cursor bound to the query that made it (partition, table, pk, prefix)."""
+    raw = json.dumps([partition, table, pk, sk_prefix, last_sk], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
 
 
-def decode_cursor(cursor: str) -> str:
+def decode_cursor(cursor: object, partition: str, table: str, pk: str, sk_prefix: str) -> str:
+    """The sort key to continue after. Refuses anything malformed, and any cursor made by a
+    different query or team, instead of silently restarting or skipping."""
     try:
-        return base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
-    except (binascii.Error, UnicodeError, AttributeError) as exc:
-        raise ValueError("invalid cursor") from exc
+        if not isinstance(cursor, str):
+            raise TypeError
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        parts = json.loads(raw.decode("utf-8"))
+        ok = isinstance(parts, list) and len(parts) == 5 and all(isinstance(p, str) for p in parts)
+    except (TypeError, ValueError, binascii.Error):  # includes JSON and Unicode errors
+        raise ValueError("invalid cursor") from None
+    if not ok:
+        raise ValueError("invalid cursor")
+    if parts[:4] != [partition, table, pk, sk_prefix]:
+        raise ValueError("cursor belongs to a different query")
+    return str(parts[4])
 
 
 # --- data -------------------------------------------------------------------------------------
 
 
-def _validate(value: object) -> None:
+def _validate(value: object, depth: int = 0) -> None:
+    if depth > _MAX_DEPTH:  # also stops a self-referencing dict before it hits RecursionError
+        raise TypeError("data must be plain JSON: nested too deeply (or cyclic)")
     if value is None or isinstance(value, str | bool):
         return
     if isinstance(value, int):
@@ -202,12 +235,12 @@ def _validate(value: object) -> None:
             raise TypeError("data must be plain JSON: number out of range")
     elif isinstance(value, list | tuple):
         for v in value:
-            _validate(v)
+            _validate(v, depth + 1)
     elif isinstance(value, dict):
         for k, v in value.items():
             if not isinstance(k, str):
                 raise TypeError("data must be plain JSON: object keys must be strings")
-            _validate(v)
+            _validate(v, depth + 1)
     else:
         raise TypeError(f"data must be plain JSON, not {type(value).__name__}")
 
@@ -234,8 +267,12 @@ def canonical_data(data: object) -> dict[str, Any]:
     return result
 
 
-def _serialized_size(data: dict[str, Any]) -> int:
-    return len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+def _item_size(key: Key, data: dict[str, Any]) -> int:
+    size = len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    size += len(key.pk.encode()) + len(key.sk.encode())
+    if size > MAX_ITEM_BYTES:
+        raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
+    return size
 
 
 # --- conditions -------------------------------------------------------------------------------
@@ -313,11 +350,8 @@ class Put:
         _check_condition(self.when, required=False)
         _check_op_scope(self.scope)
         data = canonical_data(self.data)  # a private copy: later caller mutation cannot reach it
-        size = _serialized_size(data) + len(self.key.pk.encode()) + len(self.key.sk.encode())
-        if size > MAX_ITEM_BYTES:
-            raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
         object.__setattr__(self, "data", data)
-        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "size", _item_size(self.key, data))
 
 
 @dataclass(frozen=True)
@@ -356,15 +390,25 @@ def _check_op_scope(scope: object) -> None:
         raise TypeError("an operation's scope may only be a PlatformScope")
 
 
-def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Addr, ...]:
+class Prepared(NamedTuple):
+    """One validated operation: its resolved address, and for a ``Put`` a fresh canonical copy of
+    the data taken now (so mutation of ``op.data`` after construction cannot slip through)."""
+
+    op: Op
+    addr: Addr
+    data: dict[str, Any] | None
+
+
+def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Prepared, ...]:
     """Shape rules every store shares (DynamoDB refuses these, so the fast stores must too).
-    Returns each operation's resolved address."""
+    Raises before anything is applied."""
     if not ops:
         raise ValueError("a transaction needs at least one operation")
     if len(ops) > MAX_TRANSACTION_OPS:
         raise ValueError(f"a transaction takes at most {MAX_TRANSACTION_OPS} operations")
     seen: set[Addr] = set()
     total = 0
+    prepared: list[Prepared] = []
     for op in ops:
         if not isinstance(op, Put | Delete | Check):
             raise TypeError(f"not an operation: {op!r}")
@@ -372,15 +416,24 @@ def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Addr, ...]:
         if addr in seen:
             raise ValueError(f"item {op.key} appears more than once in a transaction")
         seen.add(addr)
+        if op.key.table == AUDIT and (
+            isinstance(op, Delete) or (isinstance(op, Put) and op.when != Absent())
+        ):
+            raise ValueError("the audit table is append-only: only Put with Absent() is allowed")
+        data = None
         if isinstance(op, Put):
-            total += op.size
+            data = canonical_data(op.data)
+            total += _item_size(op.key, data)
+        prepared.append(Prepared(op, addr, data))
     if total > MAX_TRANSACTION_BYTES:
         raise ValueError(f"transaction is {total} bytes; the limit is {MAX_TRANSACTION_BYTES}")
-    return tuple(resolve(scope, op.key, op.scope) for op in ops)
+    return tuple(prepared)
 
 
-def check_query_args(pk: object, limit: int | None, table: str) -> None:
+def check_query_args(pk: object, limit: int | None, table: str, sk_prefix: object) -> None:
     _check_part("pk", pk, MAX_PK_BYTES)
+    if not isinstance(sk_prefix, str):
+        raise TypeError(f"sk_prefix must be a str, not {type(sk_prefix).__name__}")
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("limit must be a positive int")
     if table not in TABLES:

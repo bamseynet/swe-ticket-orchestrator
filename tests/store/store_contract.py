@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from collections.abc import Callable
 from enum import StrEnum
 
 import pytest
@@ -32,6 +33,7 @@ from sto.store.ports import (
     Put,
     Store,
     TeamScope,
+    TransactionConflictError,
     VersionIs,
 )
 
@@ -58,11 +60,15 @@ def race_claims(store: Store, *, threads: int = 8, rounds: int = 40) -> list[int
                 n: int, key: Key = key, wins: list[int] = wins, b: threading.Barrier = barrier
             ) -> None:
                 b.wait()
-                try:
-                    store.transact(A, [Put(key, {"owner": n}, when=VersionIs(1))])
-                    wins.append(n)
-                except ConditionFailedError:
-                    pass
+                while True:
+                    try:
+                        store.transact(A, [Put(key, {"owner": n}, when=VersionIs(1))])
+                        wins.append(n)
+                    except TransactionConflictError:
+                        continue  # a DynamoDB store reports a conflict like this: retry
+                    except ConditionFailedError:
+                        pass
+                    return
 
             pool = [threading.Thread(target=claim, args=(n,)) for n in range(threads)]
             for t in pool:
@@ -391,12 +397,12 @@ class StoreContract:
         assert store.query(A, "REPO#r").items == ()
 
     def test_platform_keys_cannot_impersonate_a_team_partition(self, store: Store) -> None:
-        with pytest.raises(ValueError, match="TEAM#"):
+        with pytest.raises(ValueError, match="platform"):
             store.put(PLATFORM, Key("TEAM#team-a#RUN#1", "META"), {})
 
     def test_the_audit_table_is_separate_from_the_main_table(self, store: Store) -> None:
         store.put(A, Key("RUN#1", "1"), {"t": "main"})
-        store.put(A, Key("RUN#1", "1", AUDIT), {"t": "audit"})
+        store.put(A, Key("RUN#1", "1", AUDIT), {"t": "audit"}, when=Absent())
         main, audit = store.get(A, Key("RUN#1", "1")), store.get(A, Key("RUN#1", "1", AUDIT))
         assert main is not None
         assert audit is not None
@@ -425,7 +431,7 @@ class StoreContract:
                 [
                     Put(GATE, {"status": "late"}),
                     Check(Key("ORG", "SWITCH"), FieldEquals("merge", "off"), scope=PLATFORM),
-                    Put(Key("RUN#1", "SEQ#2", AUDIT), {"event": "late"}),
+                    Put(Key("RUN#1", "SEQ#2", AUDIT), {"event": "late"}, when=Absent()),
                 ],
             )
         assert caught.value.failed == (1,)
@@ -435,8 +441,9 @@ class StoreContract:
         assert store.get(A, Key("RUN#1", "SEQ#2", AUDIT)) is None
 
     def test_same_key_in_different_partitions_is_not_a_duplicate(self, store: Store) -> None:
-        store.transact(A, [Put(RUN, {"o": "team"}), Put(RUN, {"o": "platform"}, scope=PLATFORM)])
-        assert store.get(PLATFORM, RUN) is not None
+        org = Key("ORG", "META")
+        store.transact(A, [Put(org, {"o": "team"}), Put(org, {"o": "platform"}, scope=PLATFORM)])
+        assert store.get(PLATFORM, org) is not None
 
     # data normalization
 
@@ -576,3 +583,123 @@ class StoreContract:
 
     def test_simultaneous_claims_have_exactly_one_winner(self, store: Store) -> None:
         assert race_claims(store) == [1] * 40
+
+    # --- review pass 2 ------------------------------------------------------------------------
+
+    # the audit table is append-only (ADR-0017)
+
+    def test_audit_items_can_only_be_appended(self, store: Store) -> None:
+        ev = Key("RUN#1", "SEQ#1", AUDIT)
+        store.put(A, ev, {"e": "real"}, when=Absent())
+        attempts: tuple[Callable[[], None], ...] = (
+            lambda: store.put(A, ev, {"e": "forged"}),
+            lambda: store.put(A, ev, {"e": "forged"}, when=Exists()),
+            lambda: store.put(A, ev, {"e": "forged"}, when=VersionIs(1)),
+            lambda: store.delete(A, ev),
+            lambda: store.delete(A, ev, when=VersionIs(1)),
+            lambda: store.transact(A, [Put(RUN, {}), Delete(ev)]),
+        )
+        for attempt in attempts:
+            with pytest.raises(ValueError, match="append-only"):
+                attempt()
+        got = store.get(A, ev)
+        assert got is not None
+        assert got.data == {"e": "real"}
+        assert store.get(A, RUN) is None  # the refused transaction applied nothing
+        with pytest.raises(ConditionFailedError):  # an append over an existing event fails
+            store.put(A, ev, {"e": "again"}, when=Absent())
+        store.transact(A, [Check(ev, Exists())])  # reading conditions stay allowed
+
+    # platform scope is closed to team data
+
+    def test_platform_scope_refuses_keys_outside_its_partitions(self, store: Store) -> None:
+        store.put(A, Key("TEAM#team-a#RUN#1", "META"), {"owner": "a"})
+        store.put(A, RUN, {"owner": "a"})
+        for key in (
+            Key("TEAM#team-a#RUN#1", "META"),
+            RUN,
+            Key("TEAM#team-a", "x"),
+            Key("ORGX", "x"),
+        ):
+            with pytest.raises(ValueError, match="platform"):
+                store.get(PLATFORM, key)
+            with pytest.raises(ValueError, match="platform"):
+                store.query(PLATFORM, key.pk)
+            with pytest.raises(ValueError, match="platform"):
+                store.delete(PLATFORM, key)
+            with pytest.raises(ValueError, match="platform"):
+                store.transact(PLATFORM, [Check(key, Exists())])
+            with pytest.raises(ValueError, match="platform"):
+                store.transact(A, [Put(key, {}, scope=PLATFORM)])
+        assert store.get(A, RUN) is not None
+        for pk in ("ORG", "ORG#x", "USER#u", "MANIFEST#d", "REPO#r", "HOOK#slack#1"):
+            store.put(PLATFORM, Key(pk, "x"), {})
+
+    # key limits count the team prefix
+
+    def test_pk_limit_counts_the_team_prefix(self, store: Store) -> None:
+        room = 2048 - len("TEAM#team-a#")
+        store.put(A, Key("p" * room, "s"), {})
+        with pytest.raises(ValueError, match="pk"):
+            store.put(A, Key("p" * (room + 1), "s"), {})
+        with pytest.raises(ValueError, match="pk"):
+            store.get(A, Key("p" * 2048, "s"))
+        with pytest.raises(ValueError, match="pk"):
+            store.query(A, "p" * 2048)
+
+    def test_team_names_refuse_control_characters(self, store: Store) -> None:
+        for bad in ("a\x00b", "a\nb", "a\x7fb"):
+            with pytest.raises(ValueError, match="control"):
+                TeamScope(bad)
+
+    # queries and cursors
+
+    def test_sk_prefix_must_be_a_string_even_for_an_empty_result(self, store: Store) -> None:
+        for prefix in (None, 1, b"x"):
+            with pytest.raises(TypeError, match="sk_prefix"):
+                store.query(A, "EMPTY", sk_prefix=prefix)  # type: ignore[arg-type]
+
+    def test_cyclic_data_is_a_type_error(self, store: Store) -> None:
+        loop: dict[str, object] = {}
+        loop["self"] = loop
+        with pytest.raises(TypeError, match="JSON"):
+            store.put(A, RUN, loop)
+
+    def test_data_mutated_after_construction_is_caught_before_anything_applies(
+        self, store: Store
+    ) -> None:
+        sneaky = Put(Key("P", "2"), {"x": 1})
+        sneaky.data["x"] = object()
+        with pytest.raises(TypeError, match="JSON"):
+            store.transact(A, [Put(Key("P", "1"), {"ok": 1}), sneaky])
+        assert store.query(A, "P").items == ()
+
+    def _cursor(self, store: Store, scope: TeamScope, pk: str) -> str:
+        for i in range(5):
+            store.put(scope, Key(pk, f"S#{i}"), {"i": i})
+        page = store.query(scope, pk, limit=2)
+        assert page.cursor is not None
+        return page.cursor
+
+    def test_a_cursor_only_works_for_the_query_that_made_it(self, store: Store) -> None:
+        cur = self._cursor(store, A, "P")
+        for i in range(5):
+            store.put(A, Key("Q", f"S#{i}"), {})
+            store.put(B, Key("P", f"S#{i}"), {})
+        assert len(store.query(A, "P", cursor=cur).items) == 3  # the same query: fine
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(A, "Q", cursor=cur)  # another partition
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(B, "P", cursor=cur)  # another team
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(A, "P", sk_prefix="S#", cursor=cur)  # another prefix
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(A, "P", table=AUDIT, cursor=cur)  # another table
+
+    def test_malformed_cursors_are_refused_not_restarted(self, store: Store) -> None:
+        self._cursor(store, A, "P")
+        for bad in ("", "!!!!", "====", "YWJj", "YWJj=", " ", "e30=", "W10="):
+            with pytest.raises(ValueError, match="cursor"):
+                store.query(A, "P", cursor=bad)
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(A, "P", cursor=123)  # type: ignore[arg-type]
