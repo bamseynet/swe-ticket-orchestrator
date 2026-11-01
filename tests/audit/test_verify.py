@@ -28,7 +28,7 @@ from sto.engine.commands import OpenGate
 from sto.gates.hooks import ChainedAuditWriter, entry_hash
 from sto.gates.service import GateService
 from sto.store.memory import MemoryStore
-from sto.store.ports import AUDIT, Absent, Key, Put, TeamScope
+from sto.store.ports import AUDIT, Absent, Key, Put, TeamScope, VersionIs
 
 RUNS = [RUN, RUN2]
 Entries = list[dict[str, Any]]
@@ -373,3 +373,83 @@ def test_the_first_commit_landing_between_head_and_entries_is_not_tamper() -> No
 
     store.armed = first
     assert verify_run(store, TEAM, RUN) == 1
+
+
+# --- entries past the head ----------------------------------------------------------------------
+
+
+def _rolled_back(keep: int) -> MemoryStore:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3, 4, 5, 6, 7, 8])
+    entries = audit_items(store, RUN)
+    old = store.get(TEAM, Key(f"RUN#{RUN}", "CHAIN"))
+    assert old is not None
+    last = entries[keep - 1]
+    store.transact(
+        TEAM,
+        [Put(old.key, {"seq": last["seq"], "hash": last["hash"]}, VersionIs(old.version))],
+    )
+    return store
+
+
+def test_a_head_rolled_back_behind_the_entries_fails_and_signs_nothing() -> None:
+    store = _rolled_back(5)
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        verify_run(store, TEAM, RUN)
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+
+
+def test_a_junk_entry_past_the_head_is_not_clean() -> None:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3])
+    store.transact(TEAM, [Put(Key(f"RUN#{RUN}", f"{4:012d}", AUDIT), {"junk": "x"}, Absent())])
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        verify_run(store, TEAM, RUN)
+
+
+def test_a_head_with_the_right_hash_and_a_wrong_count_fails() -> None:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3])
+    entries = audit_items(store, RUN)
+    old = store.get(TEAM, Key(f"RUN#{RUN}", "CHAIN"))
+    assert old is not None
+    store.transact(
+        TEAM,
+        [Put(old.key, {"seq": 4, "hash": entries[-1]["hash"]}, VersionIs(old.version))],
+    )
+    with pytest.raises(AuditVerificationError, match="head does not match"):
+        verify_run(store, TEAM, RUN)
+
+
+def test_a_commit_that_lands_after_the_head_read_is_still_not_a_false_alarm() -> None:
+    """The entry past the head we read is genuine: the head moved on while we were looking."""
+    store, commit = racy_world()
+    n = len(audit_items(store, RUN))
+    store.armed = commit
+    assert verify_run(store, TEAM, RUN) == n
+
+
+# --- signatures are checked once ----------------------------------------------------------------
+
+
+def test_verify_team_checks_each_signature_once() -> None:
+    class Counting:
+        calls = 0
+
+        def verify(self, message: bytes, signature: Any) -> bool:
+            Counting.calls += 1
+            return signer().verify(message, signature)
+
+        def public_keys(self) -> list[Any]:
+            return []
+
+    from sto.domain import RunId
+
+    store = MemoryStore()
+    runs = [RunId.parse(f"01J0000000000000000000000{i}") for i in range(1, 6)]
+    for r in runs:
+        append(store, r, [1])
+    cps = [create_checkpoint(store, TEAM, signer(), runs, at=i, previous=[]) for i in range(3)]
+    verify_team(store, TEAM, runs, checkpoints=cps, verifier=Counting())
+    assert Counting.calls == 3

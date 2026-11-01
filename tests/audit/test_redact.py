@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import types
@@ -27,14 +26,27 @@ PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY-----"
 PAT = "github_pat_" + "11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz0123456789"
 SK = "sk-" + "mallorymallorymallorymallory"
 GL = "glpat-" + "abcdefghijklmnopqrst"
+RK = "rk_live_" + "abcdefghijklmnopqrstuvwx"
 STRIPE = "sk_live_" + "abcdefghijklmnopqrstuvwx"
 ASIA = "ASIA" + "ABCDEFGHIJKLMNOP"
 
 
 @pytest.mark.parametrize(
     "secret",
-    [GH, AWS, ASIA, SLACK, JWT, PEM, PAT, SK, GL, STRIPE],
-    ids=["ghp", "AKIA", "ASIA", "slack", "jwt", "pem", "github_pat", "sk-", "glpat", "stripe"],
+    [GH, AWS, ASIA, SLACK, JWT, PEM, PAT, SK, GL, STRIPE, RK],
+    ids=[
+        "ghp",
+        "AKIA",
+        "ASIA",
+        "slack",
+        "jwt",
+        "pem",
+        "github_pat",
+        "sk-",
+        "glpat",
+        "stripe",
+        "rk",
+    ],
 )
 def test_token_shapes_are_removed_from_free_text(secret: str) -> None:
     out = redact({"comment": f"see {secret} for details"})
@@ -58,6 +70,15 @@ def test_token_shapes_are_removed_from_free_text(secret: str) -> None:
         "https://bob:hunter2hunter2@github.com/x/y",
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkq",
         "sessionToken: abcdef123456",
+        "Cookie: sid=abc123def456; theme=dark",
+        "Set-Cookie: session=abc123def456; Path=/",
+        "Authorization: abc123def456ghi",
+        "authorization=Bearer abcdefghijkl",
+        "auth=abc123def456",
+        "jwt: abc123def456",
+        'password="unterminated words here',
+        '{\\"password\\": \\"hunter2hunter2\\"}',
+        "see Bearer abcdef0123456789xyz here",
     ],
 )
 def test_assignments_headers_urls_and_unterminated_keys_are_removed(text: str) -> None:
@@ -65,6 +86,24 @@ def test_assignments_headers_urls_and_unterminated_keys_are_removed(text: str) -
     for word in ("hunter2", "abcdef", "dXNlcjpw", "wJalrXU", "MIIEvQ", "two words"):
         assert word not in out
     assert REDACTED in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a basic approach to this",
+        "basic authentication is enough here",
+        "Basic usage of the tool",
+        "a bearer of good news",
+        "bearer authentication works",
+        "auth: failed twice",
+        "the cookie: chocolate chip",
+        "authorization: pending",
+        "jwt: see the RFC",
+    ],
+)
+def test_ordinary_prose_is_not_over_redacted(text: str) -> None:
+    assert redact_text(text) == text
 
 
 def test_text_around_a_removed_pair_is_kept() -> None:
@@ -126,24 +165,32 @@ def test_redact_does_not_mutate_and_is_idempotent() -> None:
 
 def test_redaction_is_linear_on_hostile_input() -> None:
     """Each shape took seconds to minutes with a backtracking pattern. Run in a child process
-    under a hard timeout, so a regression fails here instead of hanging the suite."""
+    under a hard timeout, so a regression fails here instead of hanging the suite. The child
+    puts this checkout's ``src`` first on its path and checks that is the ``sto`` it imported
+    (``-I`` ignores ``PYTHONPATH``, so the path is set in the code)."""
+    src = str(Path(__file__).resolve().parents[2] / "src")
     code = (
-        "import time\n"
-        "from sto.audit.redact import redact_text\n"
+        "import sys, time\n"
+        f"sys.path.insert(0, {src!r})\n"
+        "import sto.audit.redact as r\n"
+        f"assert r.__file__.startswith({src!r}), r.__file__\n"
         "shapes = ['-----BEGIN PRIVATE KEY-----' * 14000, '-----BEGIN ' + 'A ' * 200000,\n"
         "  'bearer ' * 60000, 'token=' * 60000, 'ghp_' * 80000, 'eyJaaaaa.' * 40000,\n"
-        "  'a://' * 100000, 'a' * 800000, 'password' * 100000, 'password: ' * 60000]\n"
+        "  'eyJaaaaa-' * 40000, 'eyJ' * 100000, 'eyJaaaaa_' * 40000, 'sk-' * 100000,\n"
+        "  'glpat-a ' * 50000, 'a://x:' * 50000, 'bearer' + ' ' * 1000 * 100,\n"
+        "  'token' + ' ' * 1000 * 100, 'token=\"' * 50000, \"token='a\\\" \" * 30000,\n"
+        "  'password\\\\\": ' * 30000, 'cookie:' * 50000, 'Cookie: ' + 'a' * 400000,\n"
+        "  'authorization: ' * 30000, 'auth=' * 60000, 'jwt:' * 60000, 'basic ' * 60000,\n"
+        "  'a' * 800000, 'password' * 100000, 'password: ' * 60000]\n"
         "worst = 0.0\n"
         "for s in shapes:\n"
-        "    t = time.perf_counter(); redact_text(s); worst = max(worst, time.perf_counter() - t)\n"
+        "    t = time.perf_counter(); r.redact_text(s)\n"
+        "    worst = max(worst, time.perf_counter() - t)\n"
         "print(worst)\n"
     )
-    src = str(Path(__file__).resolve().parents[2] / "src")
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code],
-        capture_output=True, text=True, timeout=60, check=True,
-        env={**os.environ, "PYTHONPATH": src},
-    )  # fmt: skip
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120, check=True
+    )
     assert float(done.stdout) < 5.0
 
 
@@ -178,3 +225,27 @@ def test_a_secret_in_a_comment_is_not_in_the_chain_and_the_hash_covers_the_store
     assert AWS not in blob
     assert REDACTED in blob
     assert verify_run(store.inner, TEAM, RUN) == len(audit_items(store.inner, RUN))
+
+
+@pytest.mark.parametrize("secret", [GH, AWS, PAT, GL, STRIPE, SLACK], ids=lambda s: s[:6])
+def test_provider_tokens_are_removed_even_glued_to_a_word_character(secret: str) -> None:
+    out = redact_text(f"x{secret}y and token{secret}")
+    assert secret not in out
+    assert secret[8:] not in out
+
+
+def test_a_long_digitless_bearer_value_is_a_credential_but_a_short_word_is_prose() -> None:
+    assert redact_text("Bearer abcdefghijklmnopqrstuv") == f"Bearer {REDACTED}"
+    assert redact_text("bearer authentication") == "bearer authentication"
+
+
+def test_a_url_password_with_an_at_sign_is_removed_whole() -> None:
+    assert redact_text("https://bob:p@ssw0rd@github.com/x") == f"https://{REDACTED}@github.com/x"
+
+
+def test_tokens_alone_is_a_count_but_secrets_and_passwords_are_secret() -> None:
+    assert redact({"tokens": 1200, "secrets": "a", "passwords": "b"}) == {
+        "tokens": 1200,
+        "secrets": REDACTED,
+        "passwords": REDACTED,
+    }

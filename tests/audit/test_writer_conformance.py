@@ -31,6 +31,7 @@ REGISTERED = {"ChainedAuditWriter"}
 ALLOWED = {
     "sto/audit/port.py",  # RefusedAttempts writes its own partition, never a run's chain
     "sto/effects/ports.py",  # names the CHAIN key to check it
+    "sto/effects/core.py",  # the effect claim holds a Check on it
     "sto/gates/hooks.py",
     "sto/gates/service.py",
     "sto/store/ports.py",
@@ -81,6 +82,16 @@ PLANTED = {
     ),
     "string literal table": "def w(store, s):\n    store.put(s, Key('p', 'k', 'audit'), {})\n",
     "string literal head": "def w(store, s):\n    store.put(s, Key('RUN#x', 'CHAIN'), {})\n",
+    "head mover via chain_key": (
+        "from sto.effects.ports import chain_key\nfrom sto.store.ports import Put\n"
+        "def w(store, s, r):\n    store.transact(s, [Put(chain_key(r), {})])\n"
+    ),
+    "getattr table": (
+        "from sto.store import ports\n"
+        "def w(s, st):\n    st.put(s, ports.Key('p', 'k', getattr(ports, 'AU' + 'DIT')), {})\n"
+    ),
+    "getattr seam name": "def w(m):\n    return getattr(m, 'AUDIT')\n",
+    "exec": "def w(code):\n    exec(code)\n",
     "wraps the writer": (
         "from sto.gates.hooks import ChainedAuditWriter\n"
         "class Mine(ChainedAuditWriter):\n    pass\n"
@@ -100,6 +111,13 @@ def test_the_scan_catches_an_unregistered_class_inside_an_allowed_module() -> No
     found = writer_scan.violations([("sto/gates/hooks.py", src)], ALLOWED, REGISTERED)
     assert found
     assert "unregistered" in found[0]
+
+
+def test_the_scan_catches_an_empty_subclass_inside_an_allowed_module() -> None:
+    src = "class ChainedAuditWriter:\n    pass\nclass Quiet(ChainedAuditWriter):\n    pass\n"
+    found = writer_scan.violations([("sto/gates/hooks.py", src)], ALLOWED, REGISTERED)
+    assert found
+    assert "Quiet" in found[0]
 
 
 def test_the_scan_leaves_protocols_and_registered_writers_alone() -> None:

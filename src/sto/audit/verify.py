@@ -72,14 +72,13 @@ def check_against_checkpoints(
     run_id: str,
     hashes: Mapping[int, str],
     *,
-    first: int,
     last: int,
     to_tip: bool,
     checkpoints: Sequence[SignedCheckpoint],
 ) -> None:
     """Compare what was seen with every checkpoint that names the run. ``hashes`` maps seq to
     hash for the entries seen (plus the anchor, when the range does not start at 1); the range
-    seen is ``first..last``. With ``to_tip`` the range must reach each checkpointed count."""
+    seen ends at ``last``. With ``to_tip`` it must reach each checkpointed count."""
     for cp in checkpoints:
         for head in cp.checkpoint.runs:
             if head.run_id != run_id:
@@ -123,6 +122,14 @@ def _walk(store: Store, scope: Scope, run_id: RunId, page_size: int) -> list[tup
             raise AuditVerificationError(
                 f"audit chain broken for run {run_id}: head does not match the last entry"
             )
+        if log.has_entry(scope, run_id, head.seq + 1):
+            # Either a commit landed after we read the head (the head has moved on), or entries
+            # sit past a head that was rolled back or never moved.
+            moved = log.head(scope, run_id)
+            if moved is None or moved.seq == head.seq:
+                raise AuditVerificationError(
+                    f"audit chain broken for run {run_id}: entries past the chain head"
+                )
         return walked
     raise AuditVerificationError(f"audit chain broken for run {run_id}: entries but no chain head")
 
@@ -148,10 +155,20 @@ def verify_run(
     checkpoints this is the unkeyed chain check only, which cannot see a removed run or tail:
     use ``verify_team`` for that."""
     check_checkpoints(team_of(scope), checkpoints, verifier)
+    return _verify_run(store, scope, run_id, checkpoints, page_size)
+
+
+def _verify_run(
+    store: Store,
+    scope: Scope,
+    run_id: RunId,
+    checkpoints: Sequence[SignedCheckpoint],
+    page_size: int = DEFAULT_PAGE,
+) -> int:
     walked = _walk(store, scope, run_id, page_size)
     count = walked[-1][0] if walked else 0
     check_against_checkpoints(
-        str(run_id), dict(walked), first=1, last=count, to_tip=True, checkpoints=checkpoints
+        str(run_id), dict(walked), last=count, to_tip=True, checkpoints=checkpoints
     )
     return count
 
@@ -184,7 +201,7 @@ def verify_team(
     named = {h.run_id for c in checkpoints for h in c.checkpoint.runs}
     ids = {str(r) for r in run_ids} | named
     counts = {
-        run: verify_run(store, scope, RunId.parse(run), checkpoints=checkpoints, verifier=verifier)
+        run: _verify_run(store, scope, RunId.parse(run), checkpoints)  # signatures checked above
         for run in sorted(ids)
     }
     uncovered = tuple(sorted(ids - named))

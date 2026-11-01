@@ -143,7 +143,10 @@ def test_omitting_previous_cannot_bless_a_truncated_store_over_a_known_one() -> 
     blessed = create_checkpoint(forged, TEAM, signer(), [RUN], at=5, previous=[])
     with pytest.raises(AuditVerificationError):
         verify_export(
-            jd(export_team(forged, TEAM, [RUN], checkpoints=[blessed])), signer(), trusted=[first]
+            jd(export_team(forged, TEAM, [RUN], checkpoints=[blessed])),
+            signer(),
+            team="t1",
+            trusted=[first],
         )
 
 
@@ -179,7 +182,7 @@ class World:
 
     def verify(self, doc: Wire, **kw: Any) -> dict[str, int]:
         kw.setdefault("trusted", [self.new])
-        return verify_export(doc, signer(), **kw)
+        return verify_export(doc, signer(), team="t1", **kw)
 
 
 @pytest.fixture
@@ -197,14 +200,14 @@ def test_a_complete_export_verifies_against_trusted_checkpoints(world: World) ->
 
 def test_the_caller_must_say_what_to_trust(world: World) -> None:
     with pytest.raises(AuditVerificationError, match="trusted checkpoints or a minimum"):
-        verify_export(world.doc(), signer())
+        verify_export(world.doc(), signer(), team="t1")
 
 
 def test_a_minimum_checkpoint_time_is_enough_trust_and_is_enforced(world: World) -> None:
     doc = world.doc()
-    assert verify_export(doc, signer(), min_checkpoint_at=20)
+    assert verify_export(doc, signer(), team="t1", min_checkpoint_at=20)
     with pytest.raises(AuditVerificationError, match="older"):
-        verify_export(doc, signer(), min_checkpoint_at=21)
+        verify_export(doc, signer(), team="t1", min_checkpoint_at=21)
 
 
 def edit_actor(d: Wire) -> None:
@@ -255,16 +258,16 @@ def test_removing_the_newest_checkpoint_from_the_file_does_not_help(world: World
     with pytest.raises(AuditVerificationError):  # trusted checkpoints still apply
         world.verify(doc)
     with pytest.raises(AuditVerificationError, match="older"):  # and so does a minimum time
-        verify_export(doc, signer(), min_checkpoint_at=20)
+        verify_export(doc, signer(), team="t1", min_checkpoint_at=20)
 
 
 def test_a_replayed_empty_checkpoint_cannot_vouch_for_an_empty_export(world: World) -> None:
     empty = create_checkpoint(MemoryStore(), TEAM, signer(), [], at=0, previous=[])
     doc = {**world.doc(), "runs": {}, "checkpoints": [empty.to_wire()]}
     with pytest.raises(AuditVerificationError, match="older"):
-        verify_export(doc, signer(), min_checkpoint_at=20)
+        verify_export(doc, signer(), team="t1", min_checkpoint_at=20)
     with pytest.raises(AuditVerificationError, match="not in the export"):
-        verify_export(doc, signer(), trusted=[world.new])
+        verify_export(doc, signer(), team="t1", trusted=[world.new])
 
 
 def test_a_run_that_no_checkpoint_names_is_refused(world: World) -> None:
@@ -299,14 +302,10 @@ def test_edits_past_the_newest_checkpoint_are_a_known_limit(world: World) -> Non
 # --- partial exports ----------------------------------------------------------------------------
 
 
-def cps_for(store: MemoryStore) -> SignedCheckpoint:
-    return create_checkpoint(store, TEAM, signer(), [RUN], at=50, previous=[])
-
-
-def seeded(ats: list[int]) -> tuple[MemoryStore, SignedCheckpoint]:
+def seeded(ats: list[int], *, at: int = 50) -> tuple[MemoryStore, SignedCheckpoint]:
     store = MemoryStore()
     append(store, RUN, ats)
-    return store, cps_for(store)
+    return store, create_checkpoint(store, TEAM, signer(), [RUN], at=at, previous=[])
 
 
 def rechain_from(entries: list[Wire], seq0: int, prev: str) -> list[Wire]:
@@ -319,80 +318,152 @@ def rechain_from(entries: list[Wire], seq0: int, prev: str) -> list[Wire]:
     return out
 
 
-def test_a_period_export_verifies_when_the_caller_allows_a_partial_range() -> None:
+def part(doc: Wire, **kw: Any) -> dict[str, int]:
+    kw = {"trusted": [], "from_start": False, **kw}
+    return verify_export(doc, signer(), team="t1", **kw)
+
+
+def test_a_range_ending_at_the_tip_verifies_from_its_anchor() -> None:
+    store, cp = seeded([100, 200, 300, 400, 500, 600])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
+    assert [e["seq"] for e in doc["runs"][str(RUN)]["entries"]] == [3, 4, 5, 6]
+    assert doc["runs"][str(RUN)]["anchor"]["seq"] == 2
+    assert part(doc, trusted=[cp], since=300) == {str(RUN): 4}
+    with pytest.raises(AuditVerificationError, match="beginning"):
+        part(doc, trusted=[cp], from_start=True)
+
+
+def test_a_range_between_checkpoints_is_refused_unless_the_caller_accepts_it() -> None:
     store, cp = seeded([100, 200, 300, 400, 500])
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=200, until=400))
     assert [e["seq"] for e in doc["runs"][str(RUN)]["entries"]] == [2, 3]
-    assert verify_export(doc, signer(), trusted=[cp], from_start=False, to_tip=False) == {
-        str(RUN): 2
-    }
-    with pytest.raises(AuditVerificationError, match="beginning"):
-        verify_export(doc, signer(), trusted=[cp], to_tip=False)  # from_start defaults to True
+    with pytest.raises(AuditVerificationError, match="no checkpoint count falls"):
+        part(doc, trusted=[cp], to_tip=False)
+    assert part(doc, trusted=[cp], to_tip=False, allow_unchecked_range=True) == {str(RUN): 2}
     with pytest.raises(AuditVerificationError, match="fewer"):
-        verify_export(doc, signer(), trusted=[cp], from_start=False)  # to_tip defaults to True
+        part(doc, trusted=[cp], allow_unchecked_range=True)  # to_tip defaults to True
 
 
 def test_the_range_bounds_are_since_inclusive_and_until_exclusive() -> None:
     store, cp = seeded([100, 200, 300, 400])
-    for since, until, want in [
-        (200, 400, [2, 3]),
-        (201, 400, [3]),
-        (200, 300, [2]),
-        (None, 200, [1]),
-    ]:
+    cases = [(200, 400, [2, 3]), (201, 400, [3]), (200, 300, [2]), (None, 200, [1])]
+    for since, until, want in cases:
         doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=since, until=until))
         assert [e["seq"] for e in doc["runs"][str(RUN)]["entries"]] == want, (since, until)
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=500))
     assert doc["runs"][str(RUN)]["entries"] == []
 
 
+def test_a_quiet_run_is_anchored_at_its_last_entry_and_an_honest_since_export_verifies() -> None:
+    store = MemoryStore()
+    append(store, RUN, [100, 200, 300, 400, 500, 600, 700, 800])
+    append(store, RUN2, [10, 20])
+    cp = create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=1, previous=[])
+    doc = jd(export_team(store, TEAM, [RUN, RUN2], checkpoints=[cp], since=300))
+    quiet = doc["runs"][str(RUN2)]
+    assert quiet["entries"] == []
+    assert quiet["anchor"]["seq"] == 2
+    assert part(doc, trusted=[cp], since=300) == {str(RUN): 6, str(RUN2): 0}
+
+
+def test_an_anchor_with_no_entries_is_compared_with_the_checkpoint() -> None:
+    store, cp = seeded([100, 200, 300])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=1000))
+    assert doc["runs"][str(RUN)]["entries"] == []
+    assert part(doc, trusted=[cp], since=1000) == {str(RUN): 0}
+    anchor = doc["runs"][str(RUN)]["anchor"]
+    body = {k: v for k, v in anchor.items() if k != "hash"} | {"actor": "framed"}
+    doc["runs"][str(RUN)]["anchor"] = {**body, "hash": entry_hash(body)}  # a valid entry, not ours
+    with pytest.raises(AuditVerificationError, match="differs from the checkpoint"):
+        part(doc, trusted=[cp], since=1000)
+
+
 def test_a_skewed_clock_gives_one_contiguous_range_that_verifies() -> None:
     store, cp = seeded([100, 200, 150, 300])
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=180))
     assert [e["seq"] for e in doc["runs"][str(RUN)]["entries"]] == [2, 3, 4]
-    assert verify_export(doc, signer(), trusted=[cp], from_start=False)[str(RUN)] == 3
+    assert part(doc, trusted=[cp], since=180)[str(RUN)] == 3
     mid = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=120, until=180))
     assert [e["seq"] for e in mid["runs"][str(RUN)]["entries"]] == [2, 3]
 
 
-def test_a_forged_partial_export_with_an_invented_anchor_fails() -> None:
+def fabricate(entries: list[Wire], seq0: int, prev: str) -> list[Wire]:
+    return rechain_from([{**e, "actor": "framed"} for e in entries], seq0, prev)
+
+
+def test_a_forged_range_from_the_real_anchor_fails_at_the_checkpointed_tip() -> None:
     store, cp = seeded([100, 200, 300, 400, 500, 600])
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
     run = doc["runs"][str(RUN)]
-    run["anchor"] = {"seq": run["anchor"]["seq"], "hash": "a" * 64}
-    run["entries"] = rechain_from(
-        [{**e, "actor": "framed"} for e in run["entries"]], run["anchor"]["seq"], "a" * 64
-    )
+    run["entries"] = fabricate(run["entries"], run["anchor"]["seq"], run["anchor"]["hash"])
     with pytest.raises(AuditVerificationError, match="differs from the checkpoint"):
-        verify_export(doc, signer(), trusted=[cp], from_start=False)
+        part(doc, trusted=[cp])
 
 
-def test_a_partial_export_that_lost_its_tail_fails_when_it_must_reach_the_tip() -> None:
+def test_a_range_fabricated_behind_an_invented_anchor_compares_nothing_and_is_refused() -> None:
+    store, cp = seeded([100, 200, 300, 400, 500, 600, 700, 800])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
+    run = doc["runs"][str(RUN)]
+    first = {k: v for k, v in run["entries"][0].items() if k != "hash"}
+    body = {**first, "seq": 100, "actor": "framed", "prev": "a" * 64}
+    run["anchor"] = {**body, "hash": entry_hash(body)}
+    run["entries"] = fabricate(run["entries"][:6], 100, run["anchor"]["hash"])
+    with pytest.raises(AuditVerificationError, match="no checkpoint count falls"):
+        part(doc, trusted=[cp])
+    assert part(doc, trusted=[cp], allow_unchecked_range=True, to_tip=False)  # only by opting in
+
+
+def test_an_empty_range_behind_an_invented_anchor_is_refused() -> None:
+    store, cp = seeded([100, 200, 300, 400, 500, 600])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=1000))
+    run = doc["runs"][str(RUN)]
+    body = {k: v for k, v in run["anchor"].items() if k != "hash"} | {"seq": 3, "prev": "b" * 64}
+    run["anchor"] = {**body, "hash": entry_hash(body)}
+    with pytest.raises(AuditVerificationError, match="fewer"):
+        part(doc, trusted=[cp])
+    with pytest.raises(AuditVerificationError, match="no checkpoint count falls"):
+        part(doc, trusted=[cp], to_tip=False)
+
+
+def test_a_range_that_lost_its_tail_fails_when_it_must_reach_the_tip() -> None:
     store, cp = seeded([100, 200, 300, 400, 500, 600])
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
     doc["runs"][str(RUN)]["entries"].pop()
     with pytest.raises(AuditVerificationError, match="fewer"):
-        verify_export(doc, signer(), trusted=[cp], from_start=False)
+        part(doc, trusted=[cp])
 
 
-def test_an_anchor_at_a_checkpointed_count_is_compared() -> None:
-    store = MemoryStore()
-    append(store, RUN, [100, 200, 300])
-    cp3 = create_checkpoint(store, TEAM, signer(), [RUN], at=30, previous=[])
-    append(store, RUN, [400, 500])
-    cp5 = create_checkpoint(store, TEAM, signer(), [RUN], at=50, previous=[cp3])
-    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp5], since=400))
-    run = doc["runs"][str(RUN)]
-    assert run["anchor"]["seq"] == 3
-    run["anchor"]["hash"] = "b" * 64
-    run["entries"] = rechain_from(run["entries"], 3, "b" * 64)
-    # entry 5 now has a different hash, and so would the anchor against checkpoint 3
-    with pytest.raises(AuditVerificationError, match="differs from the checkpoint"):
-        verify_export(doc, signer(), trusted=[cp3, cp5], from_start=False)
-    only_anchor = jd(export_team(store, TEAM, [RUN], checkpoints=[cp5], since=400))
-    only_anchor["runs"][str(RUN)]["anchor"]["hash"] = "b" * 64
+def test_the_caller_not_the_file_says_what_range_was_asked_for() -> None:
+    store, cp = seeded([100, 200, 300, 400, 500, 600])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
+    with pytest.raises(AuditVerificationError, match="anchor is not before"):
+        part(doc, trusted=[cp], since=200)  # anchor is the entry at 200
+    with pytest.raises(AuditVerificationError, match="starts before"):
+        part(doc, trusted=[cp], since=400)
+    bounded = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=200, until=400))
+    with pytest.raises(AuditVerificationError, match="past the range"):
+        part(bounded, trusted=[cp], until=300, to_tip=False, allow_unchecked_range=True)
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda a: a.update(seq=0),
+        lambda a: a.update(seq="2"),
+        lambda a: a.update(seq=-3),
+        lambda a: a.update(actor="framed"),  # hash no longer matches
+        lambda a: a.update(run="01J00000000000000000000009"),
+        lambda a: a.update(team="t2"),
+        lambda a: a.pop("prev"),
+        lambda a: a.clear(),
+    ],
+)
+def test_a_malformed_or_forged_anchor_is_refused(mangle: Callable[[Wire], object]) -> None:
+    store, cp = seeded([100, 200, 300, 400, 500, 600])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=300))
+    mangle(doc["runs"][str(RUN)]["anchor"])
     with pytest.raises(AuditVerificationError):
-        verify_export(only_anchor, signer(), trusted=[cp3], from_start=False, to_tip=False)
+        part(doc, trusted=[cp])
 
 
 def test_checkpoint_runs_are_exported_even_when_not_asked_for() -> None:
@@ -400,6 +471,33 @@ def test_checkpoint_runs_are_exported_even_when_not_asked_for() -> None:
     cp = create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=1, previous=[])
     doc = export_team(store, TEAM, [RUN], checkpoints=[cp])
     assert set(doc["runs"]) == {str(RUN), str(RUN2)}
+
+
+def test_an_export_is_checked_for_the_callers_team_not_the_files() -> None:
+    from sto.store.ports import TeamScope
+
+    t2 = TeamScope("t2")
+    store = MemoryStore()
+    append(store, RUN, [1, 2], scope=t2)
+    cp2 = create_checkpoint(store, t2, signer(), [RUN], at=9, previous=[])
+    doc = jd(export_team(store, t2, [RUN], checkpoints=[cp2]))
+    assert verify_export(doc, signer(), team="t2", min_checkpoint_at=5) == {str(RUN): 2}
+    with pytest.raises(AuditVerificationError, match="another team"):
+        verify_export(doc, signer(), team="t1", min_checkpoint_at=5)  # same key, wrong auditor
+    with pytest.raises(AuditVerificationError, match="another team"):
+        verify_export({**doc, "team": "t1"}, signer(), team="t2", min_checkpoint_at=5)
+    with pytest.raises(TypeError):
+        verify_export(doc, signer(), min_checkpoint_at=5)  # type: ignore[call-arg]
+
+
+def test_run_keys_that_fold_to_the_same_run_are_refused() -> None:
+    store = built()
+    cp = create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=1, previous=[])
+    doc = jd(export_team(store, TEAM, [RUN, RUN2], checkpoints=[cp]))
+    doc["runs"][str(RUN).lower()] = doc["runs"][str(RUN)]
+    assert str(RUN).lower() != str(RUN)
+    with pytest.raises(AuditVerificationError, match="malformed"):
+        verify_export(doc, signer(), team="t1", trusted=[cp])
 
 
 # --- every checkpoint, signature and team is checked --------------------------------------------
@@ -411,7 +509,7 @@ def test_every_embedded_and_trusted_checkpoint_must_be_signed_and_ours(world: Wo
     with pytest.raises(AuditVerificationError, match="signature"):
         world.verify(doc)
     with pytest.raises(AuditVerificationError, match="signature"):
-        verify_export(world.doc(), signer(), trusted=[world.new, bad])
+        verify_export(world.doc(), signer(), team="t1", trusted=[world.new, bad])
 
 
 def test_a_signed_checkpoint_of_another_team_is_refused_in_an_export() -> None:
@@ -430,12 +528,12 @@ def test_a_signed_checkpoint_of_another_team_is_refused_in_an_export() -> None:
     cp = create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=1, previous=[])
     doc = jd(export_team(store, TEAM, [RUN, RUN2], checkpoints=[cp]))
     with pytest.raises(AuditVerificationError, match="another team"):
-        verify_export(doc, signer(), trusted=[foreign])
+        verify_export(doc, signer(), team="t1", trusted=[foreign])
 
 
 def test_a_wrong_key_is_refused(world: World) -> None:
     with pytest.raises(AuditVerificationError, match="signature"):
-        verify_export(world.doc(), signer("audit-cp-1", b"x" * 40), trusted=[world.new])
+        verify_export(world.doc(), signer("audit-cp-1", b"x" * 40), team="t1", trusted=[world.new])
 
 
 # --- malformed files ----------------------------------------------------------------------------
@@ -477,7 +575,7 @@ def test_a_run_key_cannot_forge_a_line_in_the_error() -> None:
     doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp]))
     doc["runs"]["x\n[OK] audit verified, 0 errors\n"] = {"entries": [{"run": "evil"}]}
     with pytest.raises(AuditVerificationError) as err:
-        verify_export(doc, signer(), trusted=[cp])
+        verify_export(doc, signer(), team="t1", trusted=[cp])
     assert "malformed" in str(err.value)
     assert "[OK]" not in str(err.value)
     assert "\n" not in str(err.value)
@@ -499,3 +597,14 @@ def test_dropping_a_chain_forged_store_from_the_table_matches_the_export(world: 
 
 def test_export_of_a_period_does_not_change_a_complete_one(world: World) -> None:
     assert world.verify(world.doc(since=None, until=None))
+
+
+@pytest.mark.parametrize("seq", [0, -3])
+def test_a_validly_hashed_anchor_with_a_nonpositive_seq_is_refused(seq: int) -> None:
+    store, cp = seeded([100, 200, 300])
+    doc = jd(export_team(store, TEAM, [RUN], checkpoints=[cp], since=1000))
+    run = doc["runs"][str(RUN)]
+    body = {k: v for k, v in run["anchor"].items() if k != "hash"} | {"seq": seq}
+    run["anchor"] = {**body, "hash": entry_hash(body)}
+    with pytest.raises(AuditVerificationError, match="malformed"):
+        part(doc, trusted=[cp], to_tip=False, allow_unchecked_range=True)

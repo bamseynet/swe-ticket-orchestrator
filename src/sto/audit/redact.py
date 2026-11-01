@@ -30,6 +30,10 @@ _SECRET_WORDS = frozenset(
         "passphrase",
         "authorization",
         "credential",
+        "credentials",
+        "secrets",
+        "passwords",
+        "cookies",
         "apikey",
         "cookie",
         "auth",
@@ -46,28 +50,42 @@ def _is_secret_name(name: str) -> bool:
     words = [w.lower() for w in _SPLIT.split(_CAMEL.sub("_", name)) if w]
     if not words:
         return False
-    last = words[-1].removesuffix("s") if len(words[-1]) > 3 else words[-1]
-    if last in _SECRET_WORDS:
+    last = words[-1]
+    if last in _SECRET_WORDS:  # "tokens" is not here: it is usually a count
         return True
     return last == "key" and len(words) > 1 and words[-2] in _KEY_QUALIFIERS
 
 
 _TOKENS = (
-    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}"),
+    re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+    re.compile(r"[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"),
 )
-_BEARER = re.compile(r"(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
-_URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]{1,20}://)[^\s/@:]{1,200}:[^\s/@]{1,200}@", re.I)
+_BEARER = re.compile(
+    r"(\bbearer\s+)(?:(?=[A-Za-z0-9._~+/=-]{0,200}\d)[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{20,})",
+    re.I,
+)
+_AUTHZ_SCHEME = re.compile(
+    r"(\bauthorization[\"']?\s*[:=]\s*[\"']?(?:basic|bearer)\s+)[A-Za-z0-9._~+/=-]{8,}", re.I
+)
+_AUTHZ_BARE = re.compile(
+    r"(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?!\[REDACTED\])[^\s\"',;]{8,}", re.I
+)
+_COOKIE = re.compile(r"(\b(?:set-)?cookie\s*:\s*)[^\r\n=]{0,200}=[^\r\n]*", re.I)
+_AUTH_JWT = re.compile(
+    r"(\b(?:auth|jwt)[\"']?\s*[=:]\s*[\"']?)(?=[A-Za-z0-9._~+/=-]{0,64}\d)[A-Za-z0-9._~+/=-]{12,}",
+    re.I,
+)
+_URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]{1,20}://)[^\s/@:]{1,200}:[^\s/]{1,200}@", re.I)
 _ASSIGN = re.compile(
     r"(token|secret|password|passwd|passphrase|pwd|api[_-]?key|access[_-]?key|private[_-]?key"
     r"|secret[_-]?key|credentials?)"
-    r"(?P<sep>[\"']?\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'&}]{4,})",
+    r"(?P<sep>(?:\\?[\"'])?\s*[=:]\s*)(?:\\?\"[^\"]*\"?|'[^']*'?|[^\s,;\"'&}]{4,})",
     re.IGNORECASE,
 )
 _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----")
@@ -95,7 +113,11 @@ def redact_text(text: str) -> str:
     text = _redact_pem(text)
     for pattern in _TOKENS:
         text = pattern.sub(REDACTED, text)
+    text = _AUTHZ_SCHEME.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _AUTHZ_BARE.sub(lambda m: m.group(1) + REDACTED, text)
     text = _BEARER.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _COOKIE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _AUTH_JWT.sub(lambda m: m.group(1) + REDACTED, text)
     text = _URL_CREDS.sub(lambda m: m.group(1) + REDACTED + "@", text)
     return _ASSIGN.sub(lambda m: m.group(1) + m.group("sep") + REDACTED, text)
 

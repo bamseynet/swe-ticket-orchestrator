@@ -10,7 +10,16 @@ registration: it reads the source of every module under ``src/sto`` and reports
   ``AUDIT``, ``CHAIN_SK``, or the strings ``"CHAIN"`` and ``"audit"``) in a module that is not on
   the allow list, which catches a writer that transacts directly.
 
-Allowed modules may hold only the registered writer classes.
+Allowed modules may hold only the registered writer classes, and a class that subclasses a
+writer is one too, even when it adds nothing.
+
+Known limits, because a static scan of Python cannot close them: a writer that builds the table
+or head name from pieces at run time and reaches it without any of the names above (the scan does
+flag ``getattr`` with a concatenated or seam-named attribute, and ``eval``/``exec``/``__import__``;
+a plain variable as the attribute is allowed, since ``getattr(self, name)`` is everywhere);
+one that gets the seam through a module alias and a computed attribute chain; and code outside
+``src/sto`` that is handed a store. The conformance suite and the store's append-only rule are the
+backstop for those, and the scan is a guard against accident, not against a determined author.
 """
 
 from __future__ import annotations
@@ -19,7 +28,10 @@ import ast
 from collections.abc import Iterable
 from pathlib import Path
 
-SEAM_NAMES = frozenset({"AuditEntry", "AuditWriter", "ChainedAuditWriter", "AUDIT", "CHAIN_SK"})
+SEAM_NAMES = frozenset(
+    {"AuditEntry", "AuditWriter", "ChainedAuditWriter", "AUDIT", "CHAIN_SK", "chain_key"}
+)
+WRITER_BASES = frozenset({"AuditWriter", "ChainedAuditWriter"})
 SEAM_STRINGS = frozenset({"CHAIN", "audit"})
 
 
@@ -45,11 +57,23 @@ def _annotated_entry(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return False
 
 
+def _base_names(cls: ast.ClassDef) -> set[str]:
+    names = set()
+    for b in cls.bases:
+        if isinstance(b, ast.Name):
+            names.add(b.id)
+        elif isinstance(b, ast.Attribute):
+            names.add(b.attr)
+    return names
+
+
 def writer_classes(tree: ast.AST) -> set[str]:
     found: set[str] = set()
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef) or _is_protocol(cls):
             continue
+        if _base_names(cls) & WRITER_BASES:
+            found.add(cls.name)
         for fn in ast.walk(cls):
             if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
@@ -66,6 +90,15 @@ def writer_classes(tree: ast.AST) -> set[str]:
 def seam_uses(tree: ast.AST) -> set[str]:
     used: set[str] = set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"eval", "exec", "__import__"}:
+                used.add(f"{node.func.id}()")
+            elif node.func.id == "getattr" and len(node.args) >= 2:
+                attr = node.args[1]
+                built = isinstance(attr, ast.BinOp | ast.JoinedStr)  # 'AU' + 'DIT'
+                named = isinstance(attr, ast.Constant) and attr.value in SEAM_NAMES | SEAM_STRINGS
+                if built or named:
+                    used.add("getattr(built name)")
         if isinstance(node, ast.Name) and node.id in SEAM_NAMES:
             used.add(node.id)
         elif isinstance(node, ast.Attribute) and node.attr in SEAM_NAMES:

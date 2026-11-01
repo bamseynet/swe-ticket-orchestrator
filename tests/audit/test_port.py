@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ import pytest
 
 from audit.helpers import RUN, TEAM, Recorder, audit_items, template_run
 from sto.audit.errors import AuditVerificationError
-from sto.audit.port import AuditLog, RefusedAttempts, StoreAuditLog
+from sto.audit.port import MAX_TEXT_SLICE, AuditLog, RefusedAttempts, StoreAuditLog
 from sto.gates.hooks import ChainedAuditWriter, audit_pk
 from sto.gates.service import GateService
 from sto.store.memory import MemoryStore
@@ -121,18 +122,75 @@ def test_padding_an_attempt_cannot_erase_its_record() -> None:
     store, count = MemoryStore(), Counter()
     ra = RefusedAttempts(store, count)
     ra.record(
-        TEAM, RUN, actor="m" * 10_000, action="a" * 50_000, reason="r" * 900_000,
+        TEAM, RUN, actor="m" * 10_000, action="a " * 50_000, reason="r " * 900_000,
         data={"x": "y" * 500_000, "nested": ["z" * 100_000] * 20}, at=1,
     )  # fmt: skip
     (item,) = refused_items(store, str(RUN))
     assert count.names == []
-    assert item.data["data"]["truncated"] is True
-    assert item.data["data"]["bytes"] > 400_000
-    assert len(item.data["actor"]) < 2_000
-    assert len(item.data["action"]) < 2_000
-    assert len(item.data["reason"]) < 2_000
+    data = item.data["data"]
+    assert set(data) == {"truncated", "bytes"}  # the size only: no preview of what was cut
+    assert data["truncated"] is True
+    assert data["bytes"] > 400_000
+    for field in ("actor", "action", "reason"):
+        assert len(item.data[field]) < 1_100
+        assert item.data[field].endswith("...[truncated]")
     assert item.data["at"] == 1
     assert item.data["run"] == str(RUN)
+
+
+SECRETS = {
+    "password": ('password="{}"', "hunter2hunter2hunter2"),
+    "password-bare": ("password={}", "hunter2hunter2hunter2"),
+    "url": ("https://bob:{}@github.com/x", "hunter2hunter2hunter2"),
+    "ghp": ("{}", GH),
+    "akia": ("{}", "AKIA" + "ABCDEFGHIJKLMNOP"),
+    "jwt": ("{}", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIx.c2lnbmF0dXJlc2lnbmF0dXJl"),
+    "bearer": ("Authorization: Bearer {}", "abcdef0123456789abcdefg"),
+    "pem": ("-----BEGIN PRIVATE KEY-----\n{}", "MIIEvQIBADANBgkqhkiG9w0BAQ"),
+    "spaced": ('password="{}"', "correct horse battery staple"),
+}
+
+
+def longest_piece(secret: str, out: str, floor: int = 6) -> str:
+    """The longest slice of ``secret`` of at least ``floor`` characters found in ``out``."""
+    for n in range(len(secret), floor - 1, -1):
+        for i in range(len(secret) - n + 1):
+            if secret[i : i + n] in out:
+                return secret[i : i + n]
+    return ""
+
+
+@pytest.mark.parametrize("field", ["action", "reason"])
+@pytest.mark.parametrize("name", SECRETS)
+def test_no_part_of_a_secret_survives_the_bound_at_any_cut(name: str, field: str) -> None:
+    template, secret = SECRETS[name]
+    head = template.split("{}")[0]
+    for back in range(len(secret) + len(template) + 2):  # the slice ends at every position
+        pad = "x " * ((MAX_TEXT_SLICE - len(head) - len(secret) + back) // 2)
+        text = pad + template.replace("{}", secret) + " tail" * 400
+        store = MemoryStore()
+        fields: dict[str, Any] = {"actor": "a", "action": "x", "reason": "r", "data": {}, "at": 1}
+        fields[field] = text
+        RefusedAttempts(store, Counter()).record(TEAM, RUN, **fields)
+        out = refused_items(store, str(RUN))[0].data[field]
+        assert not longest_piece(secret, out), (back, out[-60:])
+
+
+def test_a_secret_in_the_unclaimed_run_id_is_redacted() -> None:
+    store = MemoryStore()
+    RefusedAttempts(store, Counter()).record(
+        TEAM, f"password=hunter2hunter2 {GH}", actor="a", action="x", reason="r", data={}, at=1
+    )
+    (item,) = refused_items(store, "unattributed")
+    assert "hunter2" not in item.data["claimed_run"]
+    assert GH not in item.data["claimed_run"]
+
+
+def test_text_over_the_slice_is_cut_at_a_word_and_a_single_huge_word_is_dropped() -> None:
+    store = MemoryStore()
+    ra = RefusedAttempts(store, Counter())
+    ra.record(TEAM, RUN, actor="a", action="w" * 10_000, reason="r", data={}, at=1)
+    assert refused_items(store, str(RUN))[0].data["action"] == "...[truncated]"
 
 
 def test_a_small_attempt_keeps_its_data_untruncated() -> None:
@@ -166,12 +224,88 @@ def test_a_store_failure_never_reaches_the_caller_and_is_counted() -> None:
     assert count.names == ["audit.refused_write_failed"]
 
 
-def test_unserialisable_data_is_counted_not_raised() -> None:
-    count = Counter()
-    RefusedAttempts(MemoryStore(), count).record(
-        TEAM, RUN, actor="a", action="x", reason="r", data={"k": object()}, at=1
+def nested(depth: int) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    cur = root
+    for _ in range(depth):
+        cur["a"] = {}
+        cur = cur["a"]
+    return root
+
+
+@pytest.mark.parametrize(
+    ("what", "kw", "check"),
+    [
+        ("surrogate actor", {"actor": "\ud800 x"}, lambda d: d["actor"] == "? x"),
+        ("surrogate action", {"action": "\ud800 x"}, lambda d: d["action"] == "? x"),
+        ("surrogate reason", {"reason": "\ud800 x"}, lambda d: d["reason"] == "? x"),
+        ("surrogate data", {"data": {"k": "\ud800"}}, lambda d: d["data"] == {"k": "?"}),
+        ("depth 40", {"data": nested(40)}, lambda d: "[too large]" in json.dumps(d["data"])),
+        ("depth 1100", {"data": nested(1100)}, lambda d: "[too large]" in json.dumps(d["data"])),
+        (
+            "NaN",
+            {"data": {"x": float("nan")}},
+            lambda d: d["data"] == {"x": "[number out of range]"},
+        ),
+        (
+            "infinity",
+            {"data": {"x": float("inf")}},
+            lambda d: d["data"] == {"x": "[number out of range]"},
+        ),
+        (
+            "huge int",
+            {"data": {"x": 10**40}},
+            lambda d: d["data"] == {"x": "[number out of range]"},
+        ),
+        ("int key", {"data": {1: "x"}}, lambda d: d["data"] == {"1": "x"}),
+        ("tuple key", {"data": {(1, 2): "x"}}, lambda d: d["data"] == {"(1, 2)": "x"}),
+        ("object", {"data": {"k": object()}}, lambda d: d["data"] == {"k": "[unstorable object]"}),
+        ("bytes", {"data": {"k": GH.encode()}}, lambda d: d["data"] == {"k": "[40 bytes]"}),
+        ("not a mapping", {"data": ["x"]}, lambda d: d["data"] == {"unstorable": True}),
+        ("none data", {"data": None}, lambda d: d["data"] == {"unstorable": True}),
+        ("float at", {"at": 1.5}, lambda d: d["at"] == 0),
+        ("huge at", {"at": 10**30}, lambda d: d["at"] == 0),
+    ],
+)
+def test_odd_inputs_still_leave_a_record(what: str, kw: dict[str, Any], check: Any) -> None:
+    store, count = MemoryStore(), Counter()
+    base = {"actor": "a", "action": "x", "reason": "r", "data": {}, "at": 1}
+    RefusedAttempts(store, count).record(TEAM, RUN, **{**base, **kw})
+    (item,) = refused_items(store, str(RUN))
+    assert count.names == [], what
+    assert check(item.data), (what, item.data)
+
+
+def test_a_cyclic_value_still_leaves_a_record() -> None:
+    cyc: dict[str, Any] = {}
+    cyc["self"] = cyc
+    store = MemoryStore()
+    RefusedAttempts(store, Counter()).record(
+        TEAM, RUN, actor="a", action="x", reason="r", data=cyc, at=1
     )
-    assert count.names == [] or count.names == ["audit.refused_write_failed"]
+    assert len(refused_items(store, str(RUN))) == 1
+
+
+def test_if_the_store_still_refuses_the_bounded_text_is_written_with_a_marker() -> None:
+    class RefusesFirst(MemoryStore):
+        calls = 0
+
+        def transact(self, scope: Any, ops: Any) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("item refused")
+            super().transact(scope, ops)
+
+    store, count = RefusesFirst(), Counter()
+    RefusedAttempts(store, count).record(
+        TEAM, RUN, actor="mallory", action="gate.decide", reason="no", data={"k": 1}, at=3
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert item.data["data"] == {"unstorable": True}
+    assert item.data["actor"] == "mallory"
+    assert item.data["action"] == "gate.decide"
+    assert store.calls == 2
+    assert count.names == []
 
 
 def test_a_failing_metric_does_not_break_the_best_effort_path() -> None:
@@ -200,3 +334,14 @@ def test_a_malformed_head_item_is_a_verification_error_not_a_keyerror() -> None:
     store.transact(TEAM, [Put(Key(f"RUN#{RUN}", "CHAIN"), {"x": 1})])
     with pytest.raises(AuditVerificationError, match="malformed"):
         StoreAuditLog(store).head(TEAM, RUN)
+
+
+def test_redaction_that_grows_the_data_past_the_bound_still_leaves_only_the_size() -> None:
+    store = MemoryStore()
+    data = {"k": "token=abcd " * 5_000}  # 55 KB as given, 85 KB once each value is replaced
+    assert len(json.dumps(data)) < 64 * 1_024
+    RefusedAttempts(store, Counter()).record(
+        TEAM, RUN, actor="a", action="x", reason="r", data=data, at=1
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert set(item.data["data"]) == {"truncated", "bytes"}
