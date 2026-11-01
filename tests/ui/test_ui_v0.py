@@ -1,10 +1,11 @@
 """UI v0 (D1-09) in a real browser, against the real local API (no mocks).
 
-CI's ``ui-browser`` job runs this. The job has no web setup of its own, so the test installs the
-web dependencies when they are missing (``npm ci``) and builds the bundle itself. ``vite preview``
-then serves it and forwards ``/api`` to the API (the same proxy ``make dev`` uses), the API is the
-``build_local`` stack over a temporary SQLite file, and Playwright drives Chromium through the
-demo, including a Request changes that opens round 2. Every subprocess and wait has a timeout.
+CI's ``ui-browser`` job runs this. The job sets up Node and builds the bundle (``npm ci`` and
+``npm run build`` in ``web/``) before pytest, so the test builds nothing: it fails with a pointer
+if ``web/dist`` is missing. ``vite preview`` serves that bundle and forwards ``/api`` to the API
+(the same proxy ``make dev`` uses), the API is the ``build_local`` stack over a temporary SQLite
+file, and Playwright drives Chromium through the demo, including a Request changes that opens
+round 2. Every subprocess and wait has a timeout.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import contextlib
 import importlib
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -39,19 +39,12 @@ def free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def sh(args: list[str], env: dict[str, str], timeout: float) -> None:
-    done = subprocess.run(  # noqa: S603 - fixed argv
-        args, cwd=WEB, env=env, capture_output=True, text=True, timeout=timeout, check=False
-    )
-    assert done.returncode == 0, f"{args} failed:\n{done.stdout[-2000:]}\n{done.stderr[-2000:]}"
-
-
 @pytest.fixture
 def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
-    node_env = {**os.environ, "npm_config_engine_strict": "false"}  # the runner's Node may be older
-    if not (WEB / "node_modules").exists():
-        sh(["npm", "ci", "--no-audit", "--no-fund"], node_env, 300)
-    sh(["npx", "vite", "build", "--outDir", str(tmp_path / "dist")], node_env, 120)
+    dist = WEB / "dist"
+    assert (dist / "index.html").exists(), (
+        "web/dist is missing: CI builds it before this test (cd web && npm ci && npm run build)"
+    )
 
     api_port, web_port = free_port(), free_port()
     app = build_local(
@@ -70,7 +63,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
             "vite",
             "preview",
             "--outDir",
-            str(tmp_path / "dist"),
+            str(dist),
             "--host",
             "127.0.0.1",
             "--port",
@@ -78,7 +71,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
             "--strictPort",
         ],
         cwd=WEB,
-        env={**node_env, "STO_API_PORT": str(api_port)},
+        env={**os.environ, "STO_API_PORT": str(api_port)},
         stdout=web_log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # npx starts node: stop the whole group, not just npx
@@ -112,7 +105,6 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
         server.should_exit = True
         thread.join(10)
         web_log_file.close()
-        shutil.rmtree(tmp_path / "dist", ignore_errors=True)
 
 
 @pytest.mark.ui_browser

@@ -150,8 +150,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          # TODO(D0-02): switch to `node-version-file: .nvmrc` once that file lands.
-          node-version: 24
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
@@ -279,6 +278,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The bundle is built here, not inside the browser test.
+      - run: npm ci && npm run build
+        working-directory: web
       - run: uv sync --locked --group browser
       - id: pw-version
         run: echo "v=$(uv run python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
@@ -308,8 +315,8 @@ jobs:
       - run: uv sync --locked
       - run: docker compose up -d --wait dynamodb-local
       # Whole local stack up, then the e2e tests, selected by the `e2e` marker (anything under tests/e2e/ has it).
-      # `-rA` lists every test with its outcome, so the log shows the smoke test was selected and passed.
-      # D1-10 adds the real journey under tests/e2e/.
+      # `-rA` lists every test with its outcome, so the log shows each test that was selected and passed.
+      # tests/e2e/test_skeleton.py is the journey through both gates against `scripts/dev.py`.
       - run: uv run pytest -rA -q -m e2e
       - if: failure()
         run: docker compose logs
