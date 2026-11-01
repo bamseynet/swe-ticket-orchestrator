@@ -52,7 +52,7 @@ mypy_path = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
-addopts = ["-p", "hermetic_guard", "-p", "tier_guard", "-ra", "--strict-markers", "--strict-config"]
+addopts = ["-p", "hermetic_guard", "-p", "tier_guard", "-p", "contract.suite", "-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
 pythonpath = ["src", "tests"]
 

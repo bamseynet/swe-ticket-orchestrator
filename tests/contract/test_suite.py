@@ -29,10 +29,12 @@ import pytest
 
 pytest.register_assert_rewrite("contract.suite")
 from contract.suite import (  # noqa: E402
+    CAPABILITIES,
     MAX_REPLAY_WINDOW,
     PAGE_SIZE,
     PORT_SECTIONS,
     SECURITY_CONTROLS,
+    SHAPE_RETRY_AFTER,
     SUBCLASSES,
     WAIVABLE,
     AdapterConformance,
@@ -44,16 +46,23 @@ from contract.suite import (  # noqa: E402
     MissingControl,
     Outcome,
     Port,
+    PortClaimError,
     RateShape,
     Section,
     Target,
+    Vendor,
     applicable,
+    check_class,
     check_collection,
     check_not_simulated,
     enforce_outcome,
+    is_auth_error,
+    is_fake,
+    is_reference,
     pending_controls,
     resolve,
     run_suite,
+    validate_target,
 )
 from sto.adapters.fake.notifier import FakeNotifier  # noqa: E402
 from sto.adapters.fake.scm import FakeScm  # noqa: E402
@@ -132,14 +141,6 @@ class Stub:
             self.comments.append(comment)
         return comment
 
-    def hint(self, shape: RateShape) -> float | None:
-        return {
-            RateShape.PRIMARY_429: 30.0,
-            RateShape.PRIMARY_429_NO_HEADER: None,
-            RateShape.SECONDARY_403: 30.0,
-            RateShape.PRIMARY_403_REMAINING_ZERO: 45.0,
-        }[shape]
-
     def _limit_response(self) -> Response:
         shape = self.limit_shape
         if shape is RateShape.PRIMARY_429:
@@ -148,6 +149,8 @@ class Stub:
             return Response(429, {}, {})
         if shape is RateShape.SECONDARY_403:
             return Response(403, {"retry-after": "30"}, {"message": "secondary rate limit"})
+        if shape is RateShape.SECONDARY_403_NO_HEADER:
+            return Response(403, {}, {"message": "You have exceeded a secondary rate limit."})
         reset = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(self.now) + 45)}
         return Response(403, reset, {"message": "API rate limit exceeded"})
 
@@ -180,6 +183,10 @@ class Stub:
         fault = self._fault(op, page)
         if fault == "5xx":
             return Response(503, {}, {})
+        if fault == "429":
+            return Response(429, {"retry-after": "30"}, {})
+        if fault == "401":
+            return Response(401, {}, {"message": "Bad credentials"})
         if fault == "timeout":
             raise TimeoutError("timed out")
         if op == "lookup":
@@ -237,6 +244,7 @@ class Stub:
             "truncated": f"sha256={digest[:8]}",
             "empty": "sha256=",
             "empty_key": f"sha256={digest}",
+            "blank": "",
         }[mac]
         headers = {"X-Timestamp": stamp, "X-Signature": sig}
         if with_id and self.id_in_header:
@@ -384,8 +392,12 @@ class Adapter:
         status, h = response.status, response.headers
         if status in (200, 201):
             return response.body
+        said = str(response.body.get("message", "")) if isinstance(response.body, dict) else ""
         if status == 429 or (
-            status == 403 and ("retry-after" in h or h.get("x-ratelimit-remaining") == "0")
+            status == 403
+            and (
+                "retry-after" in h or h.get("x-ratelimit-remaining") == "0" or "rate limit" in said
+            )
         ):
             raise RateLimited(self._retry_after(response, self.server.now))
         if status == 401:
@@ -478,8 +490,12 @@ class GitHubAdapter(Adapter):
     ts_signed = False
 
 
-class RefreshOnceAdapter(Adapter):
-    """Honest Jira-3LO-shaped: a 401 gets exactly one refresh and one retry."""
+class JiraAdapter(Adapter):
+    """Honest Jira-shaped: no signed timestamp, and a 401 gets exactly one refresh and one retry
+    (3LO, D6-02)."""
+
+    window: float | None = None
+    ts_signed = False
 
     def _send(self, op: str, **kw: Any) -> Response:
         response = super()._send(op, **kw)
@@ -501,16 +517,15 @@ class StubTarget(Target):
         self,
         adapter_cls: type[Adapter] = Adapter,
         stub: Stub | None = None,
-        capabilities: Capabilities | None = None,
+        vendor: Vendor = Vendor.STUB,
         replay_window: float | None = None,
     ) -> None:
+        self.vendor = vendor
         self.server = stub or Stub()
         self.adapter_cls, self.store = adapter_cls, Store(set(), [])
-        self.adapter = adapter_cls(self.server, self.store)
+        self.adapter: Adapter = adapter_cls(self.server, self.store)
         self.verifier = self.adapter.verifier
         self.watched = "G-1" if self.server.shape == "decision" else TREF.key
-        if capabilities is not None:
-            self.capabilities = capabilities
         if replay_window is not None:
             self.replay_window = replay_window
 
@@ -550,8 +565,11 @@ class StubTarget(Target):
     def server_revision(self) -> int:
         return self.server.revision
 
-    def retry_after_hint(self, shape: RateShape) -> float | None:
-        return self.server.hint(shape)
+    def clock(self) -> float:
+        return self.server.now
+
+    def probe(self) -> None:
+        self.adapter.read_revision()
 
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
         self.server.faults[op].append([mode, page, after])
@@ -600,6 +618,7 @@ class StubTarget(Target):
             ForgeKind.TRUNCATED_MAC: "truncated",
             ForgeKind.EMPTY_MAC: "empty",
             ForgeKind.EMPTY_KEY: "empty_key",
+            ForgeKind.BLANK_HEADER: "blank",
         }[how]
         secret = b"not-the-secret" if how is ForgeKind.WRONG_SECRET else SECRET
         return self.server.delivery(revision, delivery_id, secret=secret, mac=mac)
@@ -616,8 +635,11 @@ class StubTarget(Target):
     def future_dated(self, revision: int, delivery_id: str, ahead: float) -> RawWebhook:
         return self.server.delivery(revision, delivery_id, ts=self.server.now + ahead)
 
-    def bump_timestamp(self, raw: RawWebhook) -> RawWebhook:
-        return RawWebhook({**raw.headers, "X-Timestamp": str(self.server.now)}, raw.body)
+    def set_timestamp(self, raw: RawWebhook, value: str | None) -> RawWebhook:
+        headers = {k: v for k, v in raw.headers.items() if k != "X-Timestamp"}
+        if value is not None:
+            headers["X-Timestamp"] = value
+        return RawWebhook(headers, raw.body)
 
     def tamper(self, raw: RawWebhook) -> RawWebhook:
         return RawWebhook(raw.headers, raw.body + b" ")
@@ -643,16 +665,6 @@ class FormTarget(StubTarget):
 WEBHOOK_CONTROLS = frozenset(
     {Control.SIGNATURE, Control.UNSIGNED, Control.DUPLICATE, Control.REPLAY_WINDOW, Control.RESTART}
 )
-GITHUB_CAPS = Capabilities(
-    signed_timestamp=False,
-    rate_shapes=frozenset(
-        {
-            RateShape.SECONDARY_403,
-            RateShape.PRIMARY_403_REMAINING_ZERO,
-            RateShape.PRIMARY_429,
-        }
-    ),
-)
 
 
 def reference() -> Target:
@@ -664,19 +676,15 @@ def notifier_port() -> Target:
 
 
 def github_shaped() -> Target:
-    return StubTarget(GitHubAdapter, Stub(ts_signed=False), GITHUB_CAPS)
+    return StubTarget(GitHubAdapter, Stub(ts_signed=False), Vendor.GITHUB)
 
 
 def slack_shaped() -> Target:
-    return FormTarget(
-        SlackAdapter,
-        FormStub("decision"),
-        Capabilities(rate_shapes=frozenset({RateShape.PRIMARY_429_NO_HEADER})),
-    )
+    return FormTarget(SlackAdapter, FormStub("decision"), Vendor.SLACK)
 
 
 def jira_refresh_once() -> Target:
-    return StubTarget(RefreshOnceAdapter, capabilities=Capabilities(auth_refresh=AuthRefresh.ONCE))
+    return StubTarget(JiraAdapter, Stub(ts_signed=False), Vendor.JIRA)
 
 
 class WebhookOnlyTarget(StubTarget):
@@ -684,7 +692,24 @@ class WebhookOnlyTarget(StubTarget):
 
 
 def webhook_only() -> Target:
-    return WebhookOnlyTarget()
+    return WebhookOnlyTarget(GitHubAdapter, Stub(ts_signed=False), Vendor.GITHUB)
+
+
+class NoWriteTarget(StubTarget):
+    """A fake server with no write surface (D4-16): auth, reads, rate limits and webhooks."""
+
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        raise HarnessError("this server has no write surface")
+
+    def stored_ids(self) -> list[str]:
+        raise HarnessError("this server stores nothing")
+
+    def stored_id_for(self, key: str) -> str | None:
+        raise HarnessError("this server stores nothing")
+
+
+def auth_webhook() -> Target:
+    return NoWriteTarget()
 
 
 class TestReferenceAdapter(AdapterConformance):
@@ -695,15 +720,15 @@ class TestReferenceAdapter(AdapterConformance):
 
 
 class TestNotifierPort(AdapterConformance):
-    """The Notifier port: a delivery is a ``DecisionRequest | None``, and a notifier has no read,
-    so no ordering or read-back section is required of it."""
+    """The Notifier port: a delivery is a ``DecisionRequest | None``. A notifier has no state
+    read, so no ordering section; ``send`` returns a Receipt, so read-back (G8) applies."""
 
     port = Port.NOTIFIER
     registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": notifier_port}
 
 
 class TestGitHubShapedAdapter(AdapterConformance):
-    """No signed timestamp, three rate-limit shapes, signature over the body alone."""
+    """No signed timestamp, four 403/429 shapes, signature over the body alone."""
 
     port = Port.SCM
     registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": github_shaped}
@@ -717,7 +742,7 @@ class TestSlackShapedAdapter(AdapterConformance):
 
 
 class TestJiraRefreshOnceAdapter(AdapterConformance):
-    """A 401 gets exactly one refresh and one retry (D6-02)."""
+    """A 401 gets exactly one refresh and one retry (D6-02); no signed timestamp."""
 
     port = Port.TICKET_SOURCE
     registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": jira_refresh_once}
@@ -731,10 +756,10 @@ class TestWebhookOnlyTarget(AdapterConformance):
 
 
 class TestAuthWebhookTarget(AdapterConformance):
-    """A fake server's auth and webhooks (D4-16)."""
+    """A fake server's auth, reads and webhooks, with NO write surface (D4-16)."""
 
     port = Port.AUTH_WEBHOOK
-    registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": reference}
+    registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": auth_webhook}
 
 
 # --- known-bad adapters: each breaks one rule, and the suite must fail it ---------------------
@@ -1228,14 +1253,24 @@ class Bad404IsAuth(Adapter):
         return super()._unwrap(response)
 
 
-class BadRefreshTwice(Adapter):
+class BadRefreshTwice(JiraAdapter):
     def _send(self, op: str, **kw: Any) -> Response:
-        response = super()._send(op, **kw)
+        response = Adapter._send(self, op, **kw)
         for _ in range(2):
             if response.status != 401:
                 break
             self.token = self.server.handle("refresh", self.token).body["token"]
-            response = super()._send(op, **kw)
+            response = Adapter._send(self, op, **kw)
+        return response
+
+
+class BadRefreshTwiceBeforeRetry(JiraAdapter):
+    def _send(self, op: str, **kw: Any) -> Response:
+        response = Adapter._send(self, op, **kw)
+        if response.status == 401:
+            self.server.handle("refresh", self.token)
+            self.token = self.server.handle("refresh", self.token).body["token"]
+            return Adapter._send(self, op, **kw)
         return response
 
 
@@ -1283,16 +1318,233 @@ class BadShrinksRetryAfter(Adapter):
         return None if asked is None else 1.0
 
 
-class BadRefreshesWhenNotAllowed(RefreshOnceAdapter):
+class BadRefreshesWhenNotAllowed(JiraAdapter):
     """Refreshes on a 401 for a vendor that does not allow it."""
+
+
+class BadUnsignedWideWindow(GitHubAdapter):
+    """Uses the unsigned header for replay with a window of 200,000 seconds."""
+
+    window = 200_000.0
+
+
+class BadDedupeTtl100k(GitHubAdapter):
+    """Forgets a delivery ID after 100,001 seconds, though nothing bounds a replay."""
+
+    def receive(self, raw: RawWebhook) -> Any:
+        delivery_id = self.verifier.verify(raw.headers, raw.body)
+        now = self.server.now
+        stamps: dict[str, float] = self.store.__dict__.setdefault("stamps", {})
+        if delivery_id in stamps and now - stamps[delivery_id] < 100_001:
+            return None
+        result = self._parse(raw)
+        stamps[delivery_id] = now
+        self.store.queue.append(result)
+        return result
+
+
+class BadSlackNoWindow(SlackAdapter):
+    """A Slack-shaped adapter with no replay window, though Slack signs its timestamp."""
+
+    window = None
+
+
+class BadEmptyHeaderValue(Adapter):
+    def _verifier(self) -> HmacVerifier:
+        class Blank(HmacVerifier):
+            def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
+                if headers.get("X-Signature") == "":
+                    return self._checked(headers, raw_body)
+                return super().verify(headers, raw_body)
+
+        return _hmac(Blank, self)
+
+
+class BadAuthIsLocalNotFound(Adapter):
+    """An error class of its own that IS a UnknownRefError, for a 401."""
+
+    def _unwrap(self, response: Response) -> Any:
+        if response.status == 401:
+            raise _LocalNotFound("nope")
+        return super()._unwrap(response)
+
+
+class _LocalNotFound(UnknownRefError):
+    pass
+
+
+class BadAuthIsLocalStale(Adapter):
+    def _unwrap(self, response: Response) -> Any:
+        if response.status == 401:
+            raise _LocalStale("head moved")
+        return super()._unwrap(response)
+
+
+class _LocalStale(StaleHeadError):
+    pass
+
+
+class BadLookupTimeoutIsNotFound(Adapter):
+    def _find(self, key: str) -> dict[str, str] | None:
+        try:
+            return super()._find(key)
+        except TransientError as exc:
+            if "timed out" in str(exc):
+                return None
+            raise
+
+
+class BadLaterPage429IsEnd(Adapter):
+    def _find(self, key: str) -> dict[str, str] | None:
+        page: int | None = 0
+        while page is not None:
+            try:
+                body = self._call("lookup", page=page)
+            except RateLimited:
+                if page == 0:
+                    raise
+                return None
+            for comment in body["items"]:
+                if self._mine(comment, key):
+                    return comment  # type: ignore[no-any-return]
+            page = body["next"]
+        return None
+
+
+class BadRead429IsZero(Adapter):
+    def read_revision(self) -> int:
+        try:
+            return super().read_revision()
+        except RateLimited:
+            return 0
+
+
+class BadReadBack429Or401Verified(Adapter):
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        marker = self.marker(key, variant)
+        found = self._find(key)
+        if found is not None:
+            return super().write(key, variant)
+        posted = self._call("write", body=f"{marker} body-{variant}")
+        try:
+            verified = self._find(key) is not None
+        except (RateLimited, PermanentError):
+            verified = True
+        except TransientError:
+            verified = False
+        return Receipt(posted["id"], "", verified, simulated=True)
+
+
+class BadRead403IsNotFound(Adapter):
+    def read_revision(self) -> int:
+        response = self._send("read")
+        if response.status == 403 and not response.headers:
+            raise UnknownRefError("no such ticket")
+        return int(self._unwrap(response)["revision"])
+
+
+class BadWrite404IsAuth(Adapter):
+    def _call(self, op: str, **kw: Any) -> Any:
+        response = self._send(op, **kw)
+        if response.status == 404 and op == "write":
+            raise PermanentError("401 bad credentials")
+        return self._unwrap(response)
+
+
+def _capped(pages: int) -> type[Adapter]:
+    class Capped(Adapter):
+        """Stops after ``pages`` pages and calls the key absent, instead of raising."""
+
+        def _find(self, key: str) -> dict[str, str] | None:
+            for page in range(pages):
+                body = self._call("lookup", page=page)
+                for comment in body["items"]:
+                    if self._mine(comment, key):
+                        return comment  # type: ignore[no-any-return]
+                if body["next"] is None:
+                    break
+            return None
+
+    Capped.__name__ = Capped.__qualname__ = f"BadPageCap{pages}"
+    return Capped
+
+
+BadPageCap8 = _capped(8)
+BadPageCap10 = _capped(10)
+
+
+class BadHeadOnly300(Adapter):
+    """Walks every page but searches only the first 300 objects: right for newest-first only."""
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        page: int | None = 0
+        items: list[dict[str, str]] = []
+        while page is not None:
+            body = self._call("lookup", page=page)
+            items += body["items"]
+            page = body["next"]
+        return next((c for c in items[:300] if self._mine(c, key)), None)
+
+
+class BadTailOnly300(Adapter):
+    """Walks every page but searches only the last 300 objects: right for oldest-first only."""
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        page: int | None = 0
+        items: list[dict[str, str]] = []
+        while page is not None:
+            body = self._call("lookup", page=page)
+            items += body["items"]
+            page = body["next"]
+        return next((c for c in items[-300:] if self._mine(c, key)), None)
+
+
+class BadReuseCheckInMemoryOnly(Adapter):
+    def __init__(self, server: Stub, store: Store | None = None) -> None:
+        super().__init__(server, store)
+        self._args: dict[str, str] = {}
+
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        if key in self._args and self._args[key] != variant:
+            raise IdempotencyKeyReuseError("key reused")
+        found = self._find(key)
+        self._args[key] = variant
+        if found is not None:
+            return Receipt(found["id"], "", True, simulated=True)
+        return super().write(key, variant)
+
+
+class BadIgnoresArguments(Adapter):
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        found = self._find(key)
+        if found is not None:
+            return Receipt(found["id"], "", True, simulated=True)
+        return super().write(key, variant)
+
+
+class BadAuthLatches(Adapter):
+    """After one 401 every later answer is a 401, even once the credentials work again."""
+
+    def _unwrap(self, response: Response) -> Any:
+        if response.status == 401:
+            self.server.__dict__["dead"] = True
+        if self.server.__dict__.get("dead"):
+            raise PermanentError("401 latched")
+        return super()._unwrap(response)
 
 
 def _with(adapter: type[Adapter], **kw: Any) -> Callable[[], Target]:
     return lambda: StubTarget(adapter, **kw)
 
 
-ONCE = Capabilities(auth_refresh=AuthRefresh.ONCE)
-ALL_SHAPES = Capabilities(rate_shapes=frozenset(RateShape))
+def _github(adapter: type[Adapter]) -> Callable[[], Target]:
+    return lambda: StubTarget(adapter, Stub(ts_signed=False), Vendor.GITHUB)
+
+
+def _slack(adapter: type[Adapter]) -> Callable[[], Target]:
+    return lambda: FormTarget(adapter, FormStub("decision"), Vendor.SLACK)
+
+
 A = AssertionError
 F = pytest.fail.Exception  # a `pytest.raises` that did not raise, or `pytest.fail`
 P, T, K, M = PermanentError, TransientError, IdempotencyKeyReuseError, MalformedWebhookError
@@ -1311,7 +1563,7 @@ def _bad(
     name = adapter if isinstance(adapter, str) else adapter.__name__
     if factory is None:
         assert not isinstance(adapter, str)
-        factory = _with(adapter, capabilities=ALL_SHAPES)
+        factory = _with(adapter)
     KNOWN_BAD[name] = (factory, port, pinned)
 
 
@@ -1359,6 +1611,15 @@ _bad(
         "test_t6_the_production_verifier_rejects_every_kind_of_forgery": F,
     },
 )
+_bad(
+    BadEmptyHeaderValue,
+    None,
+    TS,
+    {
+        "test_t6_every_kind_of_forgery_is_rejected_and_enqueues_nothing": F,
+        "test_t6_the_production_verifier_rejects_every_kind_of_forgery": F,
+    },
+)
 _bad(BadMintsIdWhenMissing, None, TS, {"test_a_delivery_with_no_id_is_refused_not_given_one": F})
 _bad(BadNoFutureCheck, None, TS, {"test_t6_a_delivery_dated_in_the_future": F})
 _bad(
@@ -1385,6 +1646,12 @@ _bad(
     None,
     TS,
     {"test_t6_a_genuine_delivery_inside_the_replay_window_is_accepted": P},
+)
+_bad(
+    "BadHugeWindowDeclared",
+    lambda: StubTarget(Adapter, replay_window=10**9),
+    TS,
+    {"test_t6_the_replay_window_is_no_wider_than_the_suite_allows": A},
 )
 _bad(
     BadBurnsIdOfForgery,
@@ -1421,6 +1688,16 @@ _bad(
 )
 _bad(BadVolatileDedupe, None, TS, {"test_dedupe_survives_a_restart": A})
 _bad(
+    BadEnqueuesBeforeVerify,
+    None,
+    TS,
+    {
+        "test_t6_every_kind_of_forgery_is_rejected_and_enqueues_nothing": A,
+        "test_t6_genuine_delivery_is_accepted": A,
+    },
+)
+_bad(BadEnqueuesDuplicates, None, TS, {"test_redelivery_of_the_same_delivery_id_is_dropped": A})
+_bad(
     BadCachesDeliveryState,
     None,
     TS,
@@ -1440,12 +1717,14 @@ _bad(
     },
 )
 _bad(BadReadErrorsAreZero, None, TS, {"test_a_failing_read_is_an_error_not_a_zero": F})
+_bad(BadRead429IsZero, None, TS, {"test_a_failing_read_is_an_error_not_a_zero": F})
 _bad(
     BadReadAuthIsNotFound,
     None,
     TS,
-    {"test_a_read_refused_for_credentials_is_an_auth_error_not_a_missing_object": A},
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
 )
+_bad(BadRead403IsNotFound, None, TS, {"test_a_plain_403_on_a_read_is_a_permission_error": A})
 _bad(
     BadInProcessKeys,
     None,
@@ -1462,8 +1741,60 @@ _bad(
     {"test_crash_when_the_post_is_rejected_then_a_restart_writes_once": F},
 )
 _bad(BadNewKeyReturnsOld, None, TS, {"test_a_new_key_is_a_new_write": A})
-_bad(BadFirstPageLookup, None, TS, {"test_lookup_reads_every_page_in_either_order": A})
-_bad(BadTwoPageCap, None, TS, {"test_lookup_reads_every_page_in_either_order": A})
+_bad(
+    BadFreshIdOnReplay,
+    None,
+    TS,
+    {"test_a_fresh_adapter_replaying_a_key_returns_the_servers_object": A},
+)
+_bad(
+    BadReuseCheckInMemoryOnly,
+    None,
+    TS,
+    {"test_a_key_reused_with_other_arguments_is_refused_even_after_a_restart": F},
+)
+_bad(
+    BadIgnoresArguments,
+    None,
+    TS,
+    {"test_a_key_reused_with_other_arguments_is_refused_even_after_a_restart": F},
+)
+_bad(
+    BadFirstPageLookup,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
+_bad(
+    BadTwoPageCap,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
+_bad(
+    BadPageCap8,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
+_bad(
+    BadPageCap10,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
+_bad(
+    BadHeadOnly300,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
+_bad(
+    BadTailOnly300,
+    None,
+    TS,
+    {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
+)
 _bad(
     BadLaterPageErrorIsEnd,
     None,
@@ -1471,16 +1802,25 @@ _bad(
     {"test_an_error_on_a_later_page_is_not_the_end_of_the_list": F},
 )
 _bad(
+    BadLaterPage429IsEnd, None, TS, {"test_an_error_on_a_later_page_is_not_the_end_of_the_list": F}
+)
+_bad(
     BadLookupErrorIsNotFound,
     None,
     TS,
-    {"test_a_server_error_on_lookup_is_not_taken_for_not_found": F},
+    {"test_a_failed_lookup_of_any_kind_is_not_taken_for_not_found": F},
+)
+_bad(
+    BadLookupTimeoutIsNotFound,
+    None,
+    TS,
+    {"test_a_failed_lookup_of_any_kind_is_not_taken_for_not_found": F},
 )
 _bad(
     BadLookupErrorWritesAnyway,
     None,
     TS,
-    {"test_a_server_error_on_lookup_is_not_taken_for_not_found": A},
+    {"test_a_failed_lookup_of_any_kind_is_not_taken_for_not_found": A},
 )
 _bad(
     BadTrustsAnyAuthor,
@@ -1505,87 +1845,155 @@ _bad(
     TS,
     {"test_a_write_accepted_but_not_applied_is_never_reported_verified": A},
 )
+_bad(
+    "BadAlwaysVerified@notifier",
+    lambda: StubTarget(BadAlwaysVerified),
+    Port.NOTIFIER,
+    {"test_a_write_accepted_but_not_applied_is_never_reported_verified": A},
+)
 _bad(BadNeverVerified, None, TS, {"test_an_applied_write_is_reported_read_back_verified": A})
 _bad(BadReadBackAnyAuthor, None, TS, {"test_read_back_does_not_accept_another_authors_object": A})
 _bad(
     BadReadBackErrorIsVerified,
     None,
     TS,
-    {"test_a_read_back_that_fails_is_unknown_never_verified": A},
+    {"test_a_read_back_that_fails_in_any_way_is_unknown_never_verified": A},
+)
+_bad(
+    "BadReadBackErrorIsVerified@notifier",
+    lambda: StubTarget(BadReadBackErrorIsVerified),
+    Port.NOTIFIER,
+    {"test_a_read_back_that_fails_in_any_way_is_unknown_never_verified": A},
+)
+_bad(
+    BadReadBack429Or401Verified,
+    None,
+    TS,
+    {"test_a_read_back_that_fails_in_any_way_is_unknown_never_verified": A},
 )
 _bad(
     BadHammersOn429,
     None,
     TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": F},
+    {"test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": F},
 )
 _bad(
     BadLimitIsPermanent,
     None,
     TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": P},
+    {"test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": P},
 )
 _bad(
     BadSecondaryIsPermanent,
     None,
     TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": P},
+    {"test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": P},
 )
 _bad(
     BadDropsRetryAfter,
     None,
     TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": A},
+    {"test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": A},
+)
+_bad(
+    BadShrinksRetryAfter,
+    None,
+    TS,
+    {"test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": A},
 )
 _bad(
     BadPost429AssumedApplied,
     None,
     TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": F},
+    {"test_a_rate_limited_post_is_transient_and_applies_nothing": F},
 )
-_bad(
-    BadRetriesAuth,
-    None,
-    TS,
-    {"test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A},
-)
+_bad(BadRetriesAuth, None, TS, {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A})
 _bad(
     BadAuthIsNotFound,
     None,
     TS,
-    {"test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A},
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
 )
-_bad(BadPost401IsNotFound, None, TS, {"test_a_401_at_any_step_of_a_write_is_an_auth_error": A})
 _bad(
     BadAuthIsTransient,
     None,
     TS,
-    {"test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": T},
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": T},
 )
+_bad(BadAuthIsStale, None, TS, {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A})
 _bad(
-    BadAuthIsStale,
+    BadAuthIsLocalNotFound,
     None,
     TS,
-    {"test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A},
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
+)
+_bad(
+    BadAuthIsLocalStale,
+    None,
+    TS,
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
+)
+_bad(BadPost401IsNotFound, None, TS, {"test_a_401_at_any_step_of_a_write_is_an_auth_error": A})
+_bad(
+    BadAuthLatches,
+    None,
+    TS,
+    {
+        "test_the_probe_succeeds_once_auth_is_restored_and_nothing_latches": P,
+        "test_the_write_succeeds_once_auth_is_restored": P,
+    },
 )
 _bad(
     Bad403IsNotFound,
     None,
     TS,
-    {"test_a_plain_403_is_a_permission_error_not_a_rate_limit_or_a_missing_object": A},
+    {
+        "test_a_plain_403_on_a_read_is_a_permission_error": A,
+        "test_a_plain_403_at_any_step_of_a_write_is_a_permission_error": A,
+    },
 )
 _bad(
     BadEvery403IsRateLimit,
     None,
     TS,
-    {"test_a_plain_403_is_a_permission_error_not_a_rate_limit_or_a_missing_object": RateLimited},
+    {
+        "test_a_plain_403_on_a_read_is_a_permission_error": RateLimited,
+        "test_a_plain_403_at_any_step_of_a_write_is_a_permission_error": RateLimited,
+    },
 )
-_bad(Bad404IsAuth, None, TS, {"test_a_404_is_an_unknown_object_not_a_credential_error": P})
+_bad(
+    Bad404IsAuth,
+    None,
+    TS,
+    {
+        "test_a_404_on_a_read_is_an_unknown_object_not_a_credential_error": P,
+        "test_a_404_at_any_step_of_a_write_is_an_unknown_object": P,
+    },
+)
+_bad(BadWrite404IsAuth, None, TS, {"test_a_404_at_any_step_of_a_write_is_an_unknown_object": P})
 _bad(
     BadUnsignedWindow,
-    lambda: StubTarget(BadUnsignedWindow, Stub(ts_signed=False), GITHUB_CAPS),
+    _github(BadUnsignedWindow),
     Port.SCM,
     {"test_t6_a_genuine_delivery_older_than_the_window": P},
+)
+_bad(
+    BadUnsignedWideWindow,
+    _github(BadUnsignedWideWindow),
+    Port.SCM,
+    {"test_t6_a_genuine_delivery_older_than_the_window": P},
+)
+_bad(
+    BadDedupeTtl100k,
+    _github(BadDedupeTtl100k),
+    Port.SCM,
+    {"test_dedupe_does_not_expire_while_the_delivery_can_still_be_replayed": A},
+)
+_bad(
+    BadDedupeIncludesTimestamp,
+    _github(BadDedupeIncludesTimestamp),
+    Port.SCM,
+    {"test_t6_a_bumped_timestamp_cannot_revive_an_old_delivery": A},
 )
 _bad(
     BadBumpableTimestamp,
@@ -1594,60 +2002,38 @@ _bad(
     {"test_t6_a_bumped_timestamp_cannot_revive_an_old_delivery": F},
 )
 _bad(
-    "BadHugeWindowDeclared",
-    lambda: StubTarget(Adapter, replay_window=10**9),
-    TS,
-    {"test_t6_the_replay_window_is_no_wider_than_the_suite_allows": A},
+    BadSlackNoWindow,
+    _slack(BadSlackNoWindow),
+    Port.NOTIFIER,
+    {"test_t6_a_genuine_delivery_older_than_the_window": F},
 )
 _bad(
     BadRefreshTwice,
-    lambda: StubTarget(BadRefreshTwice, capabilities=ONCE),
+    lambda: StubTarget(BadRefreshTwice, Stub(ts_signed=False), Vendor.JIRA),
     TS,
-    {"test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A},
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
+)
+_bad(
+    BadRefreshTwiceBeforeRetry,
+    lambda: StubTarget(BadRefreshTwiceBeforeRetry, Stub(ts_signed=False), Vendor.JIRA),
+    TS,
+    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
 )
 _bad(
     "BadNeverRefreshes",
-    lambda: StubTarget(Adapter, capabilities=ONCE),
+    lambda: StubTarget(GitHubAdapter, Stub(ts_signed=False), Vendor.JIRA),
     TS,
     {
-        "test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A,
+        "test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A,
         "test_an_expired_token_is_refreshed_only_if_the_vendor_allows_it": P,
     },
 )
 _bad(
-    BadEnqueuesBeforeVerify,
-    None,
-    TS,
-    {
-        "test_t6_every_kind_of_forgery_is_rejected_and_enqueues_nothing": A,
-        "test_t6_genuine_delivery_is_accepted": A,
-    },
-)
-_bad(BadEnqueuesDuplicates, None, TS, {"test_redelivery_of_the_same_delivery_id_is_dropped": A})
-_bad(
-    BadDedupeIncludesTimestamp,
-    lambda: StubTarget(BadDedupeIncludesTimestamp, Stub(ts_signed=False), GITHUB_CAPS),
-    Port.SCM,
-    {"test_t6_a_bumped_timestamp_cannot_revive_an_old_delivery": A},
-)
-_bad(
-    BadFreshIdOnReplay,
-    None,
-    TS,
-    {"test_a_fresh_adapter_replaying_a_key_returns_the_servers_object": A},
-)
-_bad(
-    BadShrinksRetryAfter,
-    None,
-    TS,
-    {"test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered": A},
-)
-_bad(
     BadRefreshesWhenNotAllowed,
-    lambda: StubTarget(BadRefreshesWhenNotAllowed),
+    lambda: StubTarget(BadRefreshesWhenNotAllowed, Stub(ts_signed=False), Vendor.GITHUB),
     TS,
     {
-        "test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule": A,
+        "test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A,
         "test_an_expired_token_is_refreshed_only_if_the_vendor_allows_it": F,
     },
 )
@@ -1662,7 +2048,7 @@ def test_the_reference_and_vendor_shaped_adapters_pass_every_test() -> None:
         (slack_shaped, Port.NOTIFIER),
         (jira_refresh_once, Port.TICKET_SOURCE),
         (webhook_only, Port.WEBHOOK),
-        (reference, Port.AUTH_WEBHOOK),
+        (auth_webhook, Port.AUTH_WEBHOOK),
     ):
         failed = {n: e for n, e in run_suite(factory, port).items() if e is not None}
         assert failed == {}, (factory.__name__, port)
@@ -1678,11 +2064,31 @@ def test_known_bad_adapters_fail_the_suite(name: str) -> None:
         assert type(error) is expected, f"{name} failed {test} with {type(error).__name__}"
     broken = {n: e for n, e in results.items() if isinstance(e, (HarnessError, MissingControl))}
     assert broken == {}, "a bad adapter must fail the contract, not the harness"
+    assert not any(isinstance(e, PortClaimError) for e in results.values())
 
 
 def test_every_bad_adapter_is_in_the_table() -> None:
     defined = {k for k, v in globals().items() if k.startswith("Bad") and isinstance(v, type)}
-    assert defined <= set(KNOWN_BAD), sorted(defined - set(KNOWN_BAD))
+    assert defined <= {k.split("@")[0] for k in KNOWN_BAD}, sorted(
+        defined - {k.split("@")[0] for k in KNOWN_BAD}
+    )
+
+
+def test_every_suite_test_is_pinned_by_a_bad_adapter_or_is_a_harness_check() -> None:
+    pinned = set().union(*(set(p) for _, _, p in KNOWN_BAD.values()))
+    harness_checks = {
+        "test_a_forged_delivery_differs_from_a_genuine_one_only_in_its_signature",
+        "test_t6_the_replay_window_is_no_wider_than_the_suite_allows",
+        "test_t6_tampered_body_is_rejected",
+        "test_t6_a_bumped_timestamp_cannot_revive_an_old_delivery",
+        "test_t6_a_missing_or_garbage_time_header",
+        "test_crash_after_the_write_applied_then_a_restart_does_not_write_again",
+        "test_crash_when_the_lookup_fails_then_a_restart_writes_once",
+        "test_a_write_accepted_but_not_applied_is_never_reported_verified",
+        "test_an_applied_write_is_reported_read_back_verified",
+    }
+    unpinned = set(applicable(Port.TICKET_SOURCE)) - pinned - harness_checks
+    assert unpinned == set(), sorted(unpinned)
 
 
 def test_a_bare_target_fails_by_missing_control_or_harness_never_passes() -> None:
@@ -1702,8 +2108,7 @@ def test_an_inconsistent_forge_is_a_harness_error_not_an_adapter_failure() -> No
             return self.server.delivery(revision + 1, delivery_id, secret=b"x")
 
     name = "test_a_forged_delivery_differs_from_a_genuine_one_only_in_its_signature"
-    error = run_suite(Sloppy)[name]
-    assert type(error) is HarnessError
+    assert type(run_suite(Sloppy)[name]) is HarnessError
 
 
 def test_an_adapter_whose_forge_skips_is_a_failure_not_a_pass() -> None:
@@ -1713,47 +2118,141 @@ def test_an_adapter_whose_forge_skips_is_a_failure_not_a_pass() -> None:
         ) -> RawWebhook:
             pytest.skip("cannot forge here")
 
-    results = run_suite(Skipper)
     name = "test_t6_every_kind_of_forgery_is_rejected_and_enqueues_nothing"
-    assert isinstance(results[name], pytest.skip.Exception)
-    assert results[name] is not None
+    error = run_suite(Skipper)[name]
+    assert isinstance(error, pytest.skip.Exception)
 
 
-# --- sections, ports and capabilities -------------------------------------------------------
+# --- sections, ports, vendors -----------------------------------------------------------------
 
 
 def test_sections_come_from_the_port() -> None:
     assert PORT_SECTIONS[Port.WEBHOOK] == {Section.WEBHOOK}
-    webhook_tests = set(applicable(Port.WEBHOOK))
-    assert "test_a_new_key_is_a_new_write" not in webhook_tests
-    assert "test_t6_genuine_delivery_is_accepted" in webhook_tests
+    assert "test_a_new_key_is_a_new_write" not in applicable(Port.WEBHOOK)
+    assert "test_t6_genuine_delivery_is_accepted" in applicable(Port.WEBHOOK)
+    assert applicable(Port.TICKET_SOURCE) == applicable(Port.SCM)
+    assert set(applicable(Port.AUTH_WEBHOOK)) & set(applicable(Port.WEBHOOK)) == set(
+        applicable(Port.WEBHOOK)
+    )
+
+
+def test_a_notifier_has_read_back_and_no_ordering() -> None:
+    """``send`` returns a Receipt with ``read_back_verified``, so G8 applies; no state read."""
     notifier = set(applicable(Port.NOTIFIER))
-    assert "test_an_applied_write_is_reported_read_back_verified" not in notifier
+    assert "test_an_applied_write_is_reported_read_back_verified" in notifier
+    assert "test_a_write_accepted_but_not_applied_is_never_reported_verified" in notifier
+    assert "test_a_read_back_that_fails_in_any_way_is_unknown_never_verified" in notifier
     assert "test_delivery_order_does_not_change_what_the_adapter_reports" not in notifier
-    assert "test_a_new_key_is_a_new_write" in notifier
+    assert Section.ORDERING not in PORT_SECTIONS[Port.NOTIFIER]
 
 
 def test_a_subclass_of_a_narrow_port_has_no_other_tests_to_fail() -> None:
     assert TestWebhookOnlyTarget.test_a_new_key_is_a_new_write is None
-    assert TestNotifierPort.test_an_applied_write_is_reported_read_back_verified is None
+    assert TestNotifierPort.test_delivery_order_does_not_change_what_the_adapter_reports is None
     assert TestReferenceAdapter.test_a_new_key_is_a_new_write is not None
 
 
-def test_a_webhook_target_cannot_pick_a_narrower_port_than_its_adapter_has() -> None:
-    """The port is the one the adapter implements; the full-port reference is held to all."""
-    assert applicable(Port.TICKET_SOURCE) == applicable(Port.SCM)
-    assert set(applicable(Port.WEBHOOK)) < set(applicable(Port.TICKET_SOURCE))
+def test_the_auth_webhook_port_needs_no_write_surface() -> None:
+    target = auth_webhook()
+    with pytest.raises(HarnessError):
+        target.write("k")
+    for name in applicable(Port.AUTH_WEBHOOK):
+        assert "write" not in name
+        assert "key" not in name
 
 
-def test_capabilities_must_declare_a_rate_limit_shape() -> None:
+def test_the_port_is_verified_not_claimed() -> None:
+    """An adapter implementing a wider port cannot claim a narrower one."""
+    ticket_adapter = types.SimpleNamespace(
+        vendor=Vendor.GITHUB, adapter=FakeTicketSource(SpyWriter())
+    )
+    notifier_adapter = types.SimpleNamespace(vendor=Vendor.SLACK, adapter=FakeNotifier(SpyWriter()))
+    with pytest.raises(PortClaimError, match="narrower"):
+        validate_target(ticket_adapter, Port.WEBHOOK)  # type: ignore[arg-type]
+    with pytest.raises(PortClaimError, match="narrower"):
+        validate_target(notifier_adapter, Port.WEBHOOK)  # type: ignore[arg-type]
+    validate_target(ticket_adapter, Port.TICKET_SOURCE)  # type: ignore[arg-type]
+    validate_target(ticket_adapter, Port.SCM)  # type: ignore[arg-type]
+    validate_target(notifier_adapter, Port.NOTIFIER)  # type: ignore[arg-type]
+    validate_target(notifier_adapter, Port.TICKET_SOURCE)  # type: ignore[arg-type]
+
+
+def test_an_adapter_that_implements_no_port_cannot_claim_one() -> None:
+    class Plain:
+        pass
+
+    target = types.SimpleNamespace(vendor=Vendor.SLACK, adapter=Plain())
+    for port in (Port.TICKET_SOURCE, Port.SCM, Port.NOTIFIER):
+        with pytest.raises(PortClaimError, match="implements no"):
+            validate_target(target, port)  # type: ignore[arg-type]
+    validate_target(target, Port.WEBHOOK)  # type: ignore[arg-type]
+    validate_target(target, Port.AUTH_WEBHOOK)  # type: ignore[arg-type]
+
+
+def test_only_the_reference_adapters_are_exempt_from_the_port_check() -> None:
+    assert is_reference(Adapter)
+    assert is_reference(BadInProcessKeys)
+    assert not is_reference(FakeTicketSource)
+
+    class Local(Adapter):  # defined here, but not a module attribute: not the reference
+        pass
+
+    assert not is_reference(Local)
+    spoofed = types.SimpleNamespace(vendor=Vendor.STUB, adapter=Local(Stub()))
+    with pytest.raises(PortClaimError, match="STUB"):
+        validate_target(spoofed, Port.WEBHOOK)  # type: ignore[arg-type]
+
+
+def test_an_unsigned_timestamp_vendor_cannot_be_a_notifier() -> None:
+    """A Notifier has no ordering section, so no re-read stands in for a replay window."""
+    with pytest.raises(PortClaimError, match="unsigned"):
+        validate_target(github_shaped(), Port.NOTIFIER)
+    validate_target(slack_shaped(), Port.NOTIFIER)
+
+
+def test_a_target_must_name_a_vendor() -> None:
+    class NoVendor(Target):
+        adapter = FakeTicketSource(SpyWriter())
+
+    with pytest.raises(HarnessError, match="Vendor"):
+        validate_target(NoVendor(), Port.WEBHOOK)
+
+
+def test_vendor_capabilities_are_owned_by_the_suite() -> None:
+    assert CAPABILITIES[Vendor.SLACK].rate_shapes == {RateShape.PRIMARY_429}
+    assert CAPABILITIES[Vendor.SLACK].signed_timestamp
+    assert not CAPABILITIES[Vendor.GITHUB].signed_timestamp
+    assert RateShape.SECONDARY_403_NO_HEADER in CAPABILITIES[Vendor.GITHUB].rate_shapes
+    assert CAPABILITIES[Vendor.JIRA].auth_refresh is AuthRefresh.ONCE
+    assert CAPABILITIES[Vendor.STUB].rate_shapes == frozenset(RateShape)
+    assert set(SHAPE_RETRY_AFTER) == set(RateShape)
+    for caps in CAPABILITIES.values():
+        assert caps.rate_shapes
     with pytest.raises(ValueError, match="shape"):
-        Capabilities(rate_shapes=frozenset())
+        Capabilities(True, frozenset(), AuthRefresh.NONE)
 
 
-def test_no_capability_removes_signature_dedupe_auth_or_idempotency() -> None:
-    fields = set(Capabilities.__dataclass_fields__)
-    assert fields == {"signed_timestamp", "rate_shapes", "auth_refresh"}
+def test_no_vendor_removes_signature_dedupe_auth_or_idempotency() -> None:
     assert not {Control.SIGNATURE, Control.DUPLICATE, Control.AUTH, Control.CRASH} & WAIVABLE
+    assert set(Capabilities.__dataclass_fields__) == {
+        "signed_timestamp",
+        "rate_shapes",
+        "auth_refresh",
+    }
+
+
+def test_is_auth_error_rejects_every_port_error_and_its_subclasses() -> None:
+    assert is_auth_error(PermanentError("401"))
+    assert not is_auth_error(TransientError("429"))
+    for exc in (UnknownRefError("x"), StaleHeadError("x"), IdempotencyKeyReuseError("x")):
+        assert not is_auth_error(exc)
+    assert not is_auth_error(_LocalNotFound("x"))
+    assert not is_auth_error(_LocalStale("x"))
+
+    class AdapterAuthError(PermanentError):
+        pass
+
+    assert is_auth_error(AdapterAuthError("401"))
 
 
 # --- selection: simulated receipts, typos, every non-fake name --------------------------------
@@ -1814,11 +2313,12 @@ def test_select_reports_which_target_ran(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_the_fixture_records_the_target_that_ran() -> None:
     probe = types.SimpleNamespace(user_properties=[])
     fixture = AdapterConformance.target.__wrapped__  # type: ignore[attr-defined]
-    fixture(types.SimpleNamespace(registry={"fake": reference}), types.SimpleNamespace(node=probe))
+    holder = types.SimpleNamespace(registry={"fake": reference}, port=Port.TICKET_SOURCE)
+    fixture(holder, types.SimpleNamespace(node=probe))
     assert probe.user_properties == [("conformance_target", "fake")]
 
 
-# --- pending_controls: fake-only, pinned -----------------------------------------------------
+# --- pending_controls: fake-only by the adapter that runs, pinned --------------------------------
 
 
 def _probe() -> type[Any]:
@@ -1827,15 +2327,27 @@ def _probe() -> type[Any]:
         registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": reference}
 
     SUBCLASSES.remove(TestProbe)
-    return pending_controls(
-        Control.HTTP_ERRORS, reason="the fake has no 403 or 404", fake=FakeTicketSource
-    )(TestProbe)
+    return pending_controls(Control.HTTP_ERRORS, reason="the fake has no 403 or 404")(TestProbe)
 
 
 WAIVED = (
-    "test_a_plain_403_is_a_permission_error_not_a_rate_limit_or_a_missing_object",
-    "test_a_404_is_an_unknown_object_not_a_credential_error",
+    "test_a_plain_403_on_a_read_is_a_permission_error",
+    "test_a_404_on_a_read_is_an_unknown_object_not_a_credential_error",
+    "test_a_plain_403_at_any_step_of_a_write_is_a_permission_error",
+    "test_a_404_at_any_step_of_a_write_is_an_unknown_object",
 )
+
+
+class FakeBacked(Target):
+    """A target whose adapter really is a fake from ``sto.adapters.fake``, with no HTTP errors."""
+
+    name = "fake-backed"
+    vendor = Vendor.STUB
+    controls: ClassVar[frozenset[Control]] = frozenset()
+
+    def __init__(self, adapter: object, selected: str = "fake") -> None:
+        self.adapter = adapter
+        self.selected = selected
 
 
 def test_pending_controls_marks_strict_xfail_on_missing_control_only() -> None:
@@ -1860,39 +2372,64 @@ def test_pending_controls_does_not_mark_the_shared_base_tests() -> None:
 @pytest.mark.parametrize("control", sorted(SECURITY_CONTROLS))
 def test_pending_controls_refuses_every_non_waivable_control(control: Control) -> None:
     with pytest.raises(ValueError, match="security"):
-        pending_controls(control, reason="because", fake=FakeTicketSource)
+        pending_controls(control, reason="because")
 
 
 def test_pending_controls_refuses_a_class_with_every_control() -> None:
     with pytest.raises(ValueError, match="security"):
-        pending_controls(*Control, reason="all of them", fake=FakeTicketSource)
+        pending_controls(*Control, reason="all of them")
 
 
 def test_only_one_control_can_be_waived_at_all() -> None:
     assert {Control.HTTP_ERRORS} == WAIVABLE
-    for control in WAIVABLE:
-        assert control not in {Control.SIGNATURE, Control.AUTH, Control.RATE_LIMIT, Control.CRASH}
 
 
 @pytest.mark.parametrize("reason", ["", "   "])
 def test_pending_controls_needs_a_reason(reason: str) -> None:
     with pytest.raises(ValueError, match="reason"):
-        pending_controls(Control.HTTP_ERRORS, reason=reason, fake=FakeTicketSource)
+        pending_controls(Control.HTTP_ERRORS, reason=reason)
 
 
-@pytest.mark.parametrize("not_a_fake", [Adapter, StubTarget, Target])
-def test_pending_controls_is_for_fakes_only_in_every_mode(not_a_fake: type[Any]) -> None:
-    with pytest.raises(ValueError, match="fakes under"):
-        pending_controls(Control.HTTP_ERRORS, reason="because", fake=not_a_fake)
+def test_a_waiver_is_allowed_for_an_adapter_really_defined_as_a_fake() -> None:
+    probe = _probe()
+    target = FakeBacked(FakeTicketSource(SpyWriter()))
+    with pytest.raises(MissingControl):  # past the guard, into the test: the xfail path
+        probe().__getattribute__(WAIVED[0])(target)
+
+
+def test_a_waiver_fails_for_the_adapter_that_runs_when_it_is_not_a_fake() -> None:
+    """The running adapter is checked, not a class named when the waiver was written."""
+    probe = _probe()
+    target = FakeBacked(Bad403IsNotFound(Stub()))
+    with pytest.raises(pytest.fail.Exception, match="only for a fake"):
+        probe().__getattribute__(WAIVED[0])(target)
 
 
 @pytest.mark.parametrize("name", ["live", "staging"])
-def test_a_waived_test_fails_when_the_target_is_not_the_fake(name: str) -> None:
+def test_a_waiver_fails_when_the_target_is_not_the_fake(name: str) -> None:
     probe = _probe()
-    target = reference()
-    target.selected = name
+    target = FakeBacked(FakeTicketSource(SpyWriter()), selected=name)
     with pytest.raises(pytest.fail.Exception, match="only for the fake"):
         probe().__getattribute__(WAIVED[0])(target)
+
+
+def test_is_fake_needs_a_dot_boundary_a_loaded_module_and_the_source_location() -> None:
+    assert is_fake(FakeTicketSource)
+    assert is_fake(FakeNotifier)
+    assert is_fake(FakeScm)
+
+    class Spoof(Adapter):
+        pass
+
+    for module in ("sto.adapters.fake.github", "sto.adapters.fake_github", "sto.adapters.fake"):
+        Spoof.__module__ = module
+        assert not is_fake(Spoof), module  # not loaded, or not this class, or elsewhere on disk
+
+    class Elsewhere:
+        pass
+
+    Elsewhere.__module__ = "sto.adapters.fake.tickets"  # a loaded fake module, but not its class
+    assert not is_fake(Elsewhere)
 
 
 def test_a_missing_control_fails_rather_than_skips() -> None:
@@ -1903,13 +2440,9 @@ def test_a_missing_control_fails_rather_than_skips() -> None:
 # --- guards: no route around the suite -----------------------------------------------------
 
 
-def _try(**body: Any) -> None:
-    attrs = {
-        "port": Port.TICKET_SOURCE,
-        "registry": {"fake": reference},
-        **body,
-    }
-    type("TestRoute", (AdapterConformance,), attrs)
+def _try(*bases: type, **body: Any) -> type:
+    attrs = {"port": Port.TICKET_SOURCE, "registry": {"fake": reference}, **body}
+    return type("TestRoute", (*bases, AdapterConformance), attrs)
 
 
 def test_a_subclass_cannot_override_a_suite_test() -> None:
@@ -1926,6 +2459,51 @@ def test_a_subclass_cannot_replace_the_target_fixture() -> None:
 def test_a_subclass_cannot_set_marks_or_hide_itself(attr: str) -> None:
     with pytest.raises(TypeError, match=attr):
         _try(**{attr: [pytest.mark.skip] if attr == "pytestmark" else False})
+
+
+def test_a_mixin_cannot_supply_the_target_fixture() -> None:
+    class Mixin:
+        @pytest.fixture
+        def target(self) -> Target:
+            return reference()
+
+    with pytest.raises(TypeError, match="target"):
+        _try(Mixin)
+
+
+def test_a_mixin_cannot_override_a_suite_test() -> None:
+    class Mixin:
+        def test_t6_genuine_delivery_is_accepted(self, target: Target) -> None:
+            return None
+
+    with pytest.raises(TypeError, match="test_t6_genuine_delivery_is_accepted"):
+        _try(Mixin)
+
+
+def test_a_mixin_overriding_init_subclass_is_caught_at_collection() -> None:
+    class Mixin:
+        def __init_subclass__(cls, **kwargs: Any) -> None:  # never calls super(): opts out
+            pass
+
+    cls = _try(Mixin)  # creation is not refused: the mixin's hook ran instead of the suite's
+    try:
+        assert cls not in SUBCLASSES
+        problems = check_collection([_item(cls, "test_t6_genuine_delivery_is_accepted")], [])
+        assert any("never registered" in p for p in problems), problems
+        assert any("__init_subclass__" in p for p in check_class(cls))
+    finally:
+        if cls in SUBCLASSES:
+            SUBCLASSES.remove(cls)
+
+
+def test_collection_rechecks_a_class_whose_fixture_was_swapped_after_creation() -> None:
+    cls = _try()
+    try:
+        cls.target = lambda self: reference()  # type: ignore[attr-defined]
+        problems = check_collection([_item(cls, "test_t6_genuine_delivery_is_accepted")], [])
+        assert any("target" in p for p in problems), problems
+    finally:
+        SUBCLASSES.remove(cls)
 
 
 def test_a_conformance_subclass_must_be_named_test() -> None:
@@ -1945,50 +2523,61 @@ def test_a_conformance_subclass_must_set_port_and_registry(missing: str) -> None
         type("TestIncomplete", (AdapterConformance,), attrs)
 
 
-def _item(cls: type, name: str, fn: Any = None) -> Any:
+def _item(cls: type, name: str, fn: Any = None, marks: tuple[str, ...] = ()) -> Any:
     fn = fn or getattr(cls, name)
-    return types.SimpleNamespace(cls=cls, originalname=name, function=fn)
+    return types.SimpleNamespace(
+        cls=cls,
+        originalname=name,
+        function=fn,
+        iter_markers=lambda: iter(types.SimpleNamespace(name=m) for m in marks),
+    )
 
 
-def test_check_collection_flags_a_subclass_that_collected_nothing(tmp_path: Path) -> None:
-    class TestOrphan(AdapterConformance):
-        port = Port.WEBHOOK
-        registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": webhook_only}
-
+def test_check_collection_flags_a_subclass_that_collected_nothing() -> None:
+    cls = _try(port=Port.WEBHOOK, registry={"fake": webhook_only})
     try:
         here = [str(Path(__file__).parent)]
-        orphan = f"{__name__}.TestOrphan collected no test"
+        orphan = f"{__name__}.TestRoute collected no test"
         assert orphan in check_collection([], here)
-        items = [_item(TestOrphan, n) for n in applicable(Port.WEBHOOK)]
+        items = [_item(cls, n) for n in applicable(Port.WEBHOOK)]
         assert orphan not in check_collection(items, here)
     finally:
-        SUBCLASSES.remove(TestOrphan)
+        SUBCLASSES.remove(cls)
 
 
 def test_check_collection_flags_a_subclass_hidden_with_test_false_after_creation() -> None:
-    class TestHidden(AdapterConformance):
-        port = Port.WEBHOOK
-        registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": webhook_only}
-
-    TestHidden.__test__ = False  # type: ignore[attr-defined]  # set after creation: pytest skips it
+    cls = _try(port=Port.WEBHOOK, registry={"fake": webhook_only})
+    cls.__test__ = False  # type: ignore[attr-defined]  # after creation: pytest skips the class
     try:
         problems = check_collection([], [str(Path(__file__).parent)])
-        assert f"{__name__}.TestHidden collected no test" in problems
+        assert f"{__name__}.TestRoute collected no test" in problems
     finally:
-        SUBCLASSES.remove(TestHidden)
+        SUBCLASSES.remove(cls)
 
 
 def test_check_collection_flags_a_replaced_suite_test() -> None:
     name = "test_t6_genuine_delivery_is_accepted"
     items = [_item(TestWebhookOnlyTarget, name, lambda self, target: None)]
     problems = check_collection(items, [f"{__file__}::TestWebhookOnlyTarget"])
-    assert problems == [f"TestWebhookOnlyTarget.{name} is not the suite's own test"]
+    assert f"TestWebhookOnlyTarget.{name} is not the suite's own test" in problems
 
 
-def test_check_collection_is_quiet_for_a_genuine_item_and_a_partial_run() -> None:
+def test_check_collection_is_quiet_for_a_genuine_item_in_a_named_selection() -> None:
     name = "test_t6_genuine_delivery_is_accepted"
     items = [_item(TestWebhookOnlyTarget, name)]
-    assert check_collection(items, [f"{__file__}::TestWebhookOnlyTarget"]) == []
+    assert check_collection(items, [f"{__file__}::TestWebhookOnlyTarget::{name}"]) == []
+
+
+def test_a_node_id_narrows_the_check_only_to_the_classes_it_names() -> None:
+    """Not the whole session: a class the selection does not name is out of it, but a named class
+    is held to every test its port requires."""
+    names = [n for n in applicable(Port.WEBHOOK) if n != "test_t6_genuine_delivery_is_accepted"]
+    items = [_item(TestWebhookOnlyTarget, n) for n in names]
+    problems = check_collection(items, [f"{__file__}::TestWebhookOnlyTarget"])
+    assert (
+        "TestWebhookOnlyTarget.test_t6_genuine_delivery_is_accepted was not collected" in problems
+    )
+    assert not [p for p in problems if "TestReferenceAdapter" in p]
 
 
 def test_check_collection_flags_a_test_the_port_requires_but_was_not_collected() -> None:
@@ -1998,6 +2587,27 @@ def test_check_collection_flags_a_test_the_port_requires_but_was_not_collected()
     assert (
         "TestWebhookOnlyTarget.test_t6_genuine_delivery_is_accepted was not collected" in problems
     )
+
+
+@pytest.mark.parametrize("mark", ["live", "integration", "skip", "xfail", "e2e"])
+def test_check_collection_flags_an_in_process_class_carrying_an_escape_marker(mark: str) -> None:
+    name = "test_t6_genuine_delivery_is_accepted"
+    items = [_item(TestWebhookOnlyTarget, name, marks=(mark,))]
+    problems = check_collection(items, [f"{__file__}::TestWebhookOnlyTarget::{name}"])
+    assert any(mark in p for p in problems), problems
+
+
+def test_check_collection_allows_the_xfail_pending_controls_made() -> None:
+    probe = _probe()
+    name = WAIVED[0]
+    item = types.SimpleNamespace(
+        cls=TestReferenceAdapter,
+        originalname=name,
+        function=probe.__dict__[name],
+        iter_markers=lambda: iter([types.SimpleNamespace(name="xfail")]),
+    )
+    problems = check_collection([item], [f"{__file__}::TestReferenceAdapter::{name}"])
+    assert not [p for p in problems if "xfail" in p], problems
 
 
 def test_enforce_outcome_turns_a_skip_or_an_xfail_into_a_failure() -> None:
@@ -2023,24 +2633,30 @@ def test_enforce_outcome_allows_the_xfail_pending_controls_makes() -> None:
     assert report.outcome == "skipped"
 
 
-def test_the_collection_guard_runs_before_deselection() -> None:
-    import contract.conftest as hooks
+def test_the_collection_guard_runs_before_deselection_and_is_a_plugin_for_every_session() -> None:
+    import contract.suite as suite
 
-    options = hooks.pytest_collection_modifyitems.pytest_impl  # type: ignore[attr-defined]
+    options = suite.pytest_collection_modifyitems.pytest_impl  # type: ignore[attr-defined]
     assert options["tryfirst"] is True, "it must see items before -m and -k deselect them"
+    assert suite.pytest_runtest_makereport.pytest_impl["hookwrapper"] is True  # type: ignore[attr-defined]
+    addopts = (TESTS_DIR.parent / "pyproject.toml").read_text()
+    assert '"-p", "contract.suite"' in addopts, "loaded for every session, like hermetic_guard"
+    assert not (Path(__file__).parent / "conftest.py").exists()
 
 
 # --- the guards, end to end, in a real pytest run -------------------------------------------
 
 
-def _project(tmp_path: Path, test_source: str, conftest_source: str = "") -> Path:
+def _project(tmp_path: Path, test_source: str, conftest_extra: str = "") -> Path:
     (tmp_path / "pytest.ini").write_text(
         textwrap.dedent(
             f"""\
             [pytest]
             pythonpath = {TESTS_DIR} {SRC_DIR}
-            addopts = -p contract.conftest -p no:cacheprovider
-            markers = contract
+            addopts = -p contract.suite -p no:cacheprovider
+            markers =
+                contract
+                live
             """
         )
     )
@@ -2048,20 +2664,22 @@ def _project(tmp_path: Path, test_source: str, conftest_source: str = "") -> Pat
         "import pytest\n\n"
         "def pytest_collection_modifyitems(items):\n"
         "    for item in items:\n"
-        "        item.add_marker(pytest.mark.contract)\n" + conftest_source
+        "        item.add_marker(pytest.mark.contract)\n" + conftest_extra
     )
     (tmp_path / "test_adapter.py").write_text(
         "import pytest\n"
-        'pytest.register_assert_rewrite("contract.suite")\n'
-        "from contract.suite import AdapterConformance, Port\n"
-        "from contract.test_suite import webhook_only\n\n" + textwrap.dedent(test_source)
+        "from contract.suite import AdapterConformance, ForgeKind, Port\n"
+        "from contract.test_suite import GitHubAdapter, Stub, Vendor, WebhookOnlyTarget\n\n"
+        "def webhook_only():\n"
+        "    return WebhookOnlyTarget(GitHubAdapter, Stub(ts_signed=False), Vendor.GITHUB)\n\n"
+        + textwrap.dedent(test_source)
     )
     return tmp_path
 
 
-def _run(project: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run(project: Path, *extra: str, marker: str = "contract") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-m", "contract", str(project), *extra],
+        [sys.executable, "-m", "pytest", "-q", "-m", marker, str(project), *extra],
         cwd=project,
         capture_output=True,
         text=True,
@@ -2099,6 +2717,18 @@ def test_e2e_a_subclass_that_collects_nothing_fails_under_m_contract(tmp_path: P
     assert "TestOrphan collected no test" in result.stdout + result.stderr
 
 
+def test_e2e_a_class_marked_live_cannot_leave_the_in_process_run(tmp_path: Path) -> None:
+    source = (
+        HEALTHY
+        + """
+    pytest.mark.live(TestIngest)
+"""
+    )
+    result = _run(_project(tmp_path, source), marker="contract and not live")
+    assert result.returncode != 0, "deselected by `not live` with exit 0 was the hole"
+    assert "carries ['live']" in result.stdout + result.stderr
+
+
 def test_e2e_a_mark_applied_from_outside_cannot_skip_the_suite(tmp_path: Path) -> None:
     skip = "        item.add_marker(pytest.mark.skip(reason='not today'))\n"
     result = _run(_project(tmp_path, HEALTHY, skip))
@@ -2111,6 +2741,60 @@ def test_e2e_a_mark_applied_from_outside_cannot_xfail_the_suite(tmp_path: Path) 
     result = _run(_project(tmp_path, HEALTHY, xfail))
     assert result.returncode != 0
     assert "may not be skipped or xfailed" in result.stdout + result.stderr
+
+
+def test_e2e_the_repos_own_pytest_config_guards_a_subclass_in_another_directory(
+    tmp_path: Path,
+) -> None:
+    """From the repo's pyproject (``addopts``), under ``-m contract``, a subclass outside
+    ``tests/contract`` whose ``forge()`` skips must fail: the plugin loads for every session."""
+    other = tmp_path / "contract"
+    other.mkdir()
+    (other / "test_other.py").write_text(
+        textwrap.dedent(
+            """\
+            import pytest
+            from contract.suite import AdapterConformance, ForgeKind, Port
+            from contract.test_suite import GitHubAdapter, Stub, Vendor, WebhookOnlyTarget
+
+            class SkipsToForge(WebhookOnlyTarget):
+                def forge(self, revision, delivery_id, how=ForgeKind.WRONG_SECRET):
+                    pytest.skip("cannot forge")
+
+            def target():
+                return SkipsToForge(GitHubAdapter, Stub(ts_signed=False), Vendor.GITHUB)
+
+            class TestElsewhere(AdapterConformance):
+                port = Port.WEBHOOK
+                registry = {"fake": target}
+            """
+        )
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-m",
+            "contract",
+            "-c",
+            str(TESTS_DIR.parent / "pyproject.toml"),
+            "--rootdir",
+            str(TESTS_DIR.parent),
+            "-p",
+            "no:cacheprovider",
+            str(other / "test_other.py"),
+        ],
+        cwd=TESTS_DIR.parent,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "may not be skipped or xfailed" in output
 
 
 # --- the merged fakes (D1-04) -----------------------------------------------------------------

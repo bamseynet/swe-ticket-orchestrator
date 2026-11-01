@@ -11,29 +11,36 @@ Import it as ``contract.suite`` from any test directory (``tests/`` is on ``pyth
 
     import pytest
 
-    pytest.register_assert_rewrite("contract.suite")  # before the import, for readable failures
-    from contract.suite import AdapterConformance, Port, Target  # noqa: E402
+    from contract.suite import AdapterConformance, Port, Target, Vendor
 
     class TestMyAdapter(AdapterConformance):
         port = Port.TICKET_SOURCE
         registry = {"fake": MyFakeTarget, "live": MyLiveTarget}
 
-Outside ``tests/contract`` also load the guards, in that directory's ``conftest.py``::
+This module is also a pytest plugin, loaded for EVERY session through ``addopts`` in
+``pyproject.toml`` (``-p contract.suite``), exactly as ``hermetic_guard`` is. Its hooks fail the
+run if a subclass collected no test (under ``-m`` too), if a suite test was replaced, if an
+in-process subclass carries a marker that deselects or skips it, and if a suite test is skipped
+or xfailed by anything but ``pending_controls``. A subclass must be named ``Test*`` and cannot
+define a ``test_*`` method, the ``target`` fixture, ``pytestmark``, ``__test__`` or
+``__init_subclass__``, in itself or in a mixin. The checks run at class creation AND again at
+collection.
 
-    pytest_plugins = ["contract.conftest"]
+Known limits, deliberate routes the suite does not stop: removing a class from ``SUBCLASSES``,
+forging the private waiver token, a header name in a different case (fails closed), forging
+every ``ForgeKind`` consistently (only ``WRONG_SECRET`` is checked against ``emit``), and
+nothing requires a real adapter to HAVE a conformance subclass. The guards read the markers on
+collected items; a ``::`` argument narrows the completeness check to the classes it names.
 
-The guards (``check_collection`` and ``enforce_outcome``) fail the run if a subclass collected no
-test (under ``-m`` too), if a suite test was replaced, and if a suite test is skipped or xfailed
-by anything but ``pending_controls``. A subclass cannot override a ``test_*`` method, the
-``target`` fixture, ``pytestmark`` or ``__test__``; it must be named ``Test*``.
-
-Sections, ports and capabilities
---------------------------------
+Ports, vendors and sections
+---------------------------
 Which sections a target must pass comes from the PORT the adapter implements (``PORT_SECTIONS``),
-never from the adapter's choice. A webhook-only target (``Port.WEBHOOK``) is not asked to survive
-a crash. A target declares typed ``Capabilities`` (signed timestamp, the rate-limit shapes its
-vendor uses, auth refresh). A capability never removes a control: it selects which assertion a
-mandatory test makes. Signature, dedupe, auth and idempotency cannot be declared out.
+and the port is VERIFIED: an adapter that implements ``TicketSource``, ``ScmProvider`` or
+``Notifier`` (checked with ``isinstance``) cannot claim a narrower port. Only adapters defined in
+``contract.test_suite``, the reference and its known-bad variants, implement no real port and are
+exempt. A target names a ``Vendor``; the suite owns that vendor's ``Capabilities`` (signed
+timestamp, rate-limit shapes, auth refresh) and there is no default. A vendor never removes a
+control: it selects which assertion a mandatory test makes.
 
 What the harness is
 -------------------
@@ -43,9 +50,11 @@ asserts what the SERVER saw, never what the adapter says about itself. Security 
 failure-mapping code (signature check, dedupe, replay window, error classes, look-up-first) must
 live in the adapter under test, reached through ``target.verifier`` and ``target.deliver``. The
 suite never parses a delivery body: the target forges, tampers and re-serialises it, so a
-form-encoded vendor works. ``run_suite`` runs the suite against any target, which is how a
-known-bad adapter proves the suite can catch it; ``HarnessError`` marks a broken harness, as
-opposed to an adapter failing the contract.
+form-encoded vendor works. Authentication and rate-limit tests go through ``target.probe`` (an
+authenticated request that writes nothing), so a server with no write surface (D4-16) can run
+them. ``run_suite`` runs the suite against any target, which is how a known-bad adapter proves the
+suite can catch it; ``HarnessError`` marks a broken harness, as opposed to an adapter failing the
+contract.
 
 This section covers **Receipt-returning, keyed writes** only (comment, check, message). The SCM
 section (``MergeHandle``, ``UpdateResult``, keyless ``move_ref``, ``dequeue``, update-branch)
@@ -55,16 +64,18 @@ belongs to D4-19. A delivery's result is whatever the port returns (nudges, or a
 Not testable black-box: constant-time comparison (T4). D4-04 owns it as a static check.
 
 A test needing a control the target lacks FAILS with ``MissingControl``; it is never skipped.
-``pending_controls`` lets a FAKE (a class under ``sto.adapters.fake``) lack the one waivable
-control, with a reason; it cannot be used on anything that is not a fake.
+``pending_controls`` lets a FAKE (an adapter class really defined under ``sto.adapters.fake``)
+lack the one waivable control, with a reason; it cannot be used on anything else.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib.util
 import os
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+import sys
+from collections.abc import Callable, Generator, Iterable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -74,19 +85,42 @@ import pytest
 from sto.adapters.ports import (
     IdempotencyKeyReuseError,
     MalformedWebhookError,
+    Notifier,
     RawWebhook,
+    RefusedError,
+    ScmProvider,
+    StaleHeadError,
+    TicketSource,
     UnknownRefError,
 )
-from sto.domain.errors import PermanentError, TransientError
+from sto.domain.errors import (
+    InvalidIdError,
+    InvalidTransitionError,
+    PermanentError,
+    TransientError,
+)
 from sto.domain.models import Receipt
 
 TARGET_ENV = "STO_CONFORMANCE_TARGET"
 DEFAULT_TARGET = "fake"  # the only name whose receipts may be simulated
 MAX_REPLAY_WINDOW = 300.0  # seconds; set here, a target cannot raise it
+FAR_FUTURE = 10.0**10  # seconds; longer than any finite window an adapter could sensibly use
 PAGE_SIZE = 100  # GitHub's maximum; the server pages at this size
+DEEP = 1100  # objects on each side of a marker: past any page cap up to ten pages
 RETRIES = 5
 FAKE_MODULE = "sto.adapters.fake"
-PORT_ERROR_MODULES = frozenset({"sto.adapters.ports", "sto.domain.errors"})
+REFERENCE_MODULE = "contract.test_suite"
+PORT_ERRORS = (
+    IdempotencyKeyReuseError,
+    InvalidIdError,
+    InvalidTransitionError,
+    MalformedWebhookError,
+    RefusedError,
+    StaleHeadError,
+    UnknownRefError,
+)
+# Markers that would deselect, skip or fail-soft an in-process conformance class.
+ESCAPE_MARKERS = frozenset({"live", "integration", "e2e", "ui_browser", "skip", "skipif", "xfail"})
 
 
 class Section(StrEnum):
@@ -94,27 +128,33 @@ class Section(StrEnum):
     ORDERING = "ordering"  # needs a state read
     IDEMPOTENCY = "idempotency"  # crash at each step, restart, keys
     LOOKUP = "lookup"  # look-up-first (PLAN 6.3)
-    READ_BACK = "read_back"  # needs a read after the write
-    RATE = "rate"
-    AUTH = "auth"
+    READ_BACK = "read_back"  # a write returns a Receipt with read_back_verified (G8)
+    RATE = "rate"  # through target.probe
+    AUTH = "auth"  # through target.probe
+    WRITE_FAILURES = "write_failures"  # rate limits, auth and HTTP errors at each step of a write
 
 
 class Port(StrEnum):
     TICKET_SOURCE = "ticket_source"
     SCM = "scm"
-    NOTIFIER = "notifier"  # no read: no ordering or read-back sections
+    NOTIFIER = "notifier"  # no state read: no ordering section
     WEBHOOK = "webhook"  # ingest only (D4-03, D4-04)
-    AUTH_WEBHOOK = "auth_webhook"  # a fake server's auth and webhooks (D4-16)
+    AUTH_WEBHOOK = "auth_webhook"  # a fake server's auth, reads and webhooks (D4-16)
 
 
 _ALL = frozenset(Section)
 PORT_SECTIONS: Mapping[Port, frozenset[Section]] = {
     Port.TICKET_SOURCE: _ALL,
     Port.SCM: _ALL,
-    Port.NOTIFIER: _ALL - {Section.ORDERING, Section.READ_BACK},
+    Port.NOTIFIER: _ALL - {Section.ORDERING},
     Port.WEBHOOK: frozenset({Section.WEBHOOK}),
     Port.AUTH_WEBHOOK: frozenset({Section.WEBHOOK, Section.ORDERING, Section.RATE, Section.AUTH}),
 }
+_REAL_PORTS: tuple[tuple[Port, type], ...] = (
+    (Port.TICKET_SOURCE, TicketSource),
+    (Port.SCM, ScmProvider),
+    (Port.NOTIFIER, Notifier),
+)
 
 
 class Control(StrEnum):
@@ -149,7 +189,18 @@ class RateShape(StrEnum):
     PRIMARY_429 = "primary_429"  # 429 with Retry-After
     PRIMARY_429_NO_HEADER = "primary_429_no_header"
     SECONDARY_403 = "secondary_403"  # GitHub: 403 with Retry-After
+    SECONDARY_403_NO_HEADER = "secondary_403_no_header"  # GitHub: 403, only the message says so
     PRIMARY_403_REMAINING_ZERO = "primary_403_remaining_zero"  # 403, x-ratelimit-remaining: 0
+
+
+# What the server's answer for a shape asks the caller to wait (seconds), or None if it names none.
+SHAPE_RETRY_AFTER: Mapping[RateShape, float | None] = {
+    RateShape.PRIMARY_429: 30.0,
+    RateShape.PRIMARY_429_NO_HEADER: None,
+    RateShape.SECONDARY_403: 30.0,
+    RateShape.SECONDARY_403_NO_HEADER: None,
+    RateShape.PRIMARY_403_REMAINING_ZERO: 45.0,
+}
 
 
 class AuthRefresh(StrEnum):
@@ -162,21 +213,52 @@ class ForgeKind(StrEnum):
     TRUNCATED_MAC = "truncated_mac"
     EMPTY_MAC = "empty_mac"
     EMPTY_KEY = "empty_key"  # a MAC made with an empty secret
+    BLANK_HEADER = "blank_header"  # the signature header is present and empty
 
 
 @dataclass(frozen=True)
 class Capabilities:
-    signed_timestamp: bool = True  # False: GitHub; the adapter may use no time header for replay
-    rate_shapes: frozenset[RateShape] = field(default=frozenset({RateShape.PRIMARY_429}))
-    auth_refresh: AuthRefresh = AuthRefresh.NONE
+    signed_timestamp: bool  # False: GitHub, Jira; the adapter may use no time header for replay
+    rate_shapes: frozenset[RateShape]
+    auth_refresh: AuthRefresh
 
     def __post_init__(self) -> None:
         if not self.rate_shapes:
             raise ValueError("declare at least one rate-limit shape the vendor uses")
 
 
+class Vendor(StrEnum):
+    GITHUB = "github"
+    SLACK = "slack"
+    JIRA = "jira"
+    STUB = "stub"  # the reference and its known-bad variants only
+
+
+CAPABILITIES: Mapping[Vendor, Capabilities] = {
+    Vendor.GITHUB: Capabilities(
+        False,
+        frozenset(
+            {
+                RateShape.PRIMARY_429,
+                RateShape.PRIMARY_403_REMAINING_ZERO,
+                RateShape.SECONDARY_403,
+                RateShape.SECONDARY_403_NO_HEADER,
+            }
+        ),
+        AuthRefresh.NONE,
+    ),
+    Vendor.SLACK: Capabilities(True, frozenset({RateShape.PRIMARY_429}), AuthRefresh.NONE),
+    Vendor.JIRA: Capabilities(False, frozenset({RateShape.PRIMARY_429}), AuthRefresh.ONCE),
+    Vendor.STUB: Capabilities(True, frozenset(RateShape), AuthRefresh.NONE),
+}
+
+
 class MissingControl(AssertionError):
     """The target cannot provoke the failure this test needs."""
+
+
+class PortClaimError(AssertionError):
+    """The target claims a port or a vendor it does not have."""
 
 
 class HarnessError(Exception):
@@ -210,12 +292,17 @@ class Target:
 
     name: ClassVar[str] = "target"
     controls: ClassVar[frozenset[Control]] = frozenset()
-    capabilities: Capabilities = Capabilities()
+    vendor: Vendor  # required: the suite owns the vendor's capabilities, there is no default
     signature_header: ClassVar[str] = "X-Signature"
     replay_window: float = MAX_REPLAY_WINDOW
     watched: str = ""  # the name a nudge for the watched object must carry
     selected: str = DEFAULT_TARGET  # set by the fixture: which target ran
+    adapter: object  # the adapter under test, so the suite can verify the port it claims
     verifier: Verifier
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return CAPABILITIES[self.vendor]
 
     # --- adapter calls ---
     def write(self, key: str, variant: str = "a") -> Receipt:
@@ -236,6 +323,11 @@ class Target:
         """What the adapter says the watched object's revision is: a read it must make."""
         raise _unset("reported_revision")
 
+    def probe(self) -> None:
+        """An authenticated request that writes nothing (a read, ``auth.test``). Rate-limit and
+        auth behaviour is asserted through it."""
+        raise _unset("probe")
+
     # --- the server's view ---
     def stored_ids(self) -> list[str]:
         """IDs of the objects our principal has stored, oldest first."""
@@ -252,15 +344,15 @@ class Target:
     def server_revision(self) -> int:
         raise _unset("server_revision")
 
-    def retry_after_hint(self, shape: RateShape) -> float | None:
-        """The seconds the server's answer for this shape asks for, or None if it names none."""
-        raise _unset("retry_after_hint")
+    def clock(self) -> float:
+        raise _unset("clock")
 
     # --- controls, acting at the server ---
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
         """The next ``op`` request (``lookup``, ``write``, ``read``), after skipping ``after`` of
-        them and only for ``page`` if given, suffers ``mode``: ``5xx`` (nothing applied),
-        ``timeout`` (nothing applied) or ``lose`` (a write applied, the caller sees a timeout)."""
+        them and only for ``page`` if given, suffers ``mode``: ``5xx`` or ``timeout`` (nothing
+        applied), ``429`` or ``401`` (answered so), ``lose`` (a write applied, the caller sees a
+        timeout)."""
         raise _unset("fault_next")
 
     def respond_next(self, op: str, status: int) -> None:
@@ -321,9 +413,9 @@ class Target:
         """A genuine delivery stamped ``ahead`` seconds in the future."""
         raise _unset("future_dated")
 
-    def bump_timestamp(self, raw: RawWebhook) -> RawWebhook:
-        """The same delivery with its timestamp header set to the server's time now."""
-        raise _unset("bump_timestamp")
+    def set_timestamp(self, raw: RawWebhook, value: str | None) -> RawWebhook:
+        """The same delivery with its timestamp header set to ``value``, or removed if None."""
+        raise _unset("set_timestamp")
 
     def tamper(self, raw: RawWebhook) -> RawWebhook:
         """The same signature over a body with one byte changed."""
@@ -348,6 +440,69 @@ class Target:
         missing = sorted(c for c in needed if c not in self.controls)
         if missing:
             raise MissingControl(f"{self.name} has no control for: {', '.join(missing)}")
+
+
+# --- what a target may claim ------------------------------------------------------------------
+
+
+def _defined_under(cls: type, dotted: str, directories: Iterable[Path]) -> bool:
+    """``cls`` is REALLY defined in a module of package ``dotted`` (with a dot boundary): the
+    module is loaded under that name, holds this very class, and lives in one of ``directories``.
+    A ``__module__`` set by hand fails the last two."""
+    name = cls.__module__
+    if name != dotted and not name.startswith(dotted + "."):
+        return False
+    module = sys.modules.get(name)
+    if module is None or getattr(module, cls.__name__, None) is not cls:
+        return False
+    file = getattr(module, "__file__", None)
+    if not file:
+        return False
+    return any(Path(str(file)).resolve().is_relative_to(d) for d in directories)
+
+
+def _fake_directories() -> list[Path]:
+    spec = importlib.util.find_spec(FAKE_MODULE)
+    return [Path(p).resolve() for p in (spec.submodule_search_locations or [])] if spec else []
+
+
+def is_fake(cls: type) -> bool:
+    return _defined_under(cls, FAKE_MODULE, _fake_directories())
+
+
+def is_reference(cls: type) -> bool:
+    return _defined_under(cls, REFERENCE_MODULE, [Path(__file__).resolve().parent])
+
+
+def implemented_ports(adapter: object) -> list[Port]:
+    return [port for port, protocol in _REAL_PORTS if isinstance(adapter, protocol)]
+
+
+def validate_target(target: Target, port: Port) -> None:
+    """The target is what it says: a known vendor, a port its adapter really implements."""
+    vendor = getattr(target, "vendor", None)
+    if not isinstance(vendor, Vendor):
+        raise HarnessError("the target must name a Vendor; the suite owns its capabilities")
+    adapter = getattr(target, "adapter", None)
+    if adapter is None:
+        raise HarnessError("the target must expose the adapter under test as `adapter`")
+    reference = is_reference(type(adapter))
+    if vendor is Vendor.STUB and not reference:
+        raise PortClaimError("Vendor.STUB is for the reference adapters only")
+    if port is Port.NOTIFIER and not CAPABILITIES[vendor].signed_timestamp:
+        raise PortClaimError(
+            "an unsigned-timestamp vendor needs the re-read of an ordering section"
+        )
+    if reference:
+        return
+    implemented = implemented_ports(adapter)
+    if not implemented:
+        if port not in (Port.WEBHOOK, Port.AUTH_WEBHOOK):
+            raise PortClaimError(f"the adapter implements no {port} port")
+        return
+    needed: set[Section] = set().union(*(PORT_SECTIONS[p] for p in implemented))
+    if not needed <= PORT_SECTIONS[port]:
+        raise PortClaimError(f"the adapter implements {implemented}; {port} is narrower")
 
 
 # --- selection ------------------------------------------------------------------------------
@@ -389,11 +544,9 @@ def _crash(target: Target, point: CrashPoint) -> None:
 
 
 def is_auth_error(exc: BaseException) -> bool:
-    """A permanent error that means "your credentials or permissions are no good", not "not
-    found", "stale", "refused" or any other port error."""
-    if not isinstance(exc, PermanentError):
-        return False
-    return type(exc) is PermanentError or type(exc).__module__ not in PORT_ERROR_MODULES
+    """A permanent error that means "your credentials or permissions are no good": not "not
+    found", "stale", "refused" or any other port error, and not a subclass of one."""
+    return isinstance(exc, PermanentError) and not isinstance(exc, PORT_ERRORS)
 
 
 # --- known gaps (fakes only) ----------------------------------------------------------------
@@ -416,21 +569,16 @@ def covers(
     return tag
 
 
-def pending_controls(
-    *missing: Control, reason: str, fake: type[Any]
-) -> Callable[[type[Any]], type[Any]]:
-    """Class decorator for a FAKE (``fake`` must be defined under ``sto.adapters.fake``) that
-    lacks a waivable control. Each test needing one becomes a strict xfail on ``MissingControl``.
+def pending_controls(*missing: Control, reason: str) -> Callable[[type[Any]], type[Any]]:
+    """Class decorator for a FAKE that lacks a waivable control. Each test needing one becomes a
+    strict xfail on ``MissingControl``.
 
-    Refused unless ``fake`` is a fake, without a reason, for any non-waivable control, and when the
-    target that runs is not the default ``fake`` (checked at run time, in every mode).
+    Refused without a reason and for any non-waivable control. When the test RUNS, it fails unless
+    the target is the default ``fake`` and the adapter under test is a class really defined under
+    ``sto.adapters.fake`` (dot boundary, loaded module, source location), whatever it is called.
     """
     if not reason.strip():
         raise ValueError("pending_controls needs a reason")
-    if not fake.__module__.startswith(FAKE_MODULE):
-        raise ValueError(
-            f"pending_controls is for fakes under {FAKE_MODULE}, not {fake.__module__}"
-        )
     banned = sorted(set(missing) - WAIVABLE)
     if banned:
         raise ValueError(f"pending_controls cannot waive security controls: {', '.join(banned)}")
@@ -445,8 +593,11 @@ def pending_controls(
 
             def guarded(*a: Any, _fn: Callable[..., None] = fn, **k: Any) -> None:
                 target = a[1] if len(a) > 1 else k.get("target")
-                if getattr(target, "selected", DEFAULT_TARGET) != DEFAULT_TARGET:
+                adapter = getattr(target, "adapter", None)
+                if getattr(target, "selected", None) != DEFAULT_TARGET or adapter is None:
                     pytest.fail("pending_controls is only for the fake target")
+                if not is_fake(type(adapter)):
+                    pytest.fail(f"pending_controls is only for a fake under {FAKE_MODULE}")
                 _fn(*a, **k)
 
             own = functools.wraps(fn)(guarded)  # a copy: marking `fn` would mark every class
@@ -469,10 +620,10 @@ def retrying[T](call: Callable[[], T], attempts: int = RETRIES) -> T:
     raise AssertionError("unreachable")
 
 
-# --- guards -----------------------------------------------------------------------------------
+# --- guards: class checks, collection checks, outcome checks ----------------------------------
 
 SUBCLASSES: list[type] = []
-_FORBIDDEN = ("target", "pytestmark", "__test__")
+_FORBIDDEN = ("target", "pytestmark", "__test__", "__init_subclass__")
 
 
 def applicable(port: Port) -> list[str]:
@@ -483,49 +634,112 @@ def applicable(port: Port) -> list[str]:
     )
 
 
-def _module_file(cls: type) -> Path | None:
-    module = __import__(cls.__module__, fromlist=["_"])
+def check_class(cls: type) -> list[str]:
+    """Why ``cls`` is not a faithful conformance subclass, looking through its whole MRO (mixins
+    too). A test may be absent (``None``: the port does not require it) or the waiver copy that
+    ``pending_controls`` made; nothing else."""
+    problems = []
+    if not cls.__name__.startswith("Test"):
+        problems.append(f"{cls.__name__} must be named Test*: pytest collects none of its tests")
+    for klass in cls.__mro__:
+        if klass is AdapterConformance or klass is object:
+            continue
+        for name, value in vars(klass).items():
+            if name in _FORBIDDEN and not (name == "target" and klass is AdapterConformance):
+                problems.append(f"{cls.__name__} ({klass.__name__}) defines {name!r}")
+            elif name in _SUITE_TESTS:
+                genuine = _SUITE_TESTS[name]
+                waived = getattr(value, "_waiver", None) is _WAIVER and (
+                    getattr(value, "__wrapped__", None) is genuine
+                )
+                if value is not None and not waived and klass is not cls:
+                    problems.append(f"{cls.__name__} ({klass.__name__}) overrides {name}")
+                elif value is not None and not waived:
+                    problems.append(f"{cls.__name__} overrides {name}")
+    if "target" in dir(cls) and not _has_suite_fixture(cls):
+        problems.append(f"{cls.__name__} replaces the target fixture")
+    for attr in ("port", "registry"):
+        if not hasattr(cls, attr):
+            problems.append(f"{cls.__name__} must set `{attr}`")
+    return problems
+
+
+def _has_suite_fixture(cls: type) -> bool:
+    import inspect
+
+    return inspect.getattr_static(cls, "target") is inspect.getattr_static(
+        AdapterConformance, "target"
+    )
+
+
+def _file_of(cls: type) -> Path | None:
+    module = sys.modules.get(cls.__module__)
     file = getattr(module, "__file__", None)
-    return Path(file).resolve() if file else None
+    return Path(str(file)).resolve() if file else None
+
+
+def _scope(args: Iterable[str]) -> tuple[list[Path], dict[Path, set[str]]]:
+    """Directories and files the session was pointed at, and the classes a ``::`` argument names
+    (a class named there narrows the completeness check to itself)."""
+    paths: list[Path] = []
+    named: dict[Path, set[str]] = {}
+    for arg in args:
+        file, _, rest = str(arg).partition("::")
+        path = Path(file).resolve()
+        paths.append(path)
+        if rest:
+            named.setdefault(path, set()).add(rest.split("::")[0])
+    return paths, named
 
 
 def check_collection(items: Iterable[Any], args: Iterable[str]) -> list[str]:
     """Problems with the suite subclasses in this session. Call it with the FULL list of
-    collected items (before ``-m`` and ``-k`` deselect), as ``tests/contract/conftest.py`` does.
+    collected items (before ``-m`` and ``-k`` deselect), as the plugin hook does.
 
-    A subclass in scope (a test file under the session's arguments) must have collected, for
-    every test its port requires, the suite's own function. A run narrowed to node IDs only
-    checks that what it did collect is genuine.
+    Every class collected is re-checked (mixins and ``__init_subclass__`` included). A class in
+    scope (a test file under the session's arguments) must have collected every test its port
+    requires, as the suite's own function. An in-process class (one with a ``fake`` target) must
+    carry no marker that would deselect or skip it. A ``::`` argument names the classes it
+    selects: only those are checked for completeness, and the rest are out of the selection.
     """
     items = list(items)
     args = [str(a) for a in args]
-    partial = any("::" in a for a in args)
-    scope = [Path(a.split("::")[0]).resolve() for a in args]
+    paths, named = _scope(args)
     by_cls: dict[type, dict[str, Any]] = {}
+    problems = []
     for item in items:
         cls = getattr(item, "cls", None)
-        if cls in SUBCLASSES:
-            by_cls.setdefault(cls, {})[item.originalname] = item
-    problems = []
+        if cls is None or not (isinstance(cls, type) and issubclass(cls, AdapterConformance)):
+            continue
+        if cls not in SUBCLASSES:
+            problems.append(f"{cls.__name__} is a conformance subclass that was never registered")
+            continue
+        by_cls.setdefault(cls, {})[item.originalname] = item
     for cls, found in by_cls.items():
+        problems += check_class(cls)
         for name, item in found.items():
-            if name not in _SUITE_TESTS:
-                continue
+            genuine = _SUITE_TESTS.get(name)
             fn = item.function
-            genuine = _SUITE_TESTS[name]
             waived = getattr(fn, "_waiver", None) is _WAIVER and fn.__wrapped__ is genuine
-            if fn is not genuine and not waived:
+            if genuine is not None and fn is not genuine and not waived:
                 problems.append(f"{cls.__name__}.{name} is not the suite's own test")
-    if partial:
-        return problems
+            if "fake" in getattr(cls, "registry", {}):
+                marks = {m.name for m in item.iter_markers()} & ESCAPE_MARKERS
+                marks -= {"xfail"} if waived else set()
+                if marks:
+                    problems.append(f"{cls.__name__}.{name} carries {sorted(marks)}")
     for cls in SUBCLASSES:
-        file = _module_file(cls)
-        in_scope = file is not None and any(file == s or s in file.parents for s in scope)
-        if not in_scope:
+        file = _file_of(cls)
+        if file is None or not any(file == p or p in file.parents or p == file for p in paths):
+            continue
+        selected = [c for p, c in named.items() if p == file]
+        if selected and cls.__name__ not in set().union(*selected):
             continue
         if cls not in by_cls:
             problems.append(f"{cls.__module__}.{cls.__name__} collected no test")
             continue
+        if selected and any(a.count("::") > 1 for a in args):
+            continue  # a single test was named
         for name in applicable(cls.port):  # type: ignore[attr-defined]
             if name not in by_cls[cls]:
                 problems.append(f"{cls.__name__}.{name} was not collected")
@@ -547,6 +761,24 @@ def enforce_outcome(item: Any, report: Any) -> None:
             del report.wasxfail
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Runs before ``-m`` and ``-k`` deselect, so the CI selector cannot hide an orphan."""
+    problems = check_collection(items, config.args)
+    if problems:
+        raise pytest.UsageError("conformance suite: " + "; ".join(problems))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[Any]
+) -> Generator[None, Any, None]:
+    outcome = yield
+    enforce_outcome(item, outcome.get_result())
+
+
 class AdapterConformance:
     """The tests. Set ``port`` and ``registry``; the inherited ``target`` fixture selects."""
 
@@ -555,19 +787,9 @@ class AdapterConformance:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if not cls.__name__.startswith("Test"):
-            raise TypeError(
-                f"{cls.__name__}: a conformance subclass must be named Test*, else pytest "
-                "collects none of its tests"
-            )
-        for name in cls.__dict__:
-            if name in _FORBIDDEN or name in _SUITE_TESTS:
-                raise TypeError(
-                    f"{cls.__name__} may not define {name!r}: it would change the suite"
-                )
-        for attr in ("port", "registry"):
-            if not hasattr(cls, attr):
-                raise TypeError(f"{cls.__name__} must set `{attr}`")
+        problems = check_class(cls)
+        if problems:
+            raise TypeError("; ".join(problems))
         keep = set(applicable(cls.port))
         for name in _SUITE_TESTS:
             if name not in keep:
@@ -577,6 +799,7 @@ class AdapterConformance:
     @pytest.fixture
     def target(self, request: pytest.FixtureRequest) -> Target:
         name, target = resolve(self.registry)
+        validate_target(target, self.port)
         request.node.user_properties.append(("conformance_target", name))
         return target
 
@@ -720,16 +943,17 @@ class AdapterConformance:
 
     @covers(Section.WEBHOOK, Control.SIGNATURE, Control.REPLAY_WINDOW)
     def test_t6_a_genuine_delivery_older_than_the_window(self, target: Target) -> None:
-        """Signed timestamp: rejected. Unsigned timestamp (GitHub): a redelivery of an unseen ID
-        is accepted, because no time header may be trusted for replay."""
+        """Signed timestamp: rejected. Unsigned timestamp (GitHub, Jira): a delivery of an unseen
+        ID is accepted however old, because no time header may be trusted for replay."""
         target.require(Control.SIGNATURE, Control.REPLAY_WINDOW)
         raw = target.emit(1, "d-1")
-        target.advance_clock(min(target.replay_window, MAX_REPLAY_WINDOW) + 1)
         if target.capabilities.signed_timestamp:
+            target.advance_clock(min(target.replay_window, MAX_REPLAY_WINDOW) + 1)
             with pytest.raises(PermanentError):
                 target.deliver(raw)
             assert target.queued() == 0
         else:
+            target.advance_clock(FAR_FUTURE)
             assert target.deliver(raw).accepted
 
     @covers(Section.WEBHOOK, Control.SIGNATURE, Control.REPLAY_WINDOW)
@@ -741,6 +965,18 @@ class AdapterConformance:
         target.advance_clock(min(target.replay_window, MAX_REPLAY_WINDOW) - 1)
         assert target.deliver(raw).accepted
 
+    @covers(Section.WEBHOOK, Control.SIGNATURE, Control.REPLAY_WINDOW)
+    def test_t6_a_missing_or_garbage_time_header(self, target: Target) -> None:
+        """Signed timestamp: both are refused. Unsigned: both are accepted (header ignored)."""
+        target.require(Control.SIGNATURE, Control.REPLAY_WINDOW)
+        for i, value in enumerate((None, "not-a-time")):
+            raw = target.set_timestamp(target.emit(1, f"d-{i}"), value)
+            if target.capabilities.signed_timestamp:
+                with pytest.raises(PermanentError):
+                    target.deliver(raw)
+            else:
+                assert target.deliver(raw).accepted
+
     @covers(Section.WEBHOOK, Control.SIGNATURE, Control.REPLAY_WINDOW, Control.DUPLICATE)
     def test_t6_a_bumped_timestamp_cannot_revive_an_old_delivery(self, target: Target) -> None:
         """Signed timestamp: the bump breaks the signature. Unsigned: the bump changes nothing,
@@ -748,8 +984,8 @@ class AdapterConformance:
         target.require(Control.SIGNATURE, Control.REPLAY_WINDOW, Control.DUPLICATE)
         raw = target.emit(1, "d-1")
         assert target.deliver(raw).accepted
-        target.advance_clock(100_000)
-        bumped = target.bump_timestamp(raw)
+        target.advance_clock(FAR_FUTURE)
+        bumped = target.set_timestamp(raw, str(target.clock()))
         if target.capabilities.signed_timestamp:
             with pytest.raises(PermanentError):
                 target.deliver(bumped)
@@ -798,11 +1034,12 @@ class AdapterConformance:
     def test_dedupe_does_not_expire_while_the_delivery_can_still_be_replayed(
         self, target: Target
     ) -> None:
+        """Signed timestamp: for the whole window. Unsigned: for good (no window bounds it)."""
         target.require(Control.SIGNATURE, Control.DUPLICATE, Control.REPLAY_WINDOW)
         raw = target.emit(1, "d-1")
         assert target.deliver(raw).accepted
         wait = min(target.replay_window, MAX_REPLAY_WINDOW) - 1
-        target.advance_clock(wait if target.capabilities.signed_timestamp else 100_000)
+        target.advance_clock(wait if target.capabilities.signed_timestamp else FAR_FUTURE)
         assert not target.deliver(raw).accepted
 
     @covers(Section.WEBHOOK, Control.SIGNATURE, Control.DUPLICATE, Control.RESTART)
@@ -851,21 +1088,11 @@ class AdapterConformance:
     def test_a_failing_read_is_an_error_not_a_zero(self, target: Target) -> None:
         target.require(Control.ORDERING)
         target.emit(5, "d-5")
-        for mode in ("5xx", "timeout"):
+        for mode in ("5xx", "timeout", "429"):
             target.fault_next("read", mode)
             with pytest.raises(TransientError):
                 target.reported_revision()
         assert target.reported_revision() == 5
-
-    @covers(Section.ORDERING, Control.ORDERING, Control.AUTH)
-    def test_a_read_refused_for_credentials_is_an_auth_error_not_a_missing_object(
-        self, target: Target
-    ) -> None:
-        target.require(Control.ORDERING, Control.AUTH)
-        target.revoke_auth("read")
-        with pytest.raises(PermanentError) as caught:
-            target.reported_revision()
-        assert is_auth_error(caught.value)
 
     # ==== IDEMPOTENCY: crash after write, at each step ======================================
 
@@ -930,24 +1157,30 @@ class AdapterConformance:
     # ==== LOOKUP: look-up-first (PLAN 6.3) ==================================================
 
     @covers(Section.LOOKUP, Control.CRASH, Control.RESTART, Control.LOOKUP)
-    def test_lookup_reads_every_page_in_either_order(self, target: Target) -> None:
-        """250 objects before and 250 after the marker, at a page size of 100, on a server that
-        lists newest first and on one that lists oldest first."""
+    def test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk(
+        self, target: Target
+    ) -> None:
+        """The marker sits 1100 objects from each end, at a page size of 100, on a server that
+        lists newest first and on one that lists oldest first: an adapter that reads only the
+        head, only the tail, or stops at a page cap writes twice. An absent key is a full walk."""
         target.require(Control.CRASH, Control.RESTART, Control.LOOKUP)
         for i, order in enumerate(("newest_first", "oldest_first")):
             target.set_list_order(order)
             key = f"k{i}"
-            target.seed_others(250, newer=False)
+            target.seed_others(DEEP, newer=False)
             _crash(target, CrashPoint.RESPONSE_LOST_AFTER_APPLY)
             with pytest.raises(TransientError):
                 target.write(key)
-            target.seed_others(250, newer=True)
+            target.seed_others(DEEP, newer=True)
             target.restart()
             before = target.calls("lookup")
             receipt = _write(target, key)
-            assert target.calls("lookup") - before >= 3, "the marker is on a later page"
+            assert target.calls("lookup") - before >= DEEP // PAGE_SIZE + 1, "a later page"
             assert target.stored_id_for(key) == receipt.external_id
         assert len(target.stored_ids()) == 2
+        before = target.calls("lookup")
+        _write(target, "absent")
+        assert target.calls("lookup") - before >= 4 * DEEP // PAGE_SIZE, "an absent key: all pages"
 
     @covers(Section.LOOKUP, Control.CRASH, Control.RESTART, Control.LOOKUP)
     def test_an_error_on_a_later_page_is_not_the_end_of_the_list(self, target: Target) -> None:
@@ -955,21 +1188,23 @@ class AdapterConformance:
         target.set_list_order("newest_first")
         first = _write(target, "k1")
         target.seed_others(250, newer=True)
-        target.restart()
-        target.fault_next("lookup", "5xx", page=1)
-        with pytest.raises(TransientError):
-            target.write("k1")
-        assert target.stored_ids() == [first.external_id], "a failed look-up must not write"
+        for mode in ("5xx", "timeout", "429"):
+            target.restart()
+            target.fault_next("lookup", mode, page=1)
+            with pytest.raises(TransientError):
+                target.write("k1")
+            assert target.stored_ids() == [first.external_id], f"{mode}: must not write"
 
     @covers(Section.LOOKUP, Control.CRASH, Control.RESTART, Control.LOOKUP)
-    def test_a_server_error_on_lookup_is_not_taken_for_not_found(self, target: Target) -> None:
+    def test_a_failed_lookup_of_any_kind_is_not_taken_for_not_found(self, target: Target) -> None:
         target.require(Control.CRASH, Control.RESTART, Control.LOOKUP)
         first = _write(target, "k1")
-        target.restart()
-        _crash(target, CrashPoint.LOOKUP_FAILS)
-        with pytest.raises(TransientError):
-            target.write("k1")
-        assert target.stored_ids() == [first.external_id], "a failed look-up must not write"
+        for mode in ("5xx", "timeout", "429"):
+            target.restart()
+            target.fault_next("lookup", mode)
+            with pytest.raises(TransientError):
+                target.write("k1")
+            assert target.stored_ids() == [first.external_id], f"{mode}: must not write"
         assert _write(target, "k1").external_id == first.external_id
 
     @covers(Section.LOOKUP, Control.LOOKUP)
@@ -1027,15 +1262,18 @@ class AdapterConformance:
         assert target.stored_ids() == [], "the server really did not apply it"
 
     @covers(Section.READ_BACK, Control.READ_BACK, Control.LOOKUP)
-    def test_a_read_back_that_fails_is_unknown_never_verified(self, target: Target) -> None:
+    def test_a_read_back_that_fails_in_any_way_is_unknown_never_verified(
+        self, target: Target
+    ) -> None:
         target.require(Control.READ_BACK, Control.LOOKUP)
-        target.swallow_next_write()
-        target.fault_next("lookup", "5xx", after=1)  # the look-up before the write passes
-        try:
-            receipt = target.write("k1")
-        except TransientError:
-            return
-        assert not receipt.read_back_verified
+        for i, mode in enumerate(("5xx", "timeout", "429", "401")):
+            target.swallow_next_write()
+            target.fault_next("lookup", mode, after=1)  # the look-up before the post passes
+            try:
+                receipt = target.write(f"k{i}")
+            except (TransientError, PermanentError):
+                continue
+            assert not receipt.read_back_verified, mode
 
     @covers(Section.READ_BACK, Control.READ_BACK, Control.LOOKUP)
     def test_read_back_does_not_accept_another_authors_object(self, target: Target) -> None:
@@ -1048,47 +1286,40 @@ class AdapterConformance:
             return
         assert not receipt.read_back_verified
 
-    # ==== RATE: per the shapes the vendor uses ==============================================
+    # ==== RATE: per the shapes the vendor uses, through the probe ===========================
 
     @covers(Section.RATE, Control.RATE_LIMIT)
-    def test_every_rate_limit_shape_is_transient_applies_nothing_and_is_not_hammered(
+    def test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered(
         self, target: Target
     ) -> None:
         target.require(Control.RATE_LIMIT)
-        for i, shape in enumerate(sorted(target.capabilities.rate_shapes)):
-            for op in (None, "write"):  # the first request of a write, and its post alone
-                key = f"k-{i}-{op}"
-                target.rate_limit_next(2, shape, op)
-                hint = target.retry_after_hint(shape)
-                for _ in (1, 2):
-                    limited = target.calls("limited")
-                    with pytest.raises(TransientError) as caught:
-                        target.write(key)
-                    assert target.calls("limited") == limited + 1, "one limited request, no more"
-                    retry_after = getattr(caught.value, "retry_after", None)
-                    if hint is not None:  # a shape that carries Retry-After must pass it on
-                        assert retry_after is not None
-                        assert retry_after >= hint
-                    assert target.stored_id_for(key) is None
-                receipt = retrying(functools.partial(_write, target, key))
-                assert target.stored_id_for(key) == receipt.external_id
+        for shape in sorted(target.capabilities.rate_shapes):
+            target.rate_limit_next(2, shape)
+            hint = SHAPE_RETRY_AFTER[shape]
+            for _ in (1, 2):
+                limited = target.calls("limited")
+                with pytest.raises(TransientError) as caught:
+                    target.probe()
+                assert target.calls("limited") == limited + 1, f"{shape}: one request, no more"
+                retry_after = getattr(caught.value, "retry_after", None)
+                if hint is not None:  # a shape that carries a wait must pass it on
+                    assert retry_after is not None, shape
+                    assert retry_after >= hint, shape
+            retrying(target.probe)
 
-    # ==== AUTH ===============================================================================
+    # ==== AUTH: through the probe ===========================================================
 
     @covers(Section.AUTH, Control.AUTH)
-    def test_a_401_is_an_auth_error_applies_nothing_and_is_asked_per_the_refresh_rule(
-        self, target: Target
-    ) -> None:
+    def test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule(self, target: Target) -> None:
         """No refresh: asked exactly once. Refresh once: exactly one refresh and one retry."""
         target.require(Control.AUTH)
         target.revoke_auth()
         with pytest.raises(PermanentError) as caught:
-            retrying(lambda: target.write("k1"))
+            retrying(target.probe)
         assert is_auth_error(caught.value)
         once = target.capabilities.auth_refresh is AuthRefresh.ONCE
         assert target.calls("unauthorized") == (2 if once else 1)
         assert target.calls("refresh") == (1 if once else 0)
-        assert target.stored_ids() == []
 
     @covers(Section.AUTH, Control.AUTH)
     def test_an_expired_token_is_refreshed_only_if_the_vendor_allows_it(
@@ -1097,16 +1328,61 @@ class AdapterConformance:
         target.require(Control.AUTH)
         target.expire_token()
         if target.capabilities.auth_refresh is AuthRefresh.ONCE:
-            receipt = _write(target, "k1")
+            target.probe()
             assert target.calls("refresh") == 1
-            assert target.stored_ids() == [receipt.external_id]
         else:
             with pytest.raises(PermanentError) as caught:
-                target.write("k1")
+                target.probe()
             assert is_auth_error(caught.value)
             assert target.calls("refresh") == 0
 
     @covers(Section.AUTH, Control.AUTH)
+    def test_the_probe_succeeds_once_auth_is_restored_and_nothing_latches(
+        self, target: Target
+    ) -> None:
+        target.require(Control.AUTH)
+        target.revoke_auth()
+        with pytest.raises(PermanentError):
+            target.probe()
+        target.restore_auth()
+        target.probe()
+
+    @covers(Section.AUTH, Control.AUTH, Control.HTTP_ERRORS)
+    def test_a_plain_403_on_a_read_is_a_permission_error(self, target: Target) -> None:
+        """A 403 that names no rate limit means "forbidden"."""
+        target.require(Control.AUTH, Control.HTTP_ERRORS)
+        target.respond_next("read", 403)
+        with pytest.raises(PermanentError) as caught:
+            target.probe()
+        assert is_auth_error(caught.value)
+        assert target.calls("limited") == 0
+
+    @covers(Section.AUTH, Control.AUTH, Control.HTTP_ERRORS)
+    def test_a_404_on_a_read_is_an_unknown_object_not_a_credential_error(
+        self, target: Target
+    ) -> None:
+        target.require(Control.AUTH, Control.HTTP_ERRORS)
+        target.respond_next("read", 404)
+        with pytest.raises(UnknownRefError):
+            target.probe()
+
+    # ==== WRITE_FAILURES: rate limits, auth and HTTP errors at each step of a write =========
+
+    @covers(Section.WRITE_FAILURES, Control.RATE_LIMIT)
+    def test_a_rate_limited_post_is_transient_and_applies_nothing(self, target: Target) -> None:
+        target.require(Control.RATE_LIMIT)
+        for i, shape in enumerate(sorted(target.capabilities.rate_shapes)):
+            key = f"k-{i}"
+            target.rate_limit_next(1, shape, "write")  # the look-up passes, the post is limited
+            limited = target.calls("limited")
+            with pytest.raises(TransientError):
+                target.write(key)
+            assert target.calls("limited") == limited + 1
+            assert target.stored_id_for(key) is None, shape
+            receipt = retrying(functools.partial(_write, target, key))
+            assert target.stored_id_for(key) == receipt.external_id
+
+    @covers(Section.WRITE_FAILURES, Control.AUTH)
     def test_a_401_at_any_step_of_a_write_is_an_auth_error(self, target: Target) -> None:
         target.require(Control.AUTH)
         for op in ("lookup", "write"):
@@ -1117,7 +1393,7 @@ class AdapterConformance:
             target.restore_auth()
         assert target.stored_ids() == []
 
-    @covers(Section.AUTH, Control.AUTH)
+    @covers(Section.WRITE_FAILURES, Control.AUTH)
     def test_the_write_succeeds_once_auth_is_restored(self, target: Target) -> None:
         target.require(Control.AUTH)
         target.revoke_auth()
@@ -1127,11 +1403,8 @@ class AdapterConformance:
         receipt = _write(target, "k1")
         assert target.stored_ids() == [receipt.external_id]
 
-    @covers(Section.AUTH, Control.AUTH, Control.HTTP_ERRORS)
-    def test_a_plain_403_is_a_permission_error_not_a_rate_limit_or_a_missing_object(
-        self, target: Target
-    ) -> None:
-        """A 403 that names no rate limit means "forbidden"."""
+    @covers(Section.WRITE_FAILURES, Control.AUTH, Control.HTTP_ERRORS)
+    def test_a_plain_403_at_any_step_of_a_write_is_a_permission_error(self, target: Target) -> None:
         target.require(Control.AUTH, Control.HTTP_ERRORS)
         for op in ("lookup", "write"):
             target.respond_next(op, 403)
@@ -1140,12 +1413,13 @@ class AdapterConformance:
             assert is_auth_error(caught.value), f"a 403 on {op}"
         assert target.stored_ids() == []
 
-    @covers(Section.AUTH, Control.AUTH, Control.HTTP_ERRORS)
-    def test_a_404_is_an_unknown_object_not_a_credential_error(self, target: Target) -> None:
+    @covers(Section.WRITE_FAILURES, Control.AUTH, Control.HTTP_ERRORS)
+    def test_a_404_at_any_step_of_a_write_is_an_unknown_object(self, target: Target) -> None:
         target.require(Control.AUTH, Control.HTTP_ERRORS)
-        target.respond_next("lookup", 404)
-        with pytest.raises(UnknownRefError):
-            target.write("k1")
+        for op in ("lookup", "write"):
+            target.respond_next(op, 404)
+            with pytest.raises(UnknownRefError):
+                target.write(f"k-{op}")
         assert target.stored_ids() == []
 
 
@@ -1158,7 +1432,9 @@ def run_suite(
     out: dict[str, BaseException | None] = {}
     for name in applicable(port):
         try:
-            getattr(AdapterConformance.__new__(AdapterConformance), name)(factory())
+            target = factory()
+            validate_target(target, port)
+            getattr(AdapterConformance.__new__(AdapterConformance), name)(target)
             out[name] = None
         except (Exception, pytest.fail.Exception, pytest.skip.Exception) as exc:
             out[name] = exc
