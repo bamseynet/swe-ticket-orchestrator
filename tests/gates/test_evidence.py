@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from collections.abc import Collection
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from sto.domain import Subject
+from sto.domain import Subject, from_wire, to_wire
 from sto.gates.evidence import (
     OLDER_BASE_NOTE,
+    Containment,
     Evidence,
+    EvidenceCheck,
     Validity,
+    Verdict,
     check_all,
     check_evidence,
 )
+from sto.gates.hooks import entry_hash
+from sto.store.ports import canonical_data
 
 HEAD = "a" * 40
 OLD = "b" * 40
 MERGE = "c" * 40
+NEW = "e" * 40
 EXTRA = "d" * 40
 PATCH = "p1"
 
@@ -40,132 +48,164 @@ def ev(validity: Validity, **kw: object) -> Evidence:
     return Evidence(**base)  # type: ignore[arg-type]
 
 
-# (validity, evidence overrides, subject overrides, valid, note substrings)
+PRE_PUSH = {"head_sha": None, "base_sha": OLD, "evidence_digest": None, "attention_digest": None}
+
+
+def fake_containment(answers: dict[str, Collection[str] | None]) -> Containment:
+    """A hermetic stand-in for D8-02's answer. A sha it has no entry for is unknown."""
+
+    def contained(tested_sha: str) -> Collection[str] | None:
+        return answers.get(tested_sha)
+
+    return contained
+
+
+def ev_(validity: Validity, tested: str = HEAD, patch: str = PATCH) -> Evidence:
+    return Evidence(tested_sha=tested, patch_id=patch, validity=validity)
+
+
+# (validity, tested_sha, patch_id, subject overrides, valid, notes). exact_sha and same_patch.
 CASES = [
-    # exact_sha: tested_sha must equal head_sha; the patch is irrelevant.
-    pytest.param(Validity.EXACT_SHA, {}, {}, True, [], id="exact-same-sha"),
+    pytest.param(Validity.EXACT_SHA, HEAD, PATCH, {}, True, (), id="exact-same-sha"),
+    pytest.param(Validity.EXACT_SHA, OLD, PATCH, {}, False, (), id="exact-other-sha-same-patch"),
+    pytest.param(Validity.EXACT_SHA, HEAD, "p0", {}, True, (), id="exact-same-sha-other-patch"),
+    pytest.param(Validity.EXACT_SHA, HEAD, PATCH, PRE_PUSH, False, (), id="exact-pre-push"),
+    pytest.param(Validity.SAME_PATCH, HEAD, PATCH, {}, True, (), id="patch-same-sha"),
     pytest.param(
-        Validity.EXACT_SHA, {"tested_sha": OLD}, {}, False, [], id="exact-other-sha-same-patch"
+        Validity.SAME_PATCH, OLD, PATCH, {}, True, (OLDER_BASE_NOTE,), id="patch-older-base"
     ),
+    pytest.param(Validity.SAME_PATCH, HEAD, "p0", {}, False, (), id="patch-changed-same-sha"),
+    pytest.param(Validity.SAME_PATCH, OLD, "p0", {}, False, (), id="patch-changed-older-sha"),
     pytest.param(
-        Validity.EXACT_SHA,
-        {"patch_id": "p0"},
-        {},
-        True,
-        [],
-        id="exact-same-sha-other-patch-still-holds",
-    ),
-    pytest.param(
-        Validity.EXACT_SHA,
-        {},
-        {"head_sha": None, "base_sha": OLD, "evidence_digest": None, "attention_digest": None},
-        False,
-        [],
-        id="exact-pre-push-subject-has-no-head",
-    ),
-    # same_patch: patch_id must match; an older sha is flagged, not refused.
-    pytest.param(Validity.SAME_PATCH, {}, {}, True, [], id="patch-same-sha"),
-    pytest.param(
-        Validity.SAME_PATCH,
-        {"tested_sha": OLD},
-        {},
-        True,
-        [OLDER_BASE_NOTE],
-        id="patch-older-base",
-    ),
-    pytest.param(
-        Validity.SAME_PATCH, {"patch_id": "p0"}, {}, False, [], id="patch-changed-same-sha"
+        Validity.SAME_PATCH, OLD, PATCH, PRE_PUSH, True, (), id="patch-pre-push-same-base"
     ),
     pytest.param(
         Validity.SAME_PATCH,
-        {"tested_sha": OLD, "patch_id": "p0"},
-        {},
-        False,
-        [],
-        id="patch-changed-older-sha",
+        OLD,
+        PATCH,
+        {**PRE_PUSH, "base_sha": NEW},
+        True,
+        (OLDER_BASE_NOTE,),
+        id="patch-pre-push-moved-base",
     ),
     pytest.param(
         Validity.SAME_PATCH,
-        {"tested_sha": OLD},
-        {"head_sha": None, "base_sha": OLD, "evidence_digest": None, "attention_digest": None},
-        True,
-        [],
-        id="patch-pre-push-subject-matches-on-patch-alone",
-    ),
-    # contains_sha: the deployment must contain merge_sha; extras are listed.
-    pytest.param(
-        Validity.CONTAINS_SHA,
-        {"tested_sha": MERGE},
-        {"merge_sha": MERGE},
-        True,
-        [],
-        id="contains-is-the-merge-sha",
-    ),
-    pytest.param(
-        Validity.CONTAINS_SHA,
-        {"tested_sha": OLD, "contains": frozenset({MERGE, EXTRA})},
-        {"merge_sha": MERGE},
-        True,
-        [f"also contains {EXTRA}"],
-        id="contains-lists-anything-else",
-    ),
-    pytest.param(
-        Validity.CONTAINS_SHA,
-        {"tested_sha": OLD, "contains": frozenset({EXTRA})},
-        {"merge_sha": MERGE},
+        OLD,
+        "p0",
+        {**PRE_PUSH, "base_sha": NEW},
         False,
-        [],
-        id="contains-lacks-merge-sha",
-    ),
-    pytest.param(
-        Validity.CONTAINS_SHA,
-        {"tested_sha": MERGE},
-        {},
-        False,
-        [],
-        id="contains-subject-not-merged-yet",
+        (),
+        id="patch-pre-push-changed",
     ),
 ]
 
 
-@pytest.mark.parametrize(("validity", "ev_kw", "sub_kw", "valid", "notes"), CASES)
+@pytest.mark.parametrize(("validity", "tested", "patch", "sub_kw", "valid", "notes"), CASES)
 def test_validity_table(
     validity: Validity,
-    ev_kw: dict[str, object],
+    tested: str,
+    patch: str,
     sub_kw: dict[str, object],
     valid: bool,
-    notes: list[str],
+    notes: tuple[str, ...],
 ) -> None:
-    verdict = check_evidence(ev(validity, **ev_kw), subject(**sub_kw))
+    verdict = check_evidence(ev_(validity, tested, patch), subject(**sub_kw))
     assert verdict.valid is valid
-    for n in notes:
-        assert n in verdict.notes
-    if not notes:
-        assert verdict.notes == ()
-    if not valid:
-        assert verdict.reason  # a refusal always says why
+    assert verdict.notes == notes
+    assert bool(verdict.reason) is (not valid)  # a refusal always says why
+
+
+def test_exact_and_same_patch_never_consult_containment() -> None:
+    def boom(_: str) -> Collection[str] | None:
+        raise AssertionError("containment must only be asked for contains_sha")
+
+    assert check_evidence(ev_(Validity.EXACT_SHA), subject(), boom).valid
+    assert check_evidence(ev_(Validity.SAME_PATCH), subject(), boom).valid
+
+
+MERGED = {"merge_sha": MERGE}
+STAGING = "s" * 40
+
+
+@pytest.mark.parametrize(
+    ("answer", "valid", "notes"),
+    [
+        pytest.param({MERGE}, True, (), id="contains-only-the-merge-sha"),
+        pytest.param(
+            {EXTRA, STAGING, MERGE},
+            True,
+            (f"also contains {EXTRA}", f"also contains {STAGING}"),
+            id="extras-sorted-and-complete",
+        ),
+        pytest.param(
+            {"z" * 40, MERGE, "f" * 40, EXTRA},
+            True,
+            (f"also contains {EXTRA}", f"also contains {'f' * 40}", f"also contains {'z' * 40}"),
+            id="extras-sorted-whatever-the-source-order",
+        ),
+        pytest.param({EXTRA}, False, (), id="lacks-merge-sha"),
+        pytest.param(set(), False, (), id="empty-answer-is-a-refusal"),
+    ],
+)
+def test_contains_sha_table(answer: set[str], valid: bool, notes: tuple[str, ...]) -> None:
+    contained = fake_containment({STAGING: answer})
+    verdict = check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(**MERGED), contained)
+    assert verdict.valid is valid
+    assert verdict.notes == notes
+    assert bool(verdict.reason) is (not valid)
+
+
+def test_contains_sha_asks_about_the_tested_sha() -> None:
+    asked: list[str] = []
+
+    def contained(sha: str) -> Collection[str] | None:
+        asked.append(sha)
+        return {MERGE}
+
+    check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(**MERGED), contained)
+    assert asked == [STAGING]
+
+
+def test_contains_sha_without_an_answer_is_refused_not_valid() -> None:
+    e = ev_(Validity.CONTAINS_SHA, MERGE)  # tested_sha equals merge_sha, still not enough
+    no_resolver = check_evidence(e, subject(**MERGED))
+    unknown = check_evidence(e, subject(**MERGED), fake_containment({}))
+    empty = check_evidence(e, subject(**MERGED), fake_containment({MERGE: set()}))
+    assert not no_resolver.valid
+    assert not unknown.valid
+    assert not empty.valid
+    # unknown and empty are different facts, and the reasons say so
+    assert "not known" in unknown.reason
+    assert "lacks" in empty.reason
+    assert unknown.reason != empty.reason != no_resolver.reason
+
+
+def test_contains_sha_before_a_merge_is_refused() -> None:
+    contained = fake_containment({STAGING: {MERGE}})
+    assert not check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(), contained).valid
 
 
 def test_squash_merge_frozen_subject_works_with_contains_sha() -> None:
-    # A squash merge makes a new commit: the PR head_sha is not an ancestor of the merge_sha,
-    # and the patch id of the squashed commit may differ. Staging QA ran on a deployment that
-    # contains the merge commit, so contains_sha holds against the frozen subject (PLAN 4.5).
+    # A squash merge makes a new commit: the PR head_sha is not in the merged history. Staging
+    # QA ran on a deployment that contains the merge commit, so contains_sha holds against the
+    # frozen subject, and only because the injected answer really has the merge_sha.
     frozen = subject(merge_sha=MERGE)
-    staging = ev(
-        Validity.CONTAINS_SHA, tested_sha="s" * 40, patch_id="squashed", contains=frozenset({MERGE})
-    )
-    assert check_evidence(staging, frozen).valid
-    # The same record under same_patch or exact_sha would not hold: that is why it is declared.
+    staging = ev_(Validity.CONTAINS_SHA, STAGING, "squashed")
+    assert check_evidence(staging, frozen, fake_containment({STAGING: {MERGE}})).valid
+    stale = ev_(Validity.CONTAINS_SHA, OLD, "squashed")  # a pre-merge deployment
+    refused = check_evidence(stale, frozen, fake_containment({OLD: {HEAD}, STAGING: {MERGE}}))
+    assert not refused.valid
+    # The head sha is not the merge sha, so the other validities would not have held it.
     assert not check_evidence(replace(staging, validity=Validity.EXACT_SHA), frozen).valid
     assert not check_evidence(replace(staging, validity=Validity.SAME_PATCH), frozen).valid
 
 
 def test_check_all_requires_every_piece() -> None:
-    good = ev(Validity.EXACT_SHA)
-    stale = ev(Validity.EXACT_SHA, tested_sha=OLD)
-    ok = check_all([good, ev(Validity.SAME_PATCH, tested_sha=OLD)], subject())
+    good = ev_(Validity.EXACT_SHA)
+    stale = ev_(Validity.EXACT_SHA, OLD)
+    ok = check_all([good, ev_(Validity.SAME_PATCH, OLD)], subject())
     assert ok.valid
-    assert OLDER_BASE_NOTE in ok.notes
+    assert ok.notes == (OLDER_BASE_NOTE,)
     bad = check_all([good, stale], subject())
     assert not bad.valid
     assert len(bad.failures) == 1
@@ -173,22 +213,70 @@ def test_check_all_requires_every_piece() -> None:
 
 
 def test_check_all_of_nothing_is_not_valid() -> None:
-    # A gate with no evidence must not open on a vacuous truth.
     assert not check_all([], subject()).valid
 
 
+def test_check_all_keeps_every_verdicts_notes_once_in_order() -> None:
+    contained = fake_containment({STAGING: {MERGE, EXTRA}})
+    result = check_all(
+        [
+            ev_(Validity.SAME_PATCH, OLD),  # note first
+            ev_(Validity.CONTAINS_SHA, STAGING),
+            ev_(Validity.SAME_PATCH, NEW),  # the same note again
+            ev_(Validity.EXACT_SHA),  # no notes: must not erase the earlier ones
+        ],
+        subject(**MERGED),
+        contained,
+    )
+    assert result.valid
+    assert result.notes == (OLDER_BASE_NOTE, f"also contains {EXTRA}")
+
+
+def test_check_all_passes_containment_through() -> None:
+    e = ev_(Validity.CONTAINS_SHA, STAGING)
+    assert check_all([e], subject(**MERGED), fake_containment({STAGING: {MERGE}})).valid
+    assert not check_all([e], subject(**MERGED)).valid
+
+
 def test_gate_page_data_says_evidence_from_an_older_base() -> None:
-    result = check_all([ev(Validity.SAME_PATCH, tested_sha=OLD)], subject())
+    result = check_all([ev_(Validity.SAME_PATCH, OLD)], subject())
     assert result.valid
     assert result.notes == ("evidence from an older base",)
 
 
-def test_evidence_validates_fields() -> None:
+@pytest.mark.parametrize("validity", list(Validity))
+def test_evidence_round_trips_the_store_and_the_hash_chain(validity: Validity) -> None:
+    e = ev_(validity, OLD)
+    wire = to_wire(e)
+    assert wire == {"tested_sha": OLD, "patch_id": PATCH, "validity": validity.value}
+    stored = canonical_data(wire)
+    assert from_wire(Evidence, json.loads(json.dumps(stored))) == e
+    assert len(entry_hash(wire)) == 64
+
+
+@pytest.mark.parametrize("bad", ["", " ", "\t\n"])
+def test_evidence_refuses_blank_fields(bad: str) -> None:
     with pytest.raises(ValueError, match="tested_sha"):
-        Evidence(tested_sha="", patch_id=PATCH, validity=Validity.EXACT_SHA)
-    with pytest.raises(TypeError):
+        Evidence(tested_sha=bad, patch_id=PATCH, validity=Validity.EXACT_SHA)
+    with pytest.raises(ValueError, match="patch_id"):
+        Evidence(tested_sha=HEAD, patch_id=bad, validity=Validity.EXACT_SHA)
+
+
+def test_evidence_refuses_wrong_types() -> None:
+    with pytest.raises(TypeError, match="validity"):
         Evidence(tested_sha=HEAD, patch_id=PATCH, validity="exact_sha")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="contains"):
-        Evidence(
-            tested_sha=HEAD, patch_id=PATCH, validity=Validity.EXACT_SHA, contains=frozenset({""})
-        )
+    with pytest.raises(TypeError, match="patch_id"):
+        Evidence(tested_sha=HEAD, patch_id=None, validity=Validity.EXACT_SHA)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="tested_sha"):
+        Evidence(tested_sha=None, patch_id=PATCH, validity=Validity.EXACT_SHA)  # type: ignore[arg-type]
+
+
+def test_records_are_frozen() -> None:
+    e = ev_(Validity.EXACT_SHA)
+    v = check_evidence(e, subject())
+    c = check_all([e], subject())
+    for obj, field in ((e, "tested_sha"), (v, "valid"), (c, "verdicts")):
+        with pytest.raises(FrozenInstanceError):
+            setattr(obj, field, None)
+    assert isinstance(v, Verdict)
+    assert isinstance(c, EvidenceCheck)
