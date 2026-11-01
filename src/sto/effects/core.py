@@ -62,6 +62,7 @@ from .ports import (
     IMPLICIT_TYPES,
     STALE_EDGE_TYPES,
     TEAM_SWITCHES,
+    CannotReconcile,
     EffectHandler,
     Failed,
     Outcome,
@@ -297,6 +298,8 @@ class EffectExecutor:
         for _ in range(_TRIES):
             rec = self._load(run_id, idempotency_key)
             effect = rec.effect
+            if rec.meta.get("blocked"):
+                return self._replay(rec)  # only retry_blocked clears a block, whatever the status
             if effect.status is EffectStatus.ATTEMPTING:
                 if self._clock() < float(rec.meta.get("lease_until", 0.0)):
                     return ExecResult(effect, reason="in_flight")
@@ -305,8 +308,6 @@ class EffectExecutor:
                 continue
             if effect.status not in (EffectStatus.PLANNED, EffectStatus.RETRYING):
                 return self._replay(rec)  # finished, or ACCEPTED and waiting for a poll
-            if rec.meta.get("blocked"):
-                return self._replay(rec)
             if self._exhausted(rec):
                 return self._block(rec, "attempts_exhausted")
             verdict = self._guard(rec, live)
@@ -451,6 +452,10 @@ class EffectExecutor:
             return "gate_invalid"  # the subject moved since it was approved (ticket edit, ...)
         else:
             reference = live
+        if reference.head_sha is None:
+            # A pre-push subject has no head: comparing None with None would pass any pre-push
+            # gate. v0 effects need a head (``exposing`` is not planned here).
+            return "gate_invalid"
         pk, found = run_pk(effect.run_id), []
         # REQUIREMENT ON THE AuditWriter PORT (src/sto/gates/hooks.py): every AuditWriter must move
         # ``RUN#r/CHAIN`` in the same transaction as the gate open or decision it records. This
@@ -609,8 +614,11 @@ class EffectExecutor:
             meta = {"reason": "attempts_exhausted", "blocked": f"attempts_exhausted:{reason}"}
             self._save(rec, effect, meta)
             return ExecResult(effect, reason="attempts_exhausted", blocked=True)
-        self._save(rec, effect, {"reason": reason})
-        return ExecResult(effect, reason=reason)
+        meta = {"reason": reason}
+        if rec.meta.get("blocked"):  # a block outlives a retry; only retry_blocked clears it
+            meta["blocked"] = rec.meta["blocked"]
+        self._save(rec, effect, meta)
+        return ExecResult(effect, reason=reason, blocked=bool(rec.meta.get("blocked")))
 
     # --- ACCEPTED: poll and stop ------------------------------------------------------------
 
@@ -626,10 +634,11 @@ class EffectExecutor:
 
     def reconcile(self, run_id: RunId, idempotency_key: str, handler: EffectHandler) -> ExecResult:
         """Stop's route for an attempt whose answer was lost (RETRYING, or ATTEMPTING with a lapsed
-        lease), and for an ACCEPTED one: ask the writer what became of it, dequeue it if it is
-        still pending, and settle from what is read back (PLAN 14.3, D2-11). It never voids a
-        write that may have landed, and never writes anew if the run is stopping. A merge that
-        cannot be found (moved head, closed PR) stays blocked for a person."""
+        lease), and for an ACCEPTED one (which it stops). The writer only cancels what is still
+        pending; it never writes anything new, so a Stop cannot cause a merge. If the cancel
+        succeeds the effect is VOIDED. If the writer cannot tell (moved head, nothing to
+        cancel, closed PR, a synchronous effect) the effect is blocked for a person (PLAN 14.3).
+        Finding a write that already landed needs a read-only lookup by key (D2-11)."""
         rec = self._load(run_id, idempotency_key)
         status = rec.effect.status
         if status is EffectStatus.ACCEPTED:
@@ -640,7 +649,7 @@ class EffectExecutor:
             raise ValueError(f"nothing to reconcile in a {status.value} effect")
         try:
             outcome = handler.reconcile(rec.effect)
-        except (StaleHeadError, RefusedError) as exc:
+        except (StaleHeadError, RefusedError, CannotReconcile) as exc:
             return self._block(rec, f"unreconciled:{type(exc).__name__}")
         return self._settle(run_id, idempotency_key, outcome, status, recovered=True)
 

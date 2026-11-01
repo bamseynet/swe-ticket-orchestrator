@@ -36,7 +36,7 @@ from sto.adapters.ports import (
     ScmProvider,
     StaleHeadError,
 )
-from sto.domain import Effect, Receipt, RunId, Subject
+from sto.domain import Effect, PermanentError, Receipt, RunId, Subject
 from sto.store.ports import TEAM_ROOT, Key
 
 # Only these two effects have a ``stale`` edge (PLAN 859); anywhere else StaleHeadError is a
@@ -150,10 +150,15 @@ class EffectHandler(Protocol):
         ...
 
     def reconcile(self, effect: Effect) -> Outcome:
-        """Find out what became of an attempt whose answer was lost (RETRYING, or ATTEMPTING
-        with a lapsed lease), cancelling it if it is still pending. Used when the run is
-        stopping, so it must not leave a new write behind."""
+        """Stop's route for an attempt whose answer was lost (RETRYING, or ATTEMPTING with a lapsed
+        lease): cancel it if it is still pending. It must never write anything new. Return
+        ``Voided`` if the cancel succeeded; raise ``StaleHeadError``, ``RefusedError`` or
+        ``CannotReconcile`` if it cannot tell, and the executor blocks the effect for a person."""
         ...
+
+
+class CannotReconcile(PermanentError):
+    """A handler has no safe way to find out what a lost attempt became."""
 
 
 class CallHandler:
@@ -172,7 +177,7 @@ class CallHandler:
         raise ValueError("a synchronous effect is never ACCEPTED, so there is nothing to stop")
 
     def reconcile(self, effect: Effect) -> Outcome:
-        raise ValueError("a synchronous effect has no handle to reconcile: a person decides")
+        raise CannotReconcile("a synchronous effect has no handle to reconcile: a person decides")
 
 
 class MergeHandler:
@@ -228,12 +233,11 @@ class MergeHandler:
         return self.poll(effect)
 
     def reconcile(self, effect: Effect) -> Outcome:
-        """The handle of a lost answer is only reachable by repeating the request with the same
-        key, which finds the merge if it landed. The port has no lookup by key (a gap for
-        D1-04/D4: ``ScmProvider.find_merge``), so if it never landed this enqueues it for an
-        instant before the dequeue. A moved head or a closed PR (``StaleHeadError``,
-        ``RefusedError``) leaves nothing to find and is the caller's to report."""
-        handle = self._scm.request_merge(self._pr, self._sha, self._method, effect.idempotency_key)
-        with contextlib.suppress(StaleHeadError, RefusedError):
-            self._scm.dequeue(self._pr, self._sha)
-        return self._read_back(handle)
+        """Only dequeues; it never requests a merge, so a Stop cannot cause one. A successful
+        dequeue means a merge was pending and is now cancelled (``Voided``). ``StaleHeadError``
+        (the head moved) or ``RefusedError`` (nothing pending, or the PR is closed) mean the
+        outcome is unknown: it may have landed, or never been requested, and "no merge visible"
+        is false while one is queued. Those propagate and block the effect for a person. Finding
+        a merge that already landed needs a read-only lookup by key (D2-11)."""
+        self._scm.dequeue(self._pr, self._sha)
+        return Voided("dequeued")

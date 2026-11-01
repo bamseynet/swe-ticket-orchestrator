@@ -155,9 +155,14 @@ class Clock:
         return self.now
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+# The store contract suite (tests/store/store_contract.py) proves the stores equivalent, so most
+# tests here run on memory only. The races, the demo merge and one lifecycle also run on SQLite.
+both_stores = pytest.mark.parametrize("inner", ["memory", "sqlite"], indirect=True)
+
+
+@pytest.fixture
 def inner(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Store]:
-    if request.param == "memory":
+    if getattr(request, "param", "memory") == "memory":
         yield MemoryStore()
     else:
         sqlite = SqliteStore(tmp_path / "fx.db")
@@ -302,13 +307,14 @@ def world(inner: Store) -> World:
     return w
 
 
-def calls_cleanly[T](fn: Callable[[], T]) -> T:
-    """Turn a crash inside ``fn`` into a failed assertion, so a mutant that breaks an invariant by
-    raising is still caught by an assertion in the test, with a message that names the cause."""
+def calls_cleanly[T](what: str, fn: Callable[[], T]) -> T:
+    """Run ``fn``; if it crashes, fail with an assertion that names the behaviour that broke. A
+    mutant that breaks an invariant by raising is then caught by an assertion, and the failure
+    shows ``what`` (not a bare traceback)."""
     try:
         return fn()
     except Exception as exc:
-        raise AssertionError(f"raised {exc!r}") from exc
+        raise AssertionError(f"{what}, but it raised {exc!r}") from None
 
 
 def _receipt(writes: list[str], key: str) -> Receipt:
@@ -517,6 +523,7 @@ def _demo(inner: Store) -> Demo:
     return Demo(fx, rid, e, merger, cmd, scm, approvals)
 
 
+@both_stores
 def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Store) -> None:
     d = _demo(inner)
     fresh = dataclasses.replace(d.cmd.subject)  # re-read now: same ticket, same head
@@ -528,6 +535,7 @@ def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Stor
     assert done.effect.status is EffectStatus.CONFIRMED
 
 
+@both_stores
 def test_the_real_reducers_merge_is_refused_when_a_fresh_read_shows_a_ticket_edit(
     inner: Store,
 ) -> None:
@@ -643,6 +651,7 @@ def test_each_effect_checks_its_own_switches(
 
 
 @pytest.mark.parametrize("fleet", [False, True])
+@both_stores
 def test_a_switch_turned_off_between_the_read_and_the_claim_aborts_the_claim(
     world: World, fleet: bool
 ) -> None:
@@ -659,6 +668,7 @@ def test_a_switch_turned_off_between_the_read_and_the_claim_aborts_the_claim(
 
 
 @pytest.mark.parametrize("fleet", [False, True])
+@both_stores
 def test_a_switch_item_created_between_the_read_and_the_claim_aborts_the_claim(
     world: World, fleet: bool
 ) -> None:
@@ -670,6 +680,7 @@ def test_a_switch_item_created_between_the_read_and_the_claim_aborts_the_claim(
     assert world.scm.spy.calls == ()
 
 
+@both_stores
 def test_set_switch_keeps_a_concurrent_change(world: World) -> None:
     set_switch(world.store, SCOPE, "merge", True)
     world.store.before_next_transaction(lambda: set_switch(world.store, SCOPE, "effects", False))
@@ -742,6 +753,7 @@ def test_void_leaves_finished_effects_alone(world: World) -> None:
     assert world.effect(e).status is EffectStatus.CONFIRMED
 
 
+@both_stores
 def test_stop_committing_before_the_claim_wins_and_nothing_is_written(world: World) -> None:
     """Deterministic: the void commits between the claim's read and its transaction."""
     e = world.fx.plan(world.run.id, "pr.update_branch", "s", 1, EffectClass.SCOPED, DIGEST)
@@ -753,6 +765,7 @@ def test_stop_committing_before_the_claim_wins_and_nothing_is_written(world: Wor
     assert result.effect.status is EffectStatus.VOIDED
 
 
+@both_stores
 def test_the_claim_committing_before_stop_wins_and_stop_voids_nothing(world: World) -> None:
     """Deterministic: the claim commits between the void's read and its transaction."""
     e = world.fx.plan(world.run.id, "pr.update_branch", "s", 1, EffectClass.SCOPED, DIGEST)
@@ -794,6 +807,7 @@ def _race_once(inner: Store) -> tuple[Effect, StopReport, list[str]]:
     return fx.get(run.id, e.idempotency_key), reports[0], writes
 
 
+@both_stores
 def test_concurrent_cancel_and_claim_have_exactly_one_winner(inner: Store) -> None:
     """Real threads, as a smoke test of the deterministic tests above."""
     for _ in range(20):
@@ -807,6 +821,7 @@ def test_concurrent_cancel_and_claim_have_exactly_one_winner(inner: Store) -> No
             assert report.voided == ()
 
 
+@both_stores
 def test_stop_between_the_read_and_the_claim_aborts_a_gated_claim(world: World) -> None:
     world.approve()
     e = world.plan()
@@ -816,6 +831,7 @@ def test_stop_between_the_read_and_the_claim_aborts_a_gated_claim(world: World) 
     assert result.reason == "run_not_active"
 
 
+@both_stores
 def test_a_gate_invalidated_between_the_read_and_the_claim_aborts_the_claim(world: World) -> None:
     world.approve()
     e = world.plan()
@@ -827,6 +843,7 @@ def test_a_gate_invalidated_between_the_read_and_the_claim_aborts_the_claim(worl
     assert result.reason == "gate_invalid"
 
 
+@both_stores
 def test_a_gate_item_changed_without_moving_the_chain_still_aborts_the_claim(
     world: World,
 ) -> None:
@@ -854,6 +871,7 @@ class NoChainAudit:
 
 
 @pytest.mark.parametrize("round", [2, 3])  # the next round, and a skipped number
+@both_stores
 def test_a_newer_gate_round_opened_before_the_claim_aborts_it(world: World, round: int) -> None:
     """PLAN 4.3.2: the latest instance counts. The real service opens the round, and its
     ``ChainedAuditWriter`` moves ``CHAIN``, which the claim checks (this alone covers skipped
@@ -866,6 +884,7 @@ def test_a_newer_gate_round_opened_before_the_claim_aborts_it(world: World, roun
     assert result.reason == "gate_invalid"
 
 
+@both_stores
 def test_the_next_round_is_checked_even_if_the_audit_writer_never_moves_the_chain(
     world: World,
 ) -> None:
@@ -878,6 +897,7 @@ def test_the_next_round_is_checked_even_if_the_audit_writer_never_moves_the_chai
     assert result.reason == "gate_invalid"
 
 
+@both_stores
 def test_other_gate_activity_moves_the_chain_and_the_claim_simply_retries(world: World) -> None:
     world.approve()
     e = world.plan()
@@ -938,6 +958,7 @@ def test_a_confirmed_effect_is_not_written_again(world: World) -> None:
     assert len(world.scm.spy.calls_for("mark_ready")) == 1
 
 
+@both_stores
 def test_a_lost_response_is_written_exactly_once(world: World) -> None:
     world.approve()
     e = world.plan()
@@ -1037,6 +1058,7 @@ def test_a_live_attempt_is_not_taken_over(world: World) -> None:
 
 
 @pytest.mark.parametrize("late", ["receipt", "transient", "permanent"])
+@both_stores
 def test_a_worker_whose_lease_lapsed_cannot_overwrite_the_newer_result(
     world: World, late: str
 ) -> None:
@@ -1063,6 +1085,7 @@ def test_a_worker_whose_lease_lapsed_cannot_overwrite_the_newer_result(
     assert writes == [e.idempotency_key]
 
 
+@both_stores
 def test_a_settle_that_loses_a_race_does_not_overwrite_the_newer_state(world: World) -> None:
     """Deterministic: another worker confirms between our read and our settle transaction."""
     e = world.plan("pr.update_branch", EffectClass.SCOPED)
@@ -1386,7 +1409,10 @@ def test_a_merge_reported_without_a_sha_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, merge_sha, receipt)
     )
-    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
+    polled = calls_cleanly(
+        "a merge that cannot be confirmed must stay ACCEPTED",
+        lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()),
+    )
     assert polled.effect.status is EffectStatus.ACCEPTED
     assert polled.reason == "unconfirmed"
 
@@ -1399,7 +1425,10 @@ def test_a_merge_reported_without_a_receipt_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", None)
     )
-    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
+    polled = calls_cleanly(
+        "a merge that cannot be confirmed must stay ACCEPTED",
+        lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()),
+    )
     assert polled.effect.status is EffectStatus.ACCEPTED
     assert world.effect(e).frozen_subject is None
 
@@ -1413,7 +1442,10 @@ def test_a_merge_with_a_receipt_that_failed_read_back_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", unverified)
     )
-    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
+    polled = calls_cleanly(
+        "a merge that cannot be confirmed must stay ACCEPTED",
+        lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()),
+    )
     assert polled.effect.status is EffectStatus.ACCEPTED
 
 
@@ -1548,7 +1580,10 @@ def test_a_slow_poller_cannot_overwrite_a_confirmed_merge(world: World) -> None:
             world.fx.poll(world.run.id, e.idempotency_key, inner_merger)
             return Failed("stale", "merge_stale")
 
-    result = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, Slow()))
+    result = calls_cleanly(
+        "a poll that lost to a confirmation must report 'superseded'",
+        lambda: world.fx.poll(world.run.id, e.idempotency_key, Slow()),
+    )
     assert result.reason == "superseded"
     assert world.effect(e).status is EffectStatus.CONFIRMED
 
@@ -1621,6 +1656,7 @@ def test_an_engine_implicit_effect_runs_whatever_the_run_status(
 # --- the lease and the fences (second worker, late worker) --------------------------------------
 
 
+@both_stores
 def test_a_worker_cannot_settle_while_a_second_worker_holds_the_lease(world: World) -> None:
     """A stalls past its lease; B takes over and is mid-write when A finally answers."""
     e = world.plan("pr.update_branch", EffectClass.SCOPED)
@@ -1661,6 +1697,7 @@ def test_a_worker_cannot_settle_while_a_second_worker_holds_the_lease(world: Wor
     assert final.receipt.external_id == "from-b"
 
 
+@both_stores
 def test_a_worker_whose_claim_was_taken_over_before_it_wrote_never_writes(world: World) -> None:
     e = world.plan("pr.update_branch", EffectClass.SCOPED)
     first_calls: list[str] = []
@@ -1700,6 +1737,27 @@ def test_a_decision_of_another_gate_instance_is_not_an_approval(world: World) ->
     assert world.scm.spy.calls == ()
 
 
+def test_a_pre_push_gate_never_satisfies_an_effect(world: World) -> None:
+    """A pre-push subject has no head; None == None must not pass (PLAN 4: pre_push is checked
+    only by the branch.push claim)."""
+    evil = Subject.pre_push(base_sha="b0", patch_id="EVIL", ticket_revision="r1")
+    planned = Subject.pre_push(base_sha="b0", patch_id="p1", ticket_revision="r1")
+    world.close(world.gate(subject=evil, gate_type=GateType.PRE_PUSH), DecisionKind.APPROVE)
+    e = world.fx.plan(
+        world.run.id,
+        "pr.mark_ready",
+        "merge",
+        1,
+        EffectClass.GATED,
+        planned.digest(),
+        requires_gates=("review",),
+        subject=planned,
+    )
+    result = world.go(e, live=planned)
+    assert result.reason == "gate_invalid"
+    assert world.scm.spy.calls == ()
+
+
 def test_gates_are_compared_by_head_only(world: World) -> None:
     """PLAN 4.3.2: a gate that saw other evidence, patch id or ticket text still counts."""
     other = dataclasses.replace(
@@ -1726,7 +1784,10 @@ def test_the_merge_handler_does_not_report_a_merge_without_a_sha(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, merge_sha, receipt)
     )
-    assert isinstance(world.merger().poll(effect), Pending)
+    out = calls_cleanly(
+        "a merge without a sha must be Pending", lambda: world.merger().poll(effect)
+    )
+    assert isinstance(out, Pending)
 
 
 def test_the_merge_handler_does_not_report_a_merge_without_a_receipt(
@@ -1736,7 +1797,10 @@ def test_the_merge_handler_does_not_report_a_merge_without_a_receipt(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", None)
     )
-    assert isinstance(world.merger().poll(effect), Pending)
+    out = calls_cleanly(
+        "a merge without a receipt must be Pending", lambda: world.merger().poll(effect)
+    )
+    assert isinstance(out, Pending)
 
 
 def test_the_merge_handler_reports_a_merge_with_a_receipt_and_a_sha(
@@ -1759,23 +1823,77 @@ def test_reconcile_dequeues_a_merge_whose_request_answer_was_lost(world: World) 
     e = _merge(world)
     world.scm.lose_response_next("request_merge")  # the merge is pending at the SCM
     assert world.go(e, world.merger()).effect.status is EffectStatus.RETRYING
+    requests = len(world.scm.spy.calls_for("request_merge"))
     world.set_run(RunStatus.CANCELLING)
     result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
     assert result.effect.status is EffectStatus.VOIDED
     assert result.reason == "dequeued"
     assert world.scm.poll_merge(world.scm.merges()[-1]).state is MergeState.DEQUEUED
-    assert len(world.scm.merges()) == 1  # found by key, not created again
+    assert len(world.scm.spy.calls_for("request_merge")) == requests  # reconcile never requests
+    assert len(world.scm.merges()) == 1
 
 
-def test_reconcile_confirms_a_merge_that_landed_before_the_crash(world: World) -> None:
+def test_reconcile_of_a_merge_that_landed_blocks_for_a_person(world: World) -> None:
+    """Dequeue is refused (nothing pending), and "no merge visible" is not proof of anything."""
     e = _merge(world)
     world.scm.lose_response_next("request_merge")
     world.go(e, world.merger())
     world.scm.complete_merge(world.scm.merges()[-1], "m1")
     world.set_run(RunStatus.CANCELLING)
     result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
-    assert result.effect.status is EffectStatus.CONFIRMED  # reported, not hidden
-    assert result.effect.frozen_subject == dataclasses.replace(SUBJECT, merge_sha="m1")
+    assert result.blocked
+    assert result.reason == "unreconciled:RefusedError"
+    assert world.effect(e).status is EffectStatus.RETRYING
+
+
+class InstantScm(FakeScm):
+    """An SCM whose merge queue is empty: every accepted request merges at once."""
+
+    def request_merge(self, pr: PrRef, expected_sha: str, method: MergeMethod, key: str) -> Any:
+        before = len(self.merges())
+        try:
+            handle = super().request_merge(pr, expected_sha, method, key)
+        except TransientError:
+            if len(self.merges()) > before:  # accepted, then the answer was lost: it merged
+                self.complete_merge(self.merges()[-1], "m-instant")
+            raise
+        self.complete_merge(handle, "m-instant")
+        return handle
+
+
+def _instant(world: World) -> None:
+    scm = InstantScm()
+    scm.seed_branch(REPO, "main", "b0")
+    scm.seed_branch(REPO, "sto/x", "h1", parent="b0")
+    world.pr = PrRef.of(REPO, scm.ensure_draft_pr(PrSpec(REPO, "sto/x", "main", "t", "b"), "k-pr"))
+    world.scm = scm
+
+
+@pytest.mark.parametrize("lost", ["never_requested", "answer_lost"])
+@both_stores
+def test_a_stop_never_causes_a_merge_even_on_an_instant_merge_queue(
+    world: World, lost: str
+) -> None:
+    _instant(world)
+    e = _merge(world)
+    if lost == "never_requested":
+        world.scm.fail_next("request_merge")
+    else:
+        world.scm.lose_response_next("request_merge")
+    world.go(e, world.merger())
+    requests = len(world.scm.spy.calls_for("request_merge"))
+    set_switch(world.store, SCOPE, "merge", False, fleet=True)
+    world.set_run(RunStatus.CANCELLING)
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert len(world.scm.spy.calls_for("request_merge")) == requests  # none during reconcile
+    if lost == "never_requested":
+        assert world.scm.pr_state(world.pr) == "ready"  # nothing merged by Stop
+        assert world.scm.merges() == []
+        assert result.blocked
+    else:
+        assert world.scm.pr_state(world.pr) == "merged"  # it landed before Stop: reported
+        assert result.blocked
+    assert world.effect(e).status is EffectStatus.RETRYING
 
 
 def test_reconcile_of_a_lapsed_attempt_after_a_crash(world: World) -> None:
@@ -1793,10 +1911,60 @@ def test_reconcile_of_a_lapsed_attempt_after_a_crash(world: World) -> None:
             "subject": to_wire(SUBJECT),
         },
     )
+    requests = len(world.scm.spy.calls_for("request_merge"))
     world.set_run(RunStatus.CANCELLING)
     result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
     assert result.effect.status is EffectStatus.VOIDED
     assert world.scm.poll_merge(world.scm.merges()[-1]).state is MergeState.DEQUEUED
+    assert len(world.scm.spy.calls_for("request_merge")) == requests
+
+
+def _crashed_merge(world: World) -> Effect:
+    e = _merge(world)
+    world.force(
+        e,
+        status=EffectStatus.ATTEMPTING,
+        attempts=1,
+        decision_ids=(DecisionId.new(),),
+        subject_digest=DIGEST,
+        meta={
+            "lease_owner": "dead",
+            "lease_until": world.clock.now - 1,
+            "subject": to_wire(SUBJECT),
+        },
+    )
+    return e
+
+
+@both_stores
+def test_a_block_set_by_reconcile_survives_the_next_execute(world: World) -> None:
+    e = _crashed_merge(world)
+    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")  # the head moved: reconcile cannot tell
+    assert world.fx.reconcile(world.run.id, e.idempotency_key, world.merger()).blocked
+    again = world.go(e, world.merger())
+    assert again.blocked
+    assert again.reason == "unreconciled:StaleHeadError"
+    assert world.effect(e).status is EffectStatus.ATTEMPTING  # not moved to RETRYING and re-run
+    assert world.scm.spy.calls_for("request_merge") == ()
+
+
+def test_a_block_survives_a_retry_outcome_from_reconcile(world: World) -> None:
+    e = _crashed_merge(world)
+    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")
+    world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    unverified = Receipt("x", "", read_back_verified=False)
+
+    class Unsure:
+        def execute(self, effect: Effect) -> Any: ...
+        def poll(self, effect: Effect) -> Any: ...
+        def stop(self, effect: Effect) -> Any: ...
+        def reconcile(self, effect: Effect) -> Any:
+            return Written(unverified)
+
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, Unsure())
+    assert result.effect.status is EffectStatus.RETRYING
+    assert result.blocked
+    assert world.go(e, world.merger()).blocked
 
 
 def test_reconcile_leaves_a_live_attempt_alone(world: World) -> None:
@@ -1821,21 +1989,20 @@ def test_reconcile_of_a_merge_that_cannot_be_found_stays_blocked(world: World) -
     e = _merge(world)
     world.scm.fail_next("request_merge")  # it never reached the SCM
     world.go(e, world.merger())
-    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")  # the head moved: nothing to find
+    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")  # the head moved
     result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
     assert result.blocked
     assert result.reason == "unreconciled:StaleHeadError"
     assert world.effect(e).status is EffectStatus.RETRYING
 
 
-def test_reconcile_reports_a_merge_that_died_when_the_head_moved(world: World) -> None:
+def test_reconcile_of_a_merge_nobody_requested_blocks_rather_than_deciding(world: World) -> None:
     e = _merge(world)
-    world.scm.lose_response_next("request_merge")  # it is pending at the SCM
+    world.scm.fail_next("request_merge")
     world.go(e, world.merger())
-    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")
     result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
-    assert result.effect.status is EffectStatus.FAILED
-    assert result.edge == "stale"
+    assert result.blocked
+    assert result.reason == "unreconciled:RefusedError"  # nothing pending: could mean anything
 
 
 def test_reconcile_of_an_accepted_merge_stops_it(world: World) -> None:
@@ -1851,13 +2018,15 @@ def test_reconcile_needs_something_that_was_tried(world: World) -> None:
         world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
 
 
-def test_a_synchronous_effect_has_nothing_to_reconcile(world: World) -> None:
+def test_a_synchronous_effect_blocks_instead_of_raising_on_reconcile(world: World) -> None:
     world.approve()
     e = world.plan()
     world.scm.fail_next("mark_ready")
     world.go(e)
-    with pytest.raises(ValueError, match="person decides"):
-        world.fx.reconcile(world.run.id, e.idempotency_key, world.ready())
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.ready())
+    assert result.blocked
+    assert result.reason == "unreconciled:CannotReconcile"
+    assert world.effect(e).status is EffectStatus.RETRYING
 
 
 # --- a person's Retry --------------------------------------------------------------------------
@@ -1923,6 +2092,7 @@ def test_a_retried_unreconciled_effect_runs_its_guards_again(world: World) -> No
 # --- the claim relies on the audit chain; transaction conflicts are retried ---------------------
 
 
+@both_stores
 def test_pinned_a_writer_that_never_moves_the_chain_lets_a_skipped_round_through(
     world: World,
 ) -> None:
@@ -1937,6 +2107,7 @@ def test_pinned_a_writer_that_never_moves_the_chain_lets_a_skipped_round_through
     assert len(world.scm.spy.applied("mark_ready")) == 1  # the stale approval won
 
 
+@both_stores
 def test_a_transaction_conflict_while_settling_is_retried(world: World) -> None:
     e = world.plan("pr.update_branch", EffectClass.SCOPED)
 
@@ -1945,12 +2116,13 @@ def test_a_transaction_conflict_while_settling_is_retried(world: World) -> None:
 
     world.store.before_next_transaction(lambda: None)  # the claim
     world.store.before_next_transaction(conflict)  # the settle, after the write landed
-    result = calls_cleanly(lambda: world.go(e))
+    result = calls_cleanly("a settle conflict must be retried", lambda: world.go(e))
     assert result.edge == "done"
     assert len(world.scm.spy.calls_for("mark_ready")) == 1
     assert world.effect(e).status is EffectStatus.CONFIRMED
 
 
+@both_stores
 def test_a_transaction_conflict_at_the_claim_is_retried(world: World) -> None:
     e = world.plan("pr.update_branch", EffectClass.SCOPED)
 
@@ -1958,7 +2130,7 @@ def test_a_transaction_conflict_at_the_claim_is_retried(world: World) -> None:
         raise TransactionConflictError("busy")
 
     world.store.before_next_transaction(conflict)
-    assert calls_cleanly(lambda: world.go(e)).edge == "done"
+    assert calls_cleanly("a claim conflict must be retried", lambda: world.go(e)).edge == "done"
 
 
 # --- the frozen subject is the latest merge -------------------------------------------------------
@@ -1983,3 +2155,26 @@ def test_the_frozen_subject_is_the_latest_merge_whatever_the_key_order(
         )
     world.approve(name="release")  # approved at h1
     assert world.go(_release(world), _noop(), live=SUBJECT).edge == "done"
+
+
+def test_reconcile_confirms_a_write_that_a_handler_can_read_back(world: World) -> None:
+    """A handler with a read-only lookup (D2-11) can report a lost write as landed."""
+    world.approve()
+    e = world.plan()
+    world.scm.lose_response_next("mark_ready")
+    assert world.go(e).effect.status is EffectStatus.RETRYING
+    landed = Receipt("pr-1", "", read_back_verified=True)
+
+    class Lookup:
+        def execute(self, effect: Effect) -> Any: ...
+        def poll(self, effect: Effect) -> Any: ...
+        def stop(self, effect: Effect) -> Any: ...
+        def reconcile(self, effect: Effect) -> Any:
+            return Written(landed)
+
+    result = calls_cleanly(
+        "a RETRYING write that read back as landed must be CONFIRMED",
+        lambda: world.fx.reconcile(world.run.id, e.idempotency_key, Lookup()),
+    )
+    assert result.effect.status is EffectStatus.CONFIRMED
+    assert result.effect.receipt == landed
