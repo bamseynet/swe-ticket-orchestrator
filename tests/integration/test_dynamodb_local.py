@@ -9,9 +9,10 @@ type-strict conditions, and the 1 MB query page.
 
 from __future__ import annotations
 
+import socket
 import uuid
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 import pytest
@@ -29,7 +30,19 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def env() -> Iterator[Env]:
+def env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
+    # The class inherits StoreContract's `contract` marker, so `-m contract` collects it; only
+    # the integration job (which has DynamoDB Local) may run it.
+    if "integration" not in (request.config.getoption("markexpr") or ""):
+        pytest.skip("needs DynamoDB Local: runs in the integration job only")
+
+    def loopback_only(host: str, port: int, *_: object, **__: object) -> list[Any]:
+        # urllib3 resolves even an IP literal through getaddrinfo, which the guard blocks.
+        if host != "127.0.0.1":
+            raise OSError(f"name lookups are blocked: {host}")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", loopback_only)
     suffix = uuid.uuid4().hex[:12]  # DynamoDB Local runs -sharedDb: tests must not share tables
     main, audit = f"sto-main-{suffix}", f"sto-audit-{suffix}"
     with allow_loopback_bind():
