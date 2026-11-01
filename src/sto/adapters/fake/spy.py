@@ -35,5 +35,8 @@ class SpyWriter:
             if c.error is None and not c.replayed and (method is None or c.method == method)
         )
 
+    def clear(self) -> None:
+        self._calls.clear()
+
     def record(self, call: SpyCall) -> None:
         self._calls.append(call)

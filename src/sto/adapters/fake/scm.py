@@ -93,6 +93,9 @@ class FakeScm(FakeBase):
     def pr_state(self, pr: PrRef) -> str:
         return self._pr(pr).state
 
+    def merges(self) -> list[MergeHandle]:
+        return [MergeHandle(m.id, m.pr) for m in self._merges.values()]
+
     def _settle(self, handle: MergeHandle) -> _Merge:
         merge = self._resolve(self._merge(handle))
         if merge.state is not MergeState.PENDING:

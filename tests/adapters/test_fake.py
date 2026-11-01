@@ -111,6 +111,8 @@ def test_spy_records_every_write_in_order_and_filters() -> None:
     assert spy.calls_for("comment")[0].args["body"] == "hi"
     assert spy.calls[0].port == "ticket_source"
     assert spy.calls[1].key == "k2"
+    spy.clear()
+    assert spy.calls == ()
 
 
 def test_spy_marks_refused_writes_so_applied_writes_can_be_counted() -> None:
@@ -155,12 +157,16 @@ def test_key_reuse_with_different_arguments_is_refused() -> None:
 
 def test_ticket_search_paginates_with_the_constructor_page_size() -> None:
     t, _ = _tickets(page_size=2)
-    for i in range(2):
-        t.add_ticket(Ticket(TicketRef("fake", f"T-{i + 10}"), "t", "", "open"))
+    for i in range(4):
+        t.add_ticket(Ticket(TicketRef("fake", f"T-{i + 10}"), f"t{i}", "", "open"))
     p1 = t.search(IntakeQuery(), None)
-    assert (len(p1.items), p1.next_cursor is not None) == (2, True)
+    assert len(p1.items) == 2
+    assert p1.next_cursor is not None
     p2 = t.search(IntakeQuery(), p1.next_cursor)
-    assert (len(p2.items), p2.next_cursor) == (1, None)
+    assert len(p2.items) == 2
+    p3 = t.search(IntakeQuery(), p2.next_cursor)
+    assert len(p3.items) == 1
+    assert p3.next_cursor is None
     with pytest.raises(RefusedError):
         t.search(IntakeQuery(), "not-a-cursor")
 
@@ -215,6 +221,8 @@ def test_move_ref_refuses_a_stale_expected_head_without_moving() -> None:
     assert not isinstance(err, PermanentError)
     assert err.failure_class is not FailureClass.PERMANENT
     assert not err.retryable
+    assert isinstance(intent, CommitIntent)
+    assert intent.sha
     assert scm.head(REPO, "main") == "sha0"  # the SHA was known before the ref moved
     assert spy.calls_for("move_ref")[0].args["expected_head"] == "other"
     assert intent.parent == "sha0"
@@ -238,6 +246,14 @@ def test_move_ref_is_never_a_force_push() -> None:
         scm.create_commit(REPO, PatchRef("p4"), "no-such-parent")
     with pytest.raises(UnknownRefError):
         scm.move_ref(REPO, "no-branch", sideways, expected_head="x")
+
+
+def test_pr_head_follows_the_branch_head() -> None:
+    scm, _ = _scm()
+    scm.ensure_draft_pr(SPEC, "k")
+    assert scm.pr_head(PR) == "sha0"
+    head = _advance(scm, "sto/x", "p1")
+    assert scm.pr_head(PR) == head
 
 
 def test_draft_pr_needs_existing_branches() -> None:
@@ -330,7 +346,12 @@ def test_a_head_moved_while_pending_never_reaches_merged() -> None:
     assert scm.pr_state(PR) == "ready"
     h2 = scm.request_merge(PR, scm.pr_head(PR), MergeMethod.MERGE, "m2")
     scm.fail_merge(h2)  # the test control
-    assert scm.poll_merge(h2).state is MergeState.FAILED
+    res = scm.poll_merge(h2)
+    assert res.state is MergeState.FAILED
+    assert res.receipt is not None
+    assert res.receipt.simulated
+    with pytest.raises(RefusedError):
+        scm.complete_merge(h2, merge_sha="x")
 
 
 def test_a_new_request_on_a_pr_already_merged_at_that_sha_is_success() -> None:
@@ -340,6 +361,7 @@ def test_a_new_request_on_a_pr_already_merged_at_that_sha_is_success() -> None:
     scm.complete_merge(handle, merge_sha="m-sha")
     again = scm.request_merge(PR, head, MergeMethod.SQUASH, "m-new-key")
     assert scm.poll_merge(again).state is MergeState.MERGED
+    assert len(scm.merges()) == 1
     assert len(spy.applied("request_merge")) == 2  # both calls succeeded, only one merge exists
     with pytest.raises(RefusedError):
         scm.request_merge(PR, "other-sha", MergeMethod.SQUASH, "m-other")
@@ -397,6 +419,15 @@ def test_closing_a_pr_cancels_its_pending_merge() -> None:
     assert scm.poll_merge(handle).state is MergeState.DEQUEUED
 
 
+def test_a_merged_pr_cannot_be_closed() -> None:
+    scm, _ = _scm()
+    handle = scm.request_merge(PR, _ready_pr(scm), MergeMethod.MERGE, "m1")
+    scm.complete_merge(handle, merge_sha="m")
+    with pytest.raises(RefusedError):
+        scm.close_pr(PR, "c")
+    assert scm.pr_state(PR) == "merged"
+
+
 def test_promote_never_overwrites_a_branch() -> None:
     scm, spy = _scm()
     head = _advance(scm, "sto/x", "p1")
@@ -438,16 +469,23 @@ def test_snapshot_workflow_and_revert_need_known_targets() -> None:
     # a declared revert and the engine's implicit one open one PR (PLAN 6.3)
     assert scm.open_revert_pr("m-sha", "rk2").external_id == first.external_id
     assert scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main"), "w").simulated
+    assert scm.ci_trust(REPO).trusted
 
 
 def test_scm_parse_event_delivers_changes() -> None:
     scm, _ = _scm()
     push = {"kind": "push", "repo": "acme/app", "branch": "main", "sha": "abc"}
     pr = {"kind": "pr", "repo": "acme/app", "pr": 3}
-    got = scm.parse_event(_raw(changes=[push, pr]))
-    assert [c.kind for c in got] == [ChangeKind.PUSH, ChangeKind.PR]
-    assert (got[0].repo, got[1].pr) == (REPO, PrRef(REPO, 3))
+    check = {"kind": "check", "repo": "acme/app", "sha": "abc", "check": "sto"}
+    got = scm.parse_event(_raw(changes=[push, pr, check]))
+    assert [c.kind for c in got] == [ChangeKind.PUSH, ChangeKind.PR, ChangeKind.CHECK]
+    assert (got[0].repo, got[0].branch, got[0].sha) == (REPO, "main", "abc")
+    assert got[1].pr == PrRef(REPO, 3)
+    assert got[2].check == "sto"
     assert scm.parse_event(RawWebhook({}, b"")) == []
+    for bad in (b"{", b"[]", b'{"changes": [{"kind": "pr", "repo": "no-slash"}]}'):
+        with pytest.raises(MalformedWebhookError):
+            scm.parse_event(RawWebhook({}, bad))
 
 
 def test_every_write_path_returns_a_simulated_receipt() -> None:
