@@ -19,9 +19,12 @@ Errors speak the port's types, on reads as well as writes:
 
 * A lost condition is ``ConditionFailedError`` (``failed`` = the cancelled items whose condition
   failed); a ``DynamoConditionFailedError`` also carries every item's reason.
-* Throttling, a transaction conflict, a server error or a dropped connection is
-  ``TransactionConflictError``: the one type callers retry with backoff. ``get`` and ``query``
-  raise it too. botocore's own retries run first; this is what is left after them.
+* Throttling, a transaction conflict or a failure to connect (nothing applied) is
+  ``TransactionConflictError``: the type callers retry with backoff. ``get`` and ``query`` raise
+  it for every transient failure too. botocore's own retries run first.
+* A *write* whose answer was lost (read timeout, closed connection, any 5xx,
+  ``TransactionInProgressException``) may have landed, so it is ``TransactionOutcomeUnknownError``
+  (a ``TransactionConflictError``): re-read before retrying a guarded write.
 * ``TransactionCanceledException`` is mapped per item from ``CancellationReasons``, in this order:
   a validation failure (``ValueError``), a lost condition, another permanent reason
   (``DynamoTransactionError``), then retryable ones. When reasons mix, the most definite one wins
@@ -37,6 +40,13 @@ per item, 4 MB per transaction, 400 KB per item (by DynamoDB's own accounting, n
 numbers within DynamoDB's range, UTF-8 text, and no empty object keys. The server is still the
 authority: its size and validation refusals are mapped to ``ValueError`` too.
 
+Known limits, refused here but accepted by the in-memory stores: numbers below 1E-130 and empty
+object keys. Not here: GSI and TTL attributes (the ``{pk, sk, v, d}`` item cannot serve an index;
+D3-10 owns that) and the client factory.
+
+The audit table gets a native ``PutItem``-style ``Put`` (not an ``Update``), because its role may
+only be allowed to create items (ADR-0017); the main table uses ``Update``.
+
 ``create_tables`` is for tests and local setups; real tables come from the infrastructure stack.
 """
 
@@ -46,7 +56,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import (
@@ -54,7 +64,10 @@ from botocore.exceptions import (
     ConnectionClosedError,
     ConnectTimeoutError,
     EndpointConnectionError,
+    HTTPClientError,
+    ProxyConnectionError,
     ReadTimeoutError,
+    SSLError,
 )
 
 from sto.domain.errors import PermanentError
@@ -81,6 +94,7 @@ from .ports import (
     Put,
     Scope,
     TransactionConflictError,
+    TransactionOutcomeUnknownError,
     VersionIs,
     check_query_args,
     decode_cursor,
@@ -110,27 +124,34 @@ _MAX_QUERY_LIMIT = 2**31 - 1
 # magnitudes of 1E+38 and over; nothing here is that large, but tiny floats get through the port.
 _MIN_MAGNITUDE = Decimal("1E-130")
 
-_RETRYABLE_CODES = frozenset(
+# Nothing was applied: the request was refused or never got through.
+_NOTHING_APPLIED_CODES = frozenset(
     {
         "ThrottlingException",
         "Throttling",
+        "ThrottledException",
+        "RequestThrottled",
         "ProvisionedThroughputExceededException",
         "RequestLimitExceeded",
-        "InternalServerError",
-        "ServiceUnavailable",
         "TransactionConflictException",
+    }
+)
+# The server may have applied a write before failing (any 5xx also counts, by status).
+_MAYBE_APPLIED_CODES = frozenset(
+    {
+        "InternalServerError",
+        "InternalFailure",
+        "ServiceUnavailable",
+        "ServiceUnavailableException",
         "TransactionInProgressException",
     }
 )
 _RETRYABLE_REASONS = frozenset(
     {"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"}
 )
-_CONNECTION_ERRORS = (
-    EndpointConnectionError,
-    ConnectTimeoutError,
-    ReadTimeoutError,
-    ConnectionClosedError,
-)
+_NOT_SENT_ERRORS = (EndpointConnectionError, ConnectTimeoutError, SSLError, ProxyConnectionError)
+_MAYBE_SENT_ERRORS = (ReadTimeoutError, ConnectionClosedError, HTTPClientError)
+_TRANSPORT_ERRORS = _NOT_SENT_ERRORS + _MAYBE_SENT_ERRORS
 
 _SER = TypeSerializer()
 _DESER = TypeDeserializer()
@@ -142,7 +163,7 @@ _DESER = TypeDeserializer()
 @dataclass(frozen=True)
 class CancellationReason:
     """One entry of ``CancellationReasons``: operation ``index`` (same order as the ops), its
-    ``code`` (``None`` when that operation was fine) and DynamoDB's message."""
+    ``code`` (DynamoDB's string; the string ``"None"`` when that operation was fine) and message."""
 
     index: int
     code: str
@@ -181,21 +202,38 @@ class _Conflict(TransactionConflictError):
         self.reasons = tuple(reasons)
 
 
-def _translate(exc: BaseException) -> BaseException:
+def _unsure(write: bool, message: str) -> TransactionConflictError:
+    """A write that may have landed must say so; a read has nothing to reconcile."""
+    return TransactionOutcomeUnknownError(message) if write else _Conflict(message)
+
+
+def _translate(exc: BaseException, *, write: bool) -> BaseException:
     """The port's error for a failed call, or ``exc`` itself when nothing maps."""
-    if isinstance(exc, _CONNECTION_ERRORS):
+    if isinstance(exc, _NOT_SENT_ERRORS):
         return _Conflict(f"DynamoDB was unreachable: {exc}")
+    if isinstance(exc, _MAYBE_SENT_ERRORS):
+        return _unsure(write, f"the connection failed after the request was sent: {exc}")
     if not isinstance(exc, ClientError):
         return exc
-    code = str(exc.response.get("Error", {}).get("Code", ""))
-    message = str(exc.response.get("Error", {}).get("Message", ""))
-    if code in _RETRYABLE_CODES:
+    error = exc.response.get("Error", {})
+    code, message = str(error.get("Code", "")), str(error.get("Message", ""))
+    status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
+    if code in _NOTHING_APPLIED_CODES:
         return _Conflict(f"{code}: {message}")
+    if code in _MAYBE_APPLIED_CODES or status >= 500:
+        return _unsure(write, f"{code} (HTTP {status}): {message}")
     if code == "ValidationException":
         return ValueError(message)
     if code == "TransactionCanceledException":
         return _translate_cancellation(exc, message)
     return exc
+
+
+def _fail(exc: BaseException, *, write: bool) -> NoReturn:
+    mapped = _translate(exc, write=write)
+    if mapped is exc:
+        raise exc  # nothing maps: unchanged, with no cause of its own
+    raise mapped from exc
 
 
 def _translate_cancellation(exc: ClientError, message: str) -> BaseException:
@@ -380,8 +418,8 @@ class DynamoDbStore:
             response = self._client.get_item(
                 TableName=self._tables[addr.table], Key=wire_key, ConsistentRead=True
             )
-        except (ClientError, *_CONNECTION_ERRORS) as exc:
-            raise _translate(exc) from exc
+        except (ClientError, *_TRANSPORT_ERRORS) as exc:
+            _fail(exc, write=False)
         found = response.get("Item")
         return None if found is None else _to_item(key, found)
 
@@ -429,8 +467,8 @@ class DynamoDbStore:
                 args["ExclusiveStartKey"] = start
             try:
                 response = self._client.query(**args)
-            except (ClientError, *_CONNECTION_ERRORS) as exc:
-                raise _translate(exc) from exc
+            except (ClientError, *_TRANSPORT_ERRORS) as exc:
+                _fail(exc, write=False)
             found += response["Items"]
             start = response.get("LastEvaluatedKey")  # a page ends at 1 MB or at Limit
             if not start or (want is not None and len(found) >= want):
@@ -459,8 +497,8 @@ class DynamoDbStore:
             raise ValueError(f"transaction is {total} bytes; the limit is {MAX_TRANSACTION_BYTES}")
         try:
             self._client.transact_write_items(TransactItems=wire)  # type: ignore[arg-type]
-        except (ClientError, *_CONNECTION_ERRORS) as exc:
-            raise _translate(exc) from exc
+        except (ClientError, *_TRANSPORT_ERRORS) as exc:
+            _fail(exc, write=True)
 
     def _operation(self, p: Prepared) -> tuple[dict[str, Any], int]:
         table = self._tables[p.addr.table]
@@ -472,6 +510,17 @@ class DynamoDbStore:
                 size = estimate_item_bytes(data, pk=key["pk"]["S"], sk=p.addr.sk)
                 if size > MAX_ITEM_BYTES:
                     raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
+                if p.addr.table == AUDIT:
+                    # A native Put (not an Update): the app role may be denied UpdateItem on the
+                    # audit table (ADR-0017, D11-17), and TransactWriteItems checks each operation.
+                    # The port allows only Put + Absent() there, so this is a create at v=1.
+                    put: dict[str, Any] = {
+                        "TableName": table,
+                        "Item": {**key, "v": {"N": "1"}, "d": _attr(data)},
+                        "ConditionExpression": "attribute_not_exists(#pk)",
+                        "ExpressionAttributeNames": {"#pk": "pk"},
+                    }
+                    return {"Put": put}, size
                 condition = _condition(when, names, values)
                 names |= {"#v": "v", "#d": "d"}
                 values |= {":zero": {"N": "0"}, ":one": {"N": "1"}, ":data": _attr(data)}

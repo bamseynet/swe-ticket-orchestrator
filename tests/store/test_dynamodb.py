@@ -10,6 +10,7 @@ cancellation reasons) use a wrapper around the client and only run on moto.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from collections.abc import Callable, Iterator
@@ -20,7 +21,16 @@ from typing import TYPE_CHECKING, Any, cast
 import boto3
 import pytest
 from botocore.config import Config
-from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    HTTPClientError,
+    ProxyConnectionError,
+    ReadTimeoutError,
+    SSLError,
+)
 from moto import mock_aws
 from store_contract import StoreContract, race_claims
 
@@ -40,6 +50,7 @@ from sto.store.ports import (
     Put,
     TeamScope,
     TransactionConflictError,
+    TransactionOutcomeUnknownError,
     VersionIs,
 )
 
@@ -51,7 +62,7 @@ B = TeamScope("team-b")
 RUN = Key("RUN#1", "META")
 MAIN_TABLE = "sto-main"
 AUDIT_TABLE = "sto-audit"
-NO_RETRY = Config(retries={"max_attempts": 1, "mode": "standard"})
+NO_RETRY = Config(retries={"total_max_attempts": 1, "mode": "standard"})
 
 
 def client_error(
@@ -63,24 +74,37 @@ def client_error(
     return ClientError(response, "Op")  # type: ignore[arg-type]
 
 
+@dataclass
+class AfterCall:
+    """Scripted fault: the call reaches the server and is applied, then the answer is lost."""
+
+    error: BaseException
+
+
+class EmptyPageWithNextKey:
+    """Scripted response: the first Query page is empty yet has a LastEvaluatedKey (which DynamoDB
+    may do when a filter or the 1 MB cap leaves nothing in a page)."""
+
+
 class SpyClient:
     """Wraps a boto3 client: records every call, can raise scripted errors, and can cut query
     pages short the way DynamoDB does at 1 MB. Anything else passes straight through."""
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, *, serialize: bool = True) -> None:
         self.inner = inner
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.script: dict[str, list[BaseException | None]] = {}
+        self.script: dict[str, list[Any]] = {}
         self.page_cap: int | None = None
         # moto's backend is not thread-safe, so two simultaneous transactions can both pass the
         # same condition. DynamoDB serializes them. This lock stands in for that, so the race tests
-        # here check the store's conditions; DynamoDB Local in CI proves the real thing.
-        self._serial = threading.Lock()
+        # here check the store's conditions; DynamoDB Local in CI proves the real thing, so the
+        # lock is off there (``serialize=False``) and concurrent calls reach the engine.
+        self._serial: Any = threading.Lock() if serialize else contextlib.nullcontext()
 
     def named(self, name: str) -> list[dict[str, Any]]:
         return [kw for n, kw in self.calls if n == name]
 
-    def fail(self, method: str, *errors: BaseException | None) -> None:
+    def fail(self, method: str, *errors: Any) -> None:
         self.script[method] = list(errors)
 
     def __getattr__(self, name: str) -> Any:
@@ -91,12 +115,16 @@ class SpyClient:
         def call(**kwargs: Any) -> Any:
             self.calls.append((name, kwargs))
             queue = self.script.get(name)
-            if queue:
-                err = queue.pop(0)
-                if err is not None:
-                    raise err
+            scripted = queue.pop(0) if queue else None
+            if isinstance(scripted, BaseException):
+                raise scripted
+            if scripted is EmptyPageWithNextKey:
+                start = kwargs["ExpressionAttributeValues"][":pk"]
+                return {"Items": [], "LastEvaluatedKey": {"pk": start, "sk": {"S": ""}}}
             with self._serial:
                 response = target(**kwargs)
+            if isinstance(scripted, AfterCall):
+                raise scripted.error
             if name == "query" and self.page_cap and len(response["Items"]) > self.page_cap:
                 response["Items"] = response["Items"][: self.page_cap]
                 response["LastEvaluatedKey"] = {k: response["Items"][-1][k] for k in ("pk", "sk")}
@@ -386,11 +414,18 @@ THROTTLES = [
     "ThrottlingException",
     "ProvisionedThroughputExceededException",
     "RequestLimitExceeded",
-    "InternalServerError",
-    "ServiceUnavailable",
+    "RequestThrottled",
     "TransactionConflictException",
+]
+MAYBE_APPLIED = [
+    "InternalServerError",
+    "InternalFailure",
+    "ServiceUnavailable",
+    "ServiceUnavailableException",
     "TransactionInProgressException",
 ]
+WRITES = ("put", "delete", "transact")
+READS = ("get", "query")
 OPERATIONS: dict[str, tuple[str, Callable[[DynamoDbStore], object]]] = {
     "get": ("get_item", lambda s: s.get(A, RUN)),
     "query": ("query", lambda s: s.query(A, "RUN#1")),
@@ -412,9 +447,78 @@ def test_throttling_is_a_transaction_conflict_on_every_call_including_reads(
     with pytest.raises(TransactionConflictError) as info:
         call(env.store)
     assert info.value.retryable
+    assert not isinstance(info.value, TransactionOutcomeUnknownError)  # nothing was applied
     assert info.value.__cause__ is cause
     assert code in str(info.value)
     call(env.store)  # the next attempt goes through: nothing was cached or half-applied
+
+
+@pytest.mark.parametrize("code", MAYBE_APPLIED)
+@pytest.mark.parametrize("op", OPERATIONS)
+def test_a_server_failure_may_have_applied_a_write_but_never_a_read(
+    env: Env, op: str, code: str
+) -> None:
+    method, call = OPERATIONS[op]
+    env.client.fail(method, client_error(code))
+    expected = TransactionOutcomeUnknownError if op in WRITES else TransactionConflictError
+    with pytest.raises(expected) as info:
+        call(env.store)
+    assert info.value.retryable
+    assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
+
+
+@pytest.mark.parametrize("op", OPERATIONS)
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_any_5xx_even_a_gateways_html_error_is_retryable(env: Env, op: str, status: int) -> None:
+    method, call = OPERATIONS[op]
+    exc = client_error(str(status), "<html>bad gateway</html>")
+    exc.response["ResponseMetadata"] = {"HTTPStatusCode": status}
+    env.client.fail(method, exc)
+    with pytest.raises(TransactionConflictError) as info:
+        call(env.store)
+    assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
+
+
+@pytest.mark.parametrize("op", OPERATIONS)
+def test_a_lost_answer_after_the_request_was_sent_is_unknown_for_writes(env: Env, op: str) -> None:
+    method, call = OPERATIONS[op]
+    for exc in (
+        ReadTimeoutError(endpoint_url="http://x"),
+        ConnectionClosedError(endpoint_url="http://x"),
+        HTTPClientError(error=OSError("boom")),
+    ):
+        env.client.fail(method, exc)
+        with pytest.raises(TransactionConflictError) as info:
+            call(env.store)
+        assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
+        assert info.value.__cause__ is exc
+
+
+@pytest.mark.parametrize("op", OPERATIONS)
+def test_a_failure_before_anything_was_sent_is_a_plain_conflict(env: Env, op: str) -> None:
+    method, call = OPERATIONS[op]
+    for exc in (
+        SSLError(endpoint_url="http://x", error=OSError("tls")),
+        ProxyConnectionError(proxy_url="http://p"),
+    ):
+        env.client.fail(method, exc)
+        with pytest.raises(TransactionConflictError) as info:
+            call(env.store)
+        assert not isinstance(info.value, TransactionOutcomeUnknownError)
+
+
+def test_a_write_that_landed_before_the_timeout_says_so_and_a_reread_reconciles(
+    env: Env,
+) -> None:
+    env.store.put(A, RUN, {"n": 0})
+    env.client.fail("transact_write_items", AfterCall(ReadTimeoutError(endpoint_url="http://x")))
+    with pytest.raises(TransactionOutcomeUnknownError):
+        env.store.put(A, RUN, {"n": 1}, when=VersionIs(1))
+    landed = env.store.get(A, RUN)
+    assert landed is not None
+    assert (landed.data, landed.version) == ({"n": 1}, 2)  # it did apply
+    with pytest.raises(ConditionFailedError):  # a blind retry would now lose to its own success
+        env.store.put(A, RUN, {"n": 1}, when=VersionIs(1))
 
 
 @pytest.mark.parametrize("op", OPERATIONS)
@@ -425,8 +529,9 @@ def test_a_dropped_connection_is_retryable_too(env: Env, op: str) -> None:
         ConnectTimeoutError(endpoint_url="http://x"),
     ):
         env.client.fail(method, exc)
-        with pytest.raises(TransactionConflictError):
+        with pytest.raises(TransactionConflictError) as info:
             call(env.store)
+        assert not isinstance(info.value, TransactionOutcomeUnknownError)  # nothing was sent
 
 
 @pytest.mark.parametrize(
@@ -438,6 +543,7 @@ def test_errors_that_retrying_cannot_fix_are_not_disguised(env: Env, code: str) 
         with pytest.raises(ClientError) as info:
             call(env.store)
         assert info.value.response["Error"]["Code"] == code
+        assert info.value.__cause__ is None  # raised as it was, not chained to itself
 
 
 def ok(n: int) -> list[dict[str, str]]:
@@ -573,10 +679,19 @@ def test_the_conflict_retry_contract_a_retry_after_a_conflict_succeeds(env: Env)
     assert (got.data, got.version) == ({"owner": "me"}, 2)  # applied once, not three times
 
 
-def test_the_servers_idempotency_token_is_left_to_the_sdk(env: Env) -> None:
+def test_the_sdk_sends_an_idempotency_token_so_its_own_retries_are_safe(env: Env) -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def capture(params: dict[str, Any], **_: Any) -> None:
+        bodies.append(json.loads(params["body"]))
+
+    env.client.inner.meta.events.register("before-call.dynamodb.TransactWriteItems", capture)
     env.store.put(A, RUN, {"n": 1})
-    (sent,) = env.client.named("transact_write_items")
-    assert "ClientRequestToken" not in sent  # boto3 adds one per call, so its own retries are safe
+    env.store.put(A, RUN, {"n": 2})
+    tokens = [b.get("ClientRequestToken") for b in bodies]
+    assert len(tokens) == 2
+    assert all(isinstance(t, str) and len(t) >= 16 for t in tokens)
+    assert tokens[0] != tokens[1]  # one per call; a retry of the same call reuses its own
 
 
 # --- paging, with the cut a real server makes ----------------------------------------------------
@@ -738,3 +853,79 @@ def test_decimal_helpers_are_not_leaked_into_returned_data(env: Env) -> None:
 
     assert Decimal not in types(got.data)
     assert types(got.data) == {int, float}
+
+
+# --- review pass 1 -------------------------------------------------------------------------------
+
+
+def test_audit_entries_go_out_as_a_native_put_and_main_items_as_an_update(env: Env) -> None:
+    """The app role may be denied UpdateItem on the audit table (ADR-0017); TransactWriteItems
+    checks permission per operation, so the operation kind on the wire matters."""
+    audit = Key("RUN#1", "AUD#1", AUDIT)
+    env.store.transact(
+        A,
+        [
+            Put(RUN, {"n": 1}),
+            Put(audit, {"seq": 1}, when=Absent()),
+            Check(Key("RUN#1", "X"), Absent()),
+            Delete(Key("RUN#1", "Y")),
+        ],
+    )
+    (sent,) = env.client.named("transact_write_items")
+    kinds = {
+        op_body["TableName"]: kind
+        for op in sent["TransactItems"]
+        for kind, op_body in op.items()
+        if kind in ("Update", "Put")
+    }
+    assert kinds == {MAIN_TABLE: "Update", AUDIT_TABLE: "Put"}
+    (put,) = [op["Put"] for op in sent["TransactItems"] if "Put" in op]
+    assert put["ConditionExpression"] == "attribute_not_exists(#pk)"
+    assert put["Item"]["v"] == {"N": "1"}
+    assert not any(
+        "Update" in op and op["Update"]["TableName"] == AUDIT_TABLE for op in sent["TransactItems"]
+    )
+    got = env.store.get(A, audit)
+    assert got is not None
+    assert (got.data, got.version) == ({"seq": 1}, 1)
+    with pytest.raises(ConditionFailedError):
+        env.store.put(A, audit, {"seq": 2}, when=Absent())
+
+
+def test_every_key_the_store_sends_carries_the_teams_prefix(env: Env) -> None:
+    """On the wire, for each call kind on its own, so a missing prefix in any one path shows."""
+    env.store.put(A, RUN, {"n": 1})
+    env.store.get(A, RUN)
+    env.store.query(A, "RUN#1")
+    env.store.delete(A, RUN)
+    env.store.transact(A, [Check(Key("RUN#1", "C"), Absent())])
+    sent: list[str] = []
+    for name, kw in env.client.calls:
+        if name == "get_item":
+            sent.append(kw["Key"]["pk"]["S"])
+        elif name == "query":
+            sent.append(kw["ExpressionAttributeValues"][":pk"]["S"])
+        else:
+            for op in kw["TransactItems"]:
+                body = next(iter(op.values()))
+                sent.append(body["Key"]["pk"]["S"] if "Key" in body else body["Item"]["pk"]["S"])
+    assert len(sent) == 5  # put, get, query, delete, check
+    assert all(pk == "TEAM#team-a#RUN#1" for pk in sent)
+
+
+def test_query_keeps_going_past_an_empty_page_that_has_a_next_key(env: Env) -> None:
+    for i in range(3):
+        env.store.put(A, Key("P", f"S#{i}"), {"i": i})
+    env.client.fail("query", EmptyPageWithNextKey)
+    assert [i.data["i"] for i in env.store.query(A, "P").items] == [0, 1, 2]
+    env.client.fail("query", EmptyPageWithNextKey)
+    assert [i.data["i"] for i in env.store.query(A, "P", limit=2).items] == [0, 1]
+
+
+def test_a_validation_failure_beats_a_lost_condition(env: Env) -> None:
+    env.client.fail(
+        "transact_write_items",
+        cancelled("ConditionalCheckFailed", "ValidationError", message="too big"),
+    )
+    with pytest.raises(ValueError, match="too big"):
+        env.store.transact(A, THREE)
