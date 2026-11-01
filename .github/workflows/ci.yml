@@ -42,6 +42,8 @@ concurrency:
 env:
   UV_VERSION: "0.13.6"
   PLAYWRIGHT_VERSION: "1.55.0"
+  # Tests run with a sandboxed HOME, so the browsers live at an explicit path.
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
 
 jobs:
   filter:
@@ -295,7 +297,7 @@ jobs:
       - id: pw-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/ms-playwright
+          path: .pw-browsers
           key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}
       # Playwright is CI-only and not a project dependency; the version is pinned in env.
       - run: uv run --with playwright==$PLAYWRIGHT_VERSION playwright install --with-deps chromium

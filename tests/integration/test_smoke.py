@@ -10,14 +10,14 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import urllib.request
+import socket
 from collections.abc import Iterator
 
 import pytest
 
 from hermetic_guard import allow_loopback_bind
 
-DDB_ENDPOINT = f"http://127.0.0.1:{os.environ.get('STO_DDB_PORT', '8720')}"
+DDB_PORT = int(os.environ.get("STO_DDB_PORT", "8720"))
 # DynamoDB Local does not verify signatures, but insists the request looks signed.
 FAKE_AUTH = (
     "AWS4-HMAC-SHA256 Credential=fake/20260101/us-east-1/dynamodb/aws4_request, "
@@ -32,19 +32,23 @@ def loopback() -> Iterator[None]:
 
 
 def _list_tables() -> dict[str, object]:
-    request = urllib.request.Request(  # noqa: S310 - fixed loopback http URL
-        DDB_ENDPOINT,
-        data=b"{}",
-        method="POST",
-        headers={
-            "Content-Type": "application/x-amz-json-1.0",
-            "X-Amz-Target": "DynamoDB_20120810.ListTables",
-            "Authorization": FAKE_AUTH,
-        },
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
-        body: dict[str, object] = json.load(response)
-    return body
+    """POST ListTables over a raw loopback socket (name lookups stay blocked by the guard)."""
+    payload = b"{}"
+    head = (
+        f"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        f"Content-Type: application/x-amz-json-1.0\r\n"
+        f"X-Amz-Target: DynamoDB_20120810.ListTables\r\n"
+        f"Authorization: {FAKE_AUTH}\r\nContent-Length: {len(payload)}\r\n\r\n"
+    ).encode()
+    chunks: list[bytes] = []
+    with socket.create_connection(("127.0.0.1", DDB_PORT), timeout=10) as conn:
+        conn.sendall(head + payload)
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+    header, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    assert header.startswith(b"HTTP/1.1 200"), header
+    parsed: dict[str, object] = json.loads(body[body.index(b"{") :])
+    return parsed
 
 
 @pytest.mark.integration
