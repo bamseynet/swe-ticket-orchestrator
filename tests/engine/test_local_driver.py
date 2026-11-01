@@ -1252,15 +1252,16 @@ def test_the_stop_probe_is_made_once_and_does_not_starve_the_stop(tmp_path: Path
         def stop(self, effect: Effect) -> Any:
             SlowToStop.calls += 1
             assert SlowToStop.calls < 8, "the probe is repeated, so the StopRun never runs"
-            return (
-                Pending(effect.intent or "h") if SlowToStop.calls < 3 else self.inner.stop(effect)
-            )
+            # The merge only gives way once the run has actually been stopped.
+            if w.driver.state(RID).run.status is not RunStatus.CANCELLED:
+                return Pending(effect.intent or "h")
+            return self.inner.stop(effect)
 
     w.handler = SlowToStop(w.handler)
     _stop_on_first_sleep(w)
     rs = run(w.start())
     assert rs.run.status is RunStatus.CANCELLED
-    assert SlowToStop.calls == 3  # the probe, then two more once the run was CANCELLED
+    assert SlowToStop.calls == 2  # the probe while CANCELLING, then one once CANCELLED
     assert w.scm.poll_merge(w.scm.merges()[-1]).state is MergeState.DEQUEUED
 
 
