@@ -1,0 +1,84 @@
+# Effect catalog (PLAN.md sections 6.3 and 7.2). The class comes from here, never from config.
+# outcomes: the edges a workflow must provide (V2). key_scope: the idempotency key parts; the
+# default run/stage/visit/subject opens a new record on a deliberate retry. with: the typed
+# keys a stage may pass; any other key is refused. hold: the default hold after approval.
+# Keep outcomes in step with EFFECT_OUTCOMES in src/sto/config/schema.py (checked by a test).
+effects:
+  branch.push:
+    class: exposing
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with: {}
+  branch.promote:
+    class: gated
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with: {}
+  pr.ensure_draft:
+    class: scoped
+    outcomes: [done]
+    key_scope: [run, branch]
+    hold: 0s
+    with: {}
+  pr.update_branch:
+    class: scoped
+    outcomes: [done, conflict]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with: {}
+  pr.mark_ready:
+    class: gated
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with: {}
+  pr.merge:
+    class: gated
+    outcomes: [done, conflict, stale]
+    key_scope: [run, stage, visit, subject]
+    hold: 10m
+    with:
+      method: { type: enum, values: [squash, merge, rebase], required: false }
+  pr.open_revert:
+    class: scoped
+    outcomes: [done]
+    key_scope: [run, merge_sha]
+    hold: 0s
+    with: {}
+  ticket.comment:
+    class: scoped
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with:
+      template: { type: ident, required: false }
+  ticket.transition:
+    class: gated
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with:
+      to_status_category: { type: enum, values: [todo, in_progress, done], required: true }
+  env.deploy_preview:
+    class: gated
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with: {}
+  release.trigger:
+    class: gated
+    outcomes: [done, stale]
+    key_scope: [run, stage, visit, subject]
+    hold: 10m
+    with:
+      workflow: { type: text, required: true }
+      sha_input: { type: ident, required: true }
+  notify:
+    class: scoped
+    outcomes: [done]
+    key_scope: [run, stage, visit, subject]
+    hold: 0s
+    with:
+      template: { type: ident, required: false }
