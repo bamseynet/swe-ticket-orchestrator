@@ -516,8 +516,8 @@ Both are engine actions, so they are limited to what the graph allows. A patch b
 | 2 | D3-02, D3-10 | - |
 | 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
 | 4 | D3-15, D3-19 | D3-06 |
-| 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | - |
-| 6 | D3-07, D3-20 | - |
+| 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | D3-08b |
+| 6 | D3-07, D3-20 | D3-08a |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -563,10 +563,21 @@ Escalation notifies, but grants nothing. The way out of a stuck gate is D3-20.
 
 #### D3-08: Audit chain and checkpoints
 Hash-chain audit events through a chain head item, on the `AuditWriter` seam, with signed checkpoints through the signer port, a verifier and an export.
-Secrets are redacted before storing. Refused attempts go through a separate, best-effort path.
+Secrets are redacted before storing, inside `ChainedAuditWriter` itself, so no unredacted writer exists. Refused attempts go through a separate, best-effort path.
 The writer must move `RUN#r/CHAIN` in the same transaction as the gate open or decision it records, because the D1-07 effect claim's `Check` on that item is how it notices a gate round that skips numbers. A claim that writes an audit entry drops that `Check`, since its `Put` on the chain head carries the same condition and a transaction holds one op per item. A conformance test holds every writer to this.
-**AC:** every state change produces an audit event, asserted across a template run; editing, reordering or **removing a tail or a whole run** fails verification against a checkpoint; T14 covered; update and delete are unavailable in the port.
-**Deps:** D1-06, D1-07, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/`, `tests/audit/`.
+**AC:** every gate open and decision produces an audit event, asserted across a gate sequence shaped like a template run (engine and effect changes and the real template run are D3-08a); editing, reordering or **removing a tail or a whole run** fails verification against a checkpoint; T14 covered; update and delete are unavailable in the port.
+**Deps:** D1-06, D1-07, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/`, `src/sto/gates/hooks.py`, `tests/audit/`, `tests/gates/test_service.py`.
+
+#### D3-08a: Engine and effect audit
+Split out of D3-08's review: the engine driver and the effect executor commit state with no audit entry, and no template existed to run.
+Write an audit entry for each of those state changes in the same transaction. A claim that writes an entry drops its `Check` on the chain head, since its `Put` carries the same condition.
+**AC:** every state change produces an audit event, asserted across a run of the real `standard` template by comparing the entries with the committed changes; the chain verifies after the run; a crash and resume adds no duplicate entry.
+**Deps:** D3-08, D2-05, D1-08. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/effects/core.py`, `tests/audit/test_template_run.py`.
+
+#### D3-08b: Decision comments and refused attempts
+Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLAN.md 4.9's redaction before anything is stored, comments have no size cap, and nothing calls the refused-attempt path.
+**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record.
+**Deps:** D3-08, D3-06. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_comment_redaction.py`.
 
 #### D3-09: DynamoDB store
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
@@ -1267,7 +1278,7 @@ Validation here returns the same errors as the CLI.
 #### D9-20: Audit, org and resource APIs
 Routers for audit search and export, org policy, resource bindings, sandbox images, model catalog and kill switch.
 Only auditors and org admins can reach them, by role.
-**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier.
+**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier; a complete export does not depend on a run list the caller chose.
 **Deps:** D3-03, D3-08, D10-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/audit.py`, `src/sto/api/routers/org.py`, `tests/api/test_audit_org.py`.
 
 #### D9-04: Live updates hook
@@ -1339,7 +1350,7 @@ It helps spot rubber-stamping, without ranking individuals.
 #### D9-15: Audit page
 Filter events, verify the chain, and export, with the auditor's read-only view.
 Verification shows clearly when a chain fails.
-**AC:** an auditor can change nothing; a tampered fixture fails visibly; export matches the CLI verifier.
+**AC:** an auditor can change nothing; a tampered fixture fails visibly; export matches the verifier in `src/sto/audit/`; audit entries render as untrusted text.
 **Deps:** D9-01, D9-20. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/audit/`.
 
 #### D9-16: Org page
@@ -1609,7 +1620,8 @@ A late or repeated firing is safe.
 #### D11-17: Audit stream and checkpoints
 DynamoDB stream to S3 Object Lock, verifying the chain as it copies, a scheduled KMS-signed checkpoint, and iterator age alarms well under 24 hours.
 IAM denies mutation by app roles, and Object Lock defaults to compliance mode for regulated deployments.
-**AC:** template asserts Object Lock mode, deny policies and the alarm; replay is idempotent; a broken chain or removed tail alarms.
+The verifier loads every checkpoint from the locked bucket, never from a caller or an export, and finds a team's runs itself, so a run removed whole is still noticed. Decide and record whether signing keys are per team.
+**AC:** template asserts Object Lock mode, deny policies and the alarm; replay is idempotent; a broken chain or removed tail alarms; verifying a run with live writes raises no false alarm; a verifier holding two teams' keys refuses a checkpoint signed with the wrong team's key, if keys are per team.
 **Deps:** D3-08, D11-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/lambdas/audit_stream.py`, `infra/lib/audit.ts`, `tests/lambdas/test_audit_stream.py`.
 
 #### D11-18: Deploy config and guide
@@ -1908,7 +1920,7 @@ The rehearsal itself is in D12, once there is an account.
 #### D13-16: Retention and erasure
 Data retention per class, and how an erasure request works when audit is WORM, including comment text and screenshots that may show secrets.
 Artifacts get a review and redaction path.
-**AC:** lifecycle rules match stated retention; audit stores person references so identity data can be erased from the mapping while the chain still verifies; a flagged screenshot can be withheld from display.
+**AC:** lifecycle rules match stated retention; audit stores person references so identity data can be erased from the mapping while the chain still verifies, including any raw `actor` D3-08 already put in the hash; a flagged screenshot can be withheld from display.
 **Deps:** D3-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/retention.py`, `docs/runbooks/retention.md`, `tests/audit/test_retention.py`.
 
 ---
