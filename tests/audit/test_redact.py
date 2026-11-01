@@ -179,7 +179,8 @@ def test_redaction_is_linear_on_hostile_input() -> None:
         "  'token' + ' ' * 1000 * 100, 'token=\"' * 50000, \"token='a\\\" \" * 30000,\n"
         "  'password\\\\\": ' * 30000, 'cookie:' * 50000, 'Cookie: ' + 'a' * 400000,\n"
         "  'authorization: ' * 30000, 'auth=' * 60000, 'jwt:' * 60000, 'basic ' * 60000,\n"
-        "  'xeyJaaaa' * 40000, 'eyJaaaaa.bbbbb-' * 25000,\n"
+        "  'xeyJaaaa' * 40000, 'eyJaaaaa.bbbbb-' * 25000, 'password=' + chr(92) * 400000,\n"
+        "  ('password=' + chr(92) * 3 + chr(34)) * 20000, 'token' + chr(92) * 400000,\n"
         "  'Bearer%20' * 40000, 'password%3D' * 40000,\n"
         "  'https://' * 40000, 'redis://:' * 40000, 'cookie=' * 50000, 'secret' + ' ' * 100000,\n"
         "  (chr(92) + chr(34)) * 100000, ('password=' + chr(92) + chr(34)) * 40000,\n"
@@ -192,9 +193,16 @@ def test_redaction_is_linear_on_hostile_input() -> None:
         "    worst = max(worst, time.perf_counter() - t)\n"
         "print(worst)\n"
     )
-    done = subprocess.run(
-        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120, check=True
-    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("redaction did not finish its hostile shapes in 30 s: a pattern is not linear")
     assert float(done.stdout) < 5.0
 
 
@@ -412,3 +420,152 @@ def test_redacted_key_collisions_get_a_counter_not_a_search() -> None:
 def test_a_real_key_that_looks_like_a_counter_does_not_lose_a_value() -> None:
     out = redact({f"{REDACTED}#1": 3, "ghp_" + "a" * 30: 1, "ghp_" + "b" * 30: 2})
     assert sorted(out.values()) == [1, 2, 3]
+
+
+# --- pass 4 -------------------------------------------------------------------------------------
+
+W = "Zq9xW7kP2mR4vT"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f'Authorization: Digest username="bob", response="{W}"',
+        f'Authorization: Bearer abc"{W}',
+        f"Authorization: Bearer abc'{W}",
+        f"Authorization: Bearer abc&{W}",
+        f"Cookie: a=b'{W}",
+        f'Cookie: a="b"; sid={W}',
+    ],
+)
+def test_an_unquoted_header_value_runs_to_the_end_of_the_line(text: str) -> None:
+    assert W not in redact_text(text)
+    assert W[:8] not in redact_text(text)
+
+
+def test_a_quoted_header_value_stops_at_its_own_closing_quote() -> None:
+    out = redact_text(f'{{"Authorization": "Token {W}", "keep": "this"}}')
+    assert W not in out
+    assert '"keep": "this"' in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"password1={W}",
+        f"PASSWORD2={W}",
+        f"password_old={W}",
+        f"DB_PASSWORD_1={W}",
+        f"token2={W}",
+        f"token_value={W}",
+        f"secret_value={W}",
+        f"API_KEY_2={W}",
+        f"apikey1={W}",
+        f"GITHUB_TOKEN_OLD={W}",
+        f"signing_key={W}",
+        f"encryption_key={W}",
+        f"ssh_key={W}",
+        f"sshkey: {W}",
+        f"HTTP_AUTHORIZATION=Token {W}",
+        f"HTTP_COOKIE=sid={W}",
+        f"session_cookie={W}",
+        f"MY_AUTH={W}1",
+        f"BASIC_AUTH=user:{W}1",
+        f"my_jwt={W}123",
+        f"password := {W}",
+        f'password := "{W}"',
+        f"password => {W}",
+        f'"password" => "{W}"',
+        f":password => '{W}'",
+        f"--password {W}",
+        f"--token {W}",
+        f"mysql -u root --password {W}",
+        f"--password_old {W}",
+        f"<password>{W}</password>",
+        f"<token>{W}</token>",
+        f"<API_KEY_2>{W}</API_KEY_2>",
+        f"https://x/?sig={W}",
+        f"https://x/?a=1&signature={W}&b=2",
+        f"X-Amz-Signature={W}",
+        f"https://x/?X-Amz-Signature={W}&X-Amz-Expires=60",
+    ],
+)
+def test_names_in_text_agree_with_the_names_in_dict_keys(text: str) -> None:
+    out = redact_text(text)
+    assert W not in out
+    assert W[:8] not in out
+    assert redact_text(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "pass --verbose to the script",
+        "see <token> for details",
+        "token_budget=100000 and tokens_used=500",
+        "https://x/?page=2&sort=asc",
+        "a signature line, sig for short",
+    ],
+)
+def test_the_new_shapes_leave_prose_alone(text: str) -> None:
+    assert redact_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "prefix", ["x_", "url_", "a" * 30, "foo.bar.baz.qux.quux.corge.example.com.", "(", "`"]
+)
+def test_url_credentials_are_found_after_any_prefix(prefix: str) -> None:
+    for scheme in ("https", "postgres", "s3", "a1"):
+        out = redact_text(f"{prefix}{scheme}://u:{W}@h")
+        assert W not in out, (prefix, scheme)
+
+
+def test_the_three_level_json_form_is_caught() -> None:
+    for levels in (1, 2, 3):
+        bs = "\\" * levels
+        text = bs + '"password' + bs + '": ' + bs + '"' + W + bs + '"'
+        out = redact_text(text)
+        assert W not in out, levels
+
+
+def test_url_passwords_over_300_characters_are_a_stated_limit() -> None:
+    long_pw = "p" * 400
+    assert long_pw in redact_text(f"https://u:{long_pw}@h")  # stated in the module docstring
+    assert "p" * 250 not in redact_text(f"https://u:{'p' * 250}@h")
+    assert "p" * 250 not in redact_text(f"https://{'p' * 250}@h")  # no colon: the other form
+    assert "p" * 350 in redact_text(f"https://{'p' * 350}@h")
+
+
+@pytest.mark.parametrize(
+    "name", ["auth_header", "authorization_header", "Authorization-Header", "private_key_pem"]
+)
+def test_header_and_pem_names_are_secret_names(name: str) -> None:
+    assert redact({name: W}) == {name: REDACTED}
+
+
+@pytest.mark.parametrize("name", ["oauth", "Oauth", "OAuth_provider", "token_hash", "author"])
+def test_names_that_only_look_like_secrets_are_kept(name: str) -> None:
+    assert redact({name: "keepme"}) == {name: "keepme"}
+
+
+def test_a_token_value_that_is_a_number_becomes_a_string_by_design() -> None:
+    assert redact({"token": 5}) == {"token": REDACTED}
+
+
+def test_second_pass_changes_a_password_with_slash_and_at_by_design() -> None:
+    once = redact_text("https://u:ab/cd@X@h")
+    assert once != redact_text(once)  # the docstring says idempotence is not a guarantee
+
+
+def test_collisions_that_run_into_two_planted_levels_lose_nothing() -> None:
+    planted = {f"{REDACTED}#1": "a", f"{REDACTED}#1#1": "b"}
+    keys = {f"ghp_{c * 30}": c for c in "xyz"}
+    out = redact({**planted, **keys})
+    assert sorted(out.values()) == ["a", "b", "x", "y", "z"]
+    assert len(out) == 5
+
+
+def test_a_word_after_dash_dash_password_is_taken_for_its_value_by_decision() -> None:
+    assert redact_text("the --password flag is documented") == (
+        f"the --password {REDACTED} is documented"
+    )

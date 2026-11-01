@@ -369,6 +369,7 @@ def test_a_quiet_run_is_anchored_at_its_last_entry_and_an_honest_since_export_ve
     doc = jd(export_team(store, TEAM, [RUN, RUN2], checkpoints=[cp], since=300))
     quiet = doc["runs"][str(RUN2)]
     assert quiet["entries"] == []
+    assert quiet["anchor"] is not None
     assert quiet["anchor"]["seq"] == 2
     assert part(doc, trusted=[cp], since=300).counts == {str(RUN): 6, str(RUN2): 0}
 
@@ -736,11 +737,12 @@ def test_a_run_that_began_after_the_range_is_shown_by_its_first_entry() -> None:
     late = doc["runs"][str(RUN2)]
     assert late["entries"] == []
     assert late["anchor"] is None
-    assert late["first"]["seq"] == 1
+    assert [e["seq"] for e in late["first"]] == [1, 2]  # up to the run's lowest checkpoint
     kw: dict[str, Any] = {"trusted": [cp], "from_start": False, "to_tip": False}
     kw |= {"since": 300, "until": 600}
     result = verify_export(doc, signer(), team="t1", **kw)
     assert result.counts[str(RUN2)] == 0
+    assert result.runs[str(RUN2)].compared_through == 2
     assert result.unchecked == ()
     # without the first entry, or with the caller giving no end, an empty run is not accepted
     del late["first"]
@@ -753,7 +755,7 @@ def test_a_run_that_began_after_the_range_is_shown_by_its_first_entry() -> None:
     with pytest.raises(AuditVerificationError, match="began inside"):
         verify_export(doc2, signer(), team="t1", **{**kw, "until": 1000})
     # a first entry that is not the run's first, or is not ours, is refused
-    doc2["runs"][str(RUN2)]["first"]["actor"] = "x"
+    doc2["runs"][str(RUN2)]["first"][0]["actor"] = "x"
     with pytest.raises(AuditVerificationError, match="hash"):
         verify_export(doc2, signer(), team="t1", **kw)
 
@@ -790,9 +792,9 @@ def test_the_first_entry_of_a_late_run_is_compared_with_a_checkpoint_at_count_on
     kw |= {"since": 100, "until": 400, "all_runs": True}
     result = verify_export(doc, signer(), team="t1", **kw)
     assert result.runs[str(RUN2)].compared_through == 1  # count 1 was compared, and matched
-    first = doc["runs"][str(RUN2)]["first"]
+    first = doc["runs"][str(RUN2)]["first"][0]
     body = {k: v for k, v in first.items() if k != "hash"} | {"actor": "framed"}
-    doc["runs"][str(RUN2)]["first"] = {**body, "hash": entry_hash(body)}  # valid, but not ours
+    doc["runs"][str(RUN2)]["first"] = [{**body, "hash": entry_hash(body)}]  # valid, but not ours
     with pytest.raises(AuditVerificationError, match="differs from the checkpoint"):
         verify_export(doc, signer(), team="t1", **kw)
 
@@ -808,3 +810,89 @@ def test_the_flag_voids_to_tip_for_that_run_only() -> None:
         verify_export(doc, signer(), team="t1", **kw)
     result = verify_export(doc, signer(), team="t1", allow_unchecked_range=True, **kw)
     assert result.unchecked == (str(RUN),)
+
+
+# --- pass 4: item 1, a late run's start is tied to a checkpoint -----------------------------------
+
+
+def late_doc(counts_at: list[int], ats: list[int]) -> tuple[Wire, dict[str, Any], MemoryStore]:
+    """RUN (to give the export something else) and a run whose entries all come after the range;
+    checkpoints on the late run at the given counts."""
+    store = MemoryStore()
+    append(store, RUN, [100, 200, 300])
+    append(store, RUN2, ats[: counts_at[0]])
+    cps = [create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=1, previous=[])]
+    for n, upto in enumerate(counts_at[1:], start=2):
+        append(store, RUN2, ats[len(audit_items(store, RUN2)) : upto])
+        cps.append(create_checkpoint(store, TEAM, signer(), [RUN2], at=n, previous=cps))
+    doc = jd(export_team(store, TEAM, [RUN, RUN2], checkpoints=cps, since=100, until=400))
+    kw: dict[str, Any] = {"trusted": cps, "from_start": False, "to_tip": False}
+    kw |= {"since": 100, "until": 400}
+    return doc, kw, store
+
+
+def forged_first(doc: Wire, **change: Any) -> list[Wire]:
+    first = doc["runs"][str(RUN2)]["first"]
+    body = {k: v for k, v in first[0].items() if k != "hash"} | change
+    return [{**body, "hash": entry_hash(body)}]
+
+
+def test_an_honest_late_run_passes_with_its_start_compared() -> None:
+    doc, kw, _ = late_doc([8], [900, 910, 920, 930, 940, 950, 960, 970])
+    assert len(doc["runs"][str(RUN2)]["first"]) == 8
+    result = verify_export(doc, signer(), team="t1", **kw)
+    assert result.runs[str(RUN2)].compared_through == 8
+    assert result.runs[str(RUN2)].unchecked is False
+
+
+def test_a_forged_one_entry_start_cannot_empty_a_run_behind_a_later_checkpoint() -> None:
+    doc, kw, _ = late_doc([8], [900, 910, 920, 930, 940, 950, 960, 970])
+    doc["runs"][str(RUN2)]["first"] = forged_first(doc, at=5000)  # a rehashed seq-1, far later
+    with pytest.raises(AuditVerificationError, match="no checkpoint count falls in the start"):
+        verify_export(doc, signer(), team="t1", **kw)
+    result = verify_export(doc, signer(), team="t1", allow_unchecked_range=True, **kw)
+    assert result.unchecked == (str(RUN2),)  # the flag reports it, it does not clean it
+    assert result.runs[str(RUN2)].compared_through == 0
+
+
+def test_a_forged_start_that_reaches_a_checkpointed_count_is_caught() -> None:
+    doc, kw, _ = late_doc([3, 8], [900, 910, 920, 930, 940, 950, 960, 970])
+    first = doc["runs"][str(RUN2)]["first"]
+    assert len(first) == 3
+    body = {k: v for k, v in first[1].items() if k != "hash"} | {"actor": "framed"}
+    doc["runs"][str(RUN2)]["first"] = [first[0], {**body, "hash": entry_hash(body)}, first[2]]
+    with pytest.raises(AuditVerificationError):  # the chain breaks at entry 2's successor
+        verify_export(doc, signer(), team="t1", **kw)
+    from_genesis = rechain_from(
+        [{**e, "actor": "framed"} for e in first], 0, "0" * 64
+    )  # a whole forged start, consistent with itself
+    doc["runs"][str(RUN2)]["first"] = from_genesis
+    with pytest.raises(AuditVerificationError, match="differs from the checkpoint"):
+        verify_export(doc, signer(), team="t1", **kw)
+
+
+@pytest.mark.parametrize("first", [None, [], "x", {}, [1]])
+def test_a_late_run_without_a_usable_start_is_refused(first: Any) -> None:
+    doc, kw, _ = late_doc([3], [900, 910, 920])
+    doc["runs"][str(RUN2)]["first"] = first
+    with pytest.raises(AuditVerificationError):
+        verify_export(doc, signer(), team="t1", **kw)
+
+
+# --- pass 4: test gaps -----------------------------------------------------------------------
+
+
+def test_another_runs_checkpoint_counts_do_not_make_this_range_comparable() -> None:
+    store = MemoryStore()
+    append(store, RUN, [100, 200, 300])  # RUN: checkpoint counts 3 and (later) 8
+    cp_a = create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+    append(store, RUN, [400, 500, 600, 700, 800])
+    append(store, RUN2, [100, 200, 300, 400, 500, 600])  # RUN2: only count 6
+    cp_b = create_checkpoint(store, TEAM, signer(), [RUN, RUN2], at=2, previous=[cp_a])
+    doc = jd(export_team(store, TEAM, [RUN2], checkpoints=[cp_b], since=200, until=400))
+    assert [e["seq"] for e in doc["runs"][str(RUN2)]["entries"]] == [2, 3]
+    kw: dict[str, Any] = {"trusted": [cp_a, cp_b], "from_start": False, "to_tip": False}
+    kw |= {"since": 200, "until": 400, "all_runs": False}
+    # RUN has a checkpointed count (3) inside (1, 3], RUN2 has none: only RUN2's own count may count
+    with pytest.raises(AuditVerificationError, match="no checkpoint count falls"):
+        verify_export(doc, signer(), team="t1", **kw)

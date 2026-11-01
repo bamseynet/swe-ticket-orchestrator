@@ -14,6 +14,11 @@ anchor is a whole entry, checked for its own hash, run, team and seq, and compar
 checkpoint only if one has that count. A range with no checkpointed count between its anchor and
 its last entry has nothing to compare, so it is refused unless the caller passes
 ``allow_unchecked_range=True`` and accepts that those entries rest on their own chain alone.
+
+**Not proved: entries missing after the last one in the range.** A truncated period, one emptied
+behind a real anchor, or an ``until``-only export passes with ``unchecked=False``. A run that
+began after the period is shown by its own start (entries 1 up to its lowest checkpointed count),
+so such a run's export holds entries outside the period.
 """
 
 from __future__ import annotations
@@ -66,7 +71,8 @@ def export_team(
     """A JSON-able document of the runs given and every run a checkpoint names. A run whose
     window does not start at its first entry carries the entry just before it as ``anchor`` (the
     whole entry, so it can be checked), also when the window is empty. A run that began after the
-    window carries its first entry as ``first``, which proves it has nothing in the range."""
+    window carries its first entries as ``first``: entries 1 to the run's lowest checkpointed count,
+    which can lie outside the period (the export then holds entries from before or after it)."""
     log = StoreAuditLog(store)
     names = {str(r) for r in run_ids} | {h.run_id for c in checkpoints for h in c.checkpoint.runs}
     runs: dict[str, Any] = {}
@@ -78,7 +84,9 @@ def export_team(
             "anchor": entries[lo - 1] if lo > 0 else None,
         }
         if lo == hi == 0 and entries:
-            body["first"] = entries[0]  # evidence that the run began after the range
+            # the run's start up to its lowest checkpointed count, so a signature ties it down
+            seen = [h.count for c in checkpoints for h in c.checkpoint.runs if h.run_id == run]
+            body["first"] = entries[: min(seen, default=1)]
         runs[run] = body
     return {
         "format": FORMAT,
@@ -99,7 +107,8 @@ class RunCoverage:
 
     ``compared_through`` is the highest seq whose hash was compared with a signed checkpoint
     (0 if none). **Entries after it in the range rest on the chain alone**: nothing signed covers
-    them, so a forged tail past ``compared_through`` is not detectable by this export. ``unchecked``
+    them, so a forged tail past ``compared_through`` is not detectable by this export, and
+    entries missing after the last one in the range are not either. ``unchecked``
     means no checkpoint could be compared with the range at all (see ``allow_unchecked_range``)."""
 
     entries: int
@@ -141,6 +150,12 @@ def verify_export(
     ``since`` and ``until`` are what the caller asked for: the anchor must lie before ``since``,
     the entries inside the window, and a run with an empty window needs ``until`` and proof that
     it began after it.
+
+    **Entries missing after the last one in the range look fully proved.** A truncated period, a
+    period emptied behind a real anchor, and an ``until``-only export all pass with
+    ``unchecked=False``: the proof reaches ``compared_through`` and no further, and nothing in the
+    file shows where the period ought to end. A later change will carry the entries up to the next
+    checkpoint past the range, so the end can be compared too.
 
     **A range that does not start at entry 1 (``from_start=False``) cannot prove where it
     starts.** A non-empty range needs a checkpointed count in ``(anchor, last]``; the anchor
@@ -233,7 +248,9 @@ def _verify_run_range(
     if anchor is None:
         start, hashes = (0, GENESIS_HASH), {}
         if not entries:
-            return _began_after(run, body, team, checkpoints, counts, to_tip, until)
+            return _began_after(
+                run, body, team, checkpoints, counts, to_tip, until, allow_unchecked_range
+            )
     else:
         if from_start:
             raise AuditVerificationError(f"run {run} does not start at the beginning")
@@ -275,16 +292,23 @@ def _began_after(
     counts: list[int],
     to_tip: bool,
     until: int | None,
+    allow_unchecked_range: bool,
 ) -> RunCoverage:
-    """An empty range with no anchor is only honest if the run began after the range: its first
-    entry must be there as evidence, and the caller must have said where the range ends."""
+    """An empty range with no anchor is only honest if the run began after the range. ``first``
+    must be the run's own start, entries 1 up to its lowest checkpointed count: chained from the
+    genesis and compared with that checkpoint, so a forged start cannot be rehashed to fit. The
+    caller must have said where the range ends. With no checkpointed count inside ``first`` nothing
+    signed ties the start down: refused, or reported unchecked under the flag."""
     first = body.get("first")
-    if first is None or until is None:
+    if not first or until is None:
         raise AuditVerificationError(f"run {run} has no entries in the export and shows no reason")
-    check_entries([first], run, team)  # seq 1, hash from the genesis, run and team
-    if first["at"] < until:
+    walked = dict(
+        check_entries(first, run, team)
+    )  # seq, link, hash, run and team, from the genesis
+    if first[0]["at"] < until:
         raise AuditVerificationError(f"run {run} began inside the range but has no entries")
-    check_against_checkpoints(
-        run, {1: first["hash"]}, last=0, to_tip=to_tip, checkpoints=checkpoints
-    )
-    return RunCoverage(0, 1 if 1 in counts else 0, False)
+    check_against_checkpoints(run, walked, last=0, to_tip=to_tip, checkpoints=checkpoints)
+    through = max((c for c in counts if c in walked), default=0)
+    if not through and not allow_unchecked_range:
+        raise AuditVerificationError(f"no checkpoint count falls in the start of run {run}")
+    return RunCoverage(0, through, not through)

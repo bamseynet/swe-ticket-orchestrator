@@ -104,32 +104,62 @@ _MAX_DEPTH = 20  # the store allows 32 for the whole item
 _MAX_NUMBER = 10**15
 
 
+_CUT = "[too large]"
+
+
+def _key(k: object) -> str:
+    """A dict key as text. Only strings, numbers and None are printed: anything else (bytes, a
+    tuple, an object) may hold a secret that no pattern would see, so it becomes a marker."""
+    if isinstance(k, str):
+        return _plain(k)
+    if k is None or type(k) in (bool, int, float):
+        return _plain(k)
+    return f"[{type(k).__name__} key]"
+
+
+def _unique(taken: dict[str, Any], key: str) -> str:
+    n, new = 0, key
+    while new in taken:
+        n += 1
+        new = f"{key}#{n}"
+    return new
+
+
 def _storable(value: Any, depth: int, budget: list[int]) -> Any:
     """JSON the store accepts, from anything: deep, cyclic, oversized or odd values become short
-    markers (bytes and unknown objects are never printed, they may hold secrets)."""
+    markers (bytes and unknown objects are never printed, they may hold secrets). A container cut
+    by the node budget or the item cap says so with a ``[too large]`` entry."""
     budget[0] -= 1
-    if budget[0] < 0 or depth > _MAX_DEPTH:
-        return "[too large]"
+    if depth > _MAX_DEPTH:
+        return _CUT
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
         return _plain(value)
-    if isinstance(value, int | float):
+    if type(value) in (int, float):  # exact types: a subclass can override __eq__ and raise
         ok = value == value and abs(value) < _MAX_NUMBER
         return value if ok else "[number out of range]"
     if isinstance(value, Mapping):
         mapped: dict[str, Any] = {}
-        for k, v in islice(value.items(), _MAX_NODES):
+        pairs = iter(value.items())
+        for k, v in islice(pairs, _MAX_NODES):
             if budget[0] < 0:
-                break  # stop pulling items once the budget is spent
-            mapped[_plain(k)] = _storable(v, depth + 1, budget)  # whole key: redacted, then clipped
+                mapped[_unique(mapped, _CUT)] = _CUT
+                return mapped
+            mapped[_unique(mapped, _key(k))] = _storable(v, depth + 1, budget)
+        if next(pairs, None) is not None:
+            mapped[_unique(mapped, _CUT)] = _CUT
         return mapped
     if isinstance(value, list | tuple):
         items: list[Any] = []
-        for v in islice(value, _MAX_NODES):
+        elements = iter(value)
+        for v in islice(elements, _MAX_NODES):
             if budget[0] < 0:
-                break
+                items.append(_CUT)
+                return items
             items.append(_storable(v, depth + 1, budget))
+        if next(elements, None) is not None:
+            items.append(_CUT)
         return items
     if isinstance(value, bytes | bytearray):
         return f"[{len(value)} bytes]"
@@ -210,7 +240,11 @@ class RefusedAttempts:
         the bounded text with ``{"unstorable": true}``, counted as degraded. Anything else (a
         throttle, a timeout) is retried once with the same record; a retry that finds the item
         already there succeeded the first time."""
-        full = {**body, "data": self._bounded(data)}
+        try:
+            bounded = self._bounded(data)
+        except Exception:  # a hostile mapping or number: keep the record, not the data
+            bounded = {"unstorable": True}
+        full = {**body, "data": bounded}
         try:
             self._store.transact(scope, [Put(key, full, Absent())])
         except (ValueError, TypeError):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -258,7 +258,7 @@ def nested(depth: int) -> dict[str, Any]:
             lambda d: d["data"] == {"x": "[number out of range]"},
         ),
         ("int key", {"data": {1: "x"}}, lambda d: d["data"] == {"1": "x"}),
-        ("tuple key", {"data": {(1, 2): "x"}}, lambda d: d["data"] == {"(1, 2)": "x"}),
+        ("tuple key", {"data": {(1, 2): "x"}}, lambda d: d["data"] == {"[tuple key]": "x"}),
         ("object", {"data": {"k": object()}}, lambda d: d["data"] == {"k": "[unstorable object]"}),
         ("bytes", {"data": {"k": GH.encode()}}, lambda d: d["data"] == {"k": "[40 bytes]"}),
         ("not a mapping", {"data": ["x"]}, lambda d: d["data"] == {"unstorable": True}),
@@ -306,7 +306,9 @@ def test_a_store_that_refuses_the_record_as_invalid_gets_the_bounded_text_and_a_
     RefusedAttempts(store, count).record(
         TEAM, RUN, actor="mallory", action="gate.decide", reason="not eligible", data={"k": 1}, at=3
     )
-    (item,) = refused_items(store, str(RUN))
+    items = refused_items(store, str(RUN))
+    assert len(items) == 1, "the second write must have happened"
+    item = items[0]
     assert item.data == {
         "run": str(RUN),
         "at": 3,
@@ -485,3 +487,138 @@ def test_the_node_budget_bounds_the_work_on_a_wide_cycle_by_assertion() -> None:
     )
     assert visited[0] < 50_000
     assert len(refused_items(store, str(RUN))) == 1
+
+
+# --- pass 4 ---------------------------------------------------------------------------------------
+
+V = "Zq9xW7kP2mR4vT"
+
+
+@pytest.mark.parametrize(
+    ("key", "stored"),
+    [
+        (b"hunter2hunter2", "[bytes key]"),
+        (("password", V), "[tuple key]"),
+        (frozenset({V}), "[frozenset key]"),
+        (12345, "12345"),
+        (None, "None"),
+        (1.5, "1.5"),
+        (True, "True"),
+    ],
+)
+def test_keys_that_are_not_text_or_numbers_are_markers_not_printed(key: Any, stored: str) -> None:
+    store = MemoryStore()
+    RefusedAttempts(store, Counter()).record(
+        TEAM, RUN, actor="a", action="x", reason="r", data={key: "v"}, at=1
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert item.data["data"] == {stored: "v"}
+    assert V not in json.dumps(item.data)
+    assert "hunter2" not in json.dumps(item.data)
+
+
+def test_a_key_object_whose_str_holds_a_secret_is_never_printed() -> None:
+    class Key_:
+        def __str__(self) -> str:
+            return V
+
+    store = MemoryStore()
+    RefusedAttempts(store, Counter()).record(
+        TEAM, RUN, actor="a", action="x", reason="r", data=cast(Any, {Key_(): "v"}), at=1
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert item.data["data"] == {"[Key_ key]": "v"}
+
+
+def test_two_marker_keys_do_not_overwrite_each_other() -> None:
+    store = MemoryStore()
+    RefusedAttempts(store, Counter()).record(
+        TEAM,
+        RUN,
+        actor="a",
+        action="x",
+        reason="r",
+        data=cast(Any, {b"one": 1, b"two": 2, (1,): 3}),
+        at=1,
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert sorted(item.data["data"].values()) == [1, 2, 3]
+    assert len(item.data["data"]) == 3
+
+
+class HostileMapping(dict[str, Any]):
+    def items(self) -> Any:
+        raise RuntimeError("boom")
+
+
+class HostileList(list[Any]):
+    def __iter__(self) -> Any:
+        raise RuntimeError("boom")
+
+
+class HostileInt(int):
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("boom")
+
+    __hash__ = int.__hash__
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (HostileMapping(), {"unstorable": True}),
+        ({"x": HostileList()}, {"unstorable": True}),
+        ({"x": HostileInt(1), "y": "kept"}, {"x": "[unstorable HostileInt]", "y": "kept"}),
+    ],
+    ids=["mapping", "list", "int"],
+)
+def test_hostile_data_keeps_the_record(data: Any, expected: dict[str, Any]) -> None:
+    store, count = MemoryStore(), Counter()
+    RefusedAttempts(store, count).record(
+        TEAM, RUN, actor="a", action="x", reason="r", data=data, at=1
+    )
+    (item,) = refused_items(store, str(RUN))
+    assert item.data["data"] == expected
+    assert item.data["actor"] == "a"
+    assert count.names == []
+
+
+def _cycle() -> dict[str, Any]:
+    cyc: dict[str, Any] = {}
+    for i in range(20_000):
+        cyc[f"k{i}"] = cyc
+    return cyc
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"l": list(range(20_000))},
+        {f"k{i}": 0 for i in range(20_000)},
+        {"l": [[1, 2, 3]] * 3_000},
+        _cycle(),
+    ],
+    ids=["wide-list", "wide-dict", "list-of-lists", "wide-cycle"],
+)
+def test_a_cut_is_marked_in_the_stored_data(data: dict[str, Any]) -> None:
+    from sto.audit.port import _MAX_NODES, _storable
+
+    out = _storable(data, 0, [_MAX_NODES])
+    assert "[too large]" in json.dumps(out)
+
+
+def test_a_top_level_list_and_dict_over_the_item_cap_are_marked() -> None:
+    from sto.audit.port import _MAX_NODES, _storable
+
+    long_list = _storable(list(range(_MAX_NODES + 1)), 0, [_MAX_NODES])
+    assert long_list[-1] == "[too large]"
+    long_dict = _storable({f"k{i}": 0 for i in range(_MAX_NODES + 1)}, 0, [_MAX_NODES])
+    assert "[too large]" in long_dict
+
+
+def test_a_container_that_fits_the_budget_has_no_marker() -> None:
+    from sto.audit.port import _MAX_NODES, _storable
+
+    out = _storable({"l": list(range(4_000))}, 0, [_MAX_NODES])
+    assert "[too large]" not in json.dumps(out)
+    assert len(out["l"]) == 4_000
