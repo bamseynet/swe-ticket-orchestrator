@@ -279,6 +279,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The bundle is built here, not inside the browser test.
+      - run: npm ci && npm run build
+        working-directory: web
       - run: uv sync --locked --group browser
       - id: pw-version
         run: echo "v=$(uv run python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"

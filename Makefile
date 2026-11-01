@@ -5,8 +5,8 @@ BASE ?= origin/main
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
 
-dev: ## Run the local API (loopback, dev token, SQLite file .sto/dev.db; no Docker). STO_API_PORT overrides 8710
-	STO_MODE=local uv run python -m sto.api.app
+dev: ## Run the whole local stack: API (8710), web UI (5710) and a demo run; dev token, SQLite .sto/dev.db, no Docker. STO_API_PORT / STO_WEB_PORT override
+	uv run python scripts/dev.py
 
 doctor: ## Check Python, uv, Node 24, Docker (optional) and ports; prints a fix for each. Ports: STO_API_PORT, STO_WEB_PORT
 	@command -v python3 >/dev/null || { echo "[FAIL] python3 not found"; echo "       fix: install Python 3.12+, e.g. curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.12 --default"; exit 1; }; python3 scripts/doctor.py $(ARGS)
