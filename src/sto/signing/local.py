@@ -23,7 +23,7 @@ def _check(key_id: str, secret: bytes) -> None:
 
 
 class LocalSigner:
-    """Signs with one current key. ``retired`` keys still verify, so rotation keeps old data valid."""
+    """Signs with one current key. ``retired`` keys still verify, so rotation is safe."""
 
     def __init__(
         self, *, key_id: str, secret: bytes, retired: Mapping[str, bytes] | None = None
