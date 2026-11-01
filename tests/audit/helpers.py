@@ -8,7 +8,7 @@ from typing import Any
 
 from sto.domain import DecisionKind, GateType, RunId, Subject, Surface
 from sto.engine.commands import OpenGate
-from sto.gates.hooks import audit_pk, run_pk
+from sto.gates.hooks import AuditEntry, ChainedAuditWriter, audit_pk, run_pk
 from sto.gates.service import GateService
 from sto.signing.local import LocalSigner
 from sto.store.memory import MemoryStore
@@ -111,6 +111,7 @@ def forged_copy(
     *,
     scope: Scope = TEAM,
     fix_head: bool = True,
+    source_head: bool = False,
 ) -> MemoryStore:
     """What a writer with full access to the tables could produce: a fresh store holding each
     run's entries after ``edit`` (which may change, reorder or drop them). With ``fix_head`` the
@@ -120,7 +121,10 @@ def forged_copy(
         entries = edit(run, audit_items(source, run, scope))
         for pos, e in enumerate(entries, start=1):  # stored by position, so a swap is physical
             out.transact(scope, [Put(Key(audit_pk(run), f"{pos:012d}", AUDIT), e, Absent())])
-        if entries and fix_head:
+        old = source.get(scope, Key(run_pk(run), "CHAIN"))
+        if source_head and old is not None:  # the head is left as it was: now ahead of the entries
+            out.transact(scope, [Put(old.key, dict(old.data), Absent())])
+        elif entries and fix_head:
             last = entries[-1]
             out.transact(
                 scope,
@@ -141,3 +145,10 @@ def rechain(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out.append({**body, "hash": digest})
         prev = digest
     return out
+
+
+def append(store: MemoryStore, run: RunId, ats: Sequence[int], *, scope: Scope = TEAM) -> None:
+    """Append entries with chosen ``at`` values straight through the writer, one per value."""
+    writer = ChainedAuditWriter()
+    for n, at in enumerate(ats):
+        store.transact(scope, list(writer.ops(store, scope, AuditEntry(run, f"x{n}", "a", {}, at))))

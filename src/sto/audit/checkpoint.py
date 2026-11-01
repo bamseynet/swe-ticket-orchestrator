@@ -5,8 +5,10 @@ whole run, and the chain still agrees with itself. A checkpoint is signed throug
 port (its own key, see ``sto.signing.port``) and kept outside the table (the locked bucket), so
 the verifier can compare the table against it.
 
-Limit, by design: a checkpoint proves what existed when it was signed. Entries removed after the
-newest checkpoint, down to a count the checkpoint already covers, are not detected by it.
+Limit, by design: a checkpoint proves what existed when it was signed. Anything done past the
+newest checkpoint is not covered by it: entries removed down to a count it already covers, and
+entries edited and re-hashed after its count, both pass. A run begun after the newest checkpoint
+is not named by it. Protection of those starts when the entry reaches the locked bucket.
 """
 
 from __future__ import annotations
@@ -16,7 +18,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from sto.audit.errors import AuditVerificationError
 from sto.domain import RunId
+from sto.domain.errors import InvalidIdError
 from sto.signing.port import Signature, Signer, SigningError, Verifier
 from sto.store.ports import Scope, Store, TeamScope
 
@@ -64,8 +68,29 @@ class SignedCheckpoint:
 
     @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> SignedCheckpoint:
-        runs = tuple(RunHead(str(r["run"]), int(r["count"]), str(r["hash"])) for r in wire["runs"])
-        return cls(Checkpoint(str(wire["team"]), int(wire["at"]), runs), str(wire["signature"]))
+        try:
+            runs = tuple(
+                RunHead(str(RunId.parse(r["run"])), _count(r["count"]), _text(r["hash"]))
+                for r in wire["runs"]
+            )
+            at, team = wire["at"], wire["team"]
+            if type(at) is not int or not isinstance(team, str):
+                raise TypeError("at/team")
+            return cls(Checkpoint(team, at, runs), _text(wire["signature"]))
+        except (KeyError, TypeError, ValueError, AttributeError, InvalidIdError) as exc:
+            raise AuditVerificationError("malformed checkpoint") from exc
+
+
+def _count(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise TypeError("count")
+    return value
+
+
+def _text(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("text")
+    return value
 
 
 def create_checkpoint(
@@ -75,17 +100,25 @@ def create_checkpoint(
     run_ids: Iterable[RunId],
     *,
     at: int,
-    previous: Sequence[SignedCheckpoint] = (),
+    previous: Sequence[SignedCheckpoint],
 ) -> SignedCheckpoint:
     """Sign the current head of every run in ``run_ids`` and of every run an earlier checkpoint
-    named. It first verifies the store against ``previous``, so a checkpoint is never signed over
-    a table that already lost data."""
+    named. ``previous`` is required (pass ``[]`` for the first one): the store is first verified
+    against it, so a checkpoint is never signed over a table that already lost data."""
     from sto.audit.verify import verify_team, walk_run
 
     if not isinstance(scope, TeamScope):
         raise ValueError("checkpoints are per team")
     ids = {str(r) for r in run_ids} | {h.run_id for cp in previous for h in cp.checkpoint.runs}
-    verify_team(store, scope, [RunId.parse(i) for i in ids], checkpoints=previous, verifier=signer)
+    verify_team(
+        store,
+        scope,
+        [RunId.parse(i) for i in ids],
+        checkpoints=previous,
+        verifier=signer,
+        allow_unanchored=True,  # the first checkpoint has nothing to be anchored to
+        allow_uncovered=True,  # new runs are what this checkpoint is for
+    )
     heads = []
     for run in sorted(ids):
         count, last = walk_run(store, scope, RunId.parse(run))

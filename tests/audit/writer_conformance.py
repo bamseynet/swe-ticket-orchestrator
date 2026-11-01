@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from audit.helpers import RUN, TEAM, Recorder, subject
+from audit.helpers import RUN, TEAM, Recorder, audit_items, subject, template_run
+from sto.audit.verify import verify_run
 from sto.domain import DecisionKind, GateType, Surface
 from sto.engine.commands import OpenGate
 from sto.gates.hooks import AuditWriter, run_pk
@@ -26,11 +27,24 @@ class AuditWriterConformance:
         rec = Recorder()
         return GateService(rec, audit=self.make_writer()), rec
 
+    def _head(self, rec: Recorder) -> Any:
+        head = rec.get(TEAM, CHAIN)
+        assert head is not None, "the chain head must exist after a gate change"
+        return head
+
     def _chain_put(self, ops: Any) -> Put:
         puts = [o for o in ops if o.key == CHAIN]
         assert len(puts) == 1, "the transaction must write the chain head exactly once"
         assert isinstance(puts[0], Put), "the chain head must be written, not just checked"
         return puts[0]
+
+    def test_what_it_stores_verifies_as_a_chain(self) -> None:
+        """Moving the head is not enough: the entries must chain, hash and match the head."""
+        service, rec = self._service()
+        template_run(service, RUN)
+        n = len(audit_items(rec.inner, RUN))
+        assert n == 8
+        assert verify_run(rec.inner, TEAM, RUN) == n
 
     def test_open_moves_the_chain_head_in_the_same_transaction(self) -> None:
         service, rec = self._service()
@@ -42,7 +56,7 @@ class AuditWriterConformance:
     def test_decide_moves_the_chain_head_in_the_same_transaction(self) -> None:
         service, rec = self._service()
         service.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject()))
-        before = rec.get(TEAM, CHAIN)
+        before = self._head(rec)
         service.decide(
             TEAM,
             run_id=RUN,
@@ -67,14 +81,14 @@ class AuditWriterConformance:
             service.open_gate(
                 TEAM, OpenGate(RUN, "review", GateType.REVIEW, rnd, subject(str(rnd)))
             )
-            head = rec.get(TEAM, CHAIN)
+            head = self._head(rec)
             seen.append(head.version)
             service.decide(
                 TEAM, run_id=RUN, gate="review", round=rnd, kind=DecisionKind.REJECT,
                 actor="x", surface=Surface.UI, subject_digest=subject(str(rnd)).digest(),
                 comment="no",
             )  # fmt: skip
-            seen.append(rec.get(TEAM, CHAIN).version)
+            seen.append(self._head(rec).version)
         assert seen == sorted(set(seen))
         assert len(seen) == 4
 
@@ -87,7 +101,7 @@ class AuditWriterConformance:
             TEAM, run_id=RUN, gate="review", round=1, kind=DecisionKind.REJECT, actor="x",
             surface=Surface.UI, subject_digest=subject("a").digest(), comment="no",
         )  # fmt: skip
-        stale = rec.get(TEAM, CHAIN)
+        stale = self._head(rec)
         service.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 5, subject("b")))
         try:
             rec.transact(TEAM, [Check(CHAIN, VersionIs(stale.version))])

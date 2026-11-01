@@ -21,6 +21,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from sto.audit.redact import redact, redact_text
 from sto.domain import Decision, Gate, RunId
 from sto.store.ports import (
     AUDIT,
@@ -134,6 +135,9 @@ class ChainedAuditWriter:
 
     Each entry is a ``Put`` with ``Absent()`` in the audit table, and the chain head moves under
     a version condition, so two writers cannot both take the same ``seq``: one loses and retries.
+
+    Secrets are redacted here, before the hash is taken (PLAN 4.9), so no unredacted writer exists
+    and the stored form is what the verifier hashes.
     """
 
     def ops(self, reader: Reader, scope: Scope, entry: AuditEntry) -> Sequence[Op]:
@@ -147,9 +151,9 @@ class ChainedAuditWriter:
             "team": scope.team if isinstance(scope, TeamScope) else "",
             "seq": seq,
             "at": entry.at,
-            "action": entry.action,
-            "actor": entry.actor,
-            "data": entry.data,
+            "action": redact_text(entry.action),
+            "actor": entry.actor,  # identities stay readable; they are verified, not free text
+            "data": redact(entry.data),
             "prev": prev,
         }
         digest = entry_hash(body)
