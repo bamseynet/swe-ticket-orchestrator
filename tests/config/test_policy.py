@@ -1416,6 +1416,204 @@ def test_the_kanban_qa_gate_as_written_is_refused_only_for_the_extra_role() -> N
     assert _paths(issues) == ["stages.qa_gate.gate.eligible_roles"]
 
 
+# --- pass 4 ---------------------------------------------------------------------------------
+
+
+def _release_to(then: str) -> dict[str, Any]:
+    return {
+        "kind": "effect",
+        "effect": "release.trigger",
+        "requires_gates": ["review_gate"],
+        "next": {"done": then, "stale": then},
+    }
+
+
+def test_v17_refuses_a_release_after_the_qa_gate_said_no_even_for_an_exempt_gate() -> None:
+    stages = _qa_next(rejected="rejected_t", changes_requested="release_bad")
+    stages["release_bad"] = _release_to("rejected_t")
+    assert "stages.qa_gate" in _paths(_qa_check(stages))
+
+
+def test_v17_refuses_a_release_straight_after_a_merge_even_for_an_exempt_gate() -> None:
+    stages = _qa_next(rejected="rejected_t")
+    stages["merge_it"]["next"]["done"] = "release_bad"  # QA is never asked
+    stages["release_bad"] = _release_to("rejected_t")
+    assert "stages.qa_gate" in _paths(_qa_check(stages))
+
+
+def test_the_kanban_example_with_a_release_round_its_qa_gate_is_refused() -> None:
+    for edit in ("qa_no", "after_merge"):
+        doc = _kanban(["qa"])
+        st = doc["stages"]
+        st["release_bad"] = {
+            "kind": "effect",
+            "effect": "release.trigger",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "closed_rejected", "stale": "closed_rejected"},
+        }
+        if edit == "qa_no":
+            st["qa_gate"]["next"]["changes_requested"] = "release_bad"
+        else:
+            st["merge"]["next"]["done"] = "release_bad"
+        paths = _paths(_check(_load_wf(doc), _team_policy("ledger", QA)))
+        assert "stages.qa_gate" in paths, edit
+
+
+def _wait_after_merge(timeout_to: str) -> dict[str, Any]:
+    stages = _qa_after_merge(
+        rel_ok={
+            "kind": "effect",
+            "effect": "release.trigger",
+            "requires_gates": ["qa_gate"],
+            "next": {"done": "closed", "stale": "closed"},
+        },
+        ticket_done={
+            "kind": "effect",
+            "effect": "ticket.transition",
+            "with": {"to_status_category": "done"},
+            "next": {"done": "closed"},
+        },
+    )
+    stages["merge_it"]["next"]["done"] = "await"
+    stages["await"]["next"] = {"resumed": "qa_gate", "timeout": timeout_to}
+    return stages
+
+
+@pytest.mark.parametrize("timeout_to", ["done", "rel_ok", "ticket_done", "incident"])
+def test_v17_follows_a_wait_timeout_after_a_merge_that_does_not_give_up(timeout_to: str) -> None:
+    assert "stages.qa_gate" in _paths(_qa_check(_wait_after_merge(timeout_to)))
+
+
+@pytest.mark.parametrize("timeout_to", ["closed", "rejected_t", "expired_t"])
+def test_v17_ignores_a_wait_timeout_after_a_merge_that_only_gives_up(timeout_to: str) -> None:
+    assert _qa_check(_wait_after_merge(timeout_to)) == []
+
+
+def _ungated_by_route(*, late_route: bool) -> dict[str, Any]:
+    """security_gate (required when risk is high) reached with no route in front of it."""
+    stages = _security_flow(
+        late={
+            "kind": "route",
+            "field": "risk",
+            "order": ["low", "medium", "high"],
+            "next": {"default": "review_gate"},
+        }
+    )
+    stages["merge_ok"]["requires_gates"] = ["review_gate"]  # nobody lists security_gate
+    stages["impl"]["next"] = {"ready": "security_gate"}
+    stages["security_gate"]["next"]["approved"] = "late" if late_route else "review_gate"
+    stages["review_gate"]["next"]["approved"] = "merge_ok"
+    return stages
+
+
+@pytest.mark.parametrize("late_route", [False, True], ids=["no_route", "route_after_the_gate"])
+def test_v17_holds_a_when_gate_that_no_route_reaches_to_requires_gates(late_route: bool) -> None:
+    wf = _flow(_ungated_by_route(late_route=late_route))
+    assert "stages.merge_ok.requires_gates" in _paths(_check(wf, _only(SECURITY_HIGH)))
+
+
+def test_v17_does_not_count_a_route_on_another_field_as_holding_a_when_gate() -> None:
+    stages = _ungated_by_route(late_route=False)
+    stages["impl"]["next"] = {"ready": "route_prio"}
+    stages["route_prio"] = {
+        "kind": "route",
+        "field": "priority",
+        "order": ["low", "high"],
+        "next": {"default": "security_gate"},
+    }
+    assert "stages.merge_ok.requires_gates" in _paths(_check(_flow(stages), _only(SECURITY_HIGH)))
+
+
+def test_the_regulated_example_without_its_route_is_held_to_requires_gates() -> None:
+    doc = _flatten("ledger-regulated")
+    st = doc["stages"]
+    del st["change_route"]
+    st["qa_gate"]["next"]["approved"] = "mark_ready"
+    st["triage"]["next"]["ready"] = "change_gate"
+    st["change_gate"]["next"]["approved"] = "refine"
+    doc["on_external_commit"] = "triage"
+    assert "stages.merge.requires_gates" in _paths(_check(_load_wf(doc), LEDGER))
+
+
+@pytest.mark.parametrize(
+    "with_",
+    [
+        {"to_status_category": "Done"},
+        {"to_status_category": "DONE"},
+        {"to_status": "done"},
+        None,
+    ],
+    ids=["Done", "DONE", "other_key", "no_with"],
+)
+def test_v17_counts_every_spelling_of_a_ticket_moved_to_done(with_: Any) -> None:
+    ticket = _ticket_done()
+    if with_ is None:
+        del ticket["with"]
+    else:
+        ticket["with"] = with_
+    stages = _security_flow(ticket_done=ticket)
+    stages["security_gate"]["next"]["changes_requested"] = "ticket_done"
+    assert "stages.security_gate" in _paths(_check(_flow(stages), _only(SECURITY)))
+
+
+@pytest.mark.parametrize("category", ["in_progress", "In Progress", "todo"])
+def test_v17_does_not_count_a_ticket_moved_to_another_category(category: str) -> None:
+    ticket = _ticket_done()
+    ticket["with"] = {"to_status_category": category}
+    stages = _security_flow(ticket_state=ticket)
+    stages["security_gate"]["next"]["changes_requested"] = "ticket_state"
+    assert _check(_flow(stages), _only(SECURITY)) == []
+
+
+def _qa_floor_policy(floor: int) -> Any:
+    def apply(data: dict[str, Any]) -> None:
+        data["teams"]["ledger"]["required_gates"] = [QA]
+        data["teams"]["ledger"]["min_quorum"] = {"qa": floor}
+        data["teams"]["ledger"]["allowed_carry_over"] = ["none"]
+
+    return _policy(apply)
+
+
+@pytest.mark.parametrize("written_type", ["qa", "custom", "review"])
+def test_v17_applies_the_floor_of_the_role_not_only_of_the_written_type(
+    written_type: str,
+) -> None:
+    stages = _qa_after_merge()
+    stages["qa_gate"] = _gate(written_type, ["qa"], {"approved": "done", "rejected": "rejected_t"})
+    issues = _check(_flow(stages), _qa_floor_policy(2))
+    assert _paths(issues) == ["stages.qa_gate.gate.quorum"]  # once, not once per rule
+
+
+def test_v17_accepts_the_role_floor_when_the_quorum_meets_it() -> None:
+    stages = _qa_after_merge()
+    stages["qa_gate"] = _gate(
+        "custom", ["qa"], {"approved": "done", "rejected": "rejected_t"}, count=2
+    )
+    assert _check(_flow(stages), _qa_floor_policy(2)) == []
+
+
+def test_v17_role_floors_leave_gates_the_org_did_not_require_alone() -> None:
+    stages = _qa_after_merge()
+    stages["other"] = _gate("custom", ["qa"], {"approved": "done", "rejected": "rejected_t"})
+    stages["qa_gate"]["next"]["approved"] = "other"
+    stages["qa_gate"]["gate"]["quorum"] = [{"role": "qa", "count": 2}]
+    assert _check(_flow(stages), _qa_floor_policy(2)) == []
+
+
+def test_v17_ranks_ignore_a_route_on_another_field() -> None:
+    # a priority route whose order holds "high" says nothing about how risk is ranked
+    def other_field(stages: dict[str, Any]) -> None:
+        stages["security_gate"]["next"]["approved"] = "route_prio"
+        stages["route_prio"] = {
+            "kind": "route",
+            "field": "priority",
+            "order": ["low", "high", "urgent"],
+            "next": {"default": "review_gate"},
+        }
+
+    assert _check(_wf(other_field), _policy()) == []
+
+
 def _with_hotfix(doc: dict[str, Any], via: str) -> dict[str, Any]:
     """A second review, QA and merge after merge.<via>; the new merge does not list security."""
     doc = copy.deepcopy(doc)
