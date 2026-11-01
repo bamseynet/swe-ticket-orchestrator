@@ -40,7 +40,8 @@ Known limits, deliberate routes the suite does not stop:
 * Nothing requires a real adapter to HAVE a conformance subclass.
 * A silent page cap above about 150 pages is not seen: the marker is 5,100 objects (51 pages at
   100 a page) from each end, and the absent-key walk covers about 150 pages including the read-back
-  walk (measured: a cap up to 153 fails, 154 passes). A cap of 34 pages or more, up to that, fails.
+  walk. Measured: caps of 5, 33, 34, 50, 51, 100 and 153 pages fail, and 154 passes
+  (``BadPageCap153`` pins the edge).
 * ``forge()`` is checked for consistency across kinds (they differ from each other and from the
   genuine one, the truncated MAC is a prefix, the blank one is empty), but the suite cannot know
   the secret: a ``forge(EMPTY_KEY)`` signed with some OTHER secret passes the check, and an
@@ -48,9 +49,16 @@ Known limits, deliberate routes the suite does not stop:
   (``tests/fakes/github/webhooks/test_webhooks.py``); a new fake must do the same.
 * A ``::`` argument narrows the completeness check to the classes it names.
 
+The page base is the SUITE'S: ``fault_next(..., page=n)`` counts from zero, so ``page=1`` is the
+SECOND page. A target over a one-based server (GitHub's) adds one before it plants the fault, so
+"a later page" is a later page on either server. An adapter over such a server should follow the
+``link`` URL it is given and not compute page numbers: on GitHub's issues route that URL carries
+a cursor (``after=``), not a page number.
+
 What a fake server must provide for the suite to be meaningful: it must page at no more than 100
-items and honour ``per_page=100`` (the page size the suite assumes; an adapter must ask for it, as
-GitHub's default is 30), and a rate-limit answer must ask for at least ``SHAPE_RETRY_AFTER``
+items and honour ``per_page=100`` (the page size the suite assumes; an adapter should ask for it,
+as GitHub's default is 30, but one that omits it still passes the deep test, only with more
+pages), and a rate-limit answer must ask for at least ``SHAPE_RETRY_AFTER``
 (30 seconds for a ``Retry-After`` shape, 45 for ``x-ratelimit-reset`` shape), since the suite
 requires an adapter to pass on at least that wait.
 
@@ -143,6 +151,7 @@ RETRIES = 5
 FAKE_MODULE = "sto.adapters.fake"
 STO_MODULE = "sto"
 REFERENCE_MODULE = "contract.test_suite"
+RESTART_MARK = "_conformance_restart_mark"
 PORT_ERRORS = (
     IdempotencyKeyReuseError,
     InvalidIdError,
@@ -406,7 +415,8 @@ class Target:
     # --- controls, acting at the server ---
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
         """The next ``op`` request (``lookup``, ``write``, ``read``), after skipping ``after`` of
-        them and only for ``page`` if given, suffers ``mode``: ``5xx`` or ``timeout`` (nothing
+        them and only for ``page`` if given (counted from ZERO: 1 is the second page, whatever
+        base the server counts from), suffers ``mode``: ``5xx`` or ``timeout`` (nothing
         applied), ``429`` or ``401`` (answered so), ``lose`` (a write applied, the caller sees a
         timeout)."""
         raise _unset("fault_next")
@@ -980,18 +990,18 @@ class AdapterConformance:
         target.require(Control.RESTART)
         target.deliver(target.emit(1, "d-1"))
         adapter, verifier, queued = target.adapter, target.verifier, target.queued()
+        marked = True
+        try:  # a mark on the old object: a copy of it, shallow or deep, carries it along
+            setattr(adapter, RESTART_MARK, True)
+        except (AttributeError, TypeError):  # __slots__ or frozen: nothing a copy could carry
+            marked = False
         target.restart()
         if target.adapter is adapter:
             raise HarnessError("restart() left the same adapter in place")
         if target.verifier is verifier:
             raise HarnessError("restart() left the same verifier in place")
-        shared = sorted(
-            n
-            for n, v in vars(adapter).items()
-            if isinstance(v, (list, dict, set)) and v is vars(target.adapter).get(n)
-        )
-        if shared:
-            raise HarnessError(f"restart() kept in-memory state of the old adapter: {shared}")
+        if marked and hasattr(target.adapter, RESTART_MARK):
+            raise HarnessError("restart() copied the old adapter, and its in-memory state with it")
         if target.queued() != queued:
             raise HarnessError("restart() lost the durable queue")
 

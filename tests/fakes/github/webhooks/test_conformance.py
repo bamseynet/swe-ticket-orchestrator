@@ -30,10 +30,17 @@ from contract.suite import (
     applicable,
     run_suite,
 )
-from contract.test_suite import GitHubHeadersAdapter, Store
+from contract.test_suite import (
+    PRINCIPAL,
+    GitHubHeadersAdapter,
+    LinkFollowingAdapter,
+    Store,
+    SwallowingLinkFollowingAdapter,
+)
 from fakes.github.auth import INSTALLATION_ID, FakeGitHubAuth
 from fakes.github.webhooks import FakeWebhooks
 from sto.adapters.ports import DecisionRequest, RawWebhook
+from sto.domain.models import Receipt
 
 pytestmark = pytest.mark.contract
 
@@ -51,6 +58,7 @@ class FakeGitHubTarget(Target):
     """The harness: a thin pass-through to the fake's auth server and webhook sender."""
 
     name = "fake-github"
+    adapter_cls: type[GitHubHeadersAdapter] = GitHubHeadersAdapter
     vendor = Vendor.GITHUB
     signature_header = "X-Hub-Signature-256"
     watched = WATCHED
@@ -81,7 +89,7 @@ class FakeGitHubTarget(Target):
         return str(response.body["token"])
 
     def _fresh(self) -> GitHubHeadersAdapter:
-        adapter = GitHubHeadersAdapter(self.server, self.store)  # type: ignore[arg-type]
+        adapter = self.adapter_cls(self.server, self.store)  # type: ignore[arg-type]
         adapter.token = self.token
         return adapter
 
@@ -121,7 +129,8 @@ class FakeGitHubTarget(Target):
 
     # --- controls, acting at the server ---
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
-        self.server.fault_next(op, mode, page, after)
+        # The suite counts pages from zero; this server counts from one.
+        self.server.fault_next(op, mode, None if page is None else page + 1, after)
 
     def respond_next(self, op: str, status: int) -> None:
         self.server.respond_next(op, status)
@@ -204,3 +213,100 @@ def test_the_fake_has_no_adapter_of_its_own() -> None:
         assert classes == set(), (module.__name__, classes)
     assert not hasattr(FakeGitHubAuth, "verify")
     assert not hasattr(FakeWebhooks, "verify")
+
+
+# --- the same fake, paged by link, held to the look-up and write sections too ---------------------
+
+
+class PagedFakeGitHubTarget(FakeGitHubTarget):
+    """Every control, through the fake's list and its stand-in write. The page base is translated
+    in ``fault_next`` (the suite's page 1 is the second page; the server's is the first)."""
+
+    name = "paged-fake-github"
+    adapter_cls: type[GitHubHeadersAdapter] = LinkFollowingAdapter
+    controls = frozenset(Control)
+
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        return self.adapter.write(key, variant)
+
+    def stored_ids(self) -> list[str]:
+        return [i.id for i in self.server.items if i.author == PRINCIPAL]
+
+    def stored_id_for(self, key: str) -> str | None:
+        for i in self.server.items:
+            if i.author == PRINCIPAL and f"<!-- sto:{key}:" in i.body:
+                return i.id
+        return None
+
+    def listed(self) -> int:
+        return len(self.server.items)
+
+    def foreign_marked(self, key: str) -> bool:
+        return any(
+            i.author != PRINCIPAL and f"<!-- sto:{key}:" in i.body for i in self.server.items
+        )
+
+    def seed_others(self, n: int, newer: bool = True) -> None:
+        self.server.seed(n, "alice", older=not newer)
+
+    def set_list_order(self, order: str) -> None:
+        self.server.order = order
+
+    def plant_foreign_marker(self, key: str, variant: str = "a", author: str = "mallory") -> None:
+        self.server.add(author, self.adapter.marker(key, variant) + " planted")
+
+    def swallow_next_write(self) -> None:
+        self.server.swallow += 1
+
+
+class UntranslatedPagedTarget(PagedFakeGitHubTarget):
+    """The mistake the page base guards against: the suite's page number sent to a one-based
+    server as it is, so "a later page" is the FIRST page."""
+
+    def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
+        self.server.fault_next(op, mode, page, after)
+
+
+def paged_fake_github() -> Target:
+    return PagedFakeGitHubTarget()
+
+
+class TestPagedFakeGitHub(AdapterConformance):
+    """All eight sections against the fake's paged list and stand-in write, through an adapter
+    that follows the ``link`` header."""
+
+    port = Port.SCM
+    registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": paged_fake_github}
+
+
+LATER_PAGE = "test_an_error_on_a_later_page_is_not_the_end_of_the_list"
+
+
+def _paged(adapter: type[GitHubHeadersAdapter], base: type[PagedFakeGitHubTarget]) -> Target:
+    target = base()
+    target.adapter_cls = adapter
+    target.adapter = target._fresh()
+    target.verifier = target.adapter.verifier
+    return target
+
+
+def test_the_paged_fake_passes_every_section_through_a_link_following_adapter() -> None:
+    failed = {n: e for n, e in run_suite(paged_fake_github, Port.SCM).items() if e is not None}
+    assert failed == {}
+
+
+def test_an_adapter_that_swallows_a_later_page_error_fails_on_the_paged_fake() -> None:
+    results = run_suite(
+        lambda: _paged(SwallowingLinkFollowingAdapter, PagedFakeGitHubTarget), Port.SCM
+    )
+    assert type(results[LATER_PAGE]) is pytest.fail.Exception  # DID NOT RAISE
+    assert [n for n, e in results.items() if e is not None] == [LATER_PAGE]
+
+
+def test_without_the_page_translation_the_same_adapter_slips_through() -> None:
+    """Why the suite fixes the page base: on a one-based server, page 1 is the first page, and a
+    fault there is not a LATER page."""
+    results = run_suite(
+        lambda: _paged(SwallowingLinkFollowingAdapter, UntranslatedPagedTarget), Port.SCM
+    )
+    assert results[LATER_PAGE] is None

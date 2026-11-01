@@ -202,8 +202,8 @@ def test_read_returns_the_current_revision(gh: FakeGitHubAuth) -> None:
 
 
 def test_an_unknown_operation_is_a_programming_error_not_a_response(gh: FakeGitHubAuth) -> None:
-    with pytest.raises(AssertionError, match="no write surface"):
-        gh.handle("write", installation_token(gh), body="x")
+    with pytest.raises(AssertionError, match="unknown op"):
+        gh.handle("delete", installation_token(gh))
 
 
 # --- pagination: GitHub's, one-based, and the link header says where the rest is --------------
@@ -270,12 +270,70 @@ def test_following_next_from_any_page_reaches_the_rest(gh: FakeGitHubAuth) -> No
     ]
 
 
-def test_per_page_is_capped_at_a_hundred_and_floored_at_one(gh: FakeGitHubAuth) -> None:
+def test_per_page_is_capped_at_a_hundred(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.seed(150, "alice")
     assert len(gh.handle("lookup", good, page=1, per_page=1000).body["items"]) == 100
     assert len(gh.handle("lookup", good, page=1, per_page=30).body["items"]) == 30
-    assert len(gh.handle("lookup", good, page=1, per_page=0).body["items"]) == 1
+    assert len(gh.handle("lookup", good, page=1, per_page=1).body["items"]) == 1
+
+
+@pytest.mark.parametrize("per_page", [0, -5, "abc", ""])
+def test_a_per_page_below_one_or_not_a_number_means_the_default_of_thirty(
+    gh: FakeGitHubAuth, per_page: object
+) -> None:
+    """As GitHub answers, checked read-only: not 1 item, the default."""
+    good = installation_token(gh)
+    gh.seed(100, "alice")
+    first = gh.handle("lookup", good, page=1, per_page=per_page)
+    assert len(first.body["items"]) == 30
+    assert link(first)["next"] == 2
+
+
+@pytest.mark.parametrize("page", [0, -1, -100, "abc", "", "1.5"])
+def test_a_page_below_one_or_not_a_number_is_page_one(gh: FakeGitHubAuth, page: object) -> None:
+    """As GitHub answers, checked read-only: the same items and the same next link as page 1,
+    so an adapter that starts at page 0 and stops on an empty page still reads the list."""
+    good = installation_token(gh)
+    gh.seed(100, "alice")
+    first = gh.handle("lookup", good, page=1)
+    odd = gh.handle("lookup", good, page=page)
+    assert odd.status == 200
+    assert odd.body == first.body
+    assert link(odd) == link(first) == {"next": 2, "last": 4}
+
+
+def test_a_bad_page_still_matches_a_fault_planted_for_page_one(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.fault_next("lookup", "5xx", page=1)
+    assert gh.handle("lookup", good, page="abc").status == 503
+    gh.fault_next("lookup", "5xx", page=1)
+    assert gh.handle("lookup", good, page=-1).status == 503
+
+
+def test_the_stand_in_write_stores_one_object_under_the_principal(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    response = gh.handle("write", good, body="hello")
+    assert response.status == 201
+    assert gh.items[-1].author == "sto-bot"
+    assert gh.items[-1].body == "hello"
+    assert gh.handle("lookup", good, page=1).body["items"][0]["id"] == response.body["id"]
+
+
+def test_a_lost_write_is_applied_and_the_caller_sees_a_timeout(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.fault_next("write", "lose")
+    with pytest.raises(TimeoutError):
+        gh.handle("write", good, body="hello")
+    assert [i.body for i in gh.items] == ["hello"]
+    assert gh.handle("write", good, body="again").status == 201
+
+
+def test_a_swallowed_write_answers_success_and_stores_nothing(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.swallow = 1
+    assert gh.handle("write", good, body="hello").status == 201
+    assert gh.items == []
 
 
 def test_an_exact_multiple_of_the_page_size_has_no_empty_last_page(gh: FakeGitHubAuth) -> None:
@@ -303,7 +361,6 @@ def test_a_page_past_the_end_is_empty(gh: FakeGitHubAuth) -> None:
     past = gh.handle("lookup", good, page=9)
     assert past.status == 200
     assert past.body == {"items": []}
-    assert "link" not in past.headers
 
 
 def test_the_list_runs_newest_first_or_oldest_first(gh: FakeGitHubAuth) -> None:
@@ -491,22 +548,20 @@ def test_a_token_can_be_narrowed_to_repositories_and_the_answer_says_what_was_gr
     gh: FakeGitHubAuth,
 ) -> None:
     response = gh.create_installation_token(
-        gh.app_jwt(), INSTALLATION_ID, repositories=["acme/app"], permissions={"contents": "read"}
+        gh.app_jwt(), INSTALLATION_ID, repositories=["app"], permissions={"contents": "read"}
     )
     assert response.status == 201
     assert response.body["permissions"] == {"contents": "read"}
     assert response.body["repository_selection"] == "selected"
-    assert response.body["repositories"] == [{"full_name": "acme/app"}]
+    assert response.body["repositories"] == [{"name": "app", "full_name": "acme/app"}]
     grant = gh.grant(str(response.body["token"]))
     assert grant is not None
-    assert grant.repositories == ("acme/app",)
+    assert grant.repositories == ("app",)
     assert grant.permissions == {"contents": "read"}
 
 
 def test_a_narrowed_token_cannot_reach_another_repository(gh: FakeGitHubAuth) -> None:
-    body = gh.create_installation_token(
-        gh.app_jwt(), INSTALLATION_ID, repositories=["acme/app"]
-    ).body
+    body = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=["app"]).body
     token = str(body["token"])
     assert gh.handle("read", token, repo="acme/app").status == 200
     other = gh.handle("read", token, repo="acme/lib")
@@ -520,11 +575,11 @@ def test_an_unnarrowed_token_reaches_every_repository_of_the_installation(
 ) -> None:
     token = installation_token(gh)
     for repo in INSTALLATION_REPOS:
-        assert gh.handle("read", token, repo=repo).status == 200
+        assert gh.handle("read", token, repo=f"acme/{repo}").status == 200
 
 
 def test_a_repository_outside_the_installation_is_a_422(gh: FakeGitHubAuth) -> None:
-    for repos in (["acme/other"], ["acme/app", "acme/other"]):
+    for repos in (["other"], ["app", "other"]):
         response = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=repos)
         assert response.status == 422
         assert "repository" in response.body["message"]
@@ -556,7 +611,7 @@ def test_a_lower_level_than_the_installations_is_fine(gh: FakeGitHubAuth) -> Non
 
 
 def test_a_refused_narrowing_issues_no_token(gh: FakeGitHubAuth) -> None:
-    gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=["acme/other"])
+    gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=["other"])
     assert gh.grant("ghs_fake_1") is None
 
 
@@ -636,3 +691,33 @@ def test_running_out_of_budget_is_counted_as_limited(gh: FakeGitHubAuth) -> None
     gh.handle("read", token)
     gh.handle("read", token)
     assert gh.counts["limited"] == 1
+
+
+def test_repositories_are_bare_names_and_owner_slash_name_is_refused(gh: FakeGitHubAuth) -> None:
+    """The docs: "List of repository names", example "Hello-World". Read from the docs, not tried
+    on real GitHub, so a correct D4-02 sends ["app"] and a wrong one is refused."""
+
+    def mint_with(repos: list[str]) -> Response:
+        return gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=repos)
+
+    assert mint_with(["app"]).status == 201
+    assert mint_with(["app", "lib"]).status == 201
+    for wrong in (["acme/app"], ["acme/app", "lib"]):
+        refused = mint_with(wrong)
+        assert refused.status == 422
+        assert "repository" in refused.body["message"]
+
+
+def test_an_unnarrowed_token_reaches_nothing_outside_the_installation(gh: FakeGitHubAuth) -> None:
+    """The 404 is inferred, not tried on real GitHub."""
+    token = installation_token(gh)
+    for repo in ("evil/other", "acme/other", "other/app", "app", "acme/"):
+        response = gh.handle("read", token, repo=repo)
+        assert response.status == 404, repo
+        assert response.body == {"message": "Not Found"}
+
+
+def test_a_narrowed_token_with_no_repository_named_gets_a_200(gh: FakeGitHubAuth) -> None:
+    """Known limit: there is nothing to refuse."""
+    body = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=["app"]).body
+    assert gh.handle("read", str(body["token"])).status == 200

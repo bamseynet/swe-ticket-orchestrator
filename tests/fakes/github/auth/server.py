@@ -16,7 +16,18 @@ Known departures, each deliberate:
   they stand in for "read the object a webhook was about" and "list comments", which D4-19 and
   later issues replace with the real routes. Paging is GitHub's: one-based ``page`` (default 1),
   ``per_page`` (default 30, at most 100), and the ``link`` header alone says where the rest is.
-* There is no write surface (``handle("write", ...)`` raises): writes belong to D4-19 and later.
+* The only write is a stand-in ``write`` (store one object under ``PRINCIPAL``), so that the
+  look-up sections can target the paged list. The real routes arrive with D4-19 and later.
+* The HMAC stand-in means a real RS256 signer gets a 401 here: D4-02 has to work around that (sign
+  with ``APP_KEY`` under ``alg: RS256``, or inject a signer).
+* Bad paging values follow GitHub as observed with read-only calls: ``page`` below 1 or not an
+  integer means page 1, and ``per_page`` below 1 or not an integer means the default of 30. Not
+  modelled, as known limits: a page far past the end (GitHub answers 422; the fake an empty 200)
+  and the ``link`` header GitHub sends on a page past the end (the fake sends none).
+* ``permissions={}`` on the mint grants nothing (untested, unsourced). A token narrowed to some
+  repositories and used with no repository named gets a 200: nothing is there to refuse.
+* A token for no narrower set reaches only the installation's repositories: ``repo`` outside them
+  is a 404, inferred and not tried live.
 """
 
 from __future__ import annotations
@@ -37,7 +48,12 @@ APP_ID = "100001"  # synthetic
 CLIENT_ID = "Iv1.synthetic0001"  # synthetic; the docs accept the client ID or the App ID as `iss`
 INSTALLATION_ID = 200002  # synthetic
 APP_KEY = b"synthetic-app-key"  # stands in for the App's RSA private key; see the module docstring
-INSTALLATION_REPOS = ("acme/app", "acme/lib")  # the repositories this installation can reach
+INSTALLATION_OWNER = "acme"  # synthetic
+# The repositories this installation can reach, as BARE names: the docs call `repositories` a
+# "List of repository names" (example "Hello-World"), so owner/name is refused at the mint. This
+# was read from the docs and NOT tried on real GitHub: prove it live (D12).
+INSTALLATION_REPOS = ("app", "lib")
+PRINCIPAL = "sto-bot"  # the login the stand-in write route stores objects under
 INSTALLATION_PERMISSIONS: Mapping[str, str] = {
     "checks": "write",
     "contents": "write",
@@ -99,6 +115,24 @@ def _iso(seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
 
 
+def _page_number(raw: object) -> int:
+    """A page below 1, or not an integer, is page 1 (as GitHub answers, observed read-only)."""
+    try:
+        number = int(str(raw))
+    except ValueError:
+        return 1
+    return number if number >= 1 else 1
+
+
+def _per_page(raw: object) -> int:
+    """Below 1 or not an integer: the default of 30. Above 100: 100."""
+    try:
+        number = int(str(raw))
+    except ValueError:
+        return DEFAULT_PER_PAGE
+    return DEFAULT_PER_PAGE if number < 1 else min(number, PAGE_SIZE)
+
+
 def _unauthorized(message: str) -> Response:
     # unsourced, observed behaviour to prove live: a 401 with this message
     return Response(401, {}, {"message": message})
@@ -124,6 +158,8 @@ class FakeGitHubAuth:
         self._limited, self._shape = 0, RateShape.PRIMARY_429
         self._limit_op: str | None = None
         self._auth_ok, self._deny_ops = True, set[str]()
+        self._lose = False
+        self.swallow = 0
 
     # --- App authentication ---------------------------------------------------------------
 
@@ -196,7 +232,8 @@ class FakeGitHubAuth:
         * The token lasts one hour. ``repositories`` and ``permissions`` narrow it; left out, it
           gets all the installation's, and the answer says what was granted
           (create-an-installation-access-token-for-an-app).
-        * An installation that is not this App's is a 404; a repository or a permission beyond the
+        * ``repositories`` are bare names ("app"), per the docs; ``owner/name`` is a 422. An
+          installation that is not this App's is a 404; a repository or a permission beyond the
           installation's is a 422 (unsourced, observed behaviour to prove live).
         * The same faults, limits and 401s as any request apply to ``installation_token``.
         """
@@ -240,7 +277,9 @@ class FakeGitHubAuth:
             "repository_selection": "selected" if repos is not None else "all",
         }
         if repos is not None:
-            granted["repositories"] = [{"full_name": r} for r in repos]
+            granted["repositories"] = [
+                {"name": r, "full_name": f"{INSTALLATION_OWNER}/{r}"} for r in repos
+            ]
         return Response(201, {}, granted)
 
     def grant(self, token: str) -> Grant | None:
@@ -280,7 +319,7 @@ class FakeGitHubAuth:
 
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
         """The next ``op`` request (after skipping ``after``, and only for ``page``, one-based)
-        suffers ``5xx``, ``timeout``, ``429`` or ``401``."""
+        suffers ``5xx``, ``timeout``, ``429`` or ``401``; a write also ``lose``."""
         self._faults[op].append([mode, page, after])
 
     def add(self, author: str, body: str, *, older: bool = False) -> Item:
@@ -373,6 +412,7 @@ class FakeGitHubAuth:
             return _unauthorized("Bad credentials"), quota
         if fault == "timeout":
             raise TimeoutError("timed out")
+        self._lose = fault == "lose"  # a write applied, the caller sees a timeout
         return None
 
     def _token_refusal(self, token: str) -> Response | None:
@@ -384,24 +424,43 @@ class FakeGitHubAuth:
         return None
 
     def handle(self, op: str, token: str, **kw: Any) -> Response:
-        """One authenticated request: ``read`` or ``lookup`` (with ``page``, ``per_page``), and
-        optionally ``repo``, which a token narrowed to other repositories cannot reach (404)."""
-        if op not in ("read", "lookup"):
-            raise AssertionError(f"unknown op {op!r}: this fake has no write surface")
-        page = int(kw.get("page", 1)) if op == "lookup" else None
+        """One authenticated request: ``read``, ``lookup`` (with ``page``, ``per_page``) or the
+        stand-in ``write`` (with ``body``), and optionally ``repo`` (``owner/name``), which a token
+        narrowed to other repositories, or outside the installation, cannot reach (404)."""
+        if op not in ("read", "lookup", "write"):
+            raise AssertionError(f"unknown op {op!r}")
+        page = _page_number(kw.get("page", 1)) if op == "lookup" else None
         early = self._preflight(op, self._token_refusal(token), page, metered=True)
         if early is not None:
             return early[0]
         quota = self._quota()
         grant = self._tokens[token]
         repo = kw.get("repo")
-        if repo is not None and grant.repositories is not None and repo not in grant.repositories:
+        if repo is not None and not self._reaches(grant, str(repo)):
             return Response(404, quota, {"message": "Not Found"})
         if op == "read":
             return Response(200, quota, {"revision": self.revision})
+        if op == "write" and self.swallow > 0:
+            self.swallow -= 1
+            return Response(201, quota, {"id": "c-swallowed"})
+        if op == "write":
+            self._seq += 1
+            item = Item(f"c-{self._seq}", PRINCIPAL, str(kw["body"]))
+            self.items.append(item)
+            if self._lose:
+                raise TimeoutError("response lost")
+            return Response(201, quota, {"id": item.id})
         return self._list(
-            quota, page if page is not None else 1, int(kw.get("per_page", DEFAULT_PER_PAGE))
+            quota, page if page is not None else 1, _per_page(kw.get("per_page", DEFAULT_PER_PAGE))
         )
+
+    @staticmethod
+    def _reaches(grant: Grant, repo: str) -> bool:
+        """``owner/name`` is inside the installation, and inside the token's narrowing if any."""
+        owner, _, name = repo.partition("/")
+        if owner != INSTALLATION_OWNER or name not in INSTALLATION_REPOS:
+            return False  # inferred 404, not tried live
+        return grant.repositories is None or name in grant.repositories
 
     def _list(self, quota: dict[str, str], page: int, per_page: int) -> Response:
         """A page of the list.
@@ -410,7 +469,6 @@ class FakeGitHubAuth:
         header names the next, previous, first and last pages and is the only way to find them.
         https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
         """
-        per_page = max(1, min(per_page, PAGE_SIZE))
         listing = list(reversed(self.items)) if self.order == "newest_first" else self.items
         chunk = listing[(page - 1) * per_page : page * per_page]
         more = len(listing) > page * per_page

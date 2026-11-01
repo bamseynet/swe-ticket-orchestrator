@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import subprocess
 import sys
 import textwrap
@@ -518,6 +519,53 @@ class GitHubHeadersAdapter(GitHubAdapter):
     secret = b"synthetic-webhook-secret"
     sig_header = "X-Hub-Signature-256"
     id_header = "X-GitHub-Delivery"
+
+
+class LinkFollowingAdapter(GitHubHeadersAdapter):
+    """Honest, over a ONE-based, ``link``-paged server (the fake GitHub): it follows the URL the
+    server gives for the next page and computes no page numbers, as D4-19 must (GitHub's issues
+    route puts a cursor in that URL)."""
+
+    @staticmethod
+    def _next_query(link: str) -> dict[str, int] | None:
+        found = re.search(r'<[^>]*\?([^>]*)>; rel="next"', link)
+        if found is None:
+            return None
+        return {k: int(v[0]) for k, v in urllib.parse.parse_qs(found.group(1)).items()}
+
+    def _page(self, query: dict[str, int]) -> tuple[list[dict[str, str]], dict[str, int] | None]:
+        response = self._send("lookup", **query)
+        body = self._unwrap(response)
+        return body["items"], self._next_query(response.headers.get("link", ""))
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        query: dict[str, int] | None = {"page": 1, "per_page": PAGE_SIZE}
+        while query is not None:
+            items, query = self._page(query)
+            for comment in items:
+                if self._mine(comment, key):
+                    return comment
+        return None
+
+
+class SwallowingLinkFollowingAdapter(LinkFollowingAdapter):
+    """Follows the links but treats an error on a LATER page as the end of the list."""
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        query: dict[str, int] | None = {"page": 1, "per_page": PAGE_SIZE}
+        first = True
+        while query is not None:
+            try:
+                items, query = self._page(query)
+            except (TransientError, PermanentError):
+                if first:
+                    raise
+                return None
+            first = False
+            for comment in items:
+                if self._mine(comment, key):
+                    return comment
+        return None
 
 
 class JiraAdapter(Adapter):
@@ -1608,6 +1656,7 @@ BadPageCap8 = _capped(8)
 BadPageCap10 = _capped(10)
 BadPageCap34 = _capped(34)
 BadPageCap50 = _capped(50)
+BadPageCap153 = _capped(153)
 
 
 class BadHeadOnly300(Adapter):
@@ -1954,6 +2003,7 @@ _bad(
 )
 _bad(BadPageCap34, None, TS, {LOOKUP_DEPTH_TEST: A})
 _bad(BadPageCap50, None, TS, {LOOKUP_DEPTH_TEST: A})
+_bad(BadPageCap153, None, TS, {LOOKUP_DEPTH_TEST: A})
 _bad(
     BadHeadOnly300,
     None,
@@ -3215,7 +3265,7 @@ RESTART_CHECK = "test_the_harness_restart_gives_a_fresh_adapter_over_the_same_du
 SEED_CHECK = "test_the_harness_seeds_and_plants_objects_the_server_lists"
 
 
-@pytest.mark.parametrize("bad", [BadPageCap34, BadPageCap50])
+@pytest.mark.parametrize("bad", [BadPageCap34, BadPageCap50, BadPageCap153])
 def test_a_silent_page_cap_of_34_or_more_fails(bad: type[Adapter]) -> None:
     error = run_suite(_with(bad), Port.TICKET_SOURCE)[LOOKUP_DEPTH]
     assert type(error) is AssertionError, f"{bad.__name__} slipped past"
@@ -3336,6 +3386,37 @@ class _CopiesTheAdapter(StubTarget):
         self.verifier = copy.copy(self.verifier)
 
 
+class _DeepCopiesTheAdapter(StubTarget):
+    def restart(self) -> None:
+        import copy
+
+        self.adapter = copy.deepcopy(self.adapter)
+        self.verifier = copy.deepcopy(self.verifier)
+
+
+class AliasingAdapter(Adapter):
+    """Honest: holds an alias of the durable table, as a real adapter may."""
+
+    def __init__(self, server: Stub, store: Store | None = None) -> None:
+        super().__init__(server, store)
+        self.seen = self.store.seen
+        self.limits = {"retries": 3}  # a constant of its own, rebuilt on every restart
+
+
+class SlotsAdapter:
+    """Honest, with ``__slots__``: nothing for a copy to carry, and no ``vars()``."""
+
+    __slots__ = ("server", "store", "verifier")
+
+    def __init__(self, server: Stub, store: Store | None = None) -> None:
+        self.server = server
+        self.store = store if store is not None else Store(set(), [])
+        self.verifier = HmacVerifier(SECRET, lambda: server.now, None, False)
+
+    receive = Adapter.receive
+    _parse = Adapter._parse
+
+
 class _SharesTheVerifier(StubTarget):
     def restart(self) -> None:
         verifier = self.verifier
@@ -3380,6 +3461,37 @@ def test_a_restart_by_copying_keeps_the_old_in_memory_state_and_is_a_harness_err
     error = run_suite(lambda: _CopiesTheAdapter(RememberingAdapter), Port.WEBHOOK)[RESTART_CHECK]
     assert type(error) is HarnessError
     assert "in-memory" in str(error)
+
+
+def test_a_deep_copy_restart_is_caught_too() -> None:
+    error = run_suite(lambda: _DeepCopiesTheAdapter(RememberingAdapter), Port.WEBHOOK)[
+        RESTART_CHECK
+    ]
+    assert type(error) is HarnessError
+
+
+def test_a_copy_restart_that_hides_the_volatile_table_in_the_store_is_caught() -> None:
+    """BadVolatileDedupe keeps its seen-IDs in a Store of its own: a scan of the adapter's top
+    level misses it, but a copy still carries the mark."""
+    error = run_suite(lambda: _CopiesTheAdapter(BadVolatileDedupe), Port.WEBHOOK)[RESTART_CHECK]
+    assert type(error) is HarnessError
+
+
+def test_bad_volatile_dedupe_fails_the_suite_on_an_honest_restart() -> None:
+    results = run_suite(lambda: StubTarget(BadVolatileDedupe), Port.WEBHOOK)
+    assert results[RESTART_CHECK] is None
+    assert type(results["test_dedupe_survives_a_restart"]) is AssertionError
+
+
+def test_an_alias_of_the_durable_store_or_a_constant_of_its_own_is_not_shared_state() -> None:
+    assert run_suite(lambda: StubTarget(AliasingAdapter), Port.WEBHOOK)[RESTART_CHECK] is None
+
+
+def test_an_adapter_with_slots_passes_the_restart_check() -> None:
+    def make() -> Target:
+        return StubTarget(SlotsAdapter, Stub(ts_signed=False), Vendor.GITHUB)  # type: ignore[arg-type]
+
+    assert run_suite(make, Port.WEBHOOK)[RESTART_CHECK] is None
 
 
 def test_a_restart_that_keeps_the_verifier_says_so_and_not_that_the_adapter_stayed() -> None:
