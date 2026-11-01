@@ -50,6 +50,12 @@ ALL_EFFECTS_SWITCH = "effects"
 EXTRA_SWITCHES = {"pr.merge": ("merge",), "release.trigger": ("release",)}
 
 
+# Engine-implicit scoped effects (PLAN 6.3: check runs, gate notifications, ``pr.close`` on reject,
+# the revert PR) run on a stopped or finished run: that is when they are needed (PLAN 6.2, 14.3).
+# Every other scoped effect is declared in the workflow and needs a live run like a gated one.
+IMPLICIT_TYPES = frozenset({"check.publish", "gate.notify", "pr.close", "pr.open_revert"})
+
+
 def switches_for(effect_type: str) -> tuple[str, ...]:
     return (ALL_EFFECTS_SWITCH, *EXTRA_SWITCHES.get(effect_type, ()))
 
@@ -143,6 +149,12 @@ class EffectHandler(Protocol):
         """Cancel an ACCEPTED effect if possible, then report where it stands."""
         ...
 
+    def reconcile(self, effect: Effect) -> Outcome:
+        """Find out what became of an attempt whose answer was lost (RETRYING, or ATTEMPTING
+        with a lapsed lease), cancelling it if it is still pending. Used when the run is
+        stopping, so it must not leave a new write behind."""
+        ...
+
 
 class CallHandler:
     """A synchronous write: ``write(idempotency_key)`` returns the adapter's receipt."""
@@ -158,6 +170,9 @@ class CallHandler:
 
     def stop(self, effect: Effect) -> Outcome:
         raise ValueError("a synchronous effect is never ACCEPTED, so there is nothing to stop")
+
+    def reconcile(self, effect: Effect) -> Outcome:
+        raise ValueError("a synchronous effect has no handle to reconcile: a person decides")
 
 
 class MergeHandler:
@@ -187,7 +202,10 @@ class MergeHandler:
     def poll(self, effect: Effect) -> Outcome:
         if effect.intent is None:
             raise ValueError("an ACCEPTED merge records its handle as intent")
-        result = self._scm.poll_merge(MergeHandle(effect.intent, self._pr))
+        return self._read_back(MergeHandle(effect.intent, self._pr))
+
+    def _read_back(self, handle: MergeHandle) -> Outcome:
+        result = self._scm.poll_merge(handle)
         match result.state:
             case MergeState.MERGED if result.receipt is not None and result.merge_sha:
                 frozen = dataclasses.replace(self._subject, merge_sha=result.merge_sha)
@@ -199,7 +217,7 @@ class MergeHandler:
             case MergeState.DEQUEUED:
                 return Voided("dequeued")
             case _:  # pending, or merged without a receipt to confirm it
-                return Pending(effect.intent)
+                return Pending(handle.id)
 
     def stop(self, effect: Effect) -> Outcome:
         """Dequeue if possible. A moved head (``StaleHeadError``) or a merge that already
@@ -208,3 +226,14 @@ class MergeHandler:
         with contextlib.suppress(StaleHeadError, RefusedError):
             self._scm.dequeue(self._pr, self._sha)
         return self.poll(effect)
+
+    def reconcile(self, effect: Effect) -> Outcome:
+        """The handle of a lost answer is only reachable by repeating the request with the same
+        key, which finds the merge if it landed. The port has no lookup by key (a gap for
+        D1-04/D4: ``ScmProvider.find_merge``), so if it never landed this enqueues it for an
+        instant before the dequeue. A moved head or a closed PR (``StaleHeadError``,
+        ``RefusedError``) leaves nothing to find and is the caller's to report."""
+        handle = self._scm.request_merge(self._pr, self._sha, self._method, effect.idempotency_key)
+        with contextlib.suppress(StaleHeadError, RefusedError):
+            self._scm.dequeue(self._pr, self._sha)
+        return self._read_back(handle)

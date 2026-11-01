@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,7 +52,15 @@ from sto.domain import (
     to_wire,
 )
 from sto.effects.core import EffectExecutor, ExecResult, StopReport, set_switch
-from sto.effects.ports import CallHandler, Failed, MergeHandler, effect_item_key
+from sto.effects.ports import (
+    CallHandler,
+    EffectHandler,
+    Failed,
+    MergeHandler,
+    Pending,
+    Written,
+    effect_item_key,
+)
 from sto.engine.commands import OpenGate, RunEffect
 from sto.engine.handlers.core import GateClosed, RunStarted, StepSucceeded
 from sto.engine.reducer import LINEAR_V0, RunState, load_handlers, next
@@ -70,6 +79,7 @@ from sto.store.ports import (
     Scope,
     Store,
     TeamScope,
+    TransactionConflictError,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -93,6 +103,7 @@ class HookStore:
     def __init__(self, inner: Store, page_limit: int | None = None) -> None:
         self.inner, self.page_limit = inner, page_limit
         self.hooks: list[Callable[[Sequence[Op]], object]] = []
+        self.after_hooks: list[Callable[[], object]] = []
 
     def get(self, scope: Scope, key: Key) -> Item | None:
         return self.inner.get(scope, key)
@@ -117,6 +128,8 @@ class HookStore:
         if self.hooks:
             self.hooks.pop(0)(ops)
         self.inner.transact(scope, ops)
+        if self.after_hooks:
+            self.after_hooks.pop(0)()
 
     def put(
         self, scope: Scope, key: Key, data: Mapping[str, Any], *, when: Condition | None = None
@@ -128,6 +141,10 @@ class HookStore:
 
     def before_next_transaction(self, hook: Callable[[], object]) -> None:
         self.hooks.append(lambda _ops: hook())
+
+    def after_next_transaction(self, hook: Callable[[], object]) -> None:
+        """Runs once the next transaction has committed (so: just after a claim)."""
+        self.after_hooks.append(hook)
 
 
 class Clock:
@@ -163,7 +180,10 @@ class World:
 
     def set_run(self, status: RunStatus) -> None:
         self.run = dataclasses.replace(
-            self.run, status=status, blocked_reason=None, version=self.run.version + 1
+            self.run,
+            status=status,
+            blocked_reason="kill_switch" if status is RunStatus.BLOCKED else None,
+            version=self.run.version + 1,
         )
         self.store.put(SCOPE, self.run_key(), to_wire(self.run))
 
@@ -206,10 +226,22 @@ class World:
         return gate
 
     def raw_decision(
-        self, gate: Gate, kind: DecisionKind, digest: str, id_: DecisionId | None = None
+        self,
+        gate: Gate,
+        kind: DecisionKind,
+        digest: str,
+        id_: DecisionId | None = None,
+        gate_id: GateId | None = None,
     ) -> Decision:
         d = Decision(
-            id_ or DecisionId.new(), gate.id, gate.round, "alice", Surface.UI, kind, digest, "ok"
+            id_ or DecisionId.new(),
+            gate_id or gate.id,
+            gate.round,
+            "alice",
+            Surface.UI,
+            kind,
+            digest,
+            "ok",
         )
         key = Key(f"RUN#{self.run.id}", f"DEC#{gate.name}#{gate.round}#{d.id}")
         self.store.put(SCOPE, key, to_wire(d))
@@ -217,7 +249,16 @@ class World:
 
     def plan(self, type_: str = "pr.mark_ready", klass: EffectClass = EffectClass.GATED) -> Effect:
         gates = ("review",) if klass is EffectClass.GATED else ()
-        return self.fx.plan(self.run.id, type_, "merge", 1, klass, DIGEST, requires_gates=gates)
+        return self.fx.plan(
+            self.run.id,
+            type_,
+            "merge",
+            1,
+            klass,
+            DIGEST,
+            requires_gates=gates,
+            subject=SUBJECT if klass is EffectClass.GATED else None,
+        )
 
     def effect(self, e: Effect) -> Effect:
         return self.fx.get(self.run.id, e.idempotency_key)
@@ -225,7 +266,7 @@ class World:
     def go(
         self,
         e: Effect,
-        handler: CallHandler | MergeHandler | None = None,
+        handler: EffectHandler | None = None,
         live: Subject | None = SUBJECT,
     ) -> ExecResult:
         return self.fx.execute(self.run.id, e.idempotency_key, handler or self.ready(), live=live)
@@ -259,6 +300,15 @@ def world(inner: Store) -> World:
     store.put(SCOPE, w.run_key(), to_wire(run))
     scm.spy.clear()
     return w
+
+
+def calls_cleanly[T](fn: Callable[[], T]) -> T:
+    """Turn a crash inside ``fn`` into a failed assertion, so a mutant that breaks an invariant by
+    raising is still caught by an assertion in the test, with a message that names the cause."""
+    try:
+        return fn()
+    except Exception as exc:
+        raise AssertionError(f"raised {exc!r}") from exc
 
 
 def _receipt(writes: list[str], key: str) -> Receipt:
@@ -358,7 +408,9 @@ def test_gated_effect_with_live_approval_runs_and_records_the_decisions(world: W
 
 def test_a_gated_effect_must_name_its_gates(world: World) -> None:
     with pytest.raises(ValueError, match="requires_gates"):
-        world.fx.plan(world.run.id, "pr.merge", "merge", 1, EffectClass.GATED, DIGEST)
+        world.fx.plan(
+            world.run.id, "pr.merge", "merge", 1, EffectClass.GATED, DIGEST, subject=SUBJECT
+        )
 
 
 @pytest.mark.parametrize("klass", [EffectClass.INTERNAL, EffectClass.EXPOSING])
@@ -378,12 +430,24 @@ def test_a_gated_effect_cannot_run_without_the_live_subject(world: World) -> Non
 # --- PLAN 4.3.2: the merge needs both gates, each at its own digest, at the same head ------------
 
 
-def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Store) -> None:
-    """The reducer decides the commands and the real ``GateService`` carries them out."""
+@dataclass
+class Demo:
+    fx: EffectExecutor
+    rid: RunId
+    e: Effect
+    merger: MergeHandler
+    cmd: RunEffect
+    scm: FakeScm
+    approvals: dict[str, Decided]
+
+
+def _demo(inner: Store) -> Demo:
+    """The reducer decides the commands and the real ``GateService`` carries them out. The ticket
+    is edited between the review gate and QA, which PLAN 272 says the QA gate simply shows."""
     load_handlers()
     rid = RunId.new()
     review = dataclasses.replace(SUBJECT, evidence_digest="review-evidence")
-    qa = dataclasses.replace(SUBJECT, evidence_digest="qa-evidence")
+    qa = dataclasses.replace(SUBJECT, evidence_digest="qa-evidence", ticket_revision="r2")
     assert review.digest() != qa.digest()
     store = HookStore(inner)
     store.put(
@@ -447,14 +511,31 @@ def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Stor
         EffectClass.GATED,
         cmd.subject_digest,
         requires_gates=cmd.requires_gates,
+        subject=cmd.subject,
     )
     merger = MergeHandler(scm, pr, cmd.subject.head_sha, MergeMethod.SQUASH, cmd.subject)
-    first = fx.execute(rid, e.idempotency_key, merger, live=cmd.subject)
+    return Demo(fx, rid, e, merger, cmd, scm, approvals)
+
+
+def test_the_real_reducers_merge_runs_with_approvals_from_both_gates(inner: Store) -> None:
+    d = _demo(inner)
+    fresh = dataclasses.replace(d.cmd.subject)  # re-read now: same ticket, same head
+    first = d.fx.execute(d.rid, d.e.idempotency_key, d.merger, live=fresh)
     assert first.effect.status is EffectStatus.ACCEPTED
-    assert first.effect.decision_ids == cmd.decision_ids
-    scm.complete_merge(scm.merges()[-1], "m1")
-    done = fx.poll(rid, e.idempotency_key, merger)
+    assert first.effect.decision_ids == d.cmd.decision_ids
+    d.scm.complete_merge(d.scm.merges()[-1], "m1")
+    done = d.fx.poll(d.rid, d.e.idempotency_key, d.merger)
     assert done.effect.status is EffectStatus.CONFIRMED
+
+
+def test_the_real_reducers_merge_is_refused_when_a_fresh_read_shows_a_ticket_edit(
+    inner: Store,
+) -> None:
+    d = _demo(inner)
+    fresh = dataclasses.replace(d.cmd.subject, ticket_revision="r3")  # edited after QA approval
+    result = d.fx.execute(d.rid, d.e.idempotency_key, d.merger, live=fresh)
+    assert result.reason == "gate_invalid"
+    assert d.scm.merges() == []
 
 
 def test_one_gate_approved_at_another_head_voids_the_merge(world: World) -> None:
@@ -468,6 +549,7 @@ def test_one_gate_approved_at_another_head_voids_the_merge(world: World) -> None
         EffectClass.GATED,
         DIGEST,
         requires_gates=("review", "qa"),
+        subject=SUBJECT,
     )
     world.go(e, world.merger())
     assert world.scm.spy.calls == ()
@@ -1077,14 +1159,16 @@ def test_planning_twice_returns_the_same_record(world: World) -> None:
 
 def test_a_new_subject_gets_a_new_record(world: World) -> None:
     first = world.plan()
+    moved = dataclasses.replace(SUBJECT, head_sha="h2")
     other = world.fx.plan(
         world.run.id,
         "pr.mark_ready",
         "merge",
         1,
         EffectClass.GATED,
-        "d2",
+        moved.digest(),
         requires_gates=("review",),
+        subject=moved,
     )
     assert other.idempotency_key != first.idempotency_key
 
@@ -1105,11 +1189,27 @@ def test_replanning_a_key_for_another_effect_is_refused(world: World) -> None:
 
 def test_replanning_with_different_gates_is_refused(world: World) -> None:
     world.fx.plan(
-        world.run.id, "a", "s", 1, EffectClass.GATED, DIGEST, requires_gates=("review",), key="k"
+        world.run.id,
+        "a",
+        "s",
+        1,
+        EffectClass.GATED,
+        DIGEST,
+        requires_gates=("review",),
+        key="k",
+        subject=SUBJECT,
     )
     with pytest.raises(ValueError, match="already"):
         world.fx.plan(
-            world.run.id, "a", "s", 1, EffectClass.GATED, DIGEST, requires_gates=("qa",), key="k"
+            world.run.id,
+            "a",
+            "s",
+            1,
+            EffectClass.GATED,
+            DIGEST,
+            requires_gates=("qa",),
+            key="k",
+            subject=SUBJECT,
         )
 
 
@@ -1174,22 +1274,43 @@ def test_after_a_merge_later_gated_effects_check_the_frozen_subject(world: World
     assert world.effect(release).status is EffectStatus.CONFIRMED
 
 
+def _release(world: World, subject: Subject = SUBJECT, name: str = "release") -> Effect:
+    return world.fx.plan(
+        world.run.id,
+        "release.trigger",
+        "r",
+        1,
+        EffectClass.GATED,
+        subject.digest(),
+        requires_gates=(name,),
+        subject=subject,
+    )
+
+
 def test_after_a_merge_a_gate_approved_at_another_head_is_still_refused(world: World) -> None:
     _merged(world)
     world.approve(name="release", subject=dataclasses.replace(SUBJECT, head_sha="h9"))
-    release = world.fx.plan(
-        world.run.id, "release.trigger", "r", 1, EffectClass.GATED, "d", requires_gates=("release",)
-    )
-    assert world.go(release, _noop(), live=SUBJECT).reason == "gate_invalid"
+    assert world.go(_release(world), _noop(), live=SUBJECT).reason == "gate_invalid"
 
 
-def test_after_a_merge_a_gate_approved_at_another_ticket_text_is_refused(world: World) -> None:
+def test_after_a_merge_an_effect_planned_for_other_code_cannot_ride_the_old_approval(
+    world: World,
+) -> None:
+    """h1 was merged; an effect planned at h9 holding only the h1 approval must not run."""
+    _merged(world)
+    world.approve(name="release")  # approved at h1 (the merged head)
+    other = _release(world, dataclasses.replace(SUBJECT, head_sha="h9"))
+    result = world.go(other, _noop(), live=SUBJECT)
+    assert result.reason == "gate_invalid"
+    assert world.effect(other).status is EffectStatus.VOIDED
+
+
+def test_after_a_merge_a_gate_approved_at_another_ticket_text_still_runs(world: World) -> None:
+    """PLAN 293: only the head matters after a merge, so a ticket edit cannot strand the run."""
     _merged(world)
     world.approve(name="release", subject=dataclasses.replace(SUBJECT, ticket_revision="r9"))
-    release = world.fx.plan(
-        world.run.id, "release.trigger", "r", 1, EffectClass.GATED, "d", requires_gates=("release",)
-    )
-    assert world.go(release, _noop(), live=SUBJECT).reason == "gate_invalid"
+    release = _release(world)
+    assert world.go(release, _noop(), live=SUBJECT).edge == "done"
 
 
 def test_the_frozen_subject_is_found_across_pages(world: World) -> None:
@@ -1265,7 +1386,7 @@ def test_a_merge_reported_without_a_sha_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, merge_sha, receipt)
     )
-    polled = world.fx.poll(world.run.id, e.idempotency_key, world.merger())
+    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
     assert polled.effect.status is EffectStatus.ACCEPTED
     assert polled.reason == "unconfirmed"
 
@@ -1278,7 +1399,7 @@ def test_a_merge_reported_without_a_receipt_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", None)
     )
-    polled = world.fx.poll(world.run.id, e.idempotency_key, world.merger())
+    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
     assert polled.effect.status is EffectStatus.ACCEPTED
     assert world.effect(e).frozen_subject is None
 
@@ -1292,7 +1413,7 @@ def test_a_merge_with_a_receipt_that_failed_read_back_is_not_confirmed(
     monkeypatch.setattr(
         world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", unverified)
     )
-    polled = world.fx.poll(world.run.id, e.idempotency_key, world.merger())
+    polled = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, world.merger()))
     assert polled.effect.status is EffectStatus.ACCEPTED
 
 
@@ -1419,12 +1540,15 @@ def test_a_slow_poller_cannot_overwrite_a_confirmed_merge(world: World) -> None:
         def stop(self, effect: Effect) -> Any:
             return inner_merger.stop(effect)
 
+        def reconcile(self, effect: Effect) -> Any:
+            return inner_merger.reconcile(effect)
+
         def poll(self, effect: Effect) -> Any:
             world.scm.complete_merge(handle, "m1")
             world.fx.poll(world.run.id, e.idempotency_key, inner_merger)
             return Failed("stale", "merge_stale")
 
-    result = world.fx.poll(world.run.id, e.idempotency_key, Slow())
+    result = calls_cleanly(lambda: world.fx.poll(world.run.id, e.idempotency_key, Slow()))
     assert result.reason == "superseded"
     assert world.effect(e).status is EffectStatus.CONFIRMED
 
@@ -1435,3 +1559,427 @@ def test_poll_and_stop_need_an_accepted_effect(world: World) -> None:
         world.fx.poll(world.run.id, e.idempotency_key, world.merger())
     with pytest.raises(ValueError, match="ACCEPTED"):
         world.fx.stop(world.run.id, e.idempotency_key, world.merger())
+
+
+# --- declared scoped effects need a live run; only engine-implicit ones run on a stopped one ----
+
+
+@pytest.mark.parametrize("effect_type", ["pr.update_branch", "pr.ensure_draft"])
+@pytest.mark.parametrize("status", [RunStatus.CANCELLING, RunStatus.CANCELLED, RunStatus.DONE])
+def test_a_declared_scoped_effect_is_voided_on_a_stopped_run(
+    world: World, effect_type: str, status: RunStatus
+) -> None:
+    e = world.plan(effect_type, EffectClass.SCOPED)
+    world.set_run(status)
+    result = world.go(e)
+    assert result.reason == "run_not_active"
+    assert world.scm.spy.calls == ()
+    assert world.effect(e).status is EffectStatus.VOIDED
+
+
+@pytest.mark.parametrize("effect_type", ["pr.update_branch", "pr.ensure_draft"])
+def test_a_declared_scoped_effect_planned_after_the_void_does_not_run(
+    world: World, effect_type: str
+) -> None:
+    world.set_run(RunStatus.CANCELLED)
+    e = world.plan(effect_type, EffectClass.SCOPED)  # planned after Stop voided the rest
+    assert world.go(e).reason == "run_not_active"
+    assert world.scm.spy.calls == ()
+
+
+@pytest.mark.parametrize("effect_type", ["pr.update_branch", "pr.ensure_draft"])
+@pytest.mark.parametrize("status", [RunStatus.BLOCKED, RunStatus.WAITING_HUMAN, RunStatus.QUEUED])
+def test_a_declared_scoped_effect_is_held_while_the_run_waits(
+    world: World, effect_type: str, status: RunStatus
+) -> None:
+    e = world.plan(effect_type, EffectClass.SCOPED)
+    world.set_run(status)
+    assert world.go(e).reason == "held"
+    assert world.scm.spy.calls == ()
+    assert world.effect(e).status is EffectStatus.PLANNED
+
+
+def test_a_declared_scoped_claim_checks_the_run_in_the_transaction(world: World) -> None:
+    e = world.plan("pr.update_branch", EffectClass.SCOPED)
+    world.store.before_next_transaction(lambda: world.set_run(RunStatus.CANCELLING))
+    assert world.go(e).reason == "run_not_active"
+    assert world.scm.spy.calls == ()
+
+
+@pytest.mark.parametrize(
+    "effect_type", ["check.publish", "gate.notify", "pr.close", "pr.open_revert"]
+)
+@pytest.mark.parametrize("status", [RunStatus.CANCELLED, RunStatus.REJECTED, RunStatus.BLOCKED])
+def test_an_engine_implicit_effect_runs_whatever_the_run_status(
+    world: World, effect_type: str, status: RunStatus
+) -> None:
+    e = world.plan(effect_type, EffectClass.SCOPED)
+    world.set_run(status)
+    assert world.go(e).edge == "done"
+
+
+# --- the lease and the fences (second worker, late worker) --------------------------------------
+
+
+def test_a_worker_cannot_settle_while_a_second_worker_holds_the_lease(world: World) -> None:
+    """A stalls past its lease; B takes over and is mid-write when A finally answers."""
+    e = world.plan("pr.update_branch", EffectClass.SCOPED)
+    a_in, b_in, a_go, b_go = (threading.Event() for _ in range(4))
+    out: dict[str, ExecResult] = {}
+
+    def a_write(key: str) -> Receipt:
+        a_in.set()
+        assert a_go.wait(10)
+        raise TransientError("A answers late")
+
+    def b_write(key: str) -> Receipt:
+        b_in.set()
+        assert b_go.wait(10)
+        return Receipt("from-b", "", read_back_verified=True)
+
+    def run(name: str, write: Callable[[str], Receipt]) -> None:
+        out[name] = world.go(e, CallHandler(write))
+
+    ta = threading.Thread(target=run, args=("a", a_write))
+    ta.start()
+    assert a_in.wait(10)
+    world.clock.now += 61  # A's lease lapses
+    tb = threading.Thread(target=run, args=("b", b_write))
+    tb.start()
+    assert b_in.wait(10)  # B holds the lease and has not answered
+    a_go.set()
+    ta.join(10)
+    assert out["a"].reason == "lease_lost"
+    held = world.effect(e)
+    assert held.status is EffectStatus.ATTEMPTING  # A did not move B's record
+    b_go.set()
+    tb.join(10)
+    assert out["b"].edge == "done"
+    final = world.effect(e)
+    assert final.status is EffectStatus.CONFIRMED
+    assert final.receipt is not None
+    assert final.receipt.external_id == "from-b"
+
+
+def test_a_worker_whose_claim_was_taken_over_before_it_wrote_never_writes(world: World) -> None:
+    e = world.plan("pr.update_branch", EffectClass.SCOPED)
+    first_calls: list[str] = []
+    writes: list[str] = []
+
+    def takeover() -> None:  # right after A's claim commits: the lease lapses and B finishes
+        world.clock.now += 61
+        world.go(e, CallHandler(lambda k: _receipt(writes, k)))
+
+    world.store.after_next_transaction(takeover)
+    result = world.go(e, CallHandler(lambda k: _receipt(first_calls, k)))
+    assert first_calls == []  # A never called its writer
+    assert result.reason == "lease_lost"
+    assert writes == [e.idempotency_key]
+    assert world.effect(e).status is EffectStatus.CONFIRMED
+
+
+def test_a_block_survives_a_later_approval_until_a_person_retries(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready")
+    world.go(e)
+    world.close(world.gate(round=2), DecisionKind.REJECT)
+    assert world.go(e).reason == "unreconciled:gate_invalid"
+    world.approve(round=3)  # a new approval at the same head would satisfy every guard
+    again = world.go(e)
+    assert again.blocked
+    assert world.effect(e).status is EffectStatus.RETRYING
+    assert len(world.scm.spy.calls_for("mark_ready")) == 1  # no second write
+
+
+def test_a_decision_of_another_gate_instance_is_not_an_approval(world: World) -> None:
+    gate = world.raw_gate(GateStatus.APPROVED)
+    world.raw_decision(gate, DecisionKind.APPROVE, gate.subject.digest(), gate_id=GateId.new())
+    e = world.plan()
+    assert world.go(e).reason == "gate_invalid"
+    assert world.scm.spy.calls == ()
+
+
+def test_gates_are_compared_by_head_only(world: World) -> None:
+    """PLAN 4.3.2: a gate that saw other evidence, patch id or ticket text still counts."""
+    other = dataclasses.replace(
+        SUBJECT, patch_id="p0", ticket_revision="r0", evidence_digest="other"
+    )
+    world.approve(subject=other)
+    e = world.plan()
+    assert world.go(e).edge == "done"
+
+
+# --- handler-level: a merge is only reported done with a receipt and a sha ---------------------
+
+
+def _accepted_merge(world: World) -> Effect:
+    return dataclasses.replace(_merge(world), intent="merge-1")
+
+
+@pytest.mark.parametrize("merge_sha", [None, ""])
+def test_the_merge_handler_does_not_report_a_merge_without_a_sha(
+    world: World, monkeypatch: pytest.MonkeyPatch, merge_sha: str | None
+) -> None:
+    effect = _accepted_merge(world)
+    receipt = Receipt("pr-1", "", read_back_verified=True)
+    monkeypatch.setattr(
+        world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, merge_sha, receipt)
+    )
+    assert isinstance(world.merger().poll(effect), Pending)
+
+
+def test_the_merge_handler_does_not_report_a_merge_without_a_receipt(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    effect = _accepted_merge(world)
+    monkeypatch.setattr(
+        world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", None)
+    )
+    assert isinstance(world.merger().poll(effect), Pending)
+
+
+def test_the_merge_handler_reports_a_merge_with_a_receipt_and_a_sha(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    effect = _accepted_merge(world)
+    receipt = Receipt("pr-1", "", read_back_verified=True)
+    monkeypatch.setattr(
+        world.scm, "poll_merge", lambda h: MergeResult(MergeState.MERGED, "m1", receipt)
+    )
+    out = world.merger().poll(effect)
+    assert isinstance(out, Written)
+    assert out.frozen_subject == dataclasses.replace(SUBJECT, merge_sha="m1")
+
+
+# --- reconcile: Stop's route for a lost attempt ----------------------------------------------
+
+
+def test_reconcile_dequeues_a_merge_whose_request_answer_was_lost(world: World) -> None:
+    e = _merge(world)
+    world.scm.lose_response_next("request_merge")  # the merge is pending at the SCM
+    assert world.go(e, world.merger()).effect.status is EffectStatus.RETRYING
+    world.set_run(RunStatus.CANCELLING)
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.effect.status is EffectStatus.VOIDED
+    assert result.reason == "dequeued"
+    assert world.scm.poll_merge(world.scm.merges()[-1]).state is MergeState.DEQUEUED
+    assert len(world.scm.merges()) == 1  # found by key, not created again
+
+
+def test_reconcile_confirms_a_merge_that_landed_before_the_crash(world: World) -> None:
+    e = _merge(world)
+    world.scm.lose_response_next("request_merge")
+    world.go(e, world.merger())
+    world.scm.complete_merge(world.scm.merges()[-1], "m1")
+    world.set_run(RunStatus.CANCELLING)
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.effect.status is EffectStatus.CONFIRMED  # reported, not hidden
+    assert result.effect.frozen_subject == dataclasses.replace(SUBJECT, merge_sha="m1")
+
+
+def test_reconcile_of_a_lapsed_attempt_after_a_crash(world: World) -> None:
+    e = _merge(world)
+    world.scm.request_merge(world.pr, "h1", MergeMethod.SQUASH, e.idempotency_key)
+    world.force(
+        e,
+        status=EffectStatus.ATTEMPTING,
+        attempts=1,
+        decision_ids=(DecisionId.new(),),
+        subject_digest=DIGEST,
+        meta={
+            "lease_owner": "dead",
+            "lease_until": world.clock.now - 1,
+            "subject": to_wire(SUBJECT),
+        },
+    )
+    world.set_run(RunStatus.CANCELLING)
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.effect.status is EffectStatus.VOIDED
+    assert world.scm.poll_merge(world.scm.merges()[-1]).state is MergeState.DEQUEUED
+
+
+def test_reconcile_leaves_a_live_attempt_alone(world: World) -> None:
+    e = _merge(world)
+    seen: list[ExecResult] = []
+
+    class Probe:
+        def execute(self, effect: Effect) -> Any:
+            seen.append(world.fx.reconcile(world.run.id, e.idempotency_key, world.merger()))
+            return Written(Receipt("x", "", read_back_verified=True))
+
+        def poll(self, effect: Effect) -> Any: ...
+        def stop(self, effect: Effect) -> Any: ...
+        def reconcile(self, effect: Effect) -> Any: ...
+
+    world.go(e, Probe())
+    assert seen[0].reason == "in_flight"
+    assert world.scm.merges() == []
+
+
+def test_reconcile_of_a_merge_that_cannot_be_found_stays_blocked(world: World) -> None:
+    e = _merge(world)
+    world.scm.fail_next("request_merge")  # it never reached the SCM
+    world.go(e, world.merger())
+    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")  # the head moved: nothing to find
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.blocked
+    assert result.reason == "unreconciled:StaleHeadError"
+    assert world.effect(e).status is EffectStatus.RETRYING
+
+
+def test_reconcile_reports_a_merge_that_died_when_the_head_moved(world: World) -> None:
+    e = _merge(world)
+    world.scm.lose_response_next("request_merge")  # it is pending at the SCM
+    world.go(e, world.merger())
+    world.scm.seed_branch(REPO, "sto/x", "h2", parent="h1")
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.effect.status is EffectStatus.FAILED
+    assert result.edge == "stale"
+
+
+def test_reconcile_of_an_accepted_merge_stops_it(world: World) -> None:
+    e = _merge(world)
+    world.go(e, world.merger())
+    result = world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+    assert result.effect.status is EffectStatus.VOIDED
+
+
+def test_reconcile_needs_something_that_was_tried(world: World) -> None:
+    e = _merge(world)
+    with pytest.raises(ValueError, match="nothing to reconcile"):
+        world.fx.reconcile(world.run.id, e.idempotency_key, world.merger())
+
+
+def test_a_synchronous_effect_has_nothing_to_reconcile(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready")
+    world.go(e)
+    with pytest.raises(ValueError, match="person decides"):
+        world.fx.reconcile(world.run.id, e.idempotency_key, world.ready())
+
+
+# --- a person's Retry --------------------------------------------------------------------------
+
+
+def test_retry_blocked_allows_another_full_round_of_attempts(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready", times=3)
+    results = [world.go(e) for _ in range(3)]
+    assert results[-1].blocked
+    world.fx.retry_blocked(world.run.id, e.idempotency_key)
+    assert world.go(e).edge == "done"
+    assert len(world.scm.spy.calls_for("mark_ready")) == 4
+    assert world.effect(e).attempts == 4
+
+
+def test_retry_blocked_is_capped_again_after_max_more_attempts(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready", times=20)
+    for _ in range(3):
+        world.go(e)
+    world.fx.retry_blocked(world.run.id, e.idempotency_key)
+    results = [world.go(e) for _ in range(4)]
+    assert [r.blocked for r in results] == [False, False, True, True]
+    assert len(world.scm.spy.calls_for("mark_ready")) == 6
+    assert world.effect(e).attempts == 6
+
+
+def test_retry_blocked_keeps_the_planned_subject(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready", times=3)
+    for _ in range(3):
+        world.go(e)
+    world.fx.retry_blocked(world.run.id, e.idempotency_key)
+    item = world.store.get(SCOPE, effect_item_key(world.run.id, e.idempotency_key))
+    assert item is not None
+    assert item.data["meta"]["subject"] == to_wire(SUBJECT)
+
+
+def test_retry_blocked_needs_a_blocked_effect(world: World) -> None:
+    e = world.plan()
+    with pytest.raises(ValueError, match="blocked"):
+        world.fx.retry_blocked(world.run.id, e.idempotency_key)
+
+
+def test_a_retried_unreconciled_effect_runs_its_guards_again(world: World) -> None:
+    world.approve()
+    e = world.plan()
+    world.scm.fail_next("mark_ready")
+    world.go(e)
+    world.close(world.gate(round=2), DecisionKind.REJECT)
+    assert world.go(e).blocked
+    world.fx.retry_blocked(world.run.id, e.idempotency_key)
+    assert world.go(e).blocked  # still no live approval: blocked again, no write
+    world.approve(round=3)
+    world.fx.retry_blocked(world.run.id, e.idempotency_key)
+    assert world.go(e).edge == "done"
+
+
+# --- the claim relies on the audit chain; transaction conflicts are retried ---------------------
+
+
+def test_pinned_a_writer_that_never_moves_the_chain_lets_a_skipped_round_through(
+    world: World,
+) -> None:
+    """The dependency, pinned: with an ``AuditWriter`` that does not move ``RUN#r/CHAIN``, a round
+    that skips a number is invisible to the claim and the stale approval is used (PLAN 4.3.2
+    broken). Every AuditWriter must move the chain; see the note at ``EffectExecutor._approval``."""
+    world.svc = GateService(world.store, audit=NoChainAudit())
+    world.approve()
+    e = world.plan()
+    world.store.before_next_transaction(lambda: world.gate(round=3))  # not round 2
+    world.go(e)
+    assert len(world.scm.spy.applied("mark_ready")) == 1  # the stale approval won
+
+
+def test_a_transaction_conflict_while_settling_is_retried(world: World) -> None:
+    e = world.plan("pr.update_branch", EffectClass.SCOPED)
+
+    def conflict() -> None:
+        raise TransactionConflictError("busy")
+
+    world.store.before_next_transaction(lambda: None)  # the claim
+    world.store.before_next_transaction(conflict)  # the settle, after the write landed
+    result = calls_cleanly(lambda: world.go(e))
+    assert result.edge == "done"
+    assert len(world.scm.spy.calls_for("mark_ready")) == 1
+    assert world.effect(e).status is EffectStatus.CONFIRMED
+
+
+def test_a_transaction_conflict_at_the_claim_is_retried(world: World) -> None:
+    e = world.plan("pr.update_branch", EffectClass.SCOPED)
+
+    def conflict() -> None:
+        raise TransactionConflictError("busy")
+
+    world.store.before_next_transaction(conflict)
+    assert calls_cleanly(lambda: world.go(e)).edge == "done"
+
+
+# --- the frozen subject is the latest merge -------------------------------------------------------
+
+
+@pytest.mark.parametrize("i", range(6))
+def test_the_frozen_subject_is_the_latest_merge_whatever_the_key_order(
+    world: World, i: int
+) -> None:
+    old = dataclasses.replace(SUBJECT, head_sha="h0", merge_sha="m0")
+    new = dataclasses.replace(SUBJECT, head_sha="h1", merge_sha="m1")
+    receipt = Receipt("pr", "", read_back_verified=True)
+    for name, frozen in ((f"m{i}-old", old), (f"m{i}-new", new)):  # the older one is planned first
+        time.sleep(0.003)  # ULIDs sort by millisecond
+        e = world.fx.plan(world.run.id, name, "s", 1, EffectClass.SCOPED, DIGEST)
+        world.force(
+            e,
+            status=EffectStatus.CONFIRMED,
+            receipt=receipt,
+            frozen_subject=frozen,
+            meta={"edge": "done"},
+        )
+    world.approve(name="release")  # approved at h1
+    assert world.go(_release(world), _noop(), live=SUBJECT).edge == "done"
