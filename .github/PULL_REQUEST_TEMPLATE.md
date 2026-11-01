@@ -18,13 +18,9 @@ Closes #
 
 <!-- "None", or list each file and why it had to change. -->
 
-None.
-
 ## Unverified until D12
 
 <!-- Anything that depends on AWS or live services and so cannot be proved offline. Write "Nothing" if truly nothing. -->
-
-Nothing.
 
 ## Independent review
 
