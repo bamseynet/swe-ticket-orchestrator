@@ -187,12 +187,66 @@ jobs:
           STO_DEPLOYMENT: deployment.example.yaml
           AWS_EC2_METADATA_DISABLED: "true" # no instance-profile lookup either
 
+  contract:
+    name: contract
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make test-contract
+
+  gate-integrity:
+    name: gate-integrity
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make test-gate
+
+  coverage:
+    name: coverage
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make coverage
+
   # The only required check. Runs always, even when every work job was skipped
   # or failed. Add new work jobs to `needs` below; do not change the script.
   ci-required:
     name: ci-required
     if: ${{ always() }}
-    needs: [filter, lint, typecheck, unit, ui, synth]
+    needs: [filter, lint, typecheck, unit, ui, synth, contract, gate-integrity, coverage]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
