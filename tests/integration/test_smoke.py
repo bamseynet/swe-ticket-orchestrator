@@ -41,7 +41,9 @@ def _list_tables() -> dict[str, object]:
         f"Authorization: {FAKE_AUTH}\r\nContent-Length: {len(payload)}\r\n\r\n"
     ).encode()
     chunks: list[bytes] = []
-    with socket.create_connection(("127.0.0.1", DDB_PORT), timeout=10) as conn:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect(("127.0.0.1", DDB_PORT))
         conn.sendall(head + payload)
         while chunk := conn.recv(65536):
             chunks.append(chunk)
