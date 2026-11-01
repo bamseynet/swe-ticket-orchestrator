@@ -1,9 +1,12 @@
 .DEFAULT_GOAL := help
 BASE ?= origin/main
-.PHONY: help test-fast test test-changed lint typecheck apply-ruleset
+.PHONY: help doctor test-fast test test-changed lint typecheck apply-ruleset
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
+
+doctor: ## Check Python, uv, Node 24, Docker (optional) and ports; prints a fix for each. Ports: STO_API_PORT, STO_WEB_PORT
+	@command -v python3 >/dev/null || { echo "[FAIL] python3 not found"; echo "       fix: install Python 3.12+, e.g. curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.12 --default"; exit 1; }; python3 scripts/doctor.py $(ARGS)
 
 test-fast: ## Hermetic unit tests, no Docker, no network (seconds)
 	uv run pytest -q

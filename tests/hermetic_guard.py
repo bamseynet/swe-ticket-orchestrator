@@ -18,11 +18,13 @@ fixtures are covered, not just test bodies. The autouse fixture is a per-test ba
 from __future__ import annotations
 
 import _socket
+import contextlib
 import inspect
 import os
 import shutil
 import socket
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -35,17 +37,56 @@ class SocketBlockedError(RuntimeError):
 
 def _install_network_guard() -> None:
     # Self-contained: its source is also written to the subprocess ``sitecustomize``.
+    import os
+
+    # ``allow_loopback_bind`` flips this; subprocesses inherit it through the environment.
+    # Guards can nest (a child pytest on top of the sitecustomize guard), so layers share one state.
+    state = _socket.__dict__.setdefault(
+        "_sto_guard_state", {"loopback": os.environ.get("STO_TEST_ALLOW_LOOPBACK") == "1"}
+    )
+    loopback_hosts = ("127.0.0.1", "::1")
+
     def blocked(*_args: Any, **_kwargs: Any) -> Any:
         raise SocketBlockedError("network sockets are blocked in tests; use an in-process fake")
+
+    def check_address(family: int, address: Any) -> None:
+        if family == socket.AF_UNIX:
+            return
+        if not (state["loopback"] and isinstance(address, tuple) and address[0] in loopback_hosts):
+            blocked()
 
     def guard(base: type) -> type:
         class Guarded(base):  # type: ignore[misc]
             def __init__(self, family: int = -1, *args: Any, **kwargs: Any) -> None:
                 fileno = kwargs.get("fileno", args[2] if len(args) > 2 else None)
-                if fileno is None and family != socket.AF_UNIX:
+                loopback_family = state["loopback"] and family in (socket.AF_INET, socket.AF_INET6)
+                if fileno is None and family != socket.AF_UNIX and not loopback_family:
                     blocked()
                 # Not super(): socket.socket.__init__ calls _socket.socket.__init__(self, ...).
                 base.__init__(self, family, *args, **kwargs)  # type: ignore[misc]
+
+            def bind(self, address: Any) -> Any:
+                check_address(self.family, address)
+                return super().bind(address)
+
+            def connect(self, address: Any) -> Any:
+                check_address(self.family, address)
+                return super().connect(address)
+
+            def connect_ex(self, address: Any) -> Any:
+                check_address(self.family, address)
+                return super().connect_ex(address)
+
+            def sendto(self, data: Any, *args: Any) -> Any:
+                # sendto(data, address) or sendto(data, flags, address)
+                check_address(self.family, args[-1] if args else None)
+                return super().sendto(data, *args)
+
+            def sendmsg(self, buffers: Any, *args: Any) -> Any:
+                # sendmsg(buffers[, ancdata[, flags[, address]]]); no address means connected
+                if len(args) > 2 and args[2] is not None:
+                    check_address(self.family, args[2])
+                return super().sendmsg(buffers, *args)
 
         return Guarded
 
@@ -72,6 +113,34 @@ _SITECUSTOMIZE = (
 )
 
 
+@contextlib.contextmanager
+def allow_loopback_bind() -> Iterator[None]:
+    """Permit bind, listen and connect on 127.0.0.1 and ::1 only, for the ``with`` body.
+
+    Name lookups and every other address stay blocked, including in Python subprocesses started
+    inside the block (they inherit it through ``STO_TEST_ALLOW_LOOPBACK``).
+    """
+    state = _socket.__dict__["_sto_guard_state"]
+    previous = (state["loopback"], os.environ.get("STO_TEST_ALLOW_LOOPBACK"))
+    state["loopback"] = True
+    os.environ["STO_TEST_ALLOW_LOOPBACK"] = "1"
+    try:
+        yield
+    finally:
+        state["loopback"] = previous[0]
+        if previous[1] is None:
+            os.environ.pop("STO_TEST_ALLOW_LOOPBACK", None)
+        else:
+            os.environ["STO_TEST_ALLOW_LOOPBACK"] = previous[1]
+
+
+@pytest.fixture
+def allow_loopback() -> Iterator[None]:
+    """Fixture form of ``allow_loopback_bind`` for tests that need real loopback listeners."""
+    with allow_loopback_bind():
+        yield
+
+
 def _sandbox_env(root: Path) -> dict[str, str]:
     return {
         "HOME": str(root / "home"),
@@ -93,6 +162,9 @@ configure_calls = 0
 def pytest_configure(config: pytest.Config) -> None:
     global configure_calls  # noqa: PLW0603
     configure_calls += 1
+    # An exported variable must not open loopback for the whole session, including through an
+    # outer sitecustomize guard; only ``allow_loopback_bind`` may.
+    os.environ.pop("STO_TEST_ALLOW_LOOPBACK", None)
     root = Path(tempfile.mkdtemp(prefix="sto-hermetic-"))
     (root / "home").mkdir()
     (root / "site").mkdir()
@@ -103,6 +175,7 @@ def pytest_configure(config: pytest.Config) -> None:
         sockets=(socket.__dict__.copy(), _socket.__dict__.copy()),
     )
     _install_network_guard()
+    _socket.__dict__["_sto_guard_state"]["loopback"] = False
     for name in [n for n in os.environ if n.startswith("AWS_")]:
         del os.environ[name]
     os.environ.update(_sandbox_env(root))
