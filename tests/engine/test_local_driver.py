@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import itertools
 import json
 import os
 import signal
@@ -25,19 +26,28 @@ from typing import Any
 
 import pytest
 
+from sto.adapters.fake.scm import FakeScm
+from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RepoRef
 from sto.domain import (
     DecisionId,
     DecisionKind,
+    Effect,
+    EffectStatus,
     FailureClass,
     Run,
     RunId,
     RunStatus,
     StepKey,
     Subject,
+    Surface,
     from_wire,
 )
+from sto.domain.errors import TransientError
+from sto.effects.core import EffectExecutor, set_switch
+from sto.effects.ports import EffectHandler, Failed, MergeHandler
 from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep, StopRun
 from sto.engine.drivers.local import (
+    EffectsExecutor,
     LeaseHeldError,
     LeaseLostError,
     LocalDriver,
@@ -61,6 +71,7 @@ from sto.engine.reducer import (
     OutOfOrderEventError,
     RunState,
 )
+from sto.gates.service import GateService
 from sto.store.memory import MemoryStore
 from sto.store.ports import (
     Key,
@@ -188,8 +199,12 @@ class CountingStore:
         raise AssertionError("the driver must commit through transact")
 
 
+_IDS = itertools.count()
+
+
 def make(store: Store, worker: object, **kw: Any) -> LocalDriver:
     kw.setdefault("owner", "me")
+    kw.setdefault("new_id", lambda: str(next(_IDS)))
     kw.setdefault("clock", fixed_clock)
     kw.setdefault("lease_seconds", 60.0)
     return LocalDriver(store, SCOPE, LINEAR_V0, worker, **kw)  # type: ignore[arg-type]
@@ -427,6 +442,9 @@ def test_stop_runs_ahead_of_a_command_that_is_not_finished(tmp_path: Path) -> No
 
     def busy_until_stopped(key: str, command: object) -> Outcome | None:
         box["order"].append(type(command).__name__)
+        # Cap the polls: a driver that never gets to the Stop fails here, on an assertion that
+        # shows the order, not only on the deadline.
+        assert len(box["order"]) < 8, f"the Stop was not seen after {box['order']}"
         if isinstance(command, RunStep):
             return Done() if "StopRun" in box["order"] else StillRunning(1.0)
         return None
@@ -444,7 +462,10 @@ def test_stop_runs_ahead_of_a_command_that_is_not_finished(tmp_path: Path) -> No
         return await d.run_until_idle(RID)
 
     rs = run(go())
-    assert box["order"][:3] == ["RunStep", "StopRun", "RunStep"]  # Stop jumped the stuck head
+    # The Stop jumped the stuck head. The head RunStep is then called again after the StopRun
+    # (the run is CANCELLED by then): that is D2-11's to stop (it owns what a Stop does to an
+    # unfinished command), so it changes this line knowingly.
+    assert box["order"][:3] == ["RunStep", "StopRun", "RunStep"]
     assert rs.run.status is RunStatus.CANCELLED
 
 
@@ -634,7 +655,7 @@ def test_second_driver_cannot_run_a_leased_run_and_never_calls_execute(tmp_path:
 def test_resume_all_reports_a_leased_run_without_stopping(tmp_path: Path) -> None:
     store, clock = MemoryStore(), Clock()
     a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
-    b = make(store, Worker(tmp_path / "b"), owner="b", clock=clock, lease_seconds=10)
+    b = make(store, Worker(tmp_path / "b"), owner="b", clock=clock, lease_seconds=10, resume_wait=0)
 
     async def go() -> dict[RunId, Any]:
         await a.start(new_run())
@@ -741,6 +762,355 @@ def test_finished_run_leaves_the_index(tmp_path: Path) -> None:
     assert run(go()) == []
 
 
+# --- owners, heartbeat, concurrent resume -----------------------------------------------------
+
+
+def test_a_reused_owner_label_does_not_share_a_lease(tmp_path: Path) -> None:
+    store = MemoryStore()
+    a = make(store, Worker(tmp_path / "a"), owner="same")
+    b = make(store, Worker(tmp_path / "b"), owner="same")
+
+    async def go() -> None:
+        await a.start(new_run())
+        await a.step(RID)
+        with pytest.raises(LeaseHeldError):
+            await b.run_until_idle(RID)
+
+    run(go())
+
+
+def test_the_lease_is_renewed_while_a_long_command_executes(tmp_path: Path) -> None:
+    """A 1 s command under a 0.3 s lease: a second driver must still be turned away."""
+    store = MemoryStore()
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                await asyncio.sleep(1.0)
+            return await super().execute(key, command)
+
+    wa, wb = Slow(tmp_path / "a"), Worker(tmp_path / "b")
+    a = make(store, wa, owner="a", clock=time.time, lease_seconds=0.3)
+    b = make(store, wb, owner="b", clock=time.time, lease_seconds=0.3)
+
+    async def go() -> RunState:
+        await a.start(new_run())
+        first = asyncio.ensure_future(a.run_until_idle(RID))
+        await asyncio.sleep(0.6)  # twice the lease into the command
+        with pytest.raises(LeaseHeldError):
+            await b.run_until_idle(RID)
+        return await first
+
+    assert run(go(), timeout=20).run.status is RunStatus.DONE
+    assert wb.calls() == []
+    assert len(wa.calls()) == len(set(wa.calls()))
+
+
+def _rid(n: int) -> RunId:
+    return RunId.from_parts(n, bytes(10))
+
+
+def test_resume_all_runs_runs_concurrently_and_isolates_faults(tmp_path: Path) -> None:
+    store = MemoryStore()
+    r1, r2, r3 = _rid(11), _rid(12), _rid(13)
+    box = {"polls": 0, "r2_finished": False}
+
+    def override(key: str, command: object) -> Outcome | None:
+        if isinstance(command, Finish) and command.run_id == r2:
+            box["r2_finished"] = True
+        if isinstance(command, RunStep) and command.run_id == r1 and not box["r2_finished"]:
+            box["polls"] += 1
+            assert box["polls"] < 30, "run 1 starved run 2: it polled 30 times first"
+            return StillRunning(0.0)
+        if isinstance(command, RunStep) and command.run_id == r3:
+            raise RuntimeError("executor fault")
+        return None
+
+    w = Worker(tmp_path / "ledger", override=override)
+    d = make(store, w)
+
+    async def go() -> dict[RunId, Any]:
+        for r in (r1, r2, r3):
+            await d.start(new_run(r))
+        return await make(store, w, owner="restart").resume_all()
+
+    out = run(go())
+    assert out[r1].run.status is RunStatus.DONE
+    assert out[r2].run.status is RunStatus.DONE
+    assert isinstance(out[r3], RuntimeError)  # reported, and the others still finished
+
+
+def test_resume_waits_for_a_dead_drivers_lease_to_expire(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    naps: list[float] = []
+
+    async def advancing_sleep(s: float) -> None:
+        naps.append(s)
+        clock.now += s
+
+    dead = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    b = make(
+        store,
+        Worker(tmp_path / "b"),
+        owner="b",
+        clock=clock,
+        lease_seconds=10,
+        sleep=advancing_sleep,
+    )
+
+    async def go() -> dict[RunId, Any]:
+        await dead.start(new_run())
+        await dead.step(RID)  # holds the lease, then "dies"
+        return await b.resume_all()
+
+    out = run(go())
+    assert out[RID].run.status is RunStatus.DONE
+    assert sum(naps) == pytest.approx(10)
+
+
+def test_wedge_check_does_not_misfire_on_a_queue_filled_just_now(tmp_path: Path) -> None:
+    store = MemoryStore()
+    api = make(store, object(), owner="api")
+
+    class Racy(LocalDriver):
+        sent = False
+
+        async def step(self, run_id: RunId) -> Any:
+            result = await super().step(run_id)
+            if result == "idle" and not self.sent:
+                self.sent = True  # another writer queues the missing event right after "idle"
+                await api.submit(RID, StepSucceeded(StepKey(RID, "implement", 1), SUBJECT))
+            return result
+
+    w = Worker(tmp_path / "ledger", override=_empty_replay)
+    d = Racy(
+        store,
+        SCOPE,
+        LINEAR_V0,
+        w,
+        owner="me",
+        clock=fixed_clock,
+        new_id=lambda: "r",
+    )
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = run(go())
+    assert rs.run.status is RunStatus.DONE
+
+
+class PagedStore(CountingStore):
+    """Returns at most two items per query, so a caller that ignores the cursor sees too few."""
+
+    def query(self, scope: Any, pk: str, **kw: Any) -> Any:
+        kw["limit"] = 2
+        return super().query(scope, pk, **kw)
+
+
+def test_timeline_and_active_runs_follow_the_cursor(tmp_path: Path) -> None:
+    store = PagedStore(MemoryStore())
+    d = make(store, Worker(tmp_path / "ledger"))
+
+    async def go() -> list[RunId]:
+        for n in (21, 22, 23):
+            await d.start(new_run(_rid(n)))
+        await d.run_until_idle(_rid(21))  # finishes: six events, three pages of two
+        return await d.active_runs()
+
+    assert run(go()) == [_rid(22), _rid(23)]  # the finished run left the index; two pages
+    assert len(d.timeline(_rid(21))) == 6
+
+
+# --- the effects adapter against the real effects service and the fakes -----------------------
+
+
+class Delegate:
+    """An ``EffectHandler`` that forwards to whatever handler the test has put on the world."""
+
+    def __init__(self, world: RealWorld) -> None:
+        self.world = world
+
+    def execute(self, effect: Effect) -> Any:
+        return self.world.handler.execute(effect)
+
+    def poll(self, effect: Effect) -> Any:
+        return self.world.handler.poll(effect)
+
+    def stop(self, effect: Effect) -> Any:
+        return self.world.handler.stop(effect)
+
+    def reconcile(self, effect: Effect) -> Any:
+        return self.world.handler.reconcile(effect)
+
+
+class RealWorld:
+    """Real ``GateService`` and ``EffectExecutor`` over one store, with the fake SCM: the driver
+    runs the real reducer's merge from the review gate to the end."""
+
+    def __init__(self, tmp_path: Path, **fx_args: Any) -> None:
+        self.store = MemoryStore()
+        self.svc = GateService(self.store)
+        self.fx = EffectExecutor(self.store, SCOPE, **fx_args)
+        self.scm = FakeScm()
+        repo = RepoRef("acme", "app")
+        self.scm.seed_branch(repo, "main", "b0")
+        self.scm.seed_branch(repo, "sto/x", "abc", parent="b0")
+        self.pr = PrRef.of(
+            repo, self.scm.ensure_draft_pr(PrSpec(repo, "sto/x", "main", "t", "b"), "k")
+        )
+        self.scm.mark_ready(self.pr, "k2")
+        self.handler: EffectHandler = MergeHandler(
+            self.scm, self.pr, "abc", MergeMethod.SQUASH, SUBJECT
+        )
+        self.live_subject = SUBJECT
+        self.sleeps: list[float] = []
+        self.on_sleep: Callable[[], Any] | None = None
+        self.driver: LocalDriver
+
+        steps = self
+
+        class Others:
+            async def execute(self, key: str, command: object) -> Outcome:
+                if isinstance(command, RunStep):
+                    ev = StepSucceeded(
+                        StepKey(command.run_id, command.stage, command.visit), SUBJECT
+                    )
+                    return Done([ev])
+                if isinstance(command, OpenGate):
+                    steps.svc.open_gate(SCOPE, command)
+                    d = steps.svc.decide(
+                        SCOPE,
+                        run_id=command.run_id,
+                        gate=command.name,
+                        round=command.round,
+                        kind=DecisionKind.APPROVE,
+                        actor="alice",
+                        surface=Surface.UI,
+                        subject_digest=command.subject.digest(),
+                    )
+                    return Done([approve_with(command, d.decision.id)])
+                if isinstance(command, StopRun):
+                    return Done([CancelCompleted(command.run_id)])
+                return Done()
+
+        async def sleep(s: float) -> None:
+            self.sleeps.append(s)
+            if self.on_sleep is not None:
+                await self.on_sleep()
+
+        adapter = EffectsExecutor(
+            self.fx,
+            {"pr.merge": Delegate(self)},
+            lambda cmd: self.live_subject,
+            lambda rid: self.driver.state(rid).run.status,
+            others=Others(),
+            poll_interval=0.5,
+        )
+        self.driver = make(self.store, adapter, sleep=sleep)
+
+    async def start(self) -> RunState:
+        await self.driver.start(new_run())
+        return await self.driver.run_until_idle(RID)
+
+    def effect(self) -> Any:
+        (item,) = [i for i in self.store.query(SCOPE, f"RUN#{RID}", sk_prefix="FX#").items]
+        return from_wire(Effect, item.data["effect"])
+
+
+def approve_with(cmd: OpenGate, decision_id: DecisionId) -> GateClosed:
+    return GateClosed(
+        cmd.run_id, cmd.name, cmd.round, DecisionKind.APPROVE, "alice", decision_id, cmd.subject
+    )
+
+
+def test_adapter_polls_an_accepted_merge_until_it_lands(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+
+    async def land() -> None:
+        w.on_sleep = None
+        w.scm.complete_merge(w.scm.merges()[-1], "m1")
+
+    w.on_sleep = land
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.DONE
+    assert w.effect().status is EffectStatus.CONFIRMED
+    assert w.sleeps == [0.5]
+    assert [e["type"] for e in w.driver.timeline(RID)][-1] == "effect.confirmed"
+
+
+def test_a_stop_between_polls_reaches_the_handler_and_dequeues_the_merge(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+
+    async def stop() -> None:
+        w.on_sleep = None
+        await w.driver.submit(RID, CancelRequested(RID))
+
+    w.on_sleep = stop
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.CANCELLED
+    assert w.effect().status is EffectStatus.VOIDED  # handler.stop dequeued it before the Stop ran
+    assert "effect.confirmed" not in [e["type"] for e in w.driver.timeline(RID)]
+    assert w.scm.merges()  # a merge was requested, and then dequeued by the handler's stop
+
+
+def test_a_blocked_effect_ends_the_run_blocked_not_spinning(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path, max_attempts=2)
+
+    class Flaky:
+        def execute(self, effect: Effect) -> Any:
+            raise TransientError("scm is down")
+
+        poll = stop = reconcile = execute
+
+    w.handler = Flaky()
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.BLOCKED
+    assert w.sleeps == [0.5]  # one retry, then blocked: EffectFailed, not another poll
+    assert w.effect().status is EffectStatus.RETRYING
+
+
+def test_a_failed_effect_without_an_edge_blocks_the_run(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+
+    class Refuses:
+        def execute(self, effect: Effect) -> Any:
+            return Failed(None, "boom")
+
+    w.handler = Refuses()  # type: ignore[assignment]
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.BLOCKED
+    assert w.effect().status is EffectStatus.FAILED
+
+
+def test_a_voided_effect_on_an_active_run_blocks_it(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    w.live_subject = dataclasses.replace(SUBJECT, ticket_revision="edited")  # gate_invalid
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.BLOCKED
+    assert w.effect().status is EffectStatus.VOIDED
+
+
+def test_a_held_merge_returns_held_and_resumes_when_released(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    set_switch(w.store, SCOPE, "effects", True)
+    set_switch(w.store, SCOPE, "merge", False)
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.RUNNING
+    assert w.driver.held(RID) == "held"
+    assert w.sleeps == []  # not polled
+    set_switch(w.store, SCOPE, "merge", True)
+
+    async def land() -> None:
+        w.on_sleep = None
+        w.scm.complete_merge(w.scm.merges()[-1], "m1")
+
+    w.on_sleep = land
+    assert run(w.driver.run_until_idle(RID)).run.status is RunStatus.DONE
+    assert w.driver.held(RID) is None
+
+
 # --- real process kill on SQLite --------------------------------------------------------------
 
 
@@ -750,8 +1120,9 @@ def _child_driver(db: str, ledger: str, auto: bool, hook: Any = None) -> LocalDr
         SCOPE,
         LINEAR_V0,
         Worker(Path(ledger), auto_approve=auto),
-        owner=f"pid{os.getpid()}",
+        owner="child",
         clock=time.time,
+        new_id=lambda: f"{os.getpid()}-{time.time_ns()}",
         lease_seconds=0.4,
         lease_wait=10,
     )
@@ -888,7 +1259,7 @@ def test_driver_loads_handlers_itself() -> None:
 
         rid = RunId.from_parts(1, bytes(10))
         d = LocalDriver(MemoryStore(), TeamScope("t"), LINEAR_V0, Idle(), owner="x",
-                        clock=lambda: 1.0)
+                        clock=lambda: 1.0, new_id=lambda: "1")
 
         async def go():
             await d.start(Run(id=rid, team="t"))

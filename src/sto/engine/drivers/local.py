@@ -17,10 +17,14 @@ A gate waiting for a person is a state with an empty inbox and no pending comman
 goes idle and a restart finds the same thing, without opening the gate again. A run that is
 idle in any other non-final status is stuck, and ``run_until_idle`` raises ``RunWedgedError``.
 
-One driver owns a run at a time, through a lease with an expiry (``owner``, ``clock`` and
-``lease_seconds`` are the caller's: the engine reads no clock of its own). A second driver
-waits up to ``lease_wait`` seconds, then raises ``LeaseHeldError``; a driver that finds the
-lease taken mid-step raises ``LeaseLostError`` and writes nothing. ``submit`` is how other
+One driver owns a run at a time, through a lease with an expiry (``clock``, ``new_id`` and
+``lease_seconds`` are the caller's: the engine reads no clock or randomness of its own, and
+``new_id`` makes every driver instance's owner unique, so a reused label cannot share a lease).
+The lease is renewed while a command executes. A second driver waits up to ``lease_wait``
+seconds, then raises ``LeaseHeldError``; a driver that finds the lease taken mid-step raises
+``LeaseLostError`` and writes nothing. ``resume_all`` runs one task per run and, for a run still
+leased by a dead driver, waits for the lease to expire (up to ``resume_wait``).
+``submit`` is how other
 writers (the API) queue an event; it never touches the lease. A lost version race reloads and
 retries, and both that and ``TransactionConflictError`` back off. Store calls run in threads so
 a busy store does not freeze the event loop.
@@ -35,29 +39,36 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from sto.domain import (
     COMMANDS,
     EVENTS,
+    EffectClass,
+    EffectStatus,
     PermanentError,
     Run,
     RunId,
     RunStatus,
+    Subject,
     TransientError,
     from_wire,
     to_wire,
 )
+from sto.effects.core import EffectExecutor, ExecResult
+from sto.effects.ports import EffectHandler
+from sto.engine.commands import RunEffect
 from sto.engine.drivers.ports import (
     CommandExecutor,
     Done,
     Held,
+    Outcome,
     StillRunning,
     command_key,
 )
-from sto.engine.handlers.core import RunStarted
+from sto.engine.handlers.core import EffectConfirmed, EffectFailed, RunStarted
 from sto.engine.reducer import (
     HandlerRegistry,
     MalformedEventError,
@@ -132,7 +143,6 @@ class _Rec:
     pending: tuple[dict[str, Any], ...]
     next_seq: int
     next_evt: int
-    rejected: tuple[dict[str, Any], ...]
     lease: dict[str, Any] | None
     version: int
 
@@ -143,7 +153,6 @@ class _Rec:
             "pending": list(self.pending),
             "next_seq": self.next_seq,
             "next_evt": self.next_evt,
-            "rejected": list(self.rejected),
             "lease": self.lease,
         }
 
@@ -161,8 +170,10 @@ class LocalDriver:
         *,
         owner: str,
         clock: Callable[[], float],
+        new_id: Callable[[], str],
         lease_seconds: float = 30.0,
         lease_wait: float = 0.0,
+        resume_wait: float | None = None,
         registry: HandlerRegistry | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backoff: float = 0.01,
@@ -170,7 +181,9 @@ class LocalDriver:
         load_handlers()  # before any stored event is decoded (decoding needs the registries)
         self._store, self._scope, self._wf = store, scope, workflow
         self._executor, self._registry = executor, registry
-        self._owner, self._clock = owner, clock
+        self._owner, self._clock = f"{owner}/{new_id()}", clock
+        self._resume_wait = lease_seconds if resume_wait is None else resume_wait
+        self._probed: set[tuple[RunId, str]] = set()
         self._ttl, self._lease_wait = lease_seconds, lease_wait
         self._sleep, self._backoff = sleep, backoff
         self._held: dict[RunId, str] = {}
@@ -192,7 +205,6 @@ class LocalDriver:
             tuple(d["pending"]),
             d["next_seq"],
             d["next_evt"],
-            tuple(d["rejected"]),
             d["lease"],
             item.version,
         )
@@ -287,7 +299,7 @@ class LocalDriver:
 
     async def start(self, run: Run) -> None:
         """Register a QUEUED run; calling it again for a known run does nothing."""
-        rec = _Rec(RunState(run), (encode(RunStarted(run.id), "event"),), (), 0, 0, (), None, 0)
+        rec = _Rec(RunState(run), (encode(RunStarted(run.id), "event"),), (), 0, 0, None, 0)
         delay = self._backoff
         for attempt in range(_RETRIES):
             try:
@@ -312,15 +324,27 @@ class LocalDriver:
         return self._load(run_id).state
 
     def rejected(self, run_id: RunId) -> list[dict[str, Any]]:
-        return list(self._load(run_id).rejected)
+        """Events refused as late or malformed: the timeline entries whose outcome is not
+        ``applied``, each with a ``reason`` (its outcome)."""
+        return [
+            {**e, "reason": e["outcome"]}
+            for e in self.timeline(run_id)
+            if e["outcome"] != "applied"
+        ]
 
     def pending_events(self, run_id: RunId) -> int:
         return len(self._load(run_id).inbox)
 
     def timeline(self, run_id: RunId) -> list[dict[str, Any]]:
         """The run's ``EVT#`` entries in order."""
-        page = self._store.query(self._scope, f"RUN#{run_id}", sk_prefix="EVT#")
-        return [i.data for i in page.items]
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            page = self._store.query(self._scope, f"RUN#{run_id}", sk_prefix="EVT#", cursor=cursor)
+            out += [i.data for i in page.items]
+            cursor = page.cursor
+            if cursor is None:
+                return out
 
     def _active_runs(self) -> list[RunId]:
         ids: list[RunId] = []
@@ -336,6 +360,44 @@ class LocalDriver:
         """Every unfinished run of this team, from the store alone."""
         return await asyncio.to_thread(self._active_runs)
 
+    def _choose(self, rec: _Rec) -> tuple[dict[str, Any], bool]:
+        """The command to run next, and whether this call is a probe.
+
+        A Stop must not wait behind a command that is not finished, so a queued ``StopRun`` goes
+        first. But while the run is CANCELLING, an effect that was already tried is called once
+        before the ``StopRun``, so its handler can stop or reconcile it (a merge in flight must
+        be dequeued, not left to land). D2-11 owns the rest of that race."""
+        run_id = rec.state.run.id
+        if rec.state.run.status is RunStatus.CANCELLING:
+            for c in rec.pending:
+                if c["cmd"]["type"] == "run_effect" and (run_id, c["key"]) not in self._probed:
+                    self._probed.add((run_id, c["key"]))
+                    return c, True
+        stops = [c for c in rec.pending if c["cmd"]["type"] == "stop_run"]
+        return (stops[0] if stops else rec.pending[0]), False
+
+    async def _heartbeat(self, run_id: RunId) -> None:
+        """Renew the lease while a command executes, so a long one does not lose the run."""
+        while True:
+            await asyncio.sleep(self._ttl / 3)
+            await self._commit(run_id, lambda r: (dataclasses.replace(r), ()))
+
+    async def _execute(self, run_id: RunId, head: dict[str, Any]) -> Outcome:
+        work = asyncio.ensure_future(
+            self._executor.execute(head["key"], decode(head["cmd"], "command"))
+        )
+        beat = asyncio.ensure_future(self._heartbeat(run_id))
+        try:
+            await asyncio.wait({work, beat}, return_when=asyncio.FIRST_COMPLETED)
+            if work.done():
+                return work.result()
+            beat.result()  # the heartbeat only ends by failing, e.g. LeaseLostError
+            raise AssertionError("unreachable")  # pragma: no cover
+        finally:
+            for t in (work, beat):
+                t.cancel()
+            await asyncio.gather(work, beat, return_exceptions=True)
+
     async def step(self, run_id: RunId) -> StepResult:
         """One durable unit of work. Queued events come before the next command."""
         rec = await self._aload(run_id)
@@ -349,15 +411,12 @@ class LocalDriver:
             return "worked"
         if not rec.pending:  # another writer finished the work while we claimed
             return "idle"
-        # A Stop must not wait behind a command that is not finished: run it first.
-        stops = [c for c in rec.pending if c["cmd"]["type"] == "stop_run"]
-        head = stops[0] if stops else rec.pending[0]
-        outcome = await self._executor.execute(head["key"], decode(head["cmd"], "command"))
-        if isinstance(outcome, StillRunning):
-            return Waiting(outcome.retry_after)
-        if isinstance(outcome, Held):
-            return outcome
-        assert isinstance(outcome, Done)
+        head, probe = self._choose(rec)
+        outcome = await self._execute(run_id, head)
+        if isinstance(outcome, StillRunning | Held):
+            if probe:
+                return "worked"  # the probe has had its one call; go on to the StopRun
+            return Waiting(outcome.retry_after) if isinstance(outcome, StillRunning) else outcome
         wires = tuple(encode(e, "event") for e in outcome.events)
         await self._commit(run_id, lambda r: self._done(r, head["key"], wires))
         return "worked"
@@ -368,22 +427,26 @@ class LocalDriver:
         any other status."""
         self._held.pop(run_id, None)
         while True:
-            result = await self.step(run_id)
-            if isinstance(result, Held):
-                self._held[run_id] = result.reason
-                break
-            if result == "worked":
-                await asyncio.sleep(0)  # an executor that never suspends must not starve the loop
-            elif isinstance(result, Waiting):
-                await self._sleep(result.retry_after)
-            else:
-                break
-        rec = await self._aload(run_id)
+            while True:
+                result = await self.step(run_id)
+                if isinstance(result, Held):
+                    self._held[run_id] = result.reason
+                    break
+                if result == "worked":
+                    await asyncio.sleep(0)  # a non-suspending executor must not starve the loop
+                elif isinstance(result, Waiting):
+                    await self._sleep(result.retry_after)
+                else:
+                    break
+            rec = await self._aload(run_id)
+            if (rec.inbox or rec.pending) and run_id not in self._held:
+                continue  # another writer queued work since we looked: not idle after all
+            break
         await self._release(run_id)
         rs = rec.state
         status = rs.run.status
         if run_id not in self._held and status not in _IDLE_OK and not status.is_terminal:
-            refused = [r["reason"] for r in rec.rejected]
+            refused = [r["reason"] for r in self.rejected(run_id)]
             raise RunWedgedError(
                 f"run {run_id} is idle in {status.value} at {rs.run.stage!r} with nothing queued"
                 f" (refused events: {refused})"
@@ -394,15 +457,28 @@ class LocalDriver:
         """Why the last ``run_until_idle`` of this run stopped on a held command, if it did."""
         return self._held.get(run_id)
 
-    async def resume_all(self) -> dict[RunId, RunState | RunWedgedError | LeaseHeldError]:
-        """After a restart: drive every unfinished run found in the store. A run that is
-        wedged or leased to a live driver is reported, not allowed to stop the others."""
-        out: dict[RunId, RunState | RunWedgedError | LeaseHeldError] = {}
-        for run_id in await self.active_runs():
+    async def _resume(self, run_id: RunId) -> RunState:
+        waited = 0.0
+        while True:
             try:
-                out[run_id] = await self.run_until_idle(run_id)
-            except (RunWedgedError, LeaseHeldError) as e:
-                out[run_id] = e
+                return await self.run_until_idle(run_id)
+            except LeaseHeldError as held:
+                if waited + held.remaining > self._resume_wait:
+                    raise
+                await self._sleep(held.remaining)  # a dead driver's lease runs out
+                waited += held.remaining
+
+    async def resume_all(self) -> dict[RunId, RunState | Exception]:
+        """After a restart: drive every unfinished run found in the store, one task per run so
+        a run that polls cannot starve another. A run that fails (wedged, leased to a live
+        driver, lease lost, an executor fault) is reported in the result, and the others go on."""
+        ids = await self.active_runs()
+        results = await asyncio.gather(*(self._resume(r) for r in ids), return_exceptions=True)
+        out: dict[RunId, RunState | Exception] = {}
+        for run_id, result in zip(ids, results, strict=True):
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
+                raise result  # cancellation is not a run's failure
+            out[run_id] = result
         return out
 
     # --- one event ----------------------------------------------------------------------------
@@ -435,13 +511,7 @@ class LocalDriver:
             # HandlersNotLoadedError, WorkflowMismatchError) is a fault of this deployment, not
             # a stale event: it propagates and the event stays queued.
             reason = "out_of_order" if isinstance(e, OutOfOrderEventError) else "malformed"
-            refused = {**wire, "reason": reason, "detail": str(e)}
-            nxt = dataclasses.replace(
-                rec,
-                inbox=rest,
-                rejected=(*rec.rejected, refused),
-                next_evt=rec.next_evt + 1,
-            )
+            nxt = dataclasses.replace(rec, inbox=rest, next_evt=rec.next_evt + 1)
             return nxt, entry(reason, rec.state, str(e))
         seq = rec.next_seq
         cmds = tuple(
@@ -467,3 +537,94 @@ class LocalDriver:
         rest = tuple(c for c in rec.pending if c["key"] != key)
         nxt = dataclasses.replace(rec, pending=rest, inbox=(*rec.inbox, *events))
         return nxt, ()
+
+
+# A run in one of these will never act again (the same set the effects service calls dead).
+_DEAD = frozenset(
+    {
+        RunStatus.CANCELLING,
+        RunStatus.CANCELLED,
+        RunStatus.DONE,
+        RunStatus.REJECTED,
+        RunStatus.CLOSED,
+        RunStatus.EXPIRED,
+    }
+)
+
+
+class EffectsExecutor:
+    """The ``CommandExecutor`` for ``RunEffect``: plans the effect (idempotent), runs it through
+    the effects service and maps the result to what the driver understands. Any other command goes
+    to ``others``.
+
+    * ``live`` reads the subject afresh from the ticket and the SCM (the effects service refuses
+      to trust the command's own subject).
+    * ``status_of`` is the run's current status: while CANCELLING an ACCEPTED effect is stopped
+      instead of polled, and an in-flight one is reconciled; a failed or voided effect on a dead
+      run is not reported (nothing is waiting for it).
+
+    Mapping (``blocked`` is checked first, because a blocked effect also has status RETRYING):
+    blocked -> ``EffectFailed``; CONFIRMED -> ``EffectConfirmed`` (with the merge SHA); FAILED or
+    VOIDED -> ``EffectFailed`` while the run is active, ``Done()`` once it is dead; ``held`` ->
+    ``Held``; anything else (in flight, RETRYING, ACCEPTED and unconfirmed, lease lost) ->
+    ``StillRunning``. The effects service runs in a thread, so a slow SCM call does not freeze
+    the loop.
+    """
+
+    def __init__(
+        self,
+        effects: EffectExecutor,
+        handlers: Mapping[str, EffectHandler],
+        live: Callable[[RunEffect], Subject],
+        status_of: Callable[[RunId], RunStatus],
+        *,
+        others: CommandExecutor | None = None,
+        poll_interval: float = 1.0,
+    ) -> None:
+        self._fx, self._handlers, self._live = effects, handlers, live
+        self._status_of, self._others, self._poll = status_of, others, poll_interval
+
+    async def execute(self, key: str, command: object) -> Outcome:
+        if not isinstance(command, RunEffect):
+            if self._others is None:
+                raise TypeError(f"no executor for {type(command).__name__}")
+            return await self._others.execute(key, command)
+        return await asyncio.to_thread(self._run_effect, command)
+
+    def _run_effect(self, cmd: RunEffect) -> Outcome:
+        fx, run_id = self._fx, cmd.run_id
+        planned = fx.plan(
+            run_id,
+            cmd.type,
+            cmd.stage,
+            cmd.visit,
+            EffectClass.GATED,
+            cmd.subject_digest,
+            requires_gates=cmd.requires_gates,
+            subject=cmd.subject,
+        )
+        handler, ikey = self._handlers[cmd.type], planned.idempotency_key
+        dying = self._status_of(run_id) is RunStatus.CANCELLING
+        status = fx.get(run_id, ikey).status
+        if status is EffectStatus.ACCEPTED:
+            result = fx.stop(run_id, ikey, handler) if dying else fx.poll(run_id, ikey, handler)
+        elif dying and status in (EffectStatus.ATTEMPTING, EffectStatus.RETRYING):
+            result = fx.reconcile(run_id, ikey, handler)
+        else:
+            result = fx.execute(run_id, ikey, handler, live=self._live(cmd))
+        return self._map(cmd, result)
+
+    def _map(self, cmd: RunEffect, result: ExecResult) -> Outcome:
+        effect = result.effect
+        failed = EffectFailed(cmd.run_id, cmd.type, cmd.visit)
+        if result.blocked:
+            return Done([failed])
+        if effect.status is EffectStatus.CONFIRMED:
+            merged = effect.frozen_subject.merge_sha if effect.frozen_subject else None
+            return Done([EffectConfirmed(cmd.run_id, cmd.type, cmd.visit, merged)])
+        if effect.status in (EffectStatus.FAILED, EffectStatus.VOIDED):
+            dead = self._status_of(cmd.run_id) in _DEAD
+            return Done() if dead else Done([failed])
+        if result.reason == "held":
+            return Held("held")
+        return StillRunning(self._poll, result.reason or effect.status.value.lower())
