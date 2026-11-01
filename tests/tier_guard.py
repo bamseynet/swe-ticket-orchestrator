@@ -14,7 +14,10 @@
 This is a best-effort guard against accidents, not a security boundary. Known limits, left open
 on purpose: shell keywords as the first word (``if docker ps; then``), ``command -v docker``
 (flagged although it only looks), ``&>file`` redirections glued to a word, and
-``Popen(["docker"], executable="/bin/echo")`` (flagged although it runs echo). Odd input fails
+``Popen(["docker"], executable="/bin/echo")`` (flagged although it runs echo),
+``echo $(x)#b; docker ps`` and ``echo a\\ #b; docker ps`` (``#`` wrongly read as a comment), heredoc
+bodies (read as commands), and an unquoted ``|`` or ``(`` in ``case`` patterns, array
+assignments and ``[[ =~ ]]`` (read as a command separator). Odd input fails
 closed: nesting deeper than ``MAX_DEPTH`` raises ``TierViolationError``.
 
 This sits beside ``hermetic_guard`` and does not change its network and AWS guards.
@@ -130,6 +133,9 @@ def _shell_segments(text: str) -> list[list[str]]:
     i = 0
     while i < len(text):
         ch = text[i]
+        if ch == "\\" and quote != "'" and text.startswith("\n", i + 1):
+            i += 2  # a line continuation joins lines and leaves no trace
+            continue
         if quote:
             if ch == quote:
                 quote = ""

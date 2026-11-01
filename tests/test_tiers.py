@@ -365,6 +365,27 @@ GAPS = {
 }
 
 
+CONTINUATIONS = [
+    "echo hi && \\\n docker ps",
+    "xargs \\\n docker rm",
+    "FOO=1 \\\n docker ps",
+    "sudo \\\n docker ps",
+    'echo hi && "\\\n"docker ps',
+]
+
+
+@pytest.mark.parametrize("command", CONTINUATIONS)
+def test_line_continuation_does_not_hide_docker(tmp_path: Path, command: str) -> None:
+    source = f"""
+        import subprocess
+        def test_gap():
+            subprocess.run({command!r}, shell=True)
+    """
+    result = run_pytest(tmp_path, source)
+    assert result.returncode == 1, result.stdout
+    assert "TierViolationError" in result.stdout
+
+
 @pytest.mark.parametrize("name", sorted(GAPS))
 def test_docker_launch_gap_is_blocked(tmp_path: Path, name: str) -> None:
     body = textwrap.indent(GAPS[name], "    ")
