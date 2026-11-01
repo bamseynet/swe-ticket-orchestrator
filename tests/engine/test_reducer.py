@@ -1,9 +1,13 @@
-"""Reducer v0: purity, ordering, every outcome of the linear two-gate workflow, and the
-registries (a new handler, event or command is added from outside reducer.py/commands.py)."""
+"""Reducer v0: purity, ordering, every outcome of the linear workflow, and the registries (a
+new handler, event or command is added from outside reducer.py/commands.py)."""
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,8 +20,11 @@ from sto.domain import (
     BLOCKED_REASONS,
     COMMANDS,
     EVENTS,
+    DecisionId,
     DecisionKind,
     FailureClass,
+    Gate,
+    GateId,
     GateType,
     PermanentError,
     Run,
@@ -26,267 +33,433 @@ from sto.domain import (
     StepKey,
     Subject,
 )
-from sto.engine.commands import Finish, OpenGate, RunStep, StopRun
+from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep, StopRun
 from sto.engine.handlers.core import (
     CancelCompleted,
     CancelRequested,
+    EffectConfirmed,
     GateClosed,
     RunStarted,
     StepFailed,
     StepSucceeded,
 )
 from sto.engine.reducer import (
+    HANDLERS,
     LINEAR_V0,
     HandlerRegistry,
+    MalformedEventError,
+    Node,
     OutOfOrderEventError,
+    RunState,
     Transition,
     Workflow,
+    WorkflowMismatchError,
     handles,
+    load_handlers,
     next,
 )
 
 RID = RunId.from_parts(1, bytes(10))
 OTHER = RunId.from_parts(2, bytes(10))
-HEAD = Subject(
-    patch_id="p1",
-    ticket_revision="r1",
-    head_sha="abc",
-    evidence_digest="e1",
-    attention_digest="a1",
-)
-PRE = Subject.pre_push(base_sha="base", patch_id="p1", ticket_revision="r1")
+WF = LINEAR_V0
+K = DecisionKind
 
 
-def run(**kw: object) -> Run:
-    return Run(id=RID, team="t", **kw)  # type: ignore[arg-type]
+def subj(sha: str = "abc", ev: str = "e1") -> Subject:
+    return Subject(
+        patch_id="p1",
+        ticket_revision="r1",
+        head_sha=sha,
+        evidence_digest=ev,
+        attention_digest="a1",
+    )
+
+
+REV = subj("abc", "review-evidence")
+QAS = subj("abc", "qa-evidence")
+NEW = subj("def", "new-evidence")
+_ids = iter(range(1, 10_000))
+
+
+def did() -> DecisionId:
+    return DecisionId.from_parts(_ids.__next__(), bytes(10))
 
 
 def key(stage: str, visit: int = 1, attempt: int = 1, rid: RunId = RID) -> StepKey:
     return StepKey(run_id=rid, stage=stage, visit=visit, attempt=attempt)
 
 
-def started() -> Run:
-    return next(run(), RunStarted(RID), LINEAR_V0).state
+def new() -> RunState:
+    return RunState(Run(id=RID, team="t"))
 
 
-def at_gate(name: str) -> Run:
-    """Drive through the workflow to the open gate ``name``."""
-    state = started()
-    for event in _events_until(name):
-        state = next(state, event, LINEAR_V0).state
-    return state
+def step(rs: RunState, event: Any) -> RunState:
+    return next(rs, event, WF).state
 
 
-def _events_until(gate: str) -> list[Any]:
-    out: list[Any] = [StepSucceeded(key("analyse"), subject=PRE)]
-    if gate == "review":
-        return out
-    out += [
-        GateClosed(RID, "review", 1, DecisionKind.APPROVE, "alice"),
-        StepSucceeded(key("implement"), subject=HEAD),
-    ]
-    return out
+def play(*events: Any) -> RunState:
+    rs = new()
+    for e in events:
+        rs = step(rs, e)
+    return rs
 
 
-def test_workflow_is_linear_with_two_gates() -> None:
-    assert [(n.name, n.kind) for n in LINEAR_V0.nodes] == [
-        ("analyse", "step"),
-        ("review", "gate"),
+def close(
+    gate: str,
+    kind: DecisionKind = K.APPROVE,
+    *,
+    round: int = 1,
+    visit: int = 1,
+    subject: Subject | None = None,
+    rid: RunId = RID,
+) -> GateClosed:
+    if subject is None and not kind.is_negative:
+        subject = REV if gate == "review_gate" else QAS
+    return GateClosed(rid, gate, round, visit, kind, "alice", did(), subject)
+
+
+START = RunStarted(RID)
+IMPL = StepSucceeded(key("implement"), REV)
+AT_REVIEW = (START, IMPL)
+REVIEW_OK = close("review_gate")
+QA_OK = StepSucceeded(key("qa"), QAS)
+AT_QA_STEP = (*AT_REVIEW, REVIEW_OK)
+AT_QA_GATE = (*AT_QA_STEP, QA_OK)
+
+
+def test_workflow_order_and_gate_types() -> None:
+    assert [(n.name, n.kind) for n in WF.nodes] == [
         ("implement", "step"),
-        ("qa", "gate"),
+        ("review_gate", "gate"),
+        ("qa", "step"),
+        ("qa_gate", "gate"),
+        ("merge", "effect"),
     ]
+    assert [n.gate_type for n in WF.nodes if n.kind == "gate"] == [GateType.REVIEW, GateType.QA]
+
+
+def test_workflow_rejects_dangling_reentry_and_bad_nodes() -> None:
+    with pytest.raises(ValueError, match="unknown node"):
+        Workflow("x", (Node("a", "step"), Node("g", "gate", gate_type=GateType.QA, on_changes="z")))
+    with pytest.raises(ValueError, match="must be a step"):
+        Workflow(
+            "x",
+            (
+                Node("g", "gate", gate_type=GateType.QA, on_changes="g"),
+                Node("e", "effect", effect="x"),
+            ),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        Workflow("x", (Node("a", "step"), Node("a", "step")))
+    with pytest.raises(ValueError, match="gate_type"):
+        Node("g", "gate")
+    with pytest.raises(ValueError, match="on_changes"):
+        Node("g", "gate", gate_type=GateType.QA, decisions=frozenset({K.REQUEST_CHANGES}))
+    with pytest.raises(ValueError, match="on_retest"):
+        Node("g", "gate", gate_type=GateType.QA, decisions=frozenset({K.RETEST}))
+    with pytest.raises(ValueError, match="effect"):
+        Node("e", "effect")
 
 
 def test_start_runs_first_stage() -> None:
-    t = next(run(), RunStarted(RID), LINEAR_V0)
-    assert t.state.status is RunStatus.RUNNING
-    assert t.state.stage == "analyse"
-    assert t.state.workflow_version == LINEAR_V0.version
-    assert t.state.version == 1
-    assert t.commands == (RunStep(RID, "analyse", visit=1, attempt=1),)
-
-
-def test_step_success_opens_gate() -> None:
-    t = next(started(), StepSucceeded(key("analyse"), subject=PRE), LINEAR_V0)
-    assert t.state.status is RunStatus.WAITING_HUMAN
-    assert t.state.stage == "review"
-    assert t.commands == (OpenGate(RID, "review", GateType.REVIEW, round=1, subject=PRE),)
-
-
-def test_step_success_before_gate_needs_a_subject() -> None:
-    with pytest.raises(OutOfOrderEventError, match="subject"):
-        next(started(), StepSucceeded(key("analyse")), LINEAR_V0)
-
-
-def test_approve_moves_to_next_stage() -> None:
-    t = next(at_gate("review"), GateClosed(RID, "review", 1, DecisionKind.APPROVE, "a"), LINEAR_V0)
-    assert t.state.status is RunStatus.RUNNING
-    assert t.state.stage == "implement"
+    t = next(new(), START, WF)
+    run = t.state.run
+    assert (run.status, run.stage, run.workflow_version, run.version) == (
+        RunStatus.RUNNING,
+        "implement",
+        WF.version,
+        1,
+    )
+    assert (t.state.visit, t.state.attempt) == (1, 1)
     assert t.commands == (RunStep(RID, "implement", visit=1, attempt=1),)
 
 
-def test_waive_is_an_approval() -> None:
-    t = next(at_gate("review"), GateClosed(RID, "review", 1, DecisionKind.WAIVE, "a"), LINEAR_V0)
-    assert t.state.stage == "implement"
+def test_implement_opens_review_gate_with_head_subject() -> None:
+    t = next(play(START), IMPL, WF)
+    assert t.state.run.status is RunStatus.WAITING_HUMAN
+    assert t.state.run.stage == "review_gate"
+    assert t.state.subject == REV
+    assert t.state.round == 1
+    assert t.commands == (OpenGate(RID, "review_gate", GateType.REVIEW, 1, REV),)
 
 
-@pytest.mark.parametrize("kind", [DecisionKind.REQUEST_CHANGES, DecisionKind.RETEST])
-def test_changes_requested_reruns_previous_stage_next_visit(kind: DecisionKind) -> None:
-    t = next(at_gate("review"), GateClosed(RID, "review", 1, kind, "a"), LINEAR_V0)
-    assert t.state.status is RunStatus.RUNNING
-    assert t.state.stage == "analyse"
-    assert t.commands == (RunStep(RID, "analyse", visit=2, attempt=1),)
+def test_every_opened_gate_builds_a_real_domain_gate() -> None:
+    for events, name in ((AT_REVIEW, "review_gate"), (AT_QA_GATE, "qa_gate")):
+        rs = new()
+        cmd: Any = None
+        for e in events:
+            t = next(rs, e, WF)
+            rs, cmd = t.state, (t.commands[0] if t.commands else cmd)
+        assert isinstance(cmd, OpenGate)
+        assert cmd.name == name
+        gate = Gate(
+            id=GateId.from_parts(1, bytes(10)),
+            run_id=cmd.run_id,
+            name=cmd.name,
+            type=cmd.type,
+            round=cmd.round,
+            subject=cmd.subject,
+        )
+        assert gate.is_open
 
 
-def test_second_round_gate_uses_the_visit_as_round() -> None:
-    state = next(
-        at_gate("review"),
-        GateClosed(RID, "review", 1, DecisionKind.REQUEST_CHANGES, "a"),
-        LINEAR_V0,
-    ).state
-    t = next(state, StepSucceeded(key("analyse", visit=2), subject=PRE), LINEAR_V0)
-    assert t.commands == (OpenGate(RID, "review", GateType.REVIEW, round=2, subject=PRE),)
+def test_step_must_report_a_head_subject_for_its_gate() -> None:
+    with pytest.raises(MalformedEventError):
+        next(play(START), StepSucceeded(key("implement")), WF)
+    pre = Subject.pre_push(base_sha="b", patch_id="p", ticket_revision="r")
+    with pytest.raises(MalformedEventError):
+        next(play(START), StepSucceeded(key("implement"), pre), WF)
 
 
-def test_reject_ends_rejected() -> None:
-    t = next(at_gate("review"), GateClosed(RID, "review", 1, DecisionKind.REJECT, "a"), LINEAR_V0)
-    assert t.state.status is RunStatus.REJECTED
+def test_review_approve_goes_to_qa_and_records_the_approval() -> None:
+    event = close("review_gate")
+    t = next(play(*AT_REVIEW), event, WF)
+    assert t.state.run.status is RunStatus.RUNNING
+    assert t.state.run.stage == "qa"
+    assert t.commands == (RunStep(RID, "qa", visit=1, attempt=1),)
+    (approval,) = t.state.approvals
+    assert (approval.gate, approval.round, approval.decision_id) == (
+        "review_gate",
+        1,
+        event.decision_id,
+    )
+    assert approval.subject_digest == REV.digest()
+
+
+def test_review_waive_approves_like_approve() -> None:
+    event = close("review_gate", K.WAIVE)
+    t = next(play(*AT_REVIEW), event, WF)
+    assert t.state.run.stage == "qa"
+    assert t.commands == (RunStep(RID, "qa", visit=1, attempt=1),)
+    assert [a.decision_id for a in t.state.approvals] == [event.decision_id]
+
+
+def test_review_request_changes_reruns_implement_and_voids_approvals() -> None:
+    t = next(play(*AT_REVIEW), close("review_gate", K.REQUEST_CHANGES), WF)
+    assert t.state.run.stage == "implement"
+    assert t.state.run.status is RunStatus.RUNNING
+    assert t.commands == (RunStep(RID, "implement", visit=2, attempt=1),)
+    assert t.state.approvals == ()
+    assert t.state.subject is None
+
+
+def test_review_reject_ends_rejected() -> None:
+    t = next(play(*AT_REVIEW), close("review_gate", K.REJECT), WF)
+    assert t.state.run.status is RunStatus.REJECTED
     assert t.commands == (Finish(RID, RunStatus.REJECTED),)
 
 
-def test_implement_opens_qa_gate_with_head_subject() -> None:
-    state = at_gate("qa")
-    assert state.stage == "qa"
-    assert state.status is RunStatus.WAITING_HUMAN
-    t = next(
-        next(at_gate("review"), _events_until("qa")[1], LINEAR_V0).state,
-        _events_until("qa")[2],
-        LINEAR_V0,
+def test_review_gate_refuses_retest() -> None:
+    with pytest.raises(MalformedEventError, match="retest"):
+        next(play(*AT_REVIEW), close("review_gate", K.RETEST), WF)
+
+
+def test_qa_step_opens_qa_gate() -> None:
+    t = next(play(*AT_QA_STEP), QA_OK, WF)
+    assert t.state.run.status is RunStatus.WAITING_HUMAN
+    assert t.state.run.stage == "qa_gate"
+    assert t.commands == (OpenGate(RID, "qa_gate", GateType.QA, 1, QAS),)
+
+
+def test_qa_step_cannot_report_a_different_sha() -> None:
+    with pytest.raises(OutOfOrderEventError, match="reviewed SHA"):
+        next(play(*AT_QA_STEP), StepSucceeded(key("qa"), NEW), WF)
+
+
+@pytest.mark.parametrize("kind", [K.APPROVE, K.WAIVE])
+def test_qa_approval_plans_the_gated_merge(kind: DecisionKind) -> None:
+    event = close("qa_gate", kind)
+    t = next(play(*AT_QA_GATE), event, WF)
+    review_id = play(*AT_QA_GATE).approvals[0].decision_id
+    assert t.state.run.status is RunStatus.RUNNING
+    assert t.state.run.stage == "merge"
+    assert t.commands == (
+        RunEffect(
+            RID,
+            "pr.merge",
+            "merge",
+            1,
+            QAS,
+            QAS.digest(),
+            ("review_gate", "qa_gate"),
+            (review_id, event.decision_id),
+        ),
     )
-    assert t.commands == (OpenGate(RID, "qa", GateType.QA, round=1, subject=HEAD),)
 
 
-def test_qa_approval_finishes_done() -> None:
-    t = next(at_gate("qa"), GateClosed(RID, "qa", 1, DecisionKind.APPROVE, "a"), LINEAR_V0)
-    assert t.state.status is RunStatus.DONE
+def test_qa_reject_ends_rejected() -> None:
+    t = next(play(*AT_QA_GATE), close("qa_gate", K.REJECT), WF)
+    assert t.state.run.status is RunStatus.REJECTED
+    assert t.commands == (Finish(RID, RunStatus.REJECTED),)
+
+
+def test_qa_request_changes_reruns_implement_then_the_review_gate() -> None:
+    t = next(play(*AT_QA_GATE), close("qa_gate", K.REQUEST_CHANGES), WF)
+    assert t.state.run.stage == "implement"
+    assert t.commands == (RunStep(RID, "implement", visit=2, attempt=1),)
+    assert t.state.approvals == ()
+    again = next(t.state, StepSucceeded(key("implement", 2), NEW), WF)
+    assert again.commands == (OpenGate(RID, "review_gate", GateType.REVIEW, 2, NEW),)
+
+
+def test_qa_retest_reruns_qa_on_the_same_sha_with_a_new_gate() -> None:
+    t = next(play(*AT_QA_GATE), close("qa_gate", K.RETEST), WF)
+    assert t.state.run.stage == "qa"
+    assert t.state.run.status is RunStatus.RUNNING
+    assert t.commands == (RunStep(RID, "qa", visit=2, attempt=1),)
+    assert [a.gate for a in t.state.approvals] == ["review_gate"]  # review approval still stands
+    with pytest.raises(OutOfOrderEventError):  # same SHA only
+        next(t.state, StepSucceeded(key("qa", 2), NEW), WF)
+    g2 = next(t.state, StepSucceeded(key("qa", 2), subj("abc", "qa-2")), WF)
+    assert g2.commands[0].round == 2  # type: ignore[attr-defined]
+    done = next(g2.state, close("qa_gate", round=2, visit=2, subject=subj("abc", "qa-2")), WF)
+    assert done.state.run.stage == "merge"
+
+
+def test_merge_confirmation_finishes_the_run() -> None:
+    rs = play(*AT_QA_GATE, close("qa_gate"))
+    t = next(rs, EffectConfirmed(RID, "pr.merge", 1, "m1"), WF)
+    assert t.state.run.status is RunStatus.DONE
     assert t.commands == (Finish(RID, RunStatus.DONE),)
 
 
-def test_qa_changes_requested_reruns_implement() -> None:
-    t = next(at_gate("qa"), GateClosed(RID, "qa", 1, DecisionKind.REQUEST_CHANGES, "a"), LINEAR_V0)
-    assert t.state.stage == "implement"
-    assert t.commands == (RunStep(RID, "implement", visit=2, attempt=1),)
-
-
 def test_transient_failure_retries_with_next_attempt() -> None:
-    t = next(started(), StepFailed(key("analyse"), FailureClass.TRANSIENT), LINEAR_V0)
-    assert t.state.status is RunStatus.RUNNING
-    assert t.commands == (RunStep(RID, "analyse", visit=1, attempt=2),)
+    t = next(play(START), StepFailed(key("implement"), FailureClass.TRANSIENT), WF)
+    assert t.state.run.status is RunStatus.RUNNING
+    assert t.state.attempt == 2
+    assert t.commands == (RunStep(RID, "implement", visit=1, attempt=2),)
 
 
-def test_transient_failure_blocks_when_attempts_exhausted() -> None:
-    t = next(
-        started(),
-        StepFailed(key("analyse", attempt=LINEAR_V0.max_attempts), FailureClass.TRANSIENT),
-        LINEAR_V0,
-    )
-    assert t.state.status is RunStatus.BLOCKED
-    assert t.state.blocked_reason == "attempts_exhausted"
+def test_transient_failures_exhaust_attempts() -> None:
+    rs = play(START)
+    for attempt in range(1, WF.max_attempts):
+        rs = step(rs, StepFailed(key("implement", attempt=attempt), FailureClass.TRANSIENT))
+    t = next(rs, StepFailed(key("implement", attempt=WF.max_attempts), FailureClass.TRANSIENT), WF)
+    assert t.state.run.status is RunStatus.BLOCKED
+    assert t.state.run.blocked_reason == "attempts_exhausted"
     assert t.commands == ()
 
 
-def test_permanent_failure_blocks_without_retry() -> None:
-    t = next(started(), StepFailed(key("analyse"), FailureClass.PERMANENT), LINEAR_V0)
-    assert t.state.status is RunStatus.BLOCKED
-    assert t.state.blocked_reason == "permanent_failure"
+@pytest.mark.parametrize(
+    ("fc", "reason"),
+    [(FailureClass.PERMANENT, "permanent_failure"), (FailureClass.DEGRADED, "degraded")],
+)
+def test_permanent_and_degraded_failures_block(fc: FailureClass, reason: str) -> None:
+    t = next(play(START), StepFailed(key("implement"), fc), WF)
+    assert (t.state.run.status, t.state.run.blocked_reason) == (RunStatus.BLOCKED, reason)
     assert t.commands == ()
 
 
-def test_degraded_failure_blocks() -> None:
-    t = next(started(), StepFailed(key("analyse"), FailureClass.DEGRADED), LINEAR_V0)
-    assert t.state.blocked_reason == "degraded"
+def test_failure_class_is_coerced_from_its_wire_value() -> None:
+    event = StepFailed(key("implement"), "transient")  # type: ignore[arg-type]
+    assert event.failure_class is FailureClass.TRANSIENT
 
 
-@pytest.mark.parametrize("setup", ["queued", "running", "gate"])
-def test_cancel_stops_the_run(setup: str) -> None:
-    state = {"queued": run(), "running": started(), "gate": at_gate("review")}[setup]
-    t = next(state, CancelRequested(RID), LINEAR_V0)
-    assert t.state.status is RunStatus.CANCELLING
+CANCELLABLE = {
+    "queued": (),
+    "running": (START,),
+    "gate": AT_REVIEW,
+    "blocked": (START, StepFailed(key("implement"), FailureClass.PERMANENT)),
+}
+
+
+@pytest.mark.parametrize("where", list(CANCELLABLE))
+def test_cancel_stops_the_run(where: str) -> None:
+    t = next(play(*CANCELLABLE[where]), CancelRequested(RID), WF)
+    assert t.state.run.status is RunStatus.CANCELLING
     assert t.commands == (StopRun(RID),)
-    done = next(t.state, CancelCompleted(RID), LINEAR_V0)
-    assert done.state.status is RunStatus.CANCELLED
+    done = next(t.state, CancelCompleted(RID), WF)
+    assert done.state.run.status is RunStatus.CANCELLED
     assert done.commands == (Finish(RID, RunStatus.CANCELLED),)
-
-
-def test_cancel_while_cancelling_is_rejected() -> None:
-    state = next(started(), CancelRequested(RID), LINEAR_V0).state
-    with pytest.raises(OutOfOrderEventError):
-        next(state, CancelRequested(RID), LINEAR_V0)
 
 
 # --- out-of-order rejection -------------------------------------------------------------------
 
+RUNNING = play(START)
+GATE1 = play(*AT_REVIEW)
+GATE_R2 = play(
+    *AT_REVIEW, close("review_gate", K.REQUEST_CHANGES), StepSucceeded(key("implement", 2), NEW)
+)
+STEP_V2 = play(*AT_REVIEW, close("review_gate", K.REQUEST_CHANGES))
+RETRIED = play(START, StepFailed(key("implement"), FailureClass.TRANSIENT))
+TERMINAL = play(*AT_REVIEW, close("review_gate", K.REJECT))
+BLOCKED = play(START, StepFailed(key("implement"), FailureClass.PERMANENT))
+MERGING = play(*AT_QA_GATE, close("qa_gate"))
 
-def test_cancel_completed_without_cancelling_is_rejected() -> None:
-    with pytest.raises(OutOfOrderEventError):
-        next(started(), CancelCompleted(RID), LINEAR_V0)
-
-
-OUT_OF_ORDER: list[tuple[str, Run, Any]] = [
-    ("step before start", run(), StepSucceeded(key("analyse"), subject=PRE)),
-    ("start twice", started(), RunStarted(RID)),
-    ("wrong stage", started(), StepSucceeded(key("implement"), subject=HEAD)),
-    ("unknown stage", started(), StepSucceeded(key("nope"), subject=HEAD)),
-    ("gate name as step", started(), StepSucceeded(key("review"), subject=PRE)),
+OUT_OF_ORDER: list[tuple[str, RunState, Any]] = [
+    ("step before start", new(), IMPL),
+    ("start twice", RUNNING, START),
+    ("wrong stage", RUNNING, StepSucceeded(key("qa"), QAS)),
+    ("unknown stage", RUNNING, StepSucceeded(key("nope"), REV)),
+    ("gate name as step", RUNNING, StepSucceeded(key("review_gate"), REV)),
+    ("gate closed while running", RUNNING, close("review_gate")),
+    ("step done while at gate", GATE1, IMPL),
+    ("wrong gate", GATE1, close("qa_gate")),
+    ("other run step", RUNNING, StepSucceeded(key("implement", rid=OTHER), REV)),
+    ("other run gate", GATE1, close("review_gate", rid=OTHER)),
+    ("failure at gate", GATE1, StepFailed(key("implement"), FailureClass.PERMANENT)),
+    # the late and duplicate cases a store CAS cannot catch
+    ("late visit-1 success during visit 2", STEP_V2, StepSucceeded(key("implement", 1), REV)),
+    ("visit 99", RUNNING, StepSucceeded(key("implement", 99), REV)),
     (
-        "gate closed while running",
-        started(),
-        GateClosed(RID, "review", 1, DecisionKind.APPROVE, "a"),
+        "round-1 approve on round-2 gate",
+        GATE_R2,
+        close("review_gate", round=1, visit=2, subject=NEW),
     ),
-    ("step done while at gate", at_gate("review"), StepSucceeded(key("analyse"), subject=PRE)),
-    ("wrong gate", at_gate("review"), GateClosed(RID, "qa", 1, DecisionKind.APPROVE, "a")),
-    ("other run", started(), StepSucceeded(key("analyse", rid=OTHER), subject=PRE)),
+    ("round 99", GATE1, close("review_gate", round=99)),
     (
-        "other run gate",
-        at_gate("review"),
-        GateClosed(OTHER, "review", 1, DecisionKind.APPROVE, "a"),
+        "gate event from an earlier visit",
+        GATE_R2,
+        close("review_gate", round=2, visit=1, subject=NEW),
     ),
-    ("failure at gate", at_gate("review"), StepFailed(key("analyse"), FailureClass.PERMANENT)),
+    (
+        "duplicate failure after retry",
+        RETRIED,
+        StepFailed(key("implement", attempt=1), FailureClass.TRANSIENT),
+    ),
+    (
+        "late attempt-1 success during attempt 2",
+        RETRIED,
+        StepSucceeded(key("implement", attempt=1), REV),
+    ),
+    ("attempt 99", RUNNING, StepFailed(key("implement", attempt=99), FailureClass.TRANSIENT)),
+    ("stale approval subject", GATE1, close("review_gate", subject=NEW)),
+    ("round-1 approve after the gate already moved", MERGING, close("review_gate")),
+    ("effect before its time", RUNNING, EffectConfirmed(RID, "pr.merge", 1)),
+    ("wrong effect", MERGING, EffectConfirmed(RID, "pr.other", 1)),
+    ("stale effect visit", MERGING, EffectConfirmed(RID, "pr.merge", 2)),
+    ("cancel completed without cancelling", RUNNING, CancelCompleted(RID)),
+    ("cancel twice", step(RUNNING, CancelRequested(RID)), CancelRequested(RID)),
+    ("step on blocked run", BLOCKED, IMPL),
+    *[
+        (f"{type(e).__name__} after terminal", TERMINAL, e)
+        for e in (START, CancelRequested(RID), IMPL, close("review_gate"))
+    ],
 ]
 
 
 @pytest.mark.parametrize(
     ("label", "state", "event"), OUT_OF_ORDER, ids=[o[0] for o in OUT_OF_ORDER]
 )
-def test_out_of_order_event_is_rejected(label: str, state: Run, event: Any) -> None:
+def test_out_of_order_event_is_rejected(label: str, state: RunState, event: Any) -> None:
     before = dataclasses.replace(state)
     with pytest.raises(OutOfOrderEventError):
-        next(state, event, LINEAR_V0)
+        next(state, event, WF)
     assert state == before
 
 
-def test_everything_is_rejected_after_a_terminal_status() -> None:
-    state = next(
-        at_gate("review"), GateClosed(RID, "review", 1, DecisionKind.REJECT, "a"), LINEAR_V0
-    ).state
-    for event in (
-        RunStarted(RID),
-        CancelRequested(RID),
-        StepSucceeded(key("analyse"), subject=PRE),
-        GateClosed(RID, "review", 1, DecisionKind.APPROVE, "a"),
-    ):
-        with pytest.raises(OutOfOrderEventError):
-            next(state, event, LINEAR_V0)
+def test_malformed_events_are_not_out_of_order() -> None:
+    for error in (MalformedEventError, OutOfOrderEventError, WorkflowMismatchError):
+        assert issubclass(error, PermanentError)
+    assert not issubclass(MalformedEventError, OutOfOrderEventError)
+    with pytest.raises(MalformedEventError, match="subject"):
+        next(GATE1, GateClosed(RID, "review_gate", 1, 1, K.APPROVE, "a", did(), None), WF)
 
 
-def test_blocked_run_rejects_progress_events() -> None:
-    state = next(started(), StepFailed(key("analyse"), FailureClass.PERMANENT), LINEAR_V0).state
-    with pytest.raises(OutOfOrderEventError):
-        next(state, StepSucceeded(key("analyse"), subject=PRE), LINEAR_V0)
-
-
-def test_out_of_order_is_a_permanent_error() -> None:
-    assert issubclass(OutOfOrderEventError, PermanentError)
+def test_workflow_version_must_match() -> None:
+    other = Workflow("other", WF.nodes)
+    with pytest.raises(WorkflowMismatchError):
+        next(RUNNING, StepSucceeded(key("implement"), REV), other)
 
 
 def test_unregistered_event_type_is_rejected() -> None:
@@ -295,79 +468,101 @@ def test_unregistered_event_type_is_rejected() -> None:
         run_id: RunId
 
     with pytest.raises(OutOfOrderEventError, match="no handler"):
-        next(started(), Stray(RID), LINEAR_V0)
+        next(RUNNING, Stray(RID), WF)
 
 
 # --- determinism ------------------------------------------------------------------------------
 
 
 def test_same_input_gives_same_output() -> None:
-    state, event = started(), StepSucceeded(key("analyse"), subject=PRE)
-    first = next(state, event, LINEAR_V0)
+    first = next(RUNNING, IMPL, WF)
     for _ in range(5):
-        assert next(state, event, LINEAR_V0) == first
-    assert state == started()  # input untouched
+        assert next(RUNNING, IMPL, WF) == first
+    assert play(START) == RUNNING  # input untouched
 
 
-def _all_events() -> list[Any]:
-    return [
-        RunStarted(RID),
-        StepSucceeded(key("analyse"), subject=PRE),
-        StepSucceeded(key("implement"), subject=HEAD),
-        StepFailed(key("analyse"), FailureClass.TRANSIENT),
-        StepFailed(key("analyse"), FailureClass.PERMANENT),
-        GateClosed(RID, "review", 1, DecisionKind.APPROVE, "a"),
-        GateClosed(RID, "review", 1, DecisionKind.REQUEST_CHANGES, "a"),
-        GateClosed(RID, "qa", 1, DecisionKind.APPROVE, "a"),
-        CancelRequested(RID),
-        CancelCompleted(RID),
-    ]
+def test_version_counts_accepted_events_only() -> None:
+    assert RUNNING.run.version == 1
+    with pytest.raises(OutOfOrderEventError):
+        next(RUNNING, START, WF)
+    assert step(RUNNING, IMPL).run.version == 2
 
 
-def _replay(events: list[Any]) -> list[tuple[Run, tuple[object, ...]] | str]:
-    state = run()
-    out: list[tuple[Run, tuple[object, ...]] | str] = []
+_EVENTS: list[Any] = [
+    START,
+    IMPL,
+    QA_OK,
+    StepFailed(key("implement"), FailureClass.TRANSIENT),
+    StepFailed(key("implement"), FailureClass.PERMANENT),
+    REVIEW_OK,
+    close("review_gate", K.REQUEST_CHANGES),
+    close("qa_gate"),
+    close("qa_gate", K.RETEST),
+    EffectConfirmed(RID, "pr.merge", 1),
+    CancelRequested(RID),
+    CancelCompleted(RID),
+]
+
+
+def _replay(events: list[Any]) -> list[Any]:
+    rs = new()
+    out: list[Any] = []
     for e in events:
         try:
-            t = next(state, e, LINEAR_V0)
-        except OutOfOrderEventError as exc:
+            t = next(rs, e, WF)
+        except (OutOfOrderEventError, MalformedEventError) as exc:
             out.append(str(exc))
             continue
-        state = t.state
+        rs = t.state
         out.append((t.state, t.commands))
     return out
 
 
-@given(st.lists(st.sampled_from(_all_events()), max_size=12))
-def test_replay_is_deterministic_and_state_stays_valid(events: list[Any]) -> None:
+@given(st.lists(st.sampled_from(_EVENTS), max_size=14))
+def test_replay_is_deterministic_and_never_corrupts_state(events: list[Any]) -> None:
     assert _replay(events) == _replay(events)
-    state = run()
+    rs = new()
     for e in events:
         try:
-            state = next(state, e, LINEAR_V0).state
-        except OutOfOrderEventError:
+            rs = next(rs, e, WF).state
+        except (OutOfOrderEventError, MalformedEventError):
             continue
-        assert state.version >= 0
-        assert state.status is not RunStatus.QUEUED
+        assert rs.run.status is not RunStatus.QUEUED
+        assert rs.run.stage in {None, *(n.name for n in WF.nodes)}
 
 
-def test_version_counts_accepted_events_only() -> None:
-    state = started()
-    assert state.version == 1
-    with pytest.raises(OutOfOrderEventError):
-        next(state, RunStarted(RID), LINEAR_V0)
-    state = next(state, StepSucceeded(key("analyse"), subject=PRE), LINEAR_V0).state
-    assert state.version == 2
+ENGINE = Path(__file__).resolve().parents[2] / "src" / "sto" / "engine"
+IMPURE_MODULES = {"time", "random", "os", "datetime", "uuid", "secrets", "socket", "subprocess"}
+IMPURE_CALLS = {"now", "utcnow", "urandom", "uuid4", "getenv", "time", "random"}
 
 
-def test_reducer_module_is_pure() -> None:
-    import sto.engine.handlers.core as core
-    import sto.engine.reducer as reducer
+@pytest.mark.parametrize("path", sorted(ENGINE.rglob("*.py")), ids=lambda p: p.name)
+def test_engine_modules_are_pure(path: Path) -> None:
+    """No clock, randomness or environment; ``Ulid.new`` is the impure ID constructor."""
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods = {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            mods = {(node.module or "").split(".")[0]}
+        else:
+            mods = set()
+        assert not mods & IMPURE_MODULES, f"{path.name} imports {mods & IMPURE_MODULES}"
+        if isinstance(node, ast.Attribute):
+            assert node.attr not in IMPURE_CALLS, f"{path.name} uses .{node.attr}"
+            if node.attr == "new" and isinstance(node.value, ast.Name):
+                assert node.value.id != "Ulid", f"{path.name} calls Ulid.new"
 
-    for mod in (reducer, core):
-        src = Path(mod.__file__ or "").read_text()
-        for banned in ("import time", "import random", "import os", "datetime", "Ulid.new", "uuid"):
-            assert banned not in src, f"{mod.__name__} uses {banned}"
+
+def test_next_does_no_import_io() -> None:
+    tree = ast.parse((ENGINE / "reducer.py").read_text())
+    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "next"]
+    calls = {
+        c.func.attr
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+    }
+    assert not calls & {"import_module", "iter_modules"}
 
 
 # --- registries -------------------------------------------------------------------------------
@@ -375,18 +570,17 @@ def test_reducer_module_is_pure() -> None:
 
 def test_core_names_are_registered() -> None:
     for name in (
-        "run.started", "step.succeeded", "step.failed", "gate.closed",
+        "run.started", "step.succeeded", "step.failed", "gate.closed", "effect.confirmed",
         "cancel.requested", "cancel.completed",
     ):  # fmt: skip
         assert name in EVENTS
-    for name in ("run_step", "open_gate", "stop_run", "finish"):
+    for name in ("run_step", "open_gate", "run_effect", "stop_run", "finish"):
         assert name in COMMANDS
     for name in ("attempts_exhausted", "permanent_failure", "degraded"):
         assert name in BLOCKED_REASONS
 
 
 def test_new_event_handler_and_command_register_from_outside() -> None:
-    """A later module adds an event, a command, a blocked reason and a handler on its own."""
     reg = HandlerRegistry()
 
     @COMMANDS.register("test.reducer_ping")
@@ -400,13 +594,12 @@ def test_new_event_handler_and_command_register_from_outside() -> None:
         run_id: RunId
 
     @handles(Pinged, registry=reg)
-    def on_pinged(state: Run, event: Pinged, workflow: Workflow) -> Transition:
+    def on_pinged(state: RunState, event: Pinged, workflow: Workflow) -> Transition:
         return Transition(state, (Ping(event.run_id),))
 
-    state = started()
-    assert next(state, Pinged(RID), LINEAR_V0, registry=reg) == Transition(state, (Ping(RID),))
+    assert next(RUNNING, Pinged(RID), WF, registry=reg) == Transition(RUNNING, (Ping(RID),))
     with pytest.raises(OutOfOrderEventError):  # the default registry never saw it
-        next(state, Pinged(RID), LINEAR_V0)
+        next(RUNNING, Pinged(RID), WF)
 
 
 def test_registry_refuses_a_second_handler_for_one_event() -> None:
@@ -417,27 +610,99 @@ def test_registry_refuses_a_second_handler_for_one_event() -> None:
         run_id: RunId
 
     @handles(E, registry=reg)
-    def one(state: Run, event: E, workflow: Workflow) -> Transition:
+    def one(state: RunState, event: E, workflow: Workflow) -> Transition:
         return Transition(state, ())
 
     with pytest.raises(ValueError, match="already"):
 
         @handles(E, registry=reg)
-        def two(state: Run, event: E, workflow: Workflow) -> Transition:
+        def two(state: RunState, event: E, workflow: Workflow) -> Transition:
             return Transition(state, ())
 
 
-def test_handler_modules_are_discovered(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A new file under engine/handlers/ is loaded without editing reducer.py."""
-    import importlib
-    import pkgutil
+def test_load_handlers_loads_a_new_file_without_editing_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pkg = tmp_path / "newhandlers"
+    pkg.mkdir()
+    (pkg / "extra.py").write_text(
+        textwrap.dedent(
+            """
+            from dataclasses import dataclass
+            from sto.engine.reducer import Transition, handles
 
-    import sto.engine.handlers as pkg
+            @dataclass(frozen=True)
+            class Extra:
+                run_id: object
 
-    names = {m.name for m in pkgutil.iter_modules(pkg.__path__)}
-    assert "core" in names
-    assert importlib.import_module("sto.engine.handlers.core")
+            @handles(Extra)
+            def on_extra(state, event, workflow):
+                return Transition(state, ())
+            """
+        )
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    load_handlers("newhandlers")
+    extra = sys.modules["newhandlers.extra"]
+    assert HANDLERS.get(extra.Extra) is extra.on_extra
+    load_handlers("newhandlers")  # idempotent: a second call does not re-register
 
 
-def test_failure_class_is_coerced_from_its_wire_value() -> None:
-    assert StepFailed(key("analyse"), "transient").failure_class is FailureClass.TRANSIENT  # type: ignore[arg-type]
+def test_load_handlers_is_what_registers_the_core_handlers() -> None:
+    """In a fresh interpreter nothing is registered until load_handlers() runs."""
+    src = str(ENGINE.parents[1])
+    code = textwrap.dedent(
+        """
+        import sys
+        from sto.engine.reducer import HANDLERS, load_handlers
+        assert 'sto.engine.handlers.core' not in sys.modules
+        load_handlers()
+        from sto.engine.handlers.core import GateClosed
+        assert HANDLERS.get(GateClosed) is not None
+        """
+    )
+    subprocess.run([sys.executable, "-I", "-c", code], check=True, env={"PYTHONPATH": src})
+
+
+# --- workflow shapes the default one never exercises --------------------------------------------
+
+
+def _one(*nodes: Node) -> Workflow:
+    return Workflow("shape", nodes)
+
+
+def test_a_workflow_that_ends_on_a_step_has_nothing_to_follow() -> None:
+    wf = _one(Node("a", "step"))
+    rs = next(new(), START, wf).state
+    with pytest.raises(OutOfOrderEventError, match="nothing follows"):
+        next(rs, StepSucceeded(key("a")), wf)
+
+
+def test_an_effect_with_no_approved_subject_is_refused() -> None:
+    wf = _one(Node("a", "step"), Node("e", "effect", effect="x"))
+    rs = next(new(), START, wf).state
+    with pytest.raises(OutOfOrderEventError, match="no approved subject"):
+        next(rs, StepSucceeded(key("a")), wf)
+
+
+def test_an_effect_lacking_a_required_approval_is_refused() -> None:
+    wf = _one(
+        Node("a", "step"),
+        Node("g", "gate", gate_type=GateType.QA, decisions=frozenset({K.APPROVE})),
+        Node("e", "effect", effect="x", requires_gates=("a",)),
+    )
+    rs = next(new(), START, wf).state
+    rs = next(rs, StepSucceeded(key("a"), REV), wf).state
+    with pytest.raises(OutOfOrderEventError, match="lacks approval"):
+        next(rs, close("g", subject=REV), wf)
+
+
+def test_a_gate_cannot_be_entered_without_a_subject() -> None:
+    wf = _one(Node("g", "gate", gate_type=GateType.QA))
+    with pytest.raises(MalformedEventError, match="head subject"):
+        next(new(), START, wf)
+
+
+def test_unknown_node_is_out_of_order() -> None:
+    with pytest.raises(OutOfOrderEventError, match="unknown node"):
+        WF.node("ghost")
