@@ -101,23 +101,29 @@ def test_concurrent_transactions_on_one_item_really_conflict_and_say_so(env: Env
     """Nothing serializes calls here (``serialize=False``), so DynamoDB itself must refuse some
     overlapping transactions. Each refusal must surface as a plain TransactionConflictError: not a
     lost condition (no condition is set), and not an unknown outcome (nothing was applied)."""
-    team, key = TeamScope("team-a"), Key("HOT", "ITEM")
-    env.store.put(team, key, {"n": 0})
+    team = TeamScope("team-a")
+    keys = [Key("HOT", f"ITEM#{i}") for i in range(3)]
+    for k in keys:
+        env.store.put(team, k, {"n": 0})
     conflicts: list[BaseException] = []
     other: list[BaseException] = []
-    barrier = threading.Barrier(8)
+    threads = 32
+    barrier = threading.Barrier(threads)
 
     def hammer(n: int) -> None:
         barrier.wait()
-        for i in range(60):
+        for i in range(150):
+            # Overlapping item sets in different orders, so transactions contend on several items.
+            chosen = keys[n % 3 :] + keys[: n % 3]
+            ops = [Put(k, {"n": n, "i": i}) for k in chosen[: 2 + (i % 2)]]
             try:
-                env.store.transact(team, [Put(key, {"n": n, "i": i})])
+                env.store.transact(team, ops)
             except TransactionConflictError as exc:
                 conflicts.append(exc)
             except BaseException as exc:
                 other.append(exc)
 
-    pool = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+    pool = [threading.Thread(target=hammer, args=(n,)) for n in range(threads)]
     for t in pool:
         t.start()
     for t in pool:
