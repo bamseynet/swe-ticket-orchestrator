@@ -412,9 +412,11 @@ def test_main_requires_environment_without_injected_api(
     assert "GITHUB_TOKEN" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("path", [".github/workflows/scope.yml", "scripts/check_scope.py"])
-def test_check_machinery_is_editable_only_by_d0_10(path: str) -> None:
-    # Even an issue whose STAGES entry declares the file cannot touch the check itself.
+GUARDED = [".github/workflows/scope.yml", "scripts/check_scope.py"]
+
+
+@pytest.mark.parametrize("path", GUARDED)
+def test_check_machinery_cannot_be_edited_even_when_declared(path: str) -> None:
     stages = STAGES + f"\n#### D0-12: Declares it\n**Run:** serial. **Files:** `{path}`.\n"
     api = FakeApi(
         body="Closes #12",
@@ -424,14 +426,31 @@ def test_check_machinery_is_editable_only_by_d0_10(path: str) -> None:
         stages=stages,
     )
     r = run(api)
-    assert any("D0-10" in e and path in e and "#12" in e for e in r.errors)
+    assert any(path in e and "#12" in e for e in r.errors)
 
 
-def test_check_machinery_editable_by_d0_10_itself() -> None:
-    api = FakeApi(files=[".github/workflows/scope.yml", "scripts/check_scope.py"])
-    stages = STAGES.replace("`.github/workflows/ci.yml`.", "`.github/workflows/scope.yml`.", 1)
-    api.stages = stages
-    assert run(api).errors == []
+@pytest.mark.parametrize("path", GUARDED)
+def test_fake_d0_10_issue_cannot_unlock_the_check_machinery(path: str) -> None:
+    # A new open issue titled [D0-10] plus a matching PR title resolves to the real D0-10
+    # declaration, which lists the file. There is no D0-10 exception, so it still fails.
+    api = FakeApi(
+        body="Closes #99",
+        title="[D0-10] Declared-files check",
+        issues={99: issue("[D0-10] Declared-files check")},
+        files=[path],
+    )
+    r = run(api)
+    assert any(path in e for e in r.errors)
+
+
+@pytest.mark.parametrize("path", GUARDED)
+def test_check_machinery_edit_needs_a_listed_humans_override(path: str) -> None:
+    labelled = {"labels": ["scope-override"]}
+    by_human = FakeApi(files=[path], events=[ev("labeled", "peter")], **labelled)
+    assert run(by_human).errors == []
+    by_worker = FakeApi(files=[path], events=[ev("labeled", "worker")], **labelled)
+    assert run(by_worker).errors
+    assert cs.check(by_human).errors  # empty actor list: nobody can override
 
 
 # ---------------------------------------------------------------- workflow and ruleset

@@ -9,8 +9,10 @@
 # checks out or runs PR code: it checks out the BASE commit, reads the changed-file list through
 # the API, has a read-only token and no secrets. Never add a checkout of the PR head ref or sha.
 # Declared files come from docs/STAGES.md at the base commit, read through the API. Because the
-# base copy runs, a PR that adds or edits this file is not checked by its own version. Override actors: repo variable SCOPE_OVERRIDE_ACTORS
-# (comma-separated logins; empty means no override is possible).
+# base copy runs, a PR that edits this file or scripts/check_scope.py is not checked by its own
+# version; the script fails any such PR unless a listed human applied the override label.
+# Override actors: repo variable SCOPE_OVERRIDE_ACTORS (comma-separated logins; empty means no
+# override is possible).
 name: Scope
 
 on:
