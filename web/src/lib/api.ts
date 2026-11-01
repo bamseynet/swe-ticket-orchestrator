@@ -34,6 +34,11 @@ export interface Gate {
 }
 export type DecisionKind = "approve" | "request_changes" | "reject";
 
+export interface StopOption {
+  method: string;
+  href: string;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -41,20 +46,34 @@ export class ApiError extends Error {
     message: string,
     readonly closedBy: string | null = null,
     readonly gateStatus: string | null = null,
+    /** The 503 `delivery_failed` case: the decision is stored, only its delivery to the run failed. */
+    readonly decisionRecorded = false,
+    /** Present when the API offers Stop (a decision on a gate whose run can still be stopped). */
+    readonly stop: StopOption | null = null,
   ) {
     super(message);
   }
 }
 
+export const TIMEOUT_MS = 10_000;
+const enc = encodeURIComponent;
+
 async function call<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   const headers = new Headers({ Authorization: `Bearer ${TOKEN}` });
-  const init: RequestInit = { method, headers };
+  const init: RequestInit = { method, headers, signal: AbortSignal.timeout(TIMEOUT_MS) };
   if (body !== undefined) {
     headers.set("Content-Type", "application/json");
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(BASE + path, init);
-  const text = await res.text();
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch(BASE + path, init);
+    text = await res.text();
+  } catch {
+    // offline, refused, or no answer within the timeout: say so instead of hanging
+    throw new ApiError(0, "network", "could not reach the server (no answer in time)");
+  }
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -63,28 +82,32 @@ async function call<T>(path: string, method = "GET", body?: unknown): Promise<T>
   }
   if (!res.ok) {
     const e = (json as { error?: Record<string, unknown> } | undefined)?.error;
+    const stop = e?.["stop"] as Partial<StopOption> | undefined;
     throw new ApiError(
       res.status,
       typeof e?.["code"] === "string" ? e["code"] : `http_${String(res.status)}`,
       typeof e?.["message"] === "string" ? e["message"] : `the server answered ${String(res.status)}`,
       typeof e?.["closed_by"] === "string" ? e["closed_by"] : null,
       typeof e?.["status"] === "string" ? e["status"] : null,
+      e?.["decision_recorded"] === true,
+      typeof stop?.href === "string" ? { method: stop.method ?? "POST", href: stop.href } : null,
     );
   }
   return json as T;
 }
 
-export const listRuns = () => call<{ runs: Run[]; cursor: string | null }>("/runs?limit=50");
+export const listRuns = (cursor: string | null = null) =>
+  call<{ runs: Run[]; cursor: string | null }>(
+    `/runs?limit=50${cursor ? `&cursor=${enc(cursor)}` : ""}`,
+  );
 export const startRun = (ticket: string) => call<Run>("/runs", "POST", { ticket });
-export const getRun = (id: string) => call<Run>(`/runs/${encodeURIComponent(id)}`);
-export const listGates = (id: string) =>
-  call<{ gates: Gate[] }>(`/runs/${encodeURIComponent(id)}/gates`);
+export const getRun = (id: string) => call<Run>(`/runs/${enc(id)}`);
+export const listGates = (id: string) => call<{ gates: Gate[] }>(`/runs/${enc(id)}/gates`);
 export const listEvents = (id: string, after: string | null) =>
   call<{ events: RunEvent[]; cursor: string | null }>(
-    `/runs/${encodeURIComponent(id)}/events?limit=500${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+    `/runs/${enc(id)}/events?limit=500${after ? `&after=${enc(after)}` : ""}`,
   );
-export const stopRun = (id: string) =>
-  call<{ accepted: boolean }>(`/runs/${encodeURIComponent(id)}/cancel`, "POST");
+export const stopRun = (id: string) => call<{ accepted: boolean }>(`/runs/${enc(id)}/cancel`, "POST");
 export const decide = (
   run: string,
   name: string,
@@ -94,7 +117,7 @@ export const decide = (
   comment: string,
 ) =>
   call<{ decision_id: string; gate: Gate }>(
-    `/runs/${encodeURIComponent(run)}/gates/${encodeURIComponent(name)}/${String(round)}/decisions`,
+    `/runs/${enc(run)}/gates/${enc(name)}/${String(round)}/decisions`,
     "POST",
     { kind, subject_digest: subjectDigest, comment },
   );

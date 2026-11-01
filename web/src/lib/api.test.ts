@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { ApiError, decide, listRuns } from "./api";
+import { ApiError, TIMEOUT_MS, decide, listRuns } from "./api";
 
 function reply(status: number, body: unknown): void {
   vi.stubGlobal(
@@ -41,4 +41,34 @@ it("survives a non-JSON failure (a proxy error page)", async () => {
   );
   const err = await listRuns().catch((e: unknown) => e);
   expect(err).toMatchObject({ status: 502, code: "http_502" });
+});
+
+it("keeps decision_recorded and the Stop option of an error", async () => {
+  reply(503, { error: { code: "delivery_failed", message: "m", decision_recorded: true } });
+  expect(await decide("R", "g", 1, "approve", "d", "").catch((e: unknown) => e)).toMatchObject({
+    status: 503, decisionRecorded: true, stop: null,
+  });
+  reply(409, { error: { code: "gate_closed", message: "m", stop: { method: "POST", href: "/runs/R/cancel" } } });
+  expect(await decide("R", "g", 1, "reject", "", "x").catch((e: unknown) => e)).toMatchObject({
+    decisionRecorded: false, stop: { href: "/runs/R/cancel" },
+  });
+});
+
+it("puts a timeout on every request, and a hung or failed one is an ApiError", async () => {
+  const spy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort());
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((_url: string, init: RequestInit) =>
+      init.signal?.aborted ? Promise.reject(new Error("aborted")) : new Promise<Response>(() => undefined),
+    ),
+  );
+  expect(await listRuns().catch((e: unknown) => e)).toMatchObject({ status: 0, code: "network" });
+  expect(spy).toHaveBeenCalledWith(TIMEOUT_MS);
+  spy.mockRestore();
+});
+
+it("sends the cursor, encoded", async () => {
+  reply(200, { runs: [], cursor: null });
+  await listRuns("a b");
+  expect(vi.mocked(fetch).mock.calls[0]?.[0]).toBe("/api/runs?limit=50&cursor=a%20b");
 });

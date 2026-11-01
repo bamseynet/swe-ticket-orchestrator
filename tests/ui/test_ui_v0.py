@@ -1,16 +1,19 @@
 """UI v0 (D1-09) in a real browser, against the real local API (no mocks).
 
-CI's ``ui-browser`` job runs this. It builds nothing special: ``vite preview`` serves the built
-bundle and forwards ``/api`` to the API (the same proxy ``make dev`` uses), the API is the
+CI's ``ui-browser`` job runs this. The job has no web setup of its own, so the test installs the
+web dependencies when they are missing (``npm ci``) and builds the bundle itself. ``vite preview``
+then serves it and forwards ``/api`` to the API (the same proxy ``make dev`` uses), the API is the
 ``build_local`` stack over a temporary SQLite file, and Playwright drives Chromium through the
-demo. Every subprocess and wait has a hard timeout.
+demo, including a Request changes that opens round 2. Every subprocess and wait has a timeout.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -59,6 +62,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
+    web_log = tmp_path / "preview.log"
     web = subprocess.Popen(  # noqa: S603 - fixed argv
         [
             "npx",
@@ -74,8 +78,9 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
         ],
         cwd=WEB,
         env={**node_env, "STO_API_PORT": str(api_port)},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=web_log.open("w"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # npx starts node: stop the whole group, not just npx
     )
     try:
         deadline = time.monotonic() + 30
@@ -89,14 +94,20 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
             except OSError:
                 time.sleep(0.2)
         else:
-            raise AssertionError("the web preview or the API did not come up in 30s")
+            raise AssertionError(
+                f"the web preview or the API did not come up in 30s; preview said:\n"
+                f"{web_log.read_text()[-2000:]}"
+            )
         yield f"http://127.0.0.1:{web_port}"
     finally:
-        web.terminate()
-        try:
-            web.wait(10)
-        except subprocess.TimeoutExpired:
-            web.kill()
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(web.pid, sig)
+            try:
+                web.wait(10)
+                break
+            except subprocess.TimeoutExpired:
+                continue
         server.should_exit = True
         thread.join(10)
         shutil.rmtree(tmp_path / "dist", ignore_errors=True)
@@ -117,7 +128,7 @@ def test_person_completes_the_demo_in_a_browser(stack: str) -> None:
             expect(page.get_by_test_id("simulated-banner")).to_contain_text("simulated")
 
             page.get_by_role("button", name="Start a run").click()
-            page.locator("li a").first.click()
+            page.wait_for_url("**/runs/*")  # Start goes to the new run
             page.get_by_role("link", name="review_gate round 1").click(timeout=LONG)
 
             # A required comment is enforced: nothing is sent, the gate stays open.
@@ -125,19 +136,30 @@ def test_person_completes_the_demo_in_a_browser(stack: str) -> None:
             expect(page.get_by_role("alert")).to_contain_text("comment is required")
             expect(page.get_by_test_id("gate-status")).to_have_text("OPEN")
 
-            page.get_by_role("button", name="Approve").click()
+            # Request changes (with its comment) closes round 1 and opens round 2.
+            page.get_by_label("Comment").fill("please redo")
+            page.get_by_role("button", name="Request changes").click()
+            expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
             # A closed gate shows who closed it, and offers no decision any more.
-            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev", timeout=LONG)
+            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
             expect(page.get_by_role("button", name="Approve")).to_have_count(0)
+
+            page.get_by_role("link", name="Back to run").click()
+            page.get_by_role("link", name="review_gate round 2").click(timeout=LONG)
+            expect(page.get_by_test_id("gate-status")).to_have_text("OPEN")
+            page.get_by_role("button", name="Approve").click()
+            expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
+            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
 
             page.get_by_role("link", name="Back to run").click()
             page.get_by_role("link", name="qa_gate round 1").click(timeout=LONG)
             page.get_by_label("Comment").fill("fine")
             page.get_by_role("button", name="Approve").click()
-            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev", timeout=LONG)
+            expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
+            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
 
             page.get_by_role("link", name="Back to run").click()
-            expect(page.get_by_text("gate.closed").first).to_be_visible(timeout=LONG)
-            expect(page.get_by_text("DONE", exact=False).first).to_be_visible(timeout=LONG)
+            expect(page.get_by_test_id("run-status")).to_have_text("DONE", timeout=LONG)
+            expect(page.get_by_text("gate.closed").first).to_be_visible()
         finally:
             browser.close()
