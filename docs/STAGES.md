@@ -296,7 +296,7 @@ A gated effect refuses to run without a live approval, and reports only what a r
 FastAPI with runs, events by cursor, gates and decisions, using a dev token.
 Everything is asynchronous, and no request holds work open.
 **AC:** OpenAPI is generated; a decision returns `409` when closed; events resume from a cursor; dev auth refuses to start outside local mode.
-**Deps:** D1-03, D1-06, D1-07. **Size:** M. **Run:** serial. **Files:** `src/sto/api/app.py`, `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `tests/api/test_v0.py`.
+**Deps:** D1-03, D1-06, D1-07. **Size:** M. **Run:** serial. **Files:** `src/sto/api/__init__.py`, `src/sto/api/app.py`, `src/sto/api/runtime.py`, `src/sto/api/routers/__init__.py`, `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `tests/api/test_v0.py`.
 
 #### D1-09: UI v0
 Run list, timeline and one gate page with Approve, Request changes and Reject.
@@ -409,11 +409,13 @@ This is the most dangerous logic in the product, and it implements invariant G13
 #### D2-10: Failure classes and retry
 Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt. This issue owns a person's Retry of a blocked effect: it writes the audit record and calls `EffectExecutor.retry_blocked` (D1-07 has no caller for it).
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
+Carried from D1-03: the local driver retries a persistent `TransientError` with capped backoff but no limit on total time, so cap it, and classify permanent errors that arrive as transient.
 **AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited.
 **Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
 
 #### D2-11: Cancel v1
 Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert. To tell that a merge landed, add a read-only `find_merge(pr)` to `ScmProvider` and the fake, since D1-07's `reconcile` only dequeues. D4-06 implements it for GitHub.
+Carried from D1-03: add the stuck-stop alarm for a dead run whose `stop` or `reconcile` keeps failing; a blocked effect on a stopped run shows only as a refused event, so show it plainly. The lease heartbeat shares the default thread pool with handler calls, and a saturated pool can delay a renewal: give it its own. A heartbeat's first load is unguarded, so a store error there aborts the command. `WAITING_EXTERNAL` needs to be idle-allowed when a handler first uses it.
 Carried from D1-07: a stalled worker past its lease can still send a request after reconcile voided the effect, and a lookup handler that returns `Written` for `pr.merge` must supply the frozen subject.
 Stopping model calls mid-step and session stopping arrive in D10-06.
 **AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`.
@@ -670,7 +672,7 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
 It is written once, and every adapter in every later stage runs it.
 **AC:** suite covers signature rejection, duplicates, out-of-order delivery, crash-after-write, rate limits and auth failure; it runs in process with no Docker; a trivial fake adapter passes it; T6 covered.
-**Deps:** D1-04. **Size:** M. **Run:** serial. **Files:** `tests/contract/suite.py`.
+**Deps:** D1-04. **Size:** M. **Run:** serial. **Files:** `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-16: Fake GitHub: auth and webhooks
 First part of an in-process fake: App auth, tokens, signatures, deliveries, pagination, rate limits and errors.
