@@ -143,7 +143,9 @@ def test_person_completes_the_demo_in_a_browser(stack: str) -> None:
             page.get_by_role("button", name="Request changes").click()
             expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
             # A closed gate shows who closed it, and offers no decision any more.
-            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
+            expect(page.get_by_test_id("closed-by")).to_have_text(
+                "CHANGES_REQUESTED, closed by dev"
+            )
             expect(page.get_by_role("button", name="Approve")).to_have_count(0)
 
             page.get_by_role("link", name="Back to run").click()
@@ -151,14 +153,14 @@ def test_person_completes_the_demo_in_a_browser(stack: str) -> None:
             expect(page.get_by_test_id("gate-status")).to_have_text("OPEN")
             page.get_by_role("button", name="Approve").click()
             expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
-            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
+            expect(page.get_by_test_id("closed-by")).to_have_text("APPROVED, closed by dev")
 
             page.get_by_role("link", name="Back to run").click()
             page.get_by_role("link", name="qa_gate round 1").click(timeout=LONG)
             page.get_by_label("Comment").fill("fine")
             page.get_by_role("button", name="Approve").click()
             expect(page.get_by_role("status").filter(has_text="Decision recorded.")).to_be_visible()
-            expect(page.get_by_test_id("closed-by")).to_contain_text("closed by dev")
+            expect(page.get_by_test_id("closed-by")).to_have_text("APPROVED, closed by dev")
 
             page.get_by_role("link", name="Back to run").click()
             expect(page.get_by_test_id("run-status")).to_have_text("DONE", timeout=LONG)

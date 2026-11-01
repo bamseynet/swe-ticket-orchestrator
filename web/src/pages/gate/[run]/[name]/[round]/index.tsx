@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ApiError,
   decide,
@@ -18,21 +18,46 @@ const ACTIONS: { label: string; kind: DecisionKind }[] = [
   { label: "Reject", kind: "reject" },
 ];
 
+/** The status each decision closes a gate as (the gate service's `_CLOSES_AS`). */
+const CLOSES_AS: Record<DecisionKind, string> = {
+  approve: "APPROVED",
+  request_changes: "CHANGES_REQUESTED",
+  reject: "REJECTED",
+};
+const KIND_OF: Record<string, DecisionKind> = {
+  APPROVED: "approve",
+  CHANGES_REQUESTED: "request_changes",
+  REJECTED: "reject",
+};
+
 /** Waits (ms) before each repeat of a decision that is stored but was not delivered to the run. */
 export const DELIVERY_BACKOFF_MS = [1000, 2000, 4000, 8000, 8000];
+/** Polls in a row that show a decided gate while its run still waits at it, before Retry. */
+export const STUCK_POLLS = 3;
 
 interface Pending {
   kind: DecisionKind;
   digest: string;
   comment: string;
   state: "delivering" | "gave_up";
-  attempt: number; // changes on each manual retry, to restart the loop
   error: string;
+  /** Set when a read shows the gate closed by something other than this decision. */
+  refused: string | null;
 }
 
 /** A closed gate is final: a read that started before the decision must not reopen it. */
 function settle(prev: Gate | null | undefined, next: Gate): Gate {
   return prev != null && prev.status !== "OPEN" && next.status === "OPEN" ? prev : next;
+}
+
+/** If the gate closed as something else than `kind` asked for, say that this decision was
+ * refused. (An approval later INVALIDATED did happen; OPEN means nothing closed it yet.) */
+function refusal(kind: DecisionKind, status: string | null, closedBy: string | null): string | null {
+  if (status === null || status === "OPEN" || status === "INVALIDATED" || status === CLOSES_AS[kind]) {
+    return null;
+  }
+  const label = ACTIONS.find((a) => a.kind === kind)?.label.toLowerCase() ?? kind;
+  return `Your ${label} was not recorded; this gate is ${status}, closed by ${closedBy ?? "no one (no decision)"}.`;
 }
 
 export default function GatePage({ params }: { params: Record<string, string> }) {
@@ -43,17 +68,21 @@ export default function GatePage({ params }: { params: Record<string, string> })
   const round = Number(roundText);
 
   const [gate, setGate] = useState<Gate | null | undefined>(undefined);
-  const [runStatus, setRunStatus] = useState<string | null>(null);
+  const [runState, setRunState] = useState<{ status: string; stage: string | null } | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ text: string; code: string } | null>(null);
   const [offerStop, setOfferStop] = useState<StopOption | null>(null);
-  const [stopNote, setStopNote] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const [comment, setComment] = useState("");
   const [sending, setSending] = useState(false);
   const [recorded, setRecorded] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [stuck, setStuck] = useState(false);
   const generation = useRef(0); // bumped by every decision, so older reads are dropped
   const busy = useRef(false);
+  const stuckPolls = useRef(0);
+  const pendingNow = useRef<Pending | null>(null);
+  pendingNow.current = pending;
   const statusLine = useRef<HTMLParagraphElement>(null);
 
   const refresh = async () => {
@@ -63,15 +92,26 @@ export default function GatePage({ params }: { params: Record<string, string> })
       if (started !== generation.current) return;
       const found = g.gates.find((x) => x.name === name && x.round === round);
       setGate((prev) => (found ? settle(prev, found) : prev === undefined ? null : prev));
-      setRunStatus(r?.status ?? null);
+      setRunState(r ? { status: r.status, stage: r.stage } : null);
       setPollError(null);
+      if (found && found.status !== "OPEN") {
+        // the answer to a decision may have been lost; a closed gate shows it did not fail
+        setActionError((e) => (e?.code === "network" ? null : e));
+        const p = pendingNow.current;
+        const refused = p ? refusal(p.kind, found.status, found.closed_by) : null;
+        if (refused !== null) setPending((now) => (now ? { ...now, refused } : now)); // not back from null
+      }
+      const decided = found !== undefined && KIND_OF[found.status] !== undefined && found.closed_by !== null;
+      const waiting = r?.status === "WAITING_HUMAN" && r.stage === name;
+      stuckPolls.current = decided && waiting ? stuckPolls.current + 1 : 0;
+      setStuck(stuckPolls.current >= STUCK_POLLS);
     } catch (e) {
       if (started === generation.current) setPollError(message(e));
     }
   };
   usePoll(refresh, 2000, validRound);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (recorded || pending) statusLine.current?.focus(); // the form is gone: keep the person's place
   }, [recorded, pending?.state]);
 
@@ -83,6 +123,23 @@ export default function GatePage({ params }: { params: Record<string, string> })
     if (!delivering) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (e: ApiError | null) => {
+      generation.current += 1;
+      setPending(null);
+      const refused =
+        (e ? refusal(delivering.kind, e.gateStatus, e.closedBy) : null) ?? pendingNow.current?.refused ?? null;
+      if (e && e.gateStatus !== null) {
+        const status = e.gateStatus;
+        setGate((prev) => (prev ? { ...prev, status, closed_by: e.closedBy } : prev));
+      }
+      if (refused !== null) {
+        setActionError({ text: refused, code: "refused" });
+        setOfferStop(e?.stop ?? null);
+      } else {
+        setRecorded(true);
+      }
+      void refresh();
+    };
     const attemptAt = (n: number, last: string) => {
       const wait = DELIVERY_BACKOFF_MS[n];
       if (wait === undefined) {
@@ -92,33 +149,27 @@ export default function GatePage({ params }: { params: Record<string, string> })
       timer = setTimeout(() => {
         decide(run, name, round, delivering.kind, delivering.digest, delivering.comment).then(
           () => {
-            if (!cancelled) delivered();
+            if (!cancelled) finish(null);
           },
           (e: unknown) => {
             if (cancelled) return;
-            if (e instanceof ApiError && e.code === "gate_closed") delivered();
+            if (e instanceof ApiError && e.code === "gate_closed") finish(e);
             else attemptAt(n + 1, message(e));
           },
         );
       }, wait);
-    };
-    const delivered = () => {
-      generation.current += 1;
-      setPending(null);
-      setRecorded(true);
-      void refresh();
     };
     attemptAt(0, delivering.error);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [isDelivering, delivering?.attempt]);
+  }, [isDelivering]);
 
   const send = async (kind: DecisionKind) => {
     if (gate == null || busy.current) return;
     if (kind !== "approve" && comment.trim() === "") {
-      setActionError("A comment is required to request changes or reject.");
+      setActionError({ text: "A comment is required to request changes or reject.", code: "comment" });
       return;
     }
     busy.current = true;
@@ -135,13 +186,23 @@ export default function GatePage({ params }: { params: Record<string, string> })
     } catch (e) {
       generation.current += 1;
       if (e instanceof ApiError && e.decisionRecorded) {
-        setPending({ kind, digest: gate.subject_digest, comment, state: "delivering", attempt: 0, error: e.message });
+        setPending({
+          kind,
+          digest: gate.subject_digest,
+          comment,
+          state: "delivering",
+          error: e.message,
+          refused: null,
+        });
       } else if (e instanceof ApiError && e.code === "gate_closed") {
-        setActionError(`This gate is already ${e.gateStatus ?? "closed"}, closed by ${e.closedBy ?? "no one (no decision)"}.`);
+        setActionError({
+          text: `This gate is already ${e.gateStatus ?? "closed"}, closed by ${e.closedBy ?? "no one (no decision)"}.`,
+          code: e.code,
+        });
         setOfferStop(e.stop);
         void refresh();
       } else {
-        setActionError(message(e));
+        setActionError({ text: message(e), code: e instanceof ApiError ? e.code : "error" });
         setOfferStop(e instanceof ApiError ? e.stop : null);
       }
     } finally {
@@ -150,14 +211,36 @@ export default function GatePage({ params }: { params: Record<string, string> })
     }
   };
 
+  /** The gate is decided but its run still waits at it (a page left during delivery): any
+   * request on a closed gate redelivers, so repeat the decision the gate shows. */
+  const retryStuck = async () => {
+    if (gate == null || busy.current) return;
+    const kind = KIND_OF[gate.status];
+    if (kind === undefined) return;
+    busy.current = true;
+    setActionError(null);
+    setNote(null);
+    try {
+      await decide(run, name, round, kind, gate.subject_digest, "retrying delivery");
+      setNote("Delivery retried.");
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "gate_closed") setNote("Delivery retried.");
+      else setActionError({ text: message(e), code: "error" });
+    } finally {
+      stuckPolls.current = 0;
+      setStuck(false);
+      busy.current = false;
+    }
+  };
+
   const stop = async () => {
-    setStopNote(null);
+    setNote(null);
     try {
       await stopRun(run);
-      setStopNote("Stop requested.");
+      setNote("Stop requested.");
       setOfferStop(null);
     } catch (e) {
-      setActionError(message(e));
+      setActionError({ text: message(e), code: "error" });
     }
   };
 
@@ -168,7 +251,7 @@ export default function GatePage({ params }: { params: Record<string, string> })
       </Layout>
     );
   }
-  const stopped = runStatus === "CANCELLING" || runStatus === "CANCELLED";
+  const stopped = runState?.status === "CANCELLING" || runState?.status === "CANCELLED";
   return (
     <Layout title={`Gate ${name}, round ${String(round)}`}>
       <p>
@@ -176,33 +259,38 @@ export default function GatePage({ params }: { params: Record<string, string> })
       </p>
       {stopped && (
         <p role="note">
-          This run is {runStatus}. A stopped run&apos;s gate stays open for now, and deciding it
-          changes nothing else.
+          This run is {runState.status}. A stopped run&apos;s gate stays open for now, and deciding
+          it changes nothing else.
         </p>
       )}
       {gate === null && <p role="alert">No gate {name} round {round} on this run.</p>}
       {pollError !== null && <p role="alert">{pollError}</p>}
-      {actionError !== null && <p role="alert">{actionError}</p>}
+      {actionError !== null && <p role="alert">{actionError.text}</p>}
       {offerStop !== null && (
         <button type="button" onClick={() => void stop()}>
           Stop
         </button>
       )}
-      {stopNote !== null && <p role="status">{stopNote}</p>}
+      {note !== null && <p role="status">{note}</p>}
+      {pending?.refused != null && <p role="alert">{pending.refused}</p>}
       {pending?.state === "delivering" && (
         <p role="status" ref={statusLine} tabIndex={-1}>
-          Decision recorded, delivering it to the run…
+          {pending.refused === null
+            ? "Decision recorded, delivering it to the run… Keep this page open."
+            : "Delivering the decision that did close this gate… Keep this page open."}
         </p>
       )}
       {pending?.state === "gave_up" && (
         <>
           <p role="alert" ref={statusLine} tabIndex={-1}>
-            Decision recorded, but it was not delivered to the run: {pending.error}
+            {pending.refused === null
+              ? `Decision recorded, but it was not delivered to the run: ${pending.error}`
+              : `The decision that closed this gate was not delivered to the run: ${pending.error}`}
           </p>
           <button
             type="button"
             onClick={() => {
-              setPending({ ...pending, state: "delivering", attempt: pending.attempt + 1 });
+              setPending({ ...pending, state: "delivering" });
             }}
           >
             Retry delivery
@@ -213,6 +301,17 @@ export default function GatePage({ params }: { params: Record<string, string> })
         <p role="status" ref={statusLine} tabIndex={-1}>
           Decision recorded.
         </p>
+      )}
+      {stuck && !pending && (
+        <>
+          <p role="alert">
+            This gate is decided, but its run is still waiting at it: the decision may not have
+            reached the run.
+          </p>
+          <button type="button" onClick={() => void retryStuck()}>
+            Retry delivery
+          </button>
+        </>
       )}
       {gate != null && (
         <>

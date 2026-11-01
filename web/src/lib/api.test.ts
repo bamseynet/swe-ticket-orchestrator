@@ -62,7 +62,11 @@ it("puts a timeout on every request, and a hung or failed one is an ApiError", a
       init.signal?.aborted ? Promise.reject(new Error("aborted")) : new Promise<Response>(() => undefined),
     ),
   );
-  expect(await listRuns().catch((e: unknown) => e)).toMatchObject({ status: 0, code: "network" });
+  // Without a signal the fetch above never answers: lose the race with a named reason instead.
+  const hung = new Promise<string>((r) => setTimeout(() => { r("HUNG: the request has no abort signal"); }, 100));
+  const outcome = await Promise.race([listRuns().catch((e: unknown) => e), hung]);
+  expect(outcome).toMatchObject({ status: 0, code: "network" });
+  expect(vi.mocked(fetch).mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
   expect(spy).toHaveBeenCalledWith(TIMEOUT_MS);
   spy.mockRestore();
 });

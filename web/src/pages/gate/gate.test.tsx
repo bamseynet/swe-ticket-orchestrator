@@ -15,7 +15,8 @@ const GATES = [
 ];
 const params = { run: "R1", name: "review_gate", round: "2" };
 const DECISION = "/api/runs/R1/gates/review_gate/2/decisions";
-const posts = (calls: Call[]) => calls.filter((c) => c.method === "POST");
+const posts = (calls: Call[], url?: string) =>
+  calls.filter((c) => c.method === "POST" && (url === undefined || c.url === url));
 
 /** The usual server: gates, a running run, and `decision` for the POST. */
 function api(decision: Handler = () => json(202, { decision_id: "x", gate: { ...GATES[1], status: "APPROVED", closed_by: "dev" } }), gates: unknown[] = GATES): Handler {
@@ -402,4 +403,270 @@ it("a repeat that was in flight when the page went away does not schedule more",
   await act(async () => { late(failed()); await Promise.resolve(); });
   await tick(30000);
   expect(posts(calls)).toHaveLength(2);
+});
+
+// ---------------------------------------------------------------- pass 2
+const closedAs = (status: string, by = "dev") => ({ ...GATES[1], status, closed_by: by });
+const conflict = (status: string, extra: object = {}) =>
+  json(409, { error: { code: "gate_closed", message: "m", status, closed_by: "dev", ...extra } });
+/** Decide with a comment first, so Reject and Request changes can be sent. */
+async function decideWith(label: string) {
+  fireEvent.change(await screen.findByLabelText("Comment"), { target: { value: "my reason" } });
+  fireEvent.click(screen.getByRole("button", { name: label }));
+}
+
+it("a 503 that is not delivery_failed is a failure to decide, not a recorded decision", async () => {
+  serve(api(() => json(503, { error: { code: "store_conflict", message: "busy" } })));
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  expect((await screen.findByRole("alert")).textContent).toContain("busy");
+  expect(screen.queryByText(/delivering|recorded/i)).toBeNull();
+  expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
+});
+
+it.each([
+  ["Reject", "reject"],
+  ["Request changes", "request_changes"],
+])("a repeated %s sends the same kind, comment and digest", async (label, kind) => {
+  let n = 0;
+  const calls = serve(api(() => (++n < 2 ? failed() : json(202, { decision_id: "x", gate: closedAs(kind === "reject" ? "REJECTED" : "CHANGES_REQUESTED") }))));
+  render(<Gate params={params} />);
+  await decideWith(label);
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  await screen.findByText("Decision recorded.");
+  expect(posts(calls).map((c) => c.body)).toEqual([
+    { kind, subject_digest: "d-r2", comment: "my reason" },
+    { kind, subject_digest: "d-r2", comment: "my reason" },
+  ]);
+});
+
+it("a 409 that is not gate_closed on a repeat is not delivery: it repeats again", async () => {
+  let n = 0;
+  const calls = serve(api(() => (++n === 2 ? json(409, { error: { code: "stale_subject", message: "changed" } }) : n === 3 ? json(202, { decision_id: "x", gate: closedAs("APPROVED") }) : failed())));
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  expect(screen.queryByText("Decision recorded.")).toBeNull();
+  expect(posts(calls)).toHaveLength(2);
+  await tick(DELIVERY_BACKOFF_MS[1] ?? 0);
+  await screen.findByText("Decision recorded.");
+  expect(posts(calls)).toHaveLength(3);
+});
+
+it.each([
+  ["202", () => json(202, { decision_id: "x", gate: closedAs("APPROVED") })],
+  ["409", () => conflict("APPROVED")],
+])("after a repeat's %s the form is gone even if every read still says OPEN", async (_name, answer) => {
+  let n = 0;
+  serve((c) => {
+    if (c.method === "POST") return ++n < 2 ? failed() : answer();
+    return c.url.endsWith("/gates") ? json(200, { gates: [GATES[1]] }) : json(200, { id: "R1", status: "WAITING_HUMAN" });
+  });
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  await screen.findByText("Decision recorded.");
+  expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+});
+
+it("a refused Reject (the gate was approved) is never shown as recorded, and keeps Stop", async () => {
+  let n = 0;
+  const calls = serve((c) => {
+    if (c.url.endsWith("/cancel")) return json(202, { id: "R1", accepted: true });
+    return api(() => (++n < 2 ? failed() : conflict("APPROVED", { stop: { method: "POST", href: "/runs/R1/cancel" } })))(c);
+  });
+  render(<Gate params={params} />);
+  await decideWith("Reject");
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toBe("Your reject was not recorded; this gate is APPROVED, closed by dev.");
+  expect(screen.queryByText("Decision recorded.")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+  await screen.findByText("Stop requested.");
+  expect(posts(calls, "/api/runs/R1/cancel")).toHaveLength(1);
+});
+
+
+it.each([
+  ["Approve", "REJECTED", "approve"],
+  ["Request changes", "APPROVED", "request changes"],
+])("%s while the gate is %s: a read during delivery says it was not recorded", async (label, status, text) => {
+  let closed = false;
+  serve((c) => {
+    if (c.method === "POST") return failed();
+    if (closed && c.url.endsWith("/gates")) return json(200, { gates: [closedAs(status)] });
+    return api()(c);
+  });
+  render(<Gate params={params} />);
+  await decideWith(label);
+  await screen.findByText(/delivering/);
+  closed = true;
+  await tick(2100);
+  const refused = await screen.findAllByRole("alert");
+  expect(refused.map((a) => a.textContent)).toContain(`Your ${text} was not recorded; this gate is ${status}, closed by dev.`);
+  expect(screen.queryByText("Decision recorded.")).toBeNull();
+});
+
+it("a refused decision whose repeat is later accepted is still not shown as recorded", async () => {
+  let n = 0;
+  serve((c) => {
+    if (c.method === "POST") return ++n < 3 ? failed() : json(202, { decision_id: "x", gate: closedAs("APPROVED") });
+    return c.url.endsWith("/gates") && n >= 1 ? json(200, { gates: [closedAs("APPROVED")] }) : api()(c);
+  });
+  render(<Gate params={params} />);
+  await decideWith("Reject");
+  await screen.findByText(/delivering/);
+  await tick(2100); // the read lands while the repeats are still failing
+  await screen.findAllByText(/was not recorded/);
+  await tick(DELIVERY_BACKOFF_MS[1] ?? 0); // then a repeat is accepted
+  await waitFor(() => { expect(screen.queryByText(/elivering/i)).toBeNull(); });
+  expect(screen.queryByText("Decision recorded.")).toBeNull();
+  expect(screen.getAllByRole("alert").map((a) => a.textContent)).toContain("Your reject was not recorded; this gate is APPROVED, closed by dev.");
+});
+
+it("an approval that was later INVALIDATED still counts as recorded", async () => {
+  let n = 0;
+  serve(api(() => (++n < 2 ? failed() : conflict("INVALIDATED"))));
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  await screen.findByText("Decision recorded.");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("a repeat's 409 shows the gate's status and closer even while reads fail", async () => {
+  let n = 0;
+  let down = false;
+  serve((c) => {
+    if (c.method === "POST") { down = true; return ++n < 2 ? failed() : conflict("APPROVED"); }
+    return down ? json(503, { error: { code: "store_conflict", message: "busy" } }) : api()(c);
+  });
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  await tick(DELIVERY_BACKOFF_MS[0] ?? 0);
+  await screen.findByText("Decision recorded.");
+  expect(screen.getByTestId("gate-status").textContent).toBe("APPROVED");
+  expect(screen.getByTestId("closed-by").textContent).toContain("closed by dev");
+});
+
+it("a lost answer to the POST is cleared once a read shows the gate closed", async () => {
+  let lost = false;
+  serve((c) => {
+    if (c.method === "POST") { lost = true; return new Error("lost"); }
+    return lost && c.url.endsWith("/gates") ? json(200, { gates: [closedAs("APPROVED")] }) : api()(c);
+  });
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  expect((await screen.findByRole("alert")).textContent).toMatch(/could not reach/);
+  await tick(2100);
+  await waitFor(() => { expect(screen.queryByRole("alert")).toBeNull(); });
+  expect(screen.getByTestId("closed-by").textContent).toContain("dev");
+});
+
+it("a known gate is kept when a later read omits it", async () => {
+  let omit = false;
+  serve((c) => (omit && c.url.endsWith("/gates") ? json(200, { gates: [] }) : api()(c)));
+  render(<Gate params={params} />);
+  await open();
+  omit = true;
+  await tick(2100);
+  expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
+  expect(screen.queryByText(/No gate/)).toBeNull();
+});
+
+it("a read that was in flight when delivery finished shows no stale error", async () => {
+  let held: ((r: Response) => void) | null = null;
+  let armed = false;
+  let n = 0;
+  serve((c) => {
+    if (c.method === "POST") return ++n < 3 ? failed() : json(202, { decision_id: "x", gate: closedAs("APPROVED") });
+    if (armed && c.url.endsWith("/gates") && held === null) return new Promise<Response>((r) => { held = r; });
+    return api()(c);
+  });
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  armed = true;
+  await tick(2100); // a poll starts and hangs
+  await waitFor(() => { expect(held).not.toBeNull(); });
+  await tick(DELIVERY_BACKOFF_MS[1] ?? 0); // the second repeat is accepted while that read hangs
+  await screen.findByText("Decision recorded.");
+  await act(async () => { (held as unknown as (r: Response) => void)(json(503, { error: { code: "store_conflict", message: "stale busy" } })); await Promise.resolve(); });
+  expect(screen.queryByText("stale busy")).toBeNull();
+});
+
+it("moves focus to the confirmation when the form goes away", async () => {
+  serve(api());
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  const status = await screen.findByText("Decision recorded.");
+  expect(document.activeElement).toBe(status);
+});
+
+it("tells the person to keep the page open while delivering", async () => {
+  serve(api(() => failed()));
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  expect((await screen.findByRole("status")).textContent).toMatch(/Keep this page open/);
+});
+
+// A page left during delivery: the gate reopens closed and the run waits at it.
+const stuckWorld = (over: object = {}) => {
+  const calls = serve((c) => {
+    if (c.method === "POST") return conflict("APPROVED");
+    if (c.url.endsWith("/gates")) return json(200, { gates: [closedAs("APPROVED", "dev")] });
+    return json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate", ...over });
+  });
+  return calls;
+};
+
+it("offers Retry delivery when the gate is decided and the run waits at it across polls", async () => {
+  const calls = stuckWorld();
+  render(<Gate params={params} />);
+  await screen.findByTestId("closed-by");
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull(); // one poll is not enough
+  await tick(2100);
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+  await tick(2100);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry delivery" }));
+  await screen.findByText("Delivery retried.");
+  expect(posts(calls, DECISION)[0]?.body).toMatchObject({ kind: "approve", subject_digest: "d-r2" });
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+});
+
+it.each([
+  ["the run moved on", { stage: "qa" }],
+  ["the run is not waiting", { status: "RUNNING" }],
+])("offers no Retry delivery when %s", async (_n, over) => {
+  stuckWorld(over);
+  render(<Gate params={params} />);
+  await screen.findByTestId("closed-by");
+  await tick(8000);
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+});
+
+it("offers no Retry delivery for a gate nobody decided", async () => {
+  serve((c) => (c.url.endsWith("/gates") ? json(200, { gates: [{ ...closedAs("EXPIRED"), closed_by: null }] }) : json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate" })));
+  render(<Gate params={params} />);
+  await screen.findByTestId("closed-by");
+  await tick(8000);
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+});
+
+it("a failed Retry delivery says so and the button stays", async () => {
+  serve((c) => {
+    if (c.method === "POST") return failed();
+    return c.url.endsWith("/gates") ? json(200, { gates: [closedAs("APPROVED")] }) : json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate" });
+  });
+  render(<Gate params={params} />);
+  await tick(4300);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry delivery" }));
+  await waitFor(() => { expect(screen.getAllByRole("alert").some((a) => /not delivered/.test(a.textContent))).toBe(true); });
 });
