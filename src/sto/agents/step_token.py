@@ -20,19 +20,26 @@ Verification fails closed. Every refusal raises ``StepTokenError`` with a stable
 * Expiry beats stage: an expired token is reported as expired even for the wrong stage.
 
 Verifying needs only a ``Verifier`` (the signer port without ``sign``). ``JwksVerifier`` builds one
-from a JWKS document, so a broker or the Gateway holds public keys only. The AWS issuer is D11-23.
+from a JWKS document, so with ``RS256`` a broker or the Gateway holds public keys only. (With
+``HS256``, as in test wiring, the verifier is the symmetric key and can sign: that is for tests and
+a single host.) The AWS issuer is D11-23.
+
+Refresh is the dispatcher's job: ``StepReissuer.reissue`` takes the presented token and the
+per-attempt secret, and ``InProcessReissuer`` re-checks all of it itself before signing.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import re
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, runtime_checkable
 
 from sto.domain.errors import PermanentError
 from sto.signing.port import Signature, Signer, SigningError, Verifier
@@ -353,6 +360,8 @@ def _int_from_b64(text: object) -> int:
         raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
     except (binascii.Error, ValueError):
         raise SigningError("invalid JWKS key") from None
+    if raw[:1] == b"\x00":  # leading zero bytes: not the canonical big-endian encoding
+        raise SigningError("invalid JWKS key")
     return int.from_bytes(raw, "big")
 
 
@@ -434,33 +443,86 @@ class JwksVerifier:
         return tuple(dict(public) for _, public in self._keys.values())
 
 
+@dataclass(frozen=True)
+class AttemptRecord:
+    """What the dispatcher stored when it started an attempt: the full context it signed for."""
+
+    context: StepContext
+    secret_digest: bytes
+    deadline: int
+    live: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context, StepContext):
+            raise _bad("invalid attempt record")
+        if not isinstance(self.secret_digest, bytes) or len(self.secret_digest) != 32:
+            raise _bad("invalid attempt record")
+        if type(self.deadline) is not int or self.deadline < 0:
+            raise _bad("invalid attempt record")
+        if type(self.live) is not bool:
+            raise _bad("invalid attempt record")
+
+    def __repr__(self) -> str:  # never show the digest
+        return f"AttemptRecord(deadline={self.deadline}, live={self.live})"
+
+
+@runtime_checkable
+class AttemptDirectory(Protocol):
+    """Which step attempts are live, with the stored context and digest of each attempt's secret.
+
+    A *step* is ``(team, run, stage, visit)``; an *attempt* adds ``attempt``. Rules every
+    implementation must keep:
+
+    * Registering attempt N **supersedes** every lower attempt of the same step. Their ``attempt()``
+      reports ``live=False`` from then on, so attempt 1 cannot refresh or read once 2 is registered.
+    * Registering a lower attempt than one already registered, an attempt that has ended, or an
+      attempt that is already registered, is refused. An ended attempt is never revived.
+    * ``end(N)`` is permanent and also works **before** ``register(N)``: a cancel that arrives first
+      sticks and the later ``register(N)`` is refused. It also raises the step's latest attempt to
+      at least N, so every lower attempt stops being live at once. A later attempt (N+1) can still
+      register: a full cancel needs a step-level stop, which is the engine's job.
+    * ``register``, ``end`` and ``attempt`` are **atomic** with respect to each other: concurrent
+      calls behave as if run one at a time, and the latest attempt of a step never goes backwards.
+    * ``deadline`` is an ``int`` (epoch seconds); anything else is refused.
+    """
+
+    def attempt(self, context: StepContext) -> AttemptRecord | None:
+        """The record, with ``live`` False once ended or superseded, or ``None`` if unknown."""
+        ...
+
+
 class StepReissuer(Protocol):
     """The dispatcher's side of a refresh. The broker holds this, never a ``Signer``.
 
-    ``reissue`` takes only a verified context: it accepts no claim to change, so a refresh cannot
-    widen stage, tools, repo or SHA. The dispatcher clamps the new expiry to the attempt's deadline
-    and refuses a step that is not live. ``ttl`` is the lifetime it asks for before clamping.
+    ``reissue`` takes the token the caller presented and the per-attempt secret. The dispatcher
+    checks both itself, and the broker's own checks are only defence in depth. A compromised
+    broker can therefore refresh only a live token it holds together with that attempt's secret.
+    ``ttl`` is the lifetime asked for before the expiry is clamped to the attempt's deadline.
     """
 
     @property
     def ttl(self) -> int: ...
 
-    def reissue(self, context: StepContext, *, now: int) -> str: ...
+    def reissue(self, token: str, secret: bytes, *, now: int) -> str: ...
 
 
 class InProcessReissuer:
     """``StepReissuer`` for one host and for tests. A deployed broker calls the dispatcher instead.
 
-    ``deadline_of`` answers for a context with the attempt's deadline, or ``None`` if the attempt
-    is not live. It is the dispatcher's own record, not the broker's.
+    Before signing it: verifies the token with its own pinned verifier (issuer, audience,
+    algorithm, expiry); looks the attempt up in the directory and requires it to be live and
+    before its deadline; compares the secret in constant time with the stored digest; requires the
+    token's context to equal the context stored at registration; and clamps the expiry to the
+    deadline. After signing it checks the attempt is still live and refuses if it ended meanwhile.
     """
 
-    __slots__ = ("_audience", "_deadline_of", "_issuer", "_signer", "_ttl")
+    __slots__ = ("_audience", "_directory", "_issuer", "_signer", "_ttl", "_verifier")
 
     def __init__(
         self,
         signer: Signer,
-        deadline_of: Callable[[StepContext], int | None],
+        verifier: StepTokenVerifier,
+        directory: AttemptDirectory,
         *,
         issuer: str = ISSUER,
         audience: str = AUDIENCE,
@@ -469,7 +531,8 @@ class InProcessReissuer:
         if type(ttl) is not int or not 0 < ttl <= MAX_TTL:
             raise _bad("invalid ttl")
         self._signer = signer
-        self._deadline_of = deadline_of
+        self._verifier = verifier
+        self._directory = directory
         self._issuer = issuer
         self._audience = audience
         self._ttl = ttl
@@ -478,17 +541,32 @@ class InProcessReissuer:
     def ttl(self) -> int:
         return self._ttl
 
-    def reissue(self, context: StepContext, *, now: int) -> str:
-        deadline = self._deadline_of(context)
-        if type(deadline) is not int:
+    def _live_record(self, context: StepContext, now: int) -> AttemptRecord:
+        record = self._directory.attempt(context)
+        if not isinstance(record, AttemptRecord) or not record.live:
             raise _bad("step not live")
-        if now >= deadline:
+        if now >= record.deadline:
             raise _bad("step deadline passed")
-        return mint_step_token(
+        return record
+
+    def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+        if type(now) is not int:
+            raise _bad("invalid now")
+        if not isinstance(secret, bytes):
+            raise _bad("bad attempt secret")
+        verified = self._verifier.verify(token, now=now)
+        record = self._live_record(verified.context, now)
+        if not hmac.compare_digest(hashlib.sha256(secret).digest(), record.secret_digest):
+            raise _bad("bad attempt secret")
+        if verified.context != record.context:
+            raise _bad("context differs from the registered attempt")
+        new = mint_step_token(
             self._signer,
-            context,
+            record.context,
             now=now,
-            ttl=min(self._ttl, deadline - now),
+            ttl=min(self._ttl, record.deadline - now),
             issuer=self._issuer,
             audience=self._audience,
         )
+        self._live_record(record.context, now)  # ended while signing: do not hand the token out
+        return new

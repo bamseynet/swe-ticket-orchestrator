@@ -6,6 +6,8 @@ import base64
 import hashlib
 import inspect
 import json
+import threading
+import types
 from typing import Any
 
 import pytest
@@ -21,6 +23,8 @@ from sto.agents.step_token import (
     MAX_TOOL_NAME,
     MAX_TOOLS,
     MAX_TTL,
+    AttemptDirectory,
+    AttemptRecord,
     InProcessReissuer,
     JwksVerifier,
     StepContext,
@@ -30,8 +34,6 @@ from sto.agents.step_token import (
 )
 from sto.budget.broker import (
     MAX_SK_LEN,
-    AttemptDirectory,
-    AttemptRecord,
     InMemoryAttemptDirectory,
     StepBroker,
     new_attempt_secret,
@@ -464,16 +466,11 @@ def test_mint_refuses_an_oversize_token(hs: LocalSigner) -> None:
     assert info.value.reason == "token too large"
 
 
-def test_deeply_nested_json_is_malformed_not_a_crash(
+def test_json_recursion_error_is_malformed_not_a_crash(
     hs: LocalSigner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    head = b64(dump(HEAD))
-    body = b64(b"[" * 3000 + b"]" * 3000)  # fits the size cap
-    assert (
-        reason(hs_verifier(hs).verify, f"{head}.{body}.{b64(b'x')}", now=NOW) == "malformed token"
-    )
-
-    # CPython's C parser nests deeper than the size cap allows; other builds raise RecursionError.
+    # CPython's C parser nests deeper than the 8 KiB size cap allows, so a real deep payload cannot
+    # reach RecursionError here; other builds do. Simulate the parser raising it.
     def too_deep(*a: Any, **kw: Any) -> Any:
         raise RecursionError
 
@@ -622,6 +619,18 @@ def test_a_key_just_under_the_minimum_size_is_refused() -> None:
         JwksVerifier({"keys": small.public_keys()})
 
 
+def test_leading_zero_bytes_in_n_or_e_are_refused(rsa_signer: RsaSigner) -> None:
+    good = rsa_signer.public_keys()[0]
+    n_raw = base64.urlsafe_b64decode(good["n"] + "==")
+    for over in (
+        {"n": b64(b"\x00" + n_raw)},
+        {"e": b64(b"\x00\x01\x00\x01")},
+    ):
+        with pytest.raises(SigningError):
+            JwksVerifier(jwk_with(rsa_signer, **over))
+    JwksVerifier(jwk_with(rsa_signer))
+
+
 def test_modulus_exponent_and_kid_limits(rsa_signer: RsaSigner) -> None:
     good = rsa_signer.public_keys()[0]
     n = int.from_bytes(base64.urlsafe_b64decode(good["n"] + "=="), "big")
@@ -670,7 +679,10 @@ class Env:
         self.verifier = hs_verifier(signer, issuer=issuer, audience=audience)
         self.reissuer = InProcessReissuer(
             signer,
-            self._deadline_of,
+            hs_verifier(
+                signer, issuer=reissue_issuer or issuer, audience=reissue_audience or audience
+            ),
+            self.directory,
             issuer=reissue_issuer or issuer,
             audience=reissue_audience or audience,
         )
@@ -681,10 +693,6 @@ class Env:
             store=self.store,
             flags=self.flags,
         )
-
-    def _deadline_of(self, context: StepContext) -> int | None:
-        record = self.directory.attempt(context)
-        return record.deadline if record is not None and record.live else None
 
     def start(
         self, context: StepContext | None = None, *, deadline: int = NOW + 7200, ttl: int = 300
@@ -708,12 +716,64 @@ def test_attempt_secret_is_long_and_random() -> None:
     assert new_attempt_secret() != new_attempt_secret()
 
 
-def test_broker_holds_no_signing_power(env: Env) -> None:
-    params = inspect.signature(StepBroker.__init__).parameters
-    assert "signer" not in params
-    assert not any(isinstance(v, Signer) for v in vars(env.broker).values())
-    assert not hasattr(env.broker, "sign")
-    assert list(inspect.signature(env.reissuer.reissue).parameters) == ["context", "now"]
+def _reachable(root: object) -> list[object]:
+    """Every object reachable through attributes, slots and containers, but not through functions
+    or bound methods (a remote callback is opaque, so its target is not part of the broker)."""
+    seen: dict[int, object] = {}
+    todo = [root]
+    while todo:
+        obj = todo.pop()
+        if id(obj) in seen or isinstance(obj, (str, bytes, int, float, bool, type(None))):
+            continue
+        seen[id(obj)] = obj
+        if isinstance(obj, (types.FunctionType, types.MethodType, types.BuiltinFunctionType)):
+            continue
+        if isinstance(obj, dict):
+            todo.extend([*obj.keys(), *obj.values()])
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            todo.extend(obj)
+        else:
+            todo.extend(getattr(obj, "__dict__", {}).values())
+            for klass in type(obj).__mro__:
+                for slot in getattr(klass, "__slots__", ()):
+                    if hasattr(obj, slot):
+                        todo.append(getattr(obj, slot))
+    return list(seen.values())
+
+
+def test_broker_holds_no_signing_power(rsa_signer: RsaSigner) -> None:
+    """Wire the broker the way a deployment does: a public-key verifier and a remote reissuer."""
+    verifier = StepTokenVerifier(
+        JwksVerifier({"keys": rsa_signer.public_keys()}), algorithm="RS256"
+    )
+    directory = InMemoryAttemptDirectory()
+    dispatcher = InProcessReissuer(rsa_signer, verifier, directory)
+
+    class Remote:
+        """What the broker holds: a call back to the dispatcher, with no signer inside."""
+
+        def __init__(self, call: Any) -> None:
+            self._call = call
+            self.ttl = dispatcher.ttl
+
+        def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+            return str(self._call(token, secret, now=now))
+
+    broker = StepBroker(
+        verifier=verifier,
+        reissuer=Remote(dispatcher.reissue),
+        directory=directory,
+        store=MemoryStore(),
+        flags=Flags(),
+    )
+    graph = _reachable(broker)
+    assert len(graph) > 5  # the walk really went somewhere
+    assert not [o for o in graph if isinstance(o, Signer) or callable(getattr(o, "sign", None))]
+    assert "signer" not in inspect.signature(StepBroker.__init__).parameters
+    # and a sanity check that the walk would find one
+    leaky = Remote(dispatcher.reissue)
+    leaky.signer = rsa_signer  # type: ignore[attr-defined]
+    assert [o for o in _reachable(leaky) if isinstance(o, Signer)]
 
 
 def test_directory_stores_a_digest_not_the_secret(env: Env) -> None:
@@ -725,10 +785,25 @@ def test_directory_stores_a_digest_not_the_secret(env: Env) -> None:
 
 
 def test_attempt_record_repr_hides_the_digest() -> None:
-    record = AttemptRecord(secret_digest=hashlib.sha256(b"x").digest(), deadline=NOW)
+    record = AttemptRecord(context=ctx(), secret_digest=hashlib.sha256(b"x").digest(), deadline=NOW)
     assert "secret_digest" not in repr(record)
     assert record.secret_digest.hex() not in repr(record)
     assert repr(record) == f"AttemptRecord(deadline={NOW}, live=True)"
+
+
+def test_attempt_record_validates_every_field() -> None:
+    digest = hashlib.sha256(b"x").digest()
+    AttemptRecord(context=ctx(), secret_digest=digest, deadline=NOW, live=False)
+    bad: list[dict[str, Any]] = [
+        {"live": 1}, {"live": None}, {"live": "yes"},
+        {"secret_digest": digest[:-1]}, {"secret_digest": digest + b"x"},
+        {"secret_digest": digest.hex()}, {"deadline": float("inf")}, {"deadline": True},
+        {"deadline": -1}, {"context": object()}, {"context": None},
+    ]  # fmt: skip
+    for over in bad:
+        kw: dict[str, Any] = {"context": ctx(), "secret_digest": digest, "deadline": NOW} | over
+        with pytest.raises(StepTokenError):
+            AttemptRecord(**kw)
 
 
 def test_register_validates_secret_and_deadline(env: Env) -> None:
@@ -753,27 +828,40 @@ def test_refresh_issues_a_new_token_with_identical_claims(env: Env) -> None:
     assert got.jti != hs_verifier(env.signer).verify(token, now=NOW + 1).jti
 
 
-def test_refresh_uses_the_callers_clock_value(env: Env) -> None:
-    seen: list[int] = []
+class SpyReissuer:
+    ttl = 300
 
-    class Spy:
-        ttl = 300
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.calls: list[tuple[str, bytes, int]] = []
 
-        def reissue(self, context: StepContext, *, now: int) -> str:
-            seen.append(now)
-            return env.reissuer.reissue(context, now=now)
+    def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+        self.calls.append((token, secret, now))
+        return str(self.inner.reissue(token, secret, now=now))
 
-    broker = StepBroker(
-        verifier=env.verifier,
-        reissuer=Spy(),
-        directory=env.directory,
-        store=env.store,
-        flags=env.flags,
-    )
+
+def spied(env: Env) -> SpyReissuer:
+    spy = SpyReissuer(env.reissuer)
+    env.broker._reissuer = spy  # noqa: SLF001
+    return spy
+
+
+def test_refresh_passes_the_token_secret_and_callers_clock(env: Env) -> None:
+    spy = spied(env)
     _, token, secret = env.start()
-    _, err = attempt(broker.refresh, token, secret, now=NOW + 5)
+    _, err = attempt(env.broker.refresh, token, secret, now=NOW + 5)
     assert err is None
-    assert seen == [NOW + 5]
+    assert spy.calls == [(token, secret, NOW + 5)]
+
+
+def test_the_reissuer_is_not_called_for_a_wrong_secret_dead_or_expired_step(env: Env) -> None:
+    spy = spied(env)
+    context, token, secret = env.start()
+    assert reason(env.broker.refresh, token, new_attempt_secret(), now=NOW) == "bad attempt secret"
+    assert reason(env.broker.refresh, token, secret, now=NOW + 300) == "expired"
+    env.directory.end(context)
+    assert reason(env.broker.refresh, token, secret, now=NOW) == "step not live"
+    assert spy.calls == []
 
 
 def test_refresh_keeps_a_non_default_issuer_and_audience(hs: LocalSigner) -> None:
@@ -797,8 +885,8 @@ def test_refresh_refuses_a_reissuer_that_changes_the_context(env: Env) -> None:
     class Widening:
         ttl = 300
 
-        def reissue(self, context: StepContext, *, now: int) -> str:
-            wider = ctx(tools=(*context.tools, "repo.write"))
+        def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+            wider = ctx(tools=("repo.read", "ticket.read", "repo.write"))
             return mint_step_token(env.signer, wider, now=now)
 
     broker = StepBroker(
@@ -813,8 +901,8 @@ def test_refresh_refuses_a_reissuer_that_outlives_the_deadline(env: Env) -> None
     class Greedy:
         ttl = 300
 
-        def reissue(self, context: StepContext, *, now: int) -> str:
-            return mint_step_token(env.signer, context, now=now, ttl=300)
+        def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+            return mint_step_token(env.signer, ctx(), now=now, ttl=300)
 
     broker = StepBroker(
         verifier=env.verifier, reissuer=Greedy(), directory=env.directory,
@@ -828,7 +916,7 @@ class FixedTtl:
     def __init__(self, ttl: int) -> None:
         self.ttl = ttl
 
-    def reissue(self, context: StepContext, *, now: int) -> str:
+    def reissue(self, token: str, secret: bytes, *, now: int) -> str:
         return ""
 
 
@@ -851,28 +939,144 @@ def test_broker_checks_reissuer_ttl_at_construction(env: Env) -> None:
         flags=env.flags,
     )
     with pytest.raises(StepTokenError):
-        InProcessReissuer(env.signer, lambda c: None, ttl=0)
+        InProcessReissuer(env.signer, env.verifier, env.directory, ttl=0)
     with pytest.raises(StepTokenError):
-        InProcessReissuer(env.signer, lambda c: None, ttl=MAX_TTL + 1)
+        InProcessReissuer(env.signer, env.verifier, env.directory, ttl=MAX_TTL + 1)
 
 
-@pytest.mark.parametrize("deadline", [float("inf"), float("nan"), 1.8e9, True, "9", None])
-def test_reissuer_refuses_a_deadline_that_is_not_an_int(env: Env, deadline: Any) -> None:
-    r = InProcessReissuer(env.signer, lambda c: deadline)
-    with pytest.raises(StepTokenError, match="step not live"):
-        r.reissue(ctx(), now=NOW)
-
-
-def test_reissuer_itself_refuses_a_dead_or_past_deadline_step(env: Env) -> None:
+def test_reissuer_clamps_to_the_deadline_and_checks_it(env: Env) -> None:
     c = ctx()
     r = env.reissuer
-    with pytest.raises(StepTokenError, match="step not live"):
-        r.reissue(c, now=NOW)
-    env.directory.register(c, new_attempt_secret(), deadline=NOW + 100)
+    _, token, secret = env.start(c, deadline=NOW + 100)
     with pytest.raises(StepTokenError, match="deadline passed"):
-        r.reissue(c, now=NOW + 100)
-    clamped = r.reissue(c, now=NOW + 90)
+        r.reissue(token, secret, now=NOW + 100)
+    clamped = r.reissue(token, secret, now=NOW + 90)
     assert env.verifier.verify(clamped, now=NOW + 90).exp == NOW + 100
+
+
+# -- the reissuer defends itself: direct calls with no broker in front --------------------------
+
+
+def test_reissuer_refuses_widened_tools(env: Env) -> None:
+    _, _, secret = env.start()
+    wider = mint_step_token(env.signer, ctx(tools=("repo.read", "repo.write")), now=NOW)
+    assert (
+        reason(env.reissuer.reissue, wider, secret, now=NOW)
+        == "context differs from the registered attempt"
+    )
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"repo": "evil/x"}, {"sha": "b" * 40}, {"tools": ()}, {"tools": ("ticket.read", "repo.read")}],
+)
+def test_reissuer_refuses_any_difference_from_the_registered_context(
+    env: Env, over: dict[str, Any]
+) -> None:
+    _, _, secret = env.start()
+    other = mint_step_token(env.signer, ctx(**over), now=NOW)
+    assert (
+        reason(env.reissuer.reissue, other, secret, now=NOW)
+        == "context differs from the registered attempt"
+    )
+
+
+def test_reissuer_refuses_another_teams_live_attempt_without_its_secret(env: Env) -> None:
+    env.start(ctx(team="alpha"))
+    _, beta_token, _ = env.start(ctx(team="beta"))
+    attacker_secret = new_attempt_secret()
+    assert (
+        reason(env.reissuer.reissue, beta_token, attacker_secret, now=NOW) == "bad attempt secret"
+    )
+
+
+def test_reissuer_refuses_a_context_object_a_duck_and_wrong_types(env: Env) -> None:
+    c, token, secret = env.start()
+
+    class Duck:
+        team, run, stage, visit, attempt = "alpha", c.run, "implement", 1, 1
+        tools, repo, sha = c.tools, c.repo, c.sha
+
+    for bad in (c, Duck(), None, 5, b"x", {"team": "alpha"}):
+        assert reason(env.reissuer.reissue, bad, secret, now=NOW) == "malformed token"
+    for bad_secret in (None, "s", 5, bytearray(secret)):
+        assert reason(env.reissuer.reissue, token, bad_secret, now=NOW) == "bad attempt secret"
+    for bad_now in ("x", None, 1.5, True):
+        assert reason(env.reissuer.reissue, token, secret, now=bad_now) == "invalid now"
+
+
+def test_reissuer_refuses_expired_forged_and_wrong_audience_tokens(env: Env) -> None:
+    _, token, secret = env.start()
+    assert reason(env.reissuer.reissue, token, secret, now=NOW + 300) == "expired"
+    head, body, sig = token.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(body + "=="))
+    claims["team"] = "beta"
+    assert (
+        reason(env.reissuer.reissue, swap_part(token, 1, dump(claims)), secret, now=NOW)
+        == "bad signature"
+    )
+    foreign = mint_step_token(env.signer, ctx(), now=NOW, audience="gateway")
+    assert reason(env.reissuer.reissue, foreign, secret, now=NOW) == "wrong audience"
+    other_issuer = mint_step_token(env.signer, ctx(), now=NOW, issuer="x")
+    assert reason(env.reissuer.reissue, other_issuer, secret, now=NOW) == "wrong issuer"
+
+
+def test_reissuer_checks_liveness_itself_not_via_the_broker(env: Env) -> None:
+    context, token, secret = env.start()
+    env.directory.end(context)
+    assert reason(env.reissuer.reissue, token, secret, now=NOW) == "step not live"
+    unknown = mint_step_token(env.signer, ctx(stage="review"), now=NOW)
+    assert reason(env.reissuer.reissue, unknown, secret, now=NOW) == "step not live"
+
+
+def test_reissuer_refuses_a_directory_that_returns_something_else(env: Env) -> None:
+    _, token, secret = env.start()
+
+    class Fake:
+        def attempt(self, context: StepContext) -> Any:
+            return types.SimpleNamespace(
+                live=True, deadline=NOW + 9999, secret_digest=hashlib.sha256(secret).digest(),
+                context=context,
+            )  # fmt: skip
+
+    r = InProcessReissuer(env.signer, env.verifier, Fake())
+    assert reason(r.reissue, token, secret, now=NOW) == "step not live"
+
+
+def test_reissuer_refuses_to_return_a_token_if_the_step_ended_while_signing(env: Env) -> None:
+    context, token, secret = env.start()
+
+    class EndingSigner:
+        algorithm = env.signer.algorithm
+        key_id = env.signer.key_id
+
+        def sign(self, message: bytes) -> Signature:
+            env.directory.end(context)  # cancel arrives mid-signature
+            return env.signer.sign(message)
+
+        def verify(self, message: bytes, signature: Signature) -> bool:
+            return env.signer.verify(message, signature)
+
+        def public_keys(self) -> list[dict[str, str]]:
+            return []
+
+    r = InProcessReissuer(EndingSigner(), env.verifier, env.directory)
+    assert reason(r.reissue, token, secret, now=NOW) == "step not live"
+
+
+def test_broker_refuses_a_token_for_a_step_that_ended_during_reissue(env: Env) -> None:
+    context, token, secret = env.start()
+
+    class EndsThenReturns:
+        ttl = 300
+
+        def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+            new = env.reissuer.reissue(token, secret, now=now)
+            env.directory.end(context)
+            return new
+
+    env.broker._reissuer = EndsThenReturns()  # noqa: SLF001
+    assert reason(env.broker.refresh, token, secret, now=NOW) == "step not live"
 
 
 def test_a_long_step_can_refresh_repeatedly_until_its_deadline(env: Env) -> None:
@@ -950,6 +1154,83 @@ def test_a_different_visit_is_a_different_step(env: Env) -> None:
     _, tok1, sec1 = env.start(ctx(visit=1, attempt=2))
     env.start(ctx(visit=2, attempt=1))
     assert env.broker.refresh(tok1, sec1, now=NOW + 1)
+
+
+def test_end_of_attempt_2_before_it_registers_stops_attempt_1(env: Env) -> None:
+    """A cancel for 2 arrives first: 2 can never register, and 1 must not run to its deadline."""
+    run = ctx().run
+    env.store.put(TeamScope("alpha"), Key(f"RUN#{run}", "TICKET#1"), {"t": 1})
+    _, tok1, sec1 = env.start(ctx(attempt=1), deadline=NOW + 100_000)
+    env.directory.end(ctx(attempt=2))
+    with pytest.raises(StepTokenError, match="ended"):
+        env.directory.register(ctx(attempt=2), new_attempt_secret(), deadline=NOW + 1000)
+    assert reason(env.broker.refresh, tok1, sec1, now=NOW + 1) == "step not live"
+    assert reason(env.broker.read_ledger, tok1, "TICKET#1", now=NOW + 1) == "step not live"
+    assert reason(env.reissuer.reissue, tok1, sec1, now=NOW + 1) == "step not live"
+
+
+def test_end_does_not_block_a_later_attempt(env: Env) -> None:
+    env.directory.end(ctx(attempt=2))
+    _, tok3, sec3 = env.start(ctx(attempt=3))
+    assert env.broker.refresh(tok3, sec3, now=NOW + 1)
+
+
+def test_end_of_a_lower_attempt_does_not_lower_the_latest(env: Env) -> None:
+    _, tok3, sec3 = env.start(ctx(attempt=3))
+    env.directory.end(ctx(attempt=1))
+    assert env.broker.refresh(tok3, sec3, now=NOW + 1)
+
+
+@pytest.mark.parametrize(
+    "other", [{"run": "OTHERRUN"}, {"stage": "review"}, {"team": "beta"}, {"visit": 2}]
+)
+def test_attempts_of_different_steps_do_not_supersede_each_other(
+    env: Env, other: dict[str, Any]
+) -> None:
+    _, tok1, sec1 = env.start(ctx(attempt=1))
+    env.start(ctx(attempt=2, **other))
+    assert env.broker.refresh(tok1, sec1, now=NOW + 1)
+    env.directory.end(ctx(attempt=5, **other))
+    assert env.broker.refresh(tok1, sec1, now=NOW + 2)
+
+
+class HookedLatest(dict[Any, int]):
+    """A ``_latest`` map that runs a callback the first time it is read."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hook: Any = None
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        hook, self.hook = self.hook, None
+        if hook is not None:
+            hook()
+        return super().get(key, default)
+
+
+def test_concurrent_register_never_moves_the_latest_attempt_backwards(env: Env) -> None:
+    """Force register(3) to run between register(2)'s check and its write."""
+    latest = HookedLatest()
+    env.directory._latest = latest  # noqa: SLF001
+    done = threading.Event()
+
+    def register_three() -> None:
+        env.directory.register(ctx(attempt=3), new_attempt_secret(), deadline=NOW + 1000)
+        done.set()
+
+    def hook() -> None:
+        threading.Thread(target=register_three, daemon=True).start()
+        done.wait(timeout=0.3)  # without a lock this finishes here; with one it waits its turn
+
+    latest.hook = hook
+    env.directory.register(ctx(attempt=2), new_attempt_secret(), deadline=NOW + 1000)
+    assert done.wait(timeout=5)
+    three = env.directory.attempt(ctx(attempt=3))
+    two = env.directory.attempt(ctx(attempt=2))
+    assert three is not None
+    assert three.live is True
+    assert two is not None
+    assert two.live is False
 
 
 def test_an_ended_attempt_cannot_be_registered_again(env: Env) -> None:
@@ -1177,7 +1458,9 @@ def test_signer_failure_during_refresh_stays_transient_and_returns_no_token(env:
         def public_keys(self) -> list[dict[str, str]]:
             return []
 
-    env.broker._reissuer = InProcessReissuer(DownSigner(), env._deadline_of)  # noqa: SLF001
+    env.broker._reissuer = InProcessReissuer(  # noqa: SLF001
+        DownSigner(), env.verifier, env.directory
+    )
     _, token, secret = env.start()
     with pytest.raises(TransientError):
         env.broker.refresh(token, secret, now=NOW)
@@ -1187,7 +1470,7 @@ def test_reissuer_returning_garbage_is_refused(env: Env) -> None:
     class Garbage:
         ttl = 300
 
-        def reissue(self, context: StepContext, *, now: int) -> str:
+        def reissue(self, token: str, secret: bytes, *, now: int) -> str:
             return "not.a.token"
 
     env.broker._reissuer = Garbage()  # noqa: SLF001
