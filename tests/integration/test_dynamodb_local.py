@@ -4,9 +4,8 @@ server-behaviour checks, on a real DynamoDB engine. CI only (``integration`` mar
 DynamoDB Local never reports a transaction conflict (32 threads by 150 transactions: none), so
 real conflicts are not shown here (D12-07); scripted ones run on moto.
 The same ``DynamoServerTests`` run on moto in ``tests/store/test_dynamodb.py``. Only what a fake
-cannot show is here: unserialized claims (``race_claims`` retries
-``TransactionConflictError`` as callers must), the server's own size and validation refusals,
-type-strict conditions, and the 1 MB query page.
+cannot show is here: claims with no lock in front of the client, the server's own size and
+validation refusals, type-strict conditions, and the 1 MB query page.
 """
 
 from __future__ import annotations
@@ -99,6 +98,13 @@ class TestDynamoDbStoreOnDynamoDbLocal(StoreContract, DynamoServerTests):
         return env.store
 
 
+def _join(pool: list[threading.Thread], what: str, seconds: float = 120) -> None:
+    for t in pool:
+        t.join(timeout=seconds)
+    stuck = sum(t.is_alive() for t in pool)
+    assert stuck == 0, f"{what}: {stuck} thread(s) still running after {seconds}s"
+
+
 @pytest.mark.integration
 def test_unserialized_claims_have_one_winner_and_no_update_is_lost(env: Env) -> None:
     """No lock sits in front of the client here (``serialize=False``), so these are real concurrent
@@ -134,8 +140,7 @@ def test_unserialized_claims_have_one_winner_and_no_update_is_lost(env: Env) -> 
         pool = [threading.Thread(target=claim, args=(n,)) for n in range(threads)]
         for t in pool:
             t.start()
-        for t in pool:
-            t.join()
+        _join(pool, f"claim round {r}")
         assert len(won) == 1
         got = env.store.get(team, key)
         assert got is not None
@@ -145,9 +150,11 @@ def test_unserialized_claims_have_one_winner_and_no_update_is_lost(env: Env) -> 
     env.store.put(team, counter, {"n": 0})
     per_thread = 15
 
+    gave_up: list[str] = []
+
     def bump() -> None:
         for _ in range(per_thread):
-            while True:
+            for _attempt in range(1000):  # bounded: a stuck loop must fail by name, not hang
                 seen = env.store.get(team, counter)
                 assert seen is not None
                 try:
@@ -158,12 +165,15 @@ def test_unserialized_claims_have_one_winner_and_no_update_is_lost(env: Env) -> 
                     break
                 except (ConditionFailedError, TransactionConflictError):
                     continue
+            else:
+                gave_up.append("increment")
+                return
 
     pool = [threading.Thread(target=bump) for _ in range(threads)]
     for t in pool:
         t.start()
-    for t in pool:
-        t.join()
+    _join(pool, "counter increments")
+    assert gave_up == [], "an increment never succeeded in 1000 attempts"
     final = env.store.get(team, counter)
     assert final is not None
     assert final.data["n"] == threads * per_thread  # no lost update
@@ -177,8 +187,8 @@ def test_the_whole_contract_suite_ran_on_dynamodb_local(request: pytest.FixtureR
     assert executed, "nothing ran on DynamoDB Local: the suite was deselected or skipped"
     expected = {
         n for cls in (StoreContract, DynamoServerTests) for n in dir(cls) if n.startswith("test_")
-    }
-    ran = {name for name in executed if name.removesuffix("]") in expected}
+    } | {test_unserialized_claims_have_one_winner_and_no_update_is_lost.__name__}
+    ran = {name.split("[")[0] for name in executed} & expected
     assert len(ran) == len(expected), f"not run on DynamoDB Local: {sorted(expected - ran)}"
 
 

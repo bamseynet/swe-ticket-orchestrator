@@ -907,21 +907,26 @@ def test_a_validation_failure_beats_a_lost_condition(env: Env) -> None:
 SECOND_ATTEMPT: dict[str, Callable[[], Any]] = {
     "connect timeout": lambda: (None, ConnectTimeoutError(endpoint_url="http://x")),
     "endpoint unreachable": lambda: (None, EndpointConnectionError(endpoint_url="http://x")),
-    "throttled": lambda: (_throttled_response(), None),
+    "throttled": lambda: (_answer("ThrottlingException"), None),
+    "transaction conflict": lambda: (_answer("TransactionConflictException"), None),
+    "expired credentials": lambda: (_answer("ExpiredTokenException"), None),
+    "validation": lambda: (_answer("ValidationException"), None),
+    "access denied": lambda: (_answer("AccessDeniedException"), None),
+    "table missing": lambda: (_answer("ResourceNotFoundException"), None),
 }
 
 
-def _throttled_response() -> Any:
+def _answer(code: str) -> Any:
     from botocore.awsrequest import AWSResponse
 
     class Raw(io.BytesIO):
         def stream(self, *_: Any, **__: Any) -> Iterator[bytes]:
             yield self.read()
 
-    body = b'{"__type":"ThrottlingException","message":"slow down"}'
+    body = json.dumps({"__type": code, "message": "after a retry"}).encode()
     http = AWSResponse("https://x", 400, {}, Raw(body))  # type: ignore[arg-type]
     parsed = {
-        "Error": {"Code": "ThrottlingException", "Message": "slow down"},
+        "Error": {"Code": code, "Message": "after a retry"},
         "ResponseMetadata": {"HTTPStatusCode": 400, "HTTPHeaders": {}},
     }
     return http, parsed

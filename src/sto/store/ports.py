@@ -81,8 +81,9 @@ class TransactionOutcomeUnknownError(TransactionConflictError):
     (a read timeout, a closed connection, a 5xx). It is a ``TransactionConflictError``, so
     existing retry loops still work, but a caller that cares must re-read and reconcile before it
     retries: a retry of a version- or status-guarded write can lose to its own earlier success
-    and report a lost condition. ``TransactionConflictError`` itself still means nothing was
-    applied (a conflict, throttling, or a failure to connect). Reads never raise this one."""
+    and report a lost condition. ``TransactionConflictError`` itself means nothing was applied by
+    that call (a conflict or throttling); a *read* that fails to connect raises it too, as a
+    read has nothing to reconcile. Reads never raise this subclass."""
 
 
 # --- scopes -----------------------------------------------------------------------------------

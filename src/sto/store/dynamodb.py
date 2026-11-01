@@ -20,12 +20,14 @@ Errors speak the port's types, on reads as well as writes:
 
 * A lost condition is ``ConditionFailedError`` (``failed`` = the cancelled items whose condition
   failed); a ``DynamoConditionFailedError`` also carries every item's reason.
-* Throttling, a transaction conflict or a failure to connect (nothing applied) is
-  ``TransactionConflictError``: the type callers retry with backoff. ``get`` and ``query`` raise
-  it for every transient failure too. botocore's own retries run first.
-* A *write* whose answer was lost (read timeout, closed connection, any 5xx,
-  ``TransactionInProgressException``) may have landed, so it is ``TransactionOutcomeUnknownError``
-  (a ``TransactionConflictError``): re-read before retrying a guarded write.
+* Throttling or a transaction conflict (nothing applied) is ``TransactionConflictError``: the type
+  callers retry with backoff. ``get`` and ``query`` raise it for every transient failure,
+  transport errors included, since a read has nothing to reconcile.
+* A *write* that may have landed is ``TransactionOutcomeUnknownError`` (a
+  ``TransactionConflictError``): re-read before retrying a guarded write. That is any transport
+  error (connect failures too, as the SDK may have retried a landed attempt), any 5xx,
+  ``TransactionInProgressException``, and any answer at all that came after SDK retries
+  (``RetryAttempts > 0``) except a ``TransactionCanceledException``, which is a verdict.
 * ``TransactionCanceledException`` is mapped per item from ``CancellationReasons``, in this order:
   a validation failure (``ValueError``), a lost condition, another permanent reason
   (``DynamoTransactionError``), then retryable ones. When reasons mix, the most definite one wins
@@ -216,9 +218,10 @@ def _translate(exc: BaseException, *, write: bool) -> BaseException:
 
     On a write every transport error is outcome-unknown, connect failures included: the SDK may
     have retried, and an earlier attempt can have landed with its answer lost. For the same reason
-    a retryable server answer that came after SDK retries (``RetryAttempts > 0``) is unknown too;
-    only a ``TransactionCanceledException`` is a verdict on the transaction itself, because a
-    replay of an applied token would have returned success."""
+    any server answer that came after SDK retries (``RetryAttempts > 0``) is unknown too, whatever
+    its code (a validation error, expired credentials, ...). Only a
+    ``TransactionCanceledException`` is a verdict on the transaction itself, because a replay of
+    an applied token would have returned success."""
     if isinstance(exc, _TRANSPORT_ERRORS):
         return _unsure(write, f"DynamoDB transport failure: {exc}")
     if not isinstance(exc, ClientError):
@@ -230,15 +233,15 @@ def _translate(exc: BaseException, *, write: bool) -> BaseException:
     retried = int(meta.get("RetryAttempts") or 0) > 0
     if code == "TransactionCanceledException":
         return _translate_cancellation(exc, message)
+    if write and retried:  # an earlier attempt may have landed, whatever this answer says
+        return _unsure(
+            write,
+            f"{code} (HTTP {status}, after {meta.get('RetryAttempts')} retries): {message}",
+        )
     if code in _MAYBE_APPLIED_CODES or status >= 500:
         return _unsure(write, f"{code} (HTTP {status}): {message}")
     if code in _NOTHING_APPLIED_CODES:
-        text = f"{code}: {message}"
-        return (
-            _unsure(write, f"{text} (after {meta.get('RetryAttempts')} retries)")
-            if retried
-            else _Conflict(text)
-        )
+        return _Conflict(f"{code}: {message}")
     if code == "ValidationException":
         return ValueError(message)
     return exc
@@ -282,8 +285,7 @@ def _utf8(text: str, what: str) -> None:
 
 
 def _number(value: float | int) -> Decimal:
-    number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
-    return number
+    return Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
 
 
 def _to_wire(value: Any) -> Any:
@@ -408,8 +410,10 @@ def _with(spec: dict[str, Any], names: dict[str, str], values: dict[str, Any]) -
 
 
 class DynamoDbStore:
-    """Store port on DynamoDB. ``client`` is a boto3 ``dynamodb`` client (thread-safe). Pass one
-    with retries configured; this class does not add its own."""
+    """Store port on DynamoDB. ``client`` is a boto3 ``dynamodb`` client (thread-safe). It must use
+    botocore's *standard* retry mode (``Config(retries={"mode": "standard", ...})``): in legacy
+    mode, the default, a 200 with a bad checksum raises a raw error on a write that landed. This
+    class adds no retries of its own."""
 
     def __init__(self, client: DynamoDBClient, *, main_table: str, audit_table: str) -> None:
         for name in (main_table, audit_table):
