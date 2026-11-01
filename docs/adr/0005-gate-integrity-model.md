@@ -10,7 +10,8 @@ ticket. The rules are in PLAN.md section 4.3. This record gives the reasons for 
 
 ## Decisions
 
-1. **A decision is bound to a subject digest** (`head_sha`, `patch_id`, evidence digest, ticket revision). A
+1. **A decision is bound to a subject digest** (`head_sha`, `patch_id`, evidence digest, attention digest, ticket revision; a `pre_push` subject is `base_sha`,
+   `patch_id`, ticket revision, per PLAN.md section 4). A
    human approves what they saw, or the server refuses it.
 2. **Reject and request-changes veto while a gate is open.** First-write-wins would let an approval that arrived
    first beat a rejection in a quorum gate, the exact bug class we found. Veto is the safe direction. Negative decisions
