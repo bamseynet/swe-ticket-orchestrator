@@ -27,7 +27,6 @@ from typing import Any, ClassVar
 
 import pytest
 
-pytest.register_assert_rewrite("contract.suite")
 from contract.suite import (  # noqa: E402
     CAPABILITIES,
     MAX_REPLAY_WINDOW,
@@ -458,6 +457,10 @@ class Adapter:
     def read_revision(self) -> int:
         return int(self._call("read")["revision"])
 
+    def probe(self) -> None:
+        """An honest authenticated request of its own, separate from ``read_revision``."""
+        self._call("read")
+
 
 class DecisionAdapter(Adapter):
     """A Notifier-port adapter: a delivery is a ``DecisionRequest``, not a list of nudges."""
@@ -569,7 +572,7 @@ class StubTarget(Target):
         return self.server.now
 
     def probe(self) -> None:
-        self.adapter.read_revision()
+        self.adapter.probe()
 
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
         self.server.faults[op].append([mode, page, after])
@@ -982,6 +985,16 @@ class BadWrongNudgeObject(Adapter):
         return [ExternalChange(ChangeKind.TICKET, ticket=TicketRef("fake", "T-0"))]
 
 
+class BadPermanentReadIsZero(Adapter):
+    """The probe is honest and separate; only `read_revision` swallows a permanent failure."""
+
+    def read_revision(self) -> int:
+        try:
+            return super().read_revision()
+        except PermanentError:
+            return 0
+
+
 class BadReadErrorsAreZero(Adapter):
     def read_revision(self) -> int:
         try:
@@ -1280,6 +1293,41 @@ class BadEnqueuesBeforeVerify(Adapter):
         return super().receive(raw)
 
 
+class BadEnqueuesUnsigned(Adapter):
+    """Enqueues a delivery that carries no signature, then rejects it."""
+
+    def receive(self, raw: RawWebhook) -> Any:
+        if "X-Signature" not in raw.headers:
+            self.store.queue.append("unsigned")
+        return super().receive(raw)
+
+
+class BadEnqueuesOnMissingId(Adapter):
+    """Enqueues a delivery that carries no ID, then refuses it."""
+
+    def receive(self, raw: RawWebhook) -> Any:
+        if not raw.headers.get("X-Delivery"):
+            self.store.queue.append("no id")
+        return super().receive(raw)
+
+
+class BadEnqueuesBeforeParse(Adapter):
+    """Enqueues a verified delivery before it knows whether the body can be read."""
+
+    def receive(self, raw: RawWebhook) -> Any:
+        delivery_id = self.verifier.verify(raw.headers, raw.body)
+        if delivery_id in self.store.seen:
+            return None
+        self.store.queue.append("raw")
+        try:
+            result = self._parse(raw)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise MalformedWebhookError("unreadable body") from exc
+        self.store.seen.add(delivery_id)
+        self.store.queue.append(result)
+        return result
+
+
 class BadEnqueuesDuplicates(Adapter):
     def receive(self, raw: RawWebhook) -> Any:
         result = super().receive(raw)
@@ -1411,6 +1459,58 @@ class BadLaterPage429IsEnd(Adapter):
         return None
 
 
+class BadLaterPageAuthIsEnd(Adapter):
+    """A 401 on a later look-up page ends the list: the key reads as absent and is written twice."""
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        page: int | None = 0
+        while page is not None:
+            try:
+                body = self._call("lookup", page=page)
+            except PermanentError:
+                if page == 0:
+                    raise
+                return None
+            for comment in body["items"]:
+                if self._mine(comment, key):
+                    return comment  # type: ignore[no-any-return]
+            page = body["next"]
+        return None
+
+
+class BadLaterPageErrorPostsThenRaises(Adapter):
+    """On an error from a later page it posts the object, then raises: a retry writes twice."""
+
+    def _find(self, key: str) -> dict[str, str] | None:
+        page: int | None = 0
+        while page is not None:
+            try:
+                body = self._call("lookup", page=page)
+            except TransientError:
+                if page > 0:
+                    self._call("write", body=f"{self.marker(key, 'a')} body-a")
+                raise
+            for comment in body["items"]:
+                if self._mine(comment, key):
+                    return comment  # type: ignore[no-any-return]
+            page = body["next"]
+        return None
+
+
+class BadForeignVariantSuppresses(Adapter):
+    """Another author's marker for the key, with other arguments, is taken for ours: our write is
+    suppressed and the receipt names their object (G9)."""
+
+    def _mine(self, comment: dict[str, str], key: str) -> bool:
+        return f"<!-- sto:{key}:" in comment["body"]
+
+    def write(self, key: str, variant: str = "a") -> Receipt:
+        found = self._find(key)
+        if found is not None:
+            return Receipt(found["id"], "", True, simulated=True)
+        return super().write(key, variant)
+
+
 class BadRead429IsZero(Adapter):
     def read_revision(self) -> int:
         try:
@@ -1531,6 +1631,21 @@ class BadAuthLatches(Adapter):
         if self.server.__dict__.get("dead"):
             raise PermanentError("401 latched")
         return super()._unwrap(response)
+
+
+class BadGitHub403IsPermission(GitHubAdapter):
+    """Treats every 403 as a permission error, including GitHub's secondary rate limit."""
+
+    def _unwrap(self, response: Response) -> Any:
+        if response.status == 403:
+            raise PermanentError("403 forbidden")
+        return super()._unwrap(response)
+
+
+class OverridesCapabilities(StubTarget):
+    """A target that claims to be GitHub but declares only the 429 shape for itself."""
+
+    capabilities = Capabilities(False, frozenset({RateShape.PRIMARY_429}), AuthRefresh.NONE)
 
 
 def _with(adapter: type[Adapter], **kw: Any) -> Callable[[], Target]:
@@ -1716,15 +1831,29 @@ _bad(
         "test_t6_genuine_delivery_is_accepted": A,
     },
 )
-_bad(BadReadErrorsAreZero, None, TS, {"test_a_failing_read_is_an_error_not_a_zero": F})
+_bad(
+    BadReadErrorsAreZero,
+    None,
+    TS,
+    {
+        "test_a_failing_read_is_an_error_not_a_zero": F,
+        "test_a_read_refused_for_credentials_is_an_auth_error_never_a_revision": F,
+        "test_a_plain_403_or_404_on_a_read_is_an_error_never_a_revision": F,
+    },
+)
 _bad(BadRead429IsZero, None, TS, {"test_a_failing_read_is_an_error_not_a_zero": F})
 _bad(
     BadReadAuthIsNotFound,
     None,
     TS,
-    {"test_a_401_is_an_auth_error_and_is_asked_per_the_refresh_rule": A},
+    {"test_a_read_refused_for_credentials_is_an_auth_error_never_a_revision": A},
 )
-_bad(BadRead403IsNotFound, None, TS, {"test_a_plain_403_on_a_read_is_a_permission_error": A})
+_bad(
+    BadRead403IsNotFound,
+    None,
+    TS,
+    {"test_a_plain_403_or_404_on_a_read_is_an_error_never_a_revision": A},
+)
 _bad(
     BadInProcessKeys,
     None,
@@ -2037,6 +2166,60 @@ _bad(
         "test_an_expired_token_is_refreshed_only_if_the_vendor_allows_it": F,
     },
 )
+_bad(
+    "BadGitHub403IsPermission",
+    _github(BadGitHub403IsPermission),
+    Port.SCM,
+    {
+        "test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": P,
+        "test_a_rate_limited_post_is_transient_and_applies_nothing": P,
+    },
+)
+_bad(
+    "BadCapabilityOverride",
+    lambda: OverridesCapabilities(BadGitHub403IsPermission, Stub(ts_signed=False), Vendor.GITHUB),
+    Port.SCM,
+    {
+        "test_every_rate_limit_shape_is_transient_carries_its_wait_and_is_not_hammered": PortClaimError  # noqa: E501
+    },
+)
+_bad(
+    BadPermanentReadIsZero,
+    None,
+    TS,
+    {
+        "test_a_read_refused_for_credentials_is_an_auth_error_never_a_revision": F,
+        "test_a_plain_403_or_404_on_a_read_is_an_error_never_a_revision": F,
+    },
+)
+_bad(
+    BadEnqueuesUnsigned,
+    None,
+    TS,
+    {"test_t6_a_delivery_with_only_the_signature_removed_is_rejected": A},
+)
+_bad(BadEnqueuesOnMissingId, None, TS, {"test_a_delivery_with_no_id_is_refused_not_given_one": A})
+_bad(
+    BadEnqueuesBeforeParse,
+    None,
+    TS,
+    {"test_a_verified_but_malformed_body_is_refused_and_does_not_burn_its_id": A},
+)
+_bad(
+    BadLaterPageErrorPostsThenRaises,
+    None,
+    TS,
+    {"test_an_error_on_a_later_page_is_not_the_end_of_the_list": A},
+)
+_bad(
+    BadForeignVariantSuppresses,
+    None,
+    TS,
+    {"test_another_authors_marker_with_other_arguments_does_not_block_our_write": A},
+)
+_bad(
+    BadLaterPageAuthIsEnd, None, TS, {"test_an_error_on_a_later_page_is_not_the_end_of_the_list": A}
+)
 # PINNED-END
 
 
@@ -2064,7 +2247,8 @@ def test_known_bad_adapters_fail_the_suite(name: str) -> None:
         assert type(error) is expected, f"{name} failed {test} with {type(error).__name__}"
     broken = {n: e for n, e in results.items() if isinstance(e, (HarnessError, MissingControl))}
     assert broken == {}, "a bad adapter must fail the contract, not the harness"
-    assert not any(isinstance(e, PortClaimError) for e in results.values())
+    if PortClaimError not in pinned.values():
+        assert not any(isinstance(e, PortClaimError) for e in results.values())
 
 
 def test_every_bad_adapter_is_in_the_table() -> None:
@@ -2239,6 +2423,18 @@ def test_no_vendor_removes_signature_dedupe_auth_or_idempotency() -> None:
         "rate_shapes",
         "auth_refresh",
     }
+
+
+def test_a_target_cannot_override_its_vendors_capabilities_by_attribute_or_property() -> None:
+    class ByProperty(StubTarget):
+        @property
+        def capabilities(self) -> Capabilities:
+            return Capabilities(True, frozenset({RateShape.PRIMARY_429}), AuthRefresh.NONE)
+
+    for target in (OverridesCapabilities(), ByProperty()):
+        with pytest.raises(PortClaimError, match="capabilities belong to the vendor"):
+            validate_target(target, Port.WEBHOOK)
+    validate_target(reference(), Port.WEBHOOK)
 
 
 def test_is_auth_error_rejects_every_port_error_and_its_subclasses() -> None:
@@ -2440,8 +2636,12 @@ def test_a_missing_control_fails_rather_than_skips() -> None:
 # --- guards: no route around the suite -----------------------------------------------------
 
 
-def _try(*bases: type, **body: Any) -> type:
+def _try(*bases: type, local: bool = True, **body: Any) -> type:
+    """A throwaway subclass. ``local`` makes it look defined inside a function, which the
+    session-wide checks leave alone (pytest cannot collect it)."""
     attrs = {"port": Port.TICKET_SOURCE, "registry": {"fake": reference}, **body}
+    if local:
+        attrs["__qualname__"] = "<locals>.TestRoute"
     return type("TestRoute", (*bases, AdapterConformance), attrs)
 
 
@@ -2458,7 +2658,7 @@ def test_a_subclass_cannot_replace_the_target_fixture() -> None:
 @pytest.mark.parametrize("attr", ["pytestmark", "__test__"])
 def test_a_subclass_cannot_set_marks_or_hide_itself(attr: str) -> None:
     with pytest.raises(TypeError, match=attr):
-        _try(**{attr: [pytest.mark.skip] if attr == "pytestmark" else False})
+        _try(**{attr: [pytest.mark.skip] if attr == "pytestmark" else False})  # type: ignore[arg-type]
 
 
 def test_a_mixin_cannot_supply_the_target_fixture() -> None:
@@ -2506,6 +2706,38 @@ def test_collection_rechecks_a_class_whose_fixture_was_swapped_after_creation() 
         SUBCLASSES.remove(cls)
 
 
+def test_a_subclass_cannot_add_a_helper_a_hook_or_override_the_suites_machinery() -> None:
+    """The allow-list: only `port`, `registry` and Python's own class attributes."""
+    with pytest.raises(TypeError, match="_crash_then_retry"):
+        _try(_crash_then_retry=lambda self, *a: None)
+    with pytest.raises(TypeError, match="pytest_generate_tests"):
+        _try(pytest_generate_tests=lambda self, metafunc: None)
+    with pytest.raises(TypeError, match="helper"):
+        _try(helper=lambda self: None)
+
+
+def test_a_subclass_removed_from_the_registry_is_still_found_at_collection() -> None:
+    cls = _try(local=False, port=Port.WEBHOOK, registry={"fake": webhook_only})
+    SUBCLASSES.remove(cls)
+    problems = check_collection([], [str(Path(__file__).parent)])
+    assert f"{cls.__name__} is a conformance subclass that was never registered" in problems
+
+
+def test_a_swallowed_init_subclass_with_a_non_test_name_is_found_at_collection() -> None:
+    class Mixin:
+        def __init_subclass__(cls, **kwargs: Any) -> None:
+            pass
+
+    cls = type(
+        "NotNamedTest",
+        (Mixin, AdapterConformance),
+        {"port": Port.WEBHOOK, "registry": {"fake": webhook_only}},
+    )
+    assert cls not in SUBCLASSES
+    problems = check_collection([], [str(Path(__file__).parent)])
+    assert any("NotNamedTest" in p and "never registered" in p for p in problems), problems
+
+
 def test_a_conformance_subclass_must_be_named_test() -> None:
     with pytest.raises(TypeError, match="Test"):
         type(
@@ -2534,7 +2766,7 @@ def _item(cls: type, name: str, fn: Any = None, marks: tuple[str, ...] = ()) -> 
 
 
 def test_check_collection_flags_a_subclass_that_collected_nothing() -> None:
-    cls = _try(port=Port.WEBHOOK, registry={"fake": webhook_only})
+    cls = _try(local=False, port=Port.WEBHOOK, registry={"fake": webhook_only})
     try:
         here = [str(Path(__file__).parent)]
         orphan = f"{__name__}.TestRoute collected no test"
@@ -2546,7 +2778,7 @@ def test_check_collection_flags_a_subclass_that_collected_nothing() -> None:
 
 
 def test_check_collection_flags_a_subclass_hidden_with_test_false_after_creation() -> None:
-    cls = _try(port=Port.WEBHOOK, registry={"fake": webhook_only})
+    cls = _try(local=False, port=Port.WEBHOOK, registry={"fake": webhook_only})
     cls.__test__ = False  # type: ignore[attr-defined]  # after creation: pytest skips the class
     try:
         problems = check_collection([], [str(Path(__file__).parent)])
@@ -2634,14 +2866,36 @@ def test_enforce_outcome_allows_the_xfail_pending_controls_makes() -> None:
 
 
 def test_the_collection_guard_runs_before_deselection_and_is_a_plugin_for_every_session() -> None:
-    import contract.suite as suite
+    import contract
 
-    options = suite.pytest_collection_modifyitems.pytest_impl  # type: ignore[attr-defined]
+    options = contract.pytest_collection_modifyitems.pytest_impl  # type: ignore[attr-defined]
     assert options["tryfirst"] is True, "it must see items before -m and -k deselect them"
-    assert suite.pytest_runtest_makereport.pytest_impl["hookwrapper"] is True  # type: ignore[attr-defined]
+    assert contract.pytest_runtest_makereport.pytest_impl["hookwrapper"] is True  # type: ignore[attr-defined]
     addopts = (TESTS_DIR.parent / "pyproject.toml").read_text()
-    assert '"-p", "contract.suite"' in addopts, "loaded for every session, like hermetic_guard"
+    assert '"-p", "contract"' in addopts, "loaded for every session, like hermetic_guard"
     assert not (Path(__file__).parent / "conftest.py").exists()
+
+
+def test_the_plugin_imports_nothing_from_sto(tmp_path: Path) -> None:
+    """Else coverage starts after ``sto`` is imported and reports it as unmeasured."""
+    out = tmp_path / "imported.txt"
+    (tmp_path / "pytest.ini").write_text(
+        f"[pytest]\npythonpath = {TESTS_DIR} {SRC_DIR}\naddopts = -p contract -p no:cacheprovider\n"
+    )
+    (tmp_path / "conftest.py").write_text(
+        "import sys\n"
+        f"open({str(out)!r}, 'w').write(repr(sorted(m for m in sys.modules "
+        "if m == 'sto' or m.startswith('sto.'))))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert out.read_text() == "[]", result.stdout + result.stderr
 
 
 # --- the guards, end to end, in a real pytest run -------------------------------------------
@@ -2653,7 +2907,7 @@ def _project(tmp_path: Path, test_source: str, conftest_extra: str = "") -> Path
             f"""\
             [pytest]
             pythonpath = {TESTS_DIR} {SRC_DIR}
-            addopts = -p contract.suite -p no:cacheprovider
+            addopts = -p contract -p no:cacheprovider
             markers =
                 contract
                 live

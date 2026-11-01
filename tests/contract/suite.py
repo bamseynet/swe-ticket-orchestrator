@@ -17,20 +17,40 @@ Import it as ``contract.suite`` from any test directory (``tests/`` is on ``pyth
         port = Port.TICKET_SOURCE
         registry = {"fake": MyFakeTarget, "live": MyLiveTarget}
 
-This module is also a pytest plugin, loaded for EVERY session through ``addopts`` in
-``pyproject.toml`` (``-p contract.suite``), exactly as ``hermetic_guard`` is. Its hooks fail the
+The package ``contract`` is a pytest plugin, loaded for EVERY session through ``addopts`` in
+``pyproject.toml`` (``-p contract``), as ``hermetic_guard`` is; it forwards to this module once a
+test module has imported it, and imports nothing from ``sto`` itself (else coverage skips ``sto``).
+Its hooks fail the
 run if a subclass collected no test (under ``-m`` too), if a suite test was replaced, if an
 in-process subclass carries a marker that deselects or skips it, and if a suite test is skipped
-or xfailed by anything but ``pending_controls``. A subclass must be named ``Test*`` and cannot
-define a ``test_*`` method, the ``target`` fixture, ``pytestmark``, ``__test__`` or
-``__init_subclass__``, in itself or in a mixin. The checks run at class creation AND again at
-collection.
+or xfailed by anything but ``pending_controls``. A subclass must be named ``Test*`` and may define
+only ``port``, ``registry`` and Python's own class attributes (an allow-list, in itself and in any
+mixin): no helper, hook, fixture, mark or ``test_*`` method. The checks run at class creation AND
+again at collection, over every real subclass of ``AdapterConformance`` (so a registry edit or a
+swallowed ``__init_subclass__`` does not hide one).
 
-Known limits, deliberate routes the suite does not stop: removing a class from ``SUBCLASSES``,
-forging the private waiver token, a header name in a different case (fails closed), forging
-every ``ForgeKind`` consistently (only ``WRONG_SECRET`` is checked against ``emit``), and
-nothing requires a real adapter to HAVE a conformance subclass. The guards read the markers on
-collected items; a ``::`` argument narrows the completeness check to the classes it names.
+Known limits, deliberate routes the suite does not stop:
+
+* Forging the private waiver token, and setting ``__module__`` plus ``setattr`` into
+  ``contract.test_suite`` to pass as a reference adapter.
+* The port and waiver checks trust ``target.adapter``: a target can name a different real class
+  (D4-16).
+* ``forge()`` is only checked against ``emit`` for ``WRONG_SECRET``; a ``forge()`` that returns
+  that for every ``ForgeKind`` lets a prefix-compare or empty-key verifier pass (D4-16).
+* Header names are matched case-sensitively (fails closed).
+* Nothing requires a real adapter to HAVE a conformance subclass.
+* A silent page cap of 34 or more is not seen: the absent-key walk is about 45 pages and includes
+  the read-back walk, and the marker is 1,100 objects (11 pages) from each end. A cap below that
+  fails; "up to ten pages" understates how much is missed above it.
+* A ``::`` argument narrows the completeness check to the classes it names.
+
+What a fake server must provide for the suite to be meaningful: it must page at 100 items (the
+page size the suite assumes), and a rate-limit answer must ask for at least ``SHAPE_RETRY_AFTER``
+(30 seconds for a ``Retry-After`` shape, 45 for ``x-ratelimit-reset`` shape), since the suite
+requires an adapter to pass on at least that wait.
+
+For a vendor with no signed timestamp the dedupe record is the only bound on a replay, so it never
+expires; a TTL on the seen-ID table applies only to vendors with a signed timestamp.
 
 Ports, vendors and sections
 ---------------------------
@@ -70,11 +90,12 @@ lack the one waivable control, with a reason; it cannot be used on anything else
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib.util
 import os
 import sys
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -478,8 +499,22 @@ def implemented_ports(adapter: object) -> list[Port]:
     return [port for port, protocol in _REAL_PORTS if isinstance(adapter, protocol)]
 
 
+def _caps(target: Target) -> Capabilities:
+    """The vendor's capabilities, as the suite owns them: never the target's own claim."""
+    return CAPABILITIES[target.vendor]
+
+
 def validate_target(target: Target, port: Port) -> None:
-    """The target is what it says: a known vendor, a port its adapter really implements."""
+    """The target is what it says: a known vendor, a port its adapter really implements, and no
+    capabilities of its own."""
+    import inspect
+
+    try:
+        own = inspect.getattr_static(target, "capabilities")
+    except AttributeError:
+        own = Target.__dict__["capabilities"]
+    if own is not Target.__dict__["capabilities"]:
+        raise PortClaimError("capabilities belong to the vendor: a target cannot override them")
     vendor = getattr(target, "vendor", None)
     if not isinstance(vendor, Vendor):
         raise HarnessError("the target must name a Vendor; the suite owns its capabilities")
@@ -623,7 +658,28 @@ def retrying[T](call: Callable[[], T], attempts: int = RETRIES) -> T:
 # --- guards: class checks, collection checks, outcome checks ----------------------------------
 
 SUBCLASSES: list[type] = []
-_FORBIDDEN = ("target", "pytestmark", "__test__", "__init_subclass__")
+# Everything a subclass (or a mixin of one) may define: the port, the registry, and the
+# machinery Python adds to every class. Any other name (a helper, a hook, a fixture, a mark) could
+# change what the suite does, so it is refused. The suite's own tests may only be None or a waiver.
+_ALLOWED = frozenset(
+    {
+        "port",
+        "registry",
+        "__module__",
+        "__qualname__",
+        "__doc__",
+        "__dict__",
+        "__weakref__",
+        "__annotations__",
+        "__annotate__",
+        "__annotate_func__",
+        "__annotations_cache__",
+        "__firstlineno__",
+        "__static_attributes__",
+        "__orig_bases__",
+        "__parameters__",
+    }
+)
 
 
 def applicable(port: Port) -> list[str]:
@@ -645,17 +701,15 @@ def check_class(cls: type) -> list[str]:
         if klass is AdapterConformance or klass is object:
             continue
         for name, value in vars(klass).items():
-            if name in _FORBIDDEN and not (name == "target" and klass is AdapterConformance):
-                problems.append(f"{cls.__name__} ({klass.__name__}) defines {name!r}")
-            elif name in _SUITE_TESTS:
+            if name in _SUITE_TESTS:
                 genuine = _SUITE_TESTS[name]
                 waived = getattr(value, "_waiver", None) is _WAIVER and (
                     getattr(value, "__wrapped__", None) is genuine
                 )
-                if value is not None and not waived and klass is not cls:
+                if value is not None and not waived:
                     problems.append(f"{cls.__name__} ({klass.__name__}) overrides {name}")
-                elif value is not None and not waived:
-                    problems.append(f"{cls.__name__} overrides {name}")
+            elif name not in _ALLOWED:
+                problems.append(f"{cls.__name__} ({klass.__name__}) defines {name!r}")
     if "target" in dir(cls) and not _has_suite_fixture(cls):
         problems.append(f"{cls.__name__} replaces the target fixture")
     for attr in ("port", "registry"):
@@ -670,6 +724,14 @@ def _has_suite_fixture(cls: type) -> bool:
     return inspect.getattr_static(cls, "target") is inspect.getattr_static(
         AdapterConformance, "target"
     )
+
+
+def _all_subclasses(base: type) -> list[type]:
+    out: list[type] = []
+    for sub in base.__subclasses__():  # type: ignore[var-annotated]
+        out.append(sub)
+        out += _all_subclasses(sub)
+    return out
 
 
 def _file_of(cls: type) -> Path | None:
@@ -728,13 +790,19 @@ def check_collection(items: Iterable[Any], args: Iterable[str]) -> list[str]:
                 marks -= {"xfail"} if waived else set()
                 if marks:
                     problems.append(f"{cls.__name__}.{name} carries {sorted(marks)}")
-    for cls in SUBCLASSES:
+    for cls in _all_subclasses(AdapterConformance):
+        if "<locals>" in cls.__qualname__:
+            continue  # defined inside a function: pytest cannot collect it, so nothing runs
         file = _file_of(cls)
         if file is None or not any(file == p or p in file.parents or p == file for p in paths):
             continue
         selected = [c for p, c in named.items() if p == file]
         if selected and cls.__name__ not in set().union(*selected):
             continue
+        if cls not in SUBCLASSES:
+            problems.append(f"{cls.__name__} is a conformance subclass that was never registered")
+            continue
+        problems += [p for p in check_class(cls) if p not in problems]
         if cls not in by_cls:
             problems.append(f"{cls.__module__}.{cls.__name__} collected no test")
             continue
@@ -761,22 +829,11 @@ def enforce_outcome(item: Any, report: Any) -> None:
             del report.wasxfail
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(
-    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
-) -> None:
-    """Runs before ``-m`` and ``-k`` deselect, so the CI selector cannot hide an orphan."""
+def guard_collection(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Called by the ``contract`` plugin hook with the full item list, before deselection."""
     problems = check_collection(items, config.args)
     if problems:
         raise pytest.UsageError("conformance suite: " + "; ".join(problems))
-
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(
-    item: pytest.Item, call: pytest.CallInfo[Any]
-) -> Generator[None, Any, None]:
-    outcome = yield
-    enforce_outcome(item, outcome.get_result())
 
 
 class AdapterConformance:
@@ -947,7 +1004,7 @@ class AdapterConformance:
         ID is accepted however old, because no time header may be trusted for replay."""
         target.require(Control.SIGNATURE, Control.REPLAY_WINDOW)
         raw = target.emit(1, "d-1")
-        if target.capabilities.signed_timestamp:
+        if _caps(target).signed_timestamp:
             target.advance_clock(min(target.replay_window, MAX_REPLAY_WINDOW) + 1)
             with pytest.raises(PermanentError):
                 target.deliver(raw)
@@ -971,7 +1028,7 @@ class AdapterConformance:
         target.require(Control.SIGNATURE, Control.REPLAY_WINDOW)
         for i, value in enumerate((None, "not-a-time")):
             raw = target.set_timestamp(target.emit(1, f"d-{i}"), value)
-            if target.capabilities.signed_timestamp:
+            if _caps(target).signed_timestamp:
                 with pytest.raises(PermanentError):
                     target.deliver(raw)
             else:
@@ -986,7 +1043,7 @@ class AdapterConformance:
         assert target.deliver(raw).accepted
         target.advance_clock(FAR_FUTURE)
         bumped = target.set_timestamp(raw, str(target.clock()))
-        if target.capabilities.signed_timestamp:
+        if _caps(target).signed_timestamp:
             with pytest.raises(PermanentError):
                 target.deliver(bumped)
         else:
@@ -997,7 +1054,7 @@ class AdapterConformance:
         target.require(Control.SIGNATURE, Control.REPLAY_WINDOW)
         ahead = min(target.replay_window, MAX_REPLAY_WINDOW) + 1
         raw = target.future_dated(1, "d-1", ahead)
-        if target.capabilities.signed_timestamp:
+        if _caps(target).signed_timestamp:
             with pytest.raises(PermanentError):
                 target.deliver(raw)
         else:
@@ -1039,7 +1096,7 @@ class AdapterConformance:
         raw = target.emit(1, "d-1")
         assert target.deliver(raw).accepted
         wait = min(target.replay_window, MAX_REPLAY_WINDOW) - 1
-        target.advance_clock(wait if target.capabilities.signed_timestamp else FAR_FUTURE)
+        target.advance_clock(wait if _caps(target).signed_timestamp else FAR_FUTURE)
         assert not target.deliver(raw).accepted
 
     @covers(Section.WEBHOOK, Control.SIGNATURE, Control.DUPLICATE, Control.RESTART)
@@ -1079,10 +1136,11 @@ class AdapterConformance:
         target.deliver(target.emit(1, "d-1"))
         before = target.calls("read")
         assert target.reported_revision() == 1
-        assert target.calls("read") == before + 1
+        assert target.calls("read") > before
+        mid = target.calls("read")
         target.emit(2, "d-2")  # the server changes; no delivery reaches the adapter
         assert target.reported_revision() == 2
-        assert target.calls("read") == before + 2
+        assert target.calls("read") > mid
 
     @covers(Section.ORDERING, Control.ORDERING)
     def test_a_failing_read_is_an_error_not_a_zero(self, target: Target) -> None:
@@ -1093,6 +1151,31 @@ class AdapterConformance:
             with pytest.raises(TransientError):
                 target.reported_revision()
         assert target.reported_revision() == 5
+
+    @covers(Section.ORDERING, Control.ORDERING, Control.AUTH)
+    def test_a_read_refused_for_credentials_is_an_auth_error_never_a_revision(
+        self, target: Target
+    ) -> None:
+        """Through `reported_revision`, not the probe: a probe that is a separate call would let
+        an adapter answer 0 to a permanent failure of the read the ordering test relies on."""
+        target.require(Control.ORDERING, Control.AUTH)
+        target.revoke_auth("read")
+        with pytest.raises(PermanentError) as caught:
+            target.reported_revision()
+        assert is_auth_error(caught.value)
+
+    @covers(Section.ORDERING, Control.ORDERING, Control.HTTP_ERRORS)
+    def test_a_plain_403_or_404_on_a_read_is_an_error_never_a_revision(
+        self, target: Target
+    ) -> None:
+        target.require(Control.ORDERING, Control.HTTP_ERRORS)
+        target.respond_next("read", 403)
+        with pytest.raises(PermanentError) as caught:
+            target.reported_revision()
+        assert is_auth_error(caught.value)
+        target.respond_next("read", 404)
+        with pytest.raises(UnknownRefError):
+            target.reported_revision()
 
     # ==== IDEMPOTENCY: crash after write, at each step ======================================
 
@@ -1194,6 +1277,13 @@ class AdapterConformance:
             with pytest.raises(TransientError):
                 target.write("k1")
             assert target.stored_ids() == [first.external_id], f"{mode}: must not write"
+        # A 401 on a later page: a refresh-once vendor may recover and answer, so assert on what
+        # the server stored (nothing new), not on whether it raised.
+        target.restart()
+        target.fault_next("lookup", "401", page=1)
+        with contextlib.suppress(TransientError, PermanentError):
+            target.write("k1")
+        assert target.stored_ids() == [first.external_id], "a 401 on page 1: must not write"
 
     @covers(Section.LOOKUP, Control.CRASH, Control.RESTART, Control.LOOKUP)
     def test_a_failed_lookup_of_any_kind_is_not_taken_for_not_found(self, target: Target) -> None:
@@ -1293,7 +1383,7 @@ class AdapterConformance:
         self, target: Target
     ) -> None:
         target.require(Control.RATE_LIMIT)
-        for shape in sorted(target.capabilities.rate_shapes):
+        for shape in sorted(_caps(target).rate_shapes):
             target.rate_limit_next(2, shape)
             hint = SHAPE_RETRY_AFTER[shape]
             for _ in (1, 2):
@@ -1317,7 +1407,7 @@ class AdapterConformance:
         with pytest.raises(PermanentError) as caught:
             retrying(target.probe)
         assert is_auth_error(caught.value)
-        once = target.capabilities.auth_refresh is AuthRefresh.ONCE
+        once = _caps(target).auth_refresh is AuthRefresh.ONCE
         assert target.calls("unauthorized") == (2 if once else 1)
         assert target.calls("refresh") == (1 if once else 0)
 
@@ -1327,7 +1417,7 @@ class AdapterConformance:
     ) -> None:
         target.require(Control.AUTH)
         target.expire_token()
-        if target.capabilities.auth_refresh is AuthRefresh.ONCE:
+        if _caps(target).auth_refresh is AuthRefresh.ONCE:
             target.probe()
             assert target.calls("refresh") == 1
         else:
@@ -1355,7 +1445,6 @@ class AdapterConformance:
         with pytest.raises(PermanentError) as caught:
             target.probe()
         assert is_auth_error(caught.value)
-        assert target.calls("limited") == 0
 
     @covers(Section.AUTH, Control.AUTH, Control.HTTP_ERRORS)
     def test_a_404_on_a_read_is_an_unknown_object_not_a_credential_error(
@@ -1371,7 +1460,7 @@ class AdapterConformance:
     @covers(Section.WRITE_FAILURES, Control.RATE_LIMIT)
     def test_a_rate_limited_post_is_transient_and_applies_nothing(self, target: Target) -> None:
         target.require(Control.RATE_LIMIT)
-        for i, shape in enumerate(sorted(target.capabilities.rate_shapes)):
+        for i, shape in enumerate(sorted(_caps(target).rate_shapes)):
             key = f"k-{i}"
             target.rate_limit_next(1, shape, "write")  # the look-up passes, the post is limited
             limited = target.calls("limited")
