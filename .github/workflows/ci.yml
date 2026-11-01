@@ -33,9 +33,10 @@ permissions:
   contents: read
 
 # A newer push to the same PR cancels the superseded run. Runs on main are never
-# cancelled, so every main commit gets a full result.
+# cancelled: GitHub keeps only one pending run per group, so main runs get a
+# per-commit group and every main commit gets a full result.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -53,22 +54,24 @@ jobs:
       # 'true' = something other than docs changed (or this is a push to main):
       # run everything. Changes to shared code, CI or lockfiles are not docs, so
       # they always land here.
-      code: ${{ github.event_name == 'push' || steps.changes.outputs.code == 'true' }}
+      code: ${{ github.event_name == 'push' || steps.changes.outputs.code == 'true' || steps.changes.outputs.spec == 'true' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # No checkout: on pull_request, paths-filter lists files through the API, and on
+      # push the paths-filter step is skipped.
       - id: changes
         if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
-          predicate-quantifier: every # every pattern must match: "anything except docs"
+          predicate-quantifier: every # within a filter every pattern must match: "anything except docs"
           filters: |
             code:
               - '**'
               - '!docs/**'
               - '!**/*.md'
               - '!LICENSE'
+            # Docs that tests read count as code (tools/backlog parses STAGES.md).
+            spec:
+              - 'docs/STAGES.md'
 
   lint:
     name: lint
