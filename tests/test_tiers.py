@@ -338,6 +338,30 @@ GAPS = {
     "xargs_in_shell_string": (
         'import subprocess\nsubprocess.run("echo a | xargs -r docker rm", shell=True)'
     ),
+    # review pass 1
+    "apostrophe_in_double_quotes": (
+        "import subprocess\nsubprocess.run('echo \"it\\'s $(docker ps)\"', shell=True)"
+    ),
+    "apostrophe_then_backtick": (
+        "import subprocess\nsubprocess.run('echo \"it\\'s `docker ps`\"', shell=True)"
+    ),
+    "xargs_gnu_i": 'import subprocess\nsubprocess.run(["xargs", "-i", "docker", "rm", "{}"])',
+    "xargs_long_option": (
+        'import subprocess\nsubprocess.run(["xargs", "--max-args", "1", "docker", "rm"])'
+    ),
+    "xargs_option_cluster": (
+        'import subprocess\nsubprocess.run(["xargs", "-rn", "1", "docker", "rm"])'
+    ),
+    "shell_true_with_executable": (
+        'import subprocess\nsubprocess.Popen("ps", shell=True, executable="docker")'
+    ),
+    "nested_escaped_backticks": (
+        'import subprocess\nsubprocess.run(r"echo `echo \\`docker ps\\``", shell=True)'
+    ),
+    "newline_separated": 'import subprocess\nsubprocess.run("echo hi\\ndocker ps", shell=True)',
+    "absurd_nesting_fails_closed": (
+        'import subprocess\nsubprocess.run("$(" * 3000 + "docker ps" + ")" * 3000, shell=True)'
+    ),
 }
 
 
@@ -373,6 +397,11 @@ INNOCENT = [
     'subprocess.run(["echo", "x"], executable="/bin/echo", check=True)',
     'subprocess.run(["xargs", "echo", "docker"], input=b"a", check=True)',
     'subprocess.run(["xargs", "-n", "1", "echo"], input=b"docker", check=True)',
+    'subprocess.run(["xargs", "-i", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run(["xargs", "--max-args", "1", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run("echo \\"it\'s\\" \'$(docker ps)\'", shell=True, check=True)',
+    "subprocess.run(\"grep ';' firefox.txt\", shell=True, check=False)",
+    'subprocess.run("echo hi # $(docker ps)", shell=True, check=True)',
 ]
 
 
