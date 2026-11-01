@@ -18,6 +18,17 @@ from pathlib import Path
 
 DEFAULT_BUDGET = 25
 
+# Files that guard or drive the tests themselves have no sibling named after them.
+OVERRIDES: dict[str, list[str]] = {
+    "tests/hermetic_guard.py": ["tests/test_guards.py"],
+    "tests/tier_guard.py": ["tests/test_tiers.py"],
+    "scripts/test_changed.py": ["tests/test_tiers.py"],
+}
+
+
+class GitError(RuntimeError):
+    """git could not list the changed files (missing base, shallow clone, not a repository)."""
+
 
 @dataclass
 class Selection:
@@ -29,12 +40,15 @@ class Selection:
             return "test-changed: no direct tests for the changed files (CI runs the rest)"
         note = f"test-changed: {len(self.paths)} direct test file(s)"
         if self.over_budget:
-            note += f"; {len(self.over_budget)} over the budget left to CI"
+            note += f"; {len(self.over_budget)} over the budget left to CI:"
+            note += "".join(f"\n  - {p}" for p in self.over_budget)
         return note
 
 
 def _candidates(rel: str) -> list[str]:
     """Direct test paths for one changed file, most specific first."""
+    if rel in OVERRIDES:
+        return OVERRIDES[rel]
     path = Path(rel)
     name = path.name
     if rel.startswith("tests/") and name.startswith("test_") and path.suffix == ".py":
@@ -69,10 +83,10 @@ def select(changed: Sequence[str], root: Path, budget: int = DEFAULT_BUDGET) -> 
 
 def changed_files(base: str, root: Path) -> list[str]:
     def git(*args: str) -> list[str]:
-        out = subprocess.run(
-            ["git", *args], cwd=root, capture_output=True, text=True, check=False
-        ).stdout
-        return out.splitlines()
+        done = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+        if done.returncode != 0:
+            raise GitError(f"git {' '.join(args)} failed: {done.stderr.strip()}")
+        return done.stdout.splitlines()
 
     files = {
         *git("diff", "--name-only", f"{base}...HEAD"),
@@ -98,7 +112,16 @@ def main(
     parser.add_argument("--files", nargs="*", help="use these changed files instead of git")
     args = parser.parse_args(argv)
     root = root or Path(__file__).resolve().parent.parent
-    changed = args.files if args.files is not None else changed_files(args.base, root)
+    try:
+        changed = args.files if args.files is not None else changed_files(args.base, root)
+    except GitError as err:
+        print(
+            f"test-changed: {err}\n"
+            f"  Cannot tell what changed, so nothing was run. Try: git fetch origin main "
+            f"(a shallow clone may need --unshallow), or pass BASE=<ref>.",
+            file=sys.stderr,
+        )
+        return 2
     selection = select(changed, root, args.budget)
     print(selection.message())
     if not selection.paths:

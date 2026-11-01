@@ -8,8 +8,8 @@ help: ## List targets
 doctor: ## Check Python, uv, Node 24, Docker (optional) and ports; prints a fix for each. Ports: STO_API_PORT, STO_WEB_PORT
 	@command -v python3 >/dev/null || { echo "[FAIL] python3 not found"; echo "       fix: install Python 3.12+, e.g. curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.12 --default"; exit 1; }; python3 scripts/doctor.py $(ARGS)
 
-test-fast: ## Hermetic unit tests, no Docker, no network (seconds)
-	uv run pytest -q
+test-fast: ## Hermetic unit tier, no Docker, no network (seconds); contract and gate have their own targets
+	uv run pytest -q -m unit
 
 test: ## Run a chosen target: make test T=tests/test_guards.py
 	@test -n "$(T)" || { echo "usage: make test T=<path-or-nodeid>"; exit 2; }

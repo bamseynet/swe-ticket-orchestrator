@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -260,46 +261,168 @@ def test_all_six_tier_markers_are_registered(tmp_path: Path) -> None:
 # (Later issues add the real contract suites and gate scenarios.)
 
 
-@pytest.mark.contract
-def test_contract_tier_is_selectable() -> None:
+def collected(tier: str) -> str:
     result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-m",
-            "contract",
-            "tests/test_tiers.py",
-        ],
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", tier, "tests/test_tiers.py"],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
-    assert "test_contract_tier_is_selectable" in result.stdout
+    assert result.returncode == 0, result.stdout
+    return result.stdout
+
+
+@pytest.mark.contract
+def test_contract_tier_selects_only_contract_tests() -> None:
+    contract, unit = collected("contract"), collected("unit")
+    assert "test_contract_tier_selects_only_contract_tests" in contract
+    assert "test_gate_tier_selects_only_gate_tests" not in contract
+    assert "test_contract_tier_selects_only_contract_tests" not in unit  # not run again as unit
 
 
 @pytest.mark.gate
-def test_gate_tier_is_selectable() -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-m",
-            "gate",
-            "tests/test_tiers.py",
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+def test_gate_tier_selects_only_gate_tests() -> None:
+    gate, unit = collected("gate"), collected("unit")
+    assert "test_gate_tier_selects_only_gate_tests" in gate
+    assert "test_contract_tier_selects_only_contract_tests" not in gate
+    assert "test_gate_tier_selects_only_gate_tests" not in unit
+
+
+# ---- review round 1: bypasses of the Docker and browser guards ----
+
+BYPASSES = {
+    "shell_string": 'import subprocess\nsubprocess.run("docker version", shell=True)',
+    "sh_dash_c": 'import subprocess\nsubprocess.run(["sh", "-c", "docker version"])',
+    "env_docker": 'import subprocess\nsubprocess.run(["/usr/bin/env", "docker", "version"])',
+    "docker_path": 'import subprocess\nsubprocess.run(["/usr/local/bin/docker", "ps"])',
+    "os_system": 'import os\nos.system("docker version")',
+    "posix_spawn": 'import os\nos.posix_spawn("/usr/bin/env", ["env", "docker", "ps"], {})',
+    "posix_spawnp": 'import os\nos.posix_spawnp("docker", ["docker", "ps"], {})',
+    "connect_ex": (
+        'import socket\ns = socket.socket(socket.AF_UNIX)\ns.connect_ex("/var/run/docker.sock")'
+    ),
+    "playwright_driver": (
+        "import subprocess\n"
+        'subprocess.run(["/venv/lib/python3.12/site-packages/playwright/driver/node", "cli.js"])'
+    ),
+    "browser_via_shell": 'import subprocess\nsubprocess.run("chromium --headless", shell=True)',
+    "browser_via_env": 'import subprocess\nsubprocess.run(["env", "google-chrome", "--version"])',
+}
+
+
+@pytest.mark.parametrize("name", sorted(BYPASSES))
+def test_guard_bypass_is_blocked(tmp_path: Path, name: str) -> None:
+    body = textwrap.indent(BYPASSES[name], "    ")
+    result = run_pytest(tmp_path, f"def test_bypass():\n{body}\n")
+    assert result.returncode == 1, result.stdout
+    assert "TierViolationError" in result.stdout
+
+
+def test_innocent_commands_are_not_blocked(tmp_path: Path) -> None:
+    source = """
+        import os, subprocess
+        def test_ok():
+            subprocess.run(["echo", "hello"], check=True)
+            subprocess.run("echo plain text", shell=True, check=True)
+            assert os.system("true") == 0
+    """
+    result = run_pytest(tmp_path, source)
+    assert result.returncode == 0, result.stdout
+
+
+def test_shell_string_with_marker_is_allowed(tmp_path: Path) -> None:
+    source = """
+        import pytest, subprocess
+        @pytest.mark.integration
+        def test_ok():
+            subprocess.run("docker version", shell=True)
+    """
+    assert run_pytest(tmp_path, source, "-m", "integration").returncode == 0
+
+
+# ---- review round 1: tier from the directory ----
+
+
+def test_directory_assigns_the_tier(tmp_path: Path) -> None:
+    for folder in ("gates", "contract", "other"):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / f"test_{folder}.py").write_text("def test_it(): pass\n")
+    gate = run_pytest(tmp_path, "def test_root(): pass\n", "-m", "gate", "--collect-only", "-q")
+    assert "gates/test_gates.py" in gate.stdout
+    assert "contract/" not in gate.stdout
+    contract = run_pytest(
+        tmp_path, "def test_root(): pass\n", "-m", "contract", "--collect-only", "-q"
     )
-    assert "test_gate_tier_is_selectable" in result.stdout
+    assert "contract/test_contract.py" in contract.stdout
+    unit = run_pytest(tmp_path, "def test_root(): pass\n", "-m", "unit", "--collect-only", "-q")
+    assert "other/test_other.py" in unit.stdout
+    assert "gates/" not in unit.stdout
+    assert "contract/" not in unit.stdout
+
+
+# ---- review round 1: test_changed failure modes and overrides ----
+
+
+def git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_missing_base_is_an_error_with_a_fetch_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "commit", "-q", "--allow-empty", "-m", "x")
+    code = test_changed.main(["--base", "origin/main"], root=tmp_path, runner=record([], 0))
+    assert code != 0
+    assert "git fetch" in capsys.readouterr().err
+
+
+def test_not_a_git_repository_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = test_changed.main([], root=tmp_path, runner=record([], 0))
+    assert code != 0
+    assert "git" in capsys.readouterr().err
+
+
+def test_guard_and_script_changes_select_their_tests(tmp_path: Path) -> None:
+    make_tree(tmp_path, ["tests/test_guards.py", "tests/test_tiers.py"])
+    changed = ["tests/hermetic_guard.py", "tests/tier_guard.py", "scripts/test_changed.py"]
+    assert test_changed.select(changed, tmp_path).paths == [
+        "tests/test_guards.py",
+        "tests/test_tiers.py",
+    ]
+
+
+def test_over_budget_files_are_named(tmp_path: Path) -> None:
+    names = [f"m{i}" for i in range(4)]
+    make_tree(
+        tmp_path,
+        [f"src/sto/domain/{n}.py" for n in names] + [f"tests/domain/test_{n}.py" for n in names],
+    )
+    selection = test_changed.select([f"src/sto/domain/{n}.py" for n in names], tmp_path, budget=2)
+    message = selection.message()
+    assert "tests/domain/test_m2.py" in message
+    assert "tests/domain/test_m3.py" in message
+
+
+# ---- review round 1: unit job excludes the other hermetic tiers; coverage sources ----
+
+
+def test_unit_job_runs_unit_only_and_coverage_measures_real_code() -> None:
+    makefile = (ROOT / "Makefile").read_text()
+    fast = makefile.split("test-fast:", 1)[1].splitlines()[1]
+    assert "-m unit" in fast
+    source = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["coverage"]["run"][
+        "source"
+    ]
+    assert {"sto", "tools", "scripts"} <= set(source)
 
 
 # ---- CI wiring and make targets ----
