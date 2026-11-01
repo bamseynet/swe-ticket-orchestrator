@@ -1,8 +1,10 @@
 """The DynamoDB store against DynamoDB Local (D3-09): the shared contract suite plus the
 server-behaviour checks, on a real DynamoDB engine. CI only (``integration`` marker, Docker).
 
+DynamoDB Local never reports a transaction conflict (32 threads by 150 transactions: none), so
+real conflicts are not shown here (D12-07); scripted ones run on moto.
 The same ``DynamoServerTests`` run on moto in ``tests/store/test_dynamodb.py``. Only what a fake
-cannot show is here: real transaction serialization (``race_claims`` retries
+cannot show is here: unserialized claims (``race_claims`` retries
 ``TransactionConflictError`` as callers must), the server's own size and validation refusals,
 type-strict conditions, and the 1 MB query page.
 """
@@ -26,12 +28,13 @@ from _dynamodb import DDB_PORT
 from hermetic_guard import allow_loopback_bind
 from sto.store.dynamodb import DynamoDbStore, create_tables
 from sto.store.ports import (
+    ConditionFailedError,
     Key,
     Put,
     Store,
     TeamScope,
     TransactionConflictError,
-    TransactionOutcomeUnknownError,
+    VersionIs,
 )
 
 if TYPE_CHECKING:
@@ -97,40 +100,74 @@ class TestDynamoDbStoreOnDynamoDbLocal(StoreContract, DynamoServerTests):
 
 
 @pytest.mark.integration
-def test_concurrent_transactions_on_one_item_really_conflict_and_say_so(env: Env) -> None:
-    """Nothing serializes calls here (``serialize=False``), so DynamoDB itself must refuse some
-    overlapping transactions. Each refusal must surface as a plain TransactionConflictError: not a
-    lost condition (no condition is set), and not an unknown outcome (nothing was applied)."""
+def test_unserialized_claims_have_one_winner_and_no_update_is_lost(env: Env) -> None:
+    """No lock sits in front of the client here (``serialize=False``), so these are real concurrent
+    transactions. DynamoDB Local never reports a conflict: 32 threads by 150 transactions over three
+    items (about 4,800) produced none, so it serializes them. This test therefore asserts what
+    holds there: one winner per claim, and every counter increment survives. A real conflict from
+    live DynamoDB is not shown here (D12-07)."""
     team = TeamScope("team-a")
-    keys = [Key("HOT", f"ITEM#{i}") for i in range(3)]
-    for k in keys:
-        env.store.put(team, k, {"n": 0})
-    conflicts: list[BaseException] = []
-    other: list[BaseException] = []
-    threads = 32
-    barrier = threading.Barrier(threads)
+    threads, rounds = 16, 10
+    for r in range(rounds):
+        key = Key("CLAIM", f"R{r}")
+        env.store.put(team, key, {"owner": None})
+        barrier = threading.Barrier(threads)
+        won: list[int] = []
 
-    def hammer(n: int) -> None:
-        barrier.wait()
-        for i in range(150):
-            # Overlapping item sets in different orders, so transactions contend on several items.
-            chosen = keys[n % 3 :] + keys[: n % 3]
-            ops = [Put(k, {"n": n, "i": i}) for k in chosen[: 2 + (i % 2)]]
-            try:
-                env.store.transact(team, ops)
-            except TransactionConflictError as exc:
-                conflicts.append(exc)
-            except BaseException as exc:
-                other.append(exc)
+        def claim(
+            n: int,
+            key: Key = key,
+            barrier: threading.Barrier = barrier,
+            won: list[int] = won,
+        ) -> None:
+            barrier.wait()
+            for _ in range(50):
+                try:
+                    env.store.transact(team, [Put(key, {"owner": n}, when=VersionIs(1))])
+                    won.append(n)
+                except TransactionConflictError:
+                    continue  # a real conflict would be retried, as callers do
+                except ConditionFailedError:
+                    pass
+                return
 
-    pool = [threading.Thread(target=hammer, args=(n,)) for n in range(threads)]
+        pool = [threading.Thread(target=claim, args=(n,)) for n in range(threads)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join()
+        assert len(won) == 1
+        got = env.store.get(team, key)
+        assert got is not None
+        assert (got.data, got.version) == ({"owner": won[0]}, 2)
+
+    counter = Key("COUNTER", "C")
+    env.store.put(team, counter, {"n": 0})
+    per_thread = 15
+
+    def bump() -> None:
+        for _ in range(per_thread):
+            while True:
+                seen = env.store.get(team, counter)
+                assert seen is not None
+                try:
+                    env.store.transact(
+                        team,
+                        [Put(counter, {"n": seen.data["n"] + 1}, when=VersionIs(seen.version))],
+                    )
+                    break
+                except (ConditionFailedError, TransactionConflictError):
+                    continue
+
+    pool = [threading.Thread(target=bump) for _ in range(threads)]
     for t in pool:
         t.start()
     for t in pool:
         t.join()
-    assert other == []
-    assert conflicts, "DynamoDB Local never reported a conflict: the test is not exercising it"
-    assert not any(isinstance(c, TransactionOutcomeUnknownError) for c in conflicts)
+    final = env.store.get(team, counter)
+    assert final is not None
+    assert final.data["n"] == threads * per_thread  # no lost update
+    assert final.version == threads * per_thread + 1
 
 
 @pytest.mark.integration
