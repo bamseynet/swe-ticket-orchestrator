@@ -54,3 +54,9 @@ def test_wire_form_is_the_ulid_string_and_roundtrips(t: int, r: bytes) -> None:
         "run": str(rid),
         "ids": [str(rid)],
     }
+
+
+@pytest.mark.parametrize("bad", [1.5, True, "1", None, -1, 2**128])
+def test_ulid_value_must_be_an_in_range_int(bad: object) -> None:
+    with pytest.raises(InvalidIdError):
+        Ulid(bad)  # type: ignore[arg-type]

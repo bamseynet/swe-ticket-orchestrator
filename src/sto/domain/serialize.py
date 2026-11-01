@@ -58,7 +58,11 @@ def _decode(tp: Any, value: Any) -> Any:
 
 
 def from_wire[T](cls: type[T], data: Any) -> T:
-    """Rebuild a model from ``to_wire`` output, parsing IDs, enums and nested records."""
+    """Rebuild a model from ``to_wire`` output, parsing IDs, enums and nested records.
+
+    The input must be plain JSON types. A DynamoDB store must normalize first (``Decimal``
+    numbers to ints, PK/SK and other key attributes dropped) in its own module.
+    """
     if not isinstance(data, dict):
         raise TypeError(f"{cls.__name__} wire form must be an object, not {type(data).__name__}")
     hints = typing.get_type_hints(cls)

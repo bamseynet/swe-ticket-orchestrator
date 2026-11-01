@@ -21,6 +21,8 @@ class Ulid:
     value: int
 
     def __post_init__(self) -> None:
+        if type(self.value) is not int:
+            raise InvalidIdError(f"ULID value must be an int, not {type(self.value).__name__}")
         if not 0 <= self.value <= _MAX:
             raise InvalidIdError(f"ULID out of range: {self.value}")
 

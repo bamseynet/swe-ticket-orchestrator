@@ -72,7 +72,8 @@ def _rec[T](label: str, cls: type[T], value: object) -> T:
 
 
 def _seq(label: str, value: object) -> tuple[Any, ...]:
-    if isinstance(value, str | bytes) or not hasattr(value, "__iter__"):
+    # Sets and dicts are refused: their iteration order is not stable.
+    if isinstance(value, str | bytes | set | frozenset | dict) or not hasattr(value, "__iter__"):
         raise TypeError(f"{label} must be a sequence, not {type(value).__name__}")
     return tuple(value)
 
@@ -272,9 +273,10 @@ class Gate:
         _opt_str("gate closed_by", self.closed_by)
         if self.status.is_open and self.closed_by is not None:
             raise ValueError("an open gate has no closed_by")
-        if self.type is GateType.PRE_PUSH and self.subject.head_sha is not None:
-            # PLAN 4: a pre_push gate closes before any commit exists, so it has no head_sha.
-            raise ValueError("a pre_push gate takes a pre-push subject (base_sha, no head_sha)")
+        if (self.type is GateType.PRE_PUSH) != (self.subject.head_sha is None):
+            # PLAN 4: a pre_push gate closes before any commit exists, so only it uses the short
+            # subject (base_sha, no head_sha); every other gate must bind evidence via head_sha.
+            raise ValueError("only a pre_push gate takes a pre-push subject, and it must")
 
     @property
     def is_open(self) -> bool:
@@ -410,6 +412,8 @@ class Effect:
             _rec("effect receipt", Receipt, self.receipt)
         if self.frozen_subject is not None:
             _rec("effect frozen_subject", Subject, self.frozen_subject)
+            if self.frozen_subject.head_sha is None or self.frozen_subject.merge_sha is None:
+                raise ValueError("effect frozen_subject must be a head subject with merge_sha")
         gated = self.klass is EffectClass.GATED
         if gated and not self.requires_gates:
             raise ValueError("a gated effect needs a non-empty requires_gates")
@@ -428,11 +432,28 @@ class Effect:
         elif self.status in _NO_RECEIPT and self.receipt is not None:
             raise ValueError(f"a {self.status.value} effect cannot hold a receipt")
 
-    def advance(self, target: EffectStatus, *, receipt: Receipt | None = None) -> Effect:
+    def advance(
+        self,
+        target: EffectStatus,
+        *,
+        receipt: Receipt | None = None,
+        decision_ids: tuple[DecisionId, ...] | None = None,
+        subject_digest: str | None = None,
+        intent: str | None = None,
+        frozen_subject: Subject | None = None,
+    ) -> Effect:
+        """Checked move. Entering ATTEMPTING counts an attempt (PLAN 6.3: RETRYING -> ATTEMPTING
+        is another one). Fields passed here replace the current ones, so a gated claim supplies
+        its ``decision_ids`` and ``subject_digest`` on the PLANNED -> ATTEMPTING step."""
         return dataclasses.replace(
             self,
             status=transition(self.status, target),
+            attempts=self.attempts + (1 if target is EffectStatus.ATTEMPTING else 0),
             receipt=receipt if receipt is not None else self.receipt,
+            decision_ids=self.decision_ids if decision_ids is None else decision_ids,
+            subject_digest=self.subject_digest if subject_digest is None else subject_digest,
+            intent=self.intent if intent is None else intent,
+            frozen_subject=self.frozen_subject if frozen_subject is None else frozen_subject,
         )
 
 

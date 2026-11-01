@@ -325,6 +325,17 @@ def test_pre_push_gate_type() -> None:
         gate(type=GateType.PRE_PUSH)  # head subject on a pre_push gate
 
 
+@pytest.mark.parametrize("gtype", list(GateType))
+@pytest.mark.parametrize("short", [True, False], ids=["pre_push_subject", "head_subject"])
+def test_gate_type_and_subject_shape_agree(gtype: GateType, short: bool) -> None:
+    subject = Subject.pre_push(base_sha="b", patch_id="p", ticket_revision="t") if short else head()
+    if (gtype is GateType.PRE_PUSH) == short:
+        assert gate(type=gtype, subject=subject).type is gtype
+    else:
+        with pytest.raises(ValueError, match="pre_push"):
+            gate(type=gtype, subject=subject)
+
+
 @pytest.mark.parametrize("terminal", [s for s in RunStatus if s.is_terminal])
 def test_incident_on_any_terminal_status(terminal: RunStatus) -> None:
     assert Run(id=RID, team="t", status=terminal, incident=True).incident
@@ -423,3 +434,43 @@ def test_numeric_fields_reject_bool_and_non_int() -> None:
         Run(id=RID, team="t", version=True)
     with pytest.raises(TypeError, match="round"):
         gate(round="1")
+
+
+def test_full_gated_claim_through_advance_only() -> None:
+    dec = DecisionId.from_parts(9, bytes(10))
+    planned = effect()
+    assert planned.attempts == 0
+    claimed = planned.advance(
+        EffectStatus.ATTEMPTING, decision_ids=(dec,), subject_digest="d", intent="abc123"
+    )
+    assert (claimed.attempts, claimed.intent, claimed.decision_ids) == (1, "abc123", (dec,))
+    retry = claimed.advance(EffectStatus.RETRYING)
+    assert retry.attempts == 1  # RETRYING itself is not an attempt
+    again = retry.advance(EffectStatus.ATTEMPTING)
+    assert again.attempts == 2  # PLAN 6.3: RETRYING -> ATTEMPTING is another attempt
+    accepted = again.advance(EffectStatus.ACCEPTED)
+    done = accepted.advance(
+        EffectStatus.CONFIRMED,
+        receipt=Receipt("42", "u", True),
+        frozen_subject=head(merge_sha="m"),
+    )
+    assert done.status is EffectStatus.CONFIRMED
+    assert done.frozen_subject is not None
+    assert done.attempts == 2
+    with pytest.raises(ValueError, match="decision_ids"):
+        planned.advance(EffectStatus.ATTEMPTING)  # a gated claim without a decision
+
+
+def test_frozen_subject_is_a_merged_head_subject() -> None:
+    effect(frozen_subject=head(merge_sha="m"))
+    with pytest.raises(ValueError, match="frozen_subject"):
+        effect(frozen_subject=head())  # no merge_sha
+    with pytest.raises(ValueError, match="frozen_subject"):
+        effect(frozen_subject=Subject.pre_push(base_sha="b", patch_id="p", ticket_revision="t"))
+
+
+def test_unordered_collections_rejected() -> None:
+    with pytest.raises(TypeError, match="requires_gates"):
+        effect(requires_gates={"a", "b"})
+    with pytest.raises(TypeError, match="decision_ids"):
+        effect(decision_ids={DecisionId.from_parts(1, bytes(10))}, subject_digest="d")

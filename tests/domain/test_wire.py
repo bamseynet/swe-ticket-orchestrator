@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -59,6 +62,7 @@ pre_push_subjects = st.builds(
     lambda b, p, t: Subject.pre_push(base_sha=b, patch_id=p, ticket_revision=t), ns, ns, ns
 )
 subjects = head_subjects() | pre_push_subjects
+merged_subjects = head_subjects().map(lambda s: dataclasses.replace(s, merge_sha="m"))
 receipts = st.builds(Receipt, ns, ns, st.booleans(), st.booleans())
 
 
@@ -73,6 +77,22 @@ def decisions(draw: st.DrawFn) -> Decision:
         kind=draw(st.sampled_from(DecisionKind)),
         subject_digest=draw(ns),
         comment=draw(ns),
+    )
+
+
+@st.composite
+def minimal_decisions(draw: st.DrawFn) -> Decision:
+    """Empty comment / digest wherever the rules allow them."""
+    kind = draw(st.sampled_from(DecisionKind))
+    return Decision(
+        id=draw(dec_ids),
+        gate_id=draw(gate_ids),
+        round=draw(pos),
+        actor=draw(ns),
+        surface=draw(st.sampled_from(Surface)),
+        kind=kind,
+        subject_digest="" if kind.is_negative else draw(ns),
+        comment=draw(ns) if kind is not DecisionKind.APPROVE else "",
     )
 
 
@@ -128,10 +148,16 @@ def effects(draw: st.DrawFn) -> Effect:
         requires_gates=tuple(draw(st.lists(ns, min_size=1, max_size=3))) if gated else (),
         decision_ids=tuple(draw(st.lists(dec_ids, min_size=1, max_size=3))) if gated else (),
         subject_digest=draw(ns) if gated else draw(st.none() | ns),
-        receipt=Receipt("1", "u", True) if status is EffectStatus.CONFIRMED else None,
+        receipt=draw(
+            st.builds(Receipt, ns, ns, st.just(True), st.booleans())
+            if status is EffectStatus.CONFIRMED
+            else (st.none() | receipts)
+            if status in (EffectStatus.ACCEPTED, EffectStatus.FAILED, EffectStatus.VOIDED)
+            else st.none()
+        ),
         attempts=draw(nonneg),
         intent=draw(st.none() | ns),
-        frozen_subject=draw(st.none() | subjects),
+        frozen_subject=draw(st.none() | merged_subjects),
     )
 
 
@@ -151,6 +177,7 @@ steps = st.builds(
     [
         (Subject, subjects),
         (Decision, decisions()),
+        (Decision, minimal_decisions()),
         (Gate, gates()),
         (Run, runs()),
         (Effect, effects()),
@@ -164,6 +191,7 @@ def test_from_wire_inverts_to_wire(cls: type, strategy: st.SearchStrategy[object
     @given(strategy)
     def check(x: object) -> None:
         assert from_wire(cls, to_wire(x)) == x
+        assert from_wire(cls, json.loads(json.dumps(to_wire(x)))) == x  # through real JSON
 
     check()
 
