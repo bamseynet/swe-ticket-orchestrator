@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 BASE ?= origin/main
-.PHONY: help test-fast test test-changed lint typecheck
+.PHONY: help test-fast test test-changed lint typecheck apply-ruleset
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
@@ -29,3 +29,8 @@ lint: ## Ruff lint and format check
 
 typecheck: ## mypy strict
 	uv run mypy
+
+apply-ruleset: ## Create or update the main ruleset from deploy/ruleset-main.json (needs repo admin; run after review)
+	@id=$$(gh api repos/{owner}/{repo}/rulesets -q '.[] | select(.name=="main-protection") | .id'); \
+	if [ -n "$$id" ]; then gh api -X PUT repos/{owner}/{repo}/rulesets/$$id --input deploy/ruleset-main.json >/dev/null && echo "updated ruleset $$id"; \
+	else gh api -X POST repos/{owner}/{repo}/rulesets --input deploy/ruleset-main.json >/dev/null && echo "created ruleset"; fi
