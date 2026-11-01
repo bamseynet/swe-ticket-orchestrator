@@ -6,14 +6,17 @@ import pytest
 
 from sto.domain.errors import PermanentError
 from sto.store.ports import (
+    PLATFORM,
     Absent,
     Check,
     ConditionFailedError,
     FieldEquals,
     Key,
+    PlatformScope,
     Put,
     TeamScope,
     VersionIs,
+    canonical_data,
 )
 
 
@@ -64,3 +67,18 @@ def test_condition_failure_is_a_permanent_error_naming_the_operations() -> None:
     assert err.failed == (1, 3)
     assert "1" in str(err)
     assert "3" in str(err)
+
+
+def test_canonical_data_is_a_private_plain_json_copy() -> None:
+    source = {"a": [1, {"b": (2,)}]}
+    out = canonical_data(source)
+    assert out == {"a": [1, {"b": [2]}]}
+    out["a"].append(3)
+    assert source == {"a": [1, {"b": (2,)}]}
+
+
+def test_platform_scope_is_explicit_and_distinct() -> None:
+    assert PlatformScope() == PLATFORM
+    assert not isinstance(PLATFORM, TeamScope)
+    with pytest.raises(TypeError, match="PlatformScope"):
+        Put(Key("p", "s"), {}, scope=TeamScope("t"))  # type: ignore[arg-type]

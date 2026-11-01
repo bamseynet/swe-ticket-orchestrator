@@ -1,29 +1,50 @@
-"""Store port (D1-01): conditional writes and multi-item transactions, always inside a team.
+"""Store port (D1-01): conditional writes and multi-item transactions, always inside a scope.
 
-The semantics here are what DynamoDB must match later (PLAN 11): ``TransactWriteItems`` with
-conditions on the version counter or a status field. One contract suite
+The semantics here are what DynamoDB must match later (PLAN 11, D3-09): ``TransactWriteItems``
+with conditions on the version counter or a status field. One contract suite
 (``tests/store/store_contract.py``) proves them on every store.
 
 * Items are plain-JSON dicts, normally ``to_wire(record)`` of a domain model; ``from_wire``
-  rebuilds the record. A DynamoDB store normalizes its own key attributes and numbers.
-* Every item has a ``version``: 1 on creation, +1 on each write. ``VersionIs`` turns it into
-  optimistic locking.
-* **Every function takes a ``TeamScope`` as its first argument,** and a store addresses items
-  only inside that team, so no query can be written without one and none can cross teams.
+  rebuilds the record. Data is canonicalized on construction (see ``canonical_data``), so every
+  store holds and compares exactly the same values.
+* ``Item.version`` is the *store's* write counter: 1 on creation, +1 on each write, and it
+  restarts at 1 after a delete (so a stale ``VersionIs(1)`` matches a deleted-and-recreated
+  item: the ABA case; use ``Absent`` to create, never delete-then-recreate under a version
+  guard). It is separate from ``Run.version`` and other counters inside the data.
+* **Every function takes a scope as its first argument.** Team data needs a ``TeamScope``; the
+  few partitions that belong to no team (ORG, REPO#r, MANIFEST#digest, HOOK#surface#id) need the
+  explicit ``PlatformScope``, so reaching one is visible and grep-able at the call site. A store
+  addresses items only inside the scope's partition, so no call can cross teams.
+* Items live in a ``table`` (``MAIN`` or ``AUDIT``; ADR-0017), so a decision, its audit event
+  and the outbox entry can commit in one transaction (PLAN 4.3 rule 6).
 * A transaction is all or nothing. Any failed condition raises ``ConditionFailedError`` and
   nothing is applied.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from sto.domain.errors import PermanentError, TransientError
 
-MAX_TRANSACTION_OPS = 100  # DynamoDB's TransactWriteItems limit
+# DynamoDB limits. Serialized JSON size only approximates DynamoDB's own item accounting
+# (attribute names, number encodings), so a real store may still refuse a borderline item.
+MAX_TRANSACTION_OPS = 100
+MAX_ITEM_BYTES = 400 * 1024
+MAX_TRANSACTION_BYTES = 4 * 1024 * 1024
+MAX_PK_BYTES = 2048
+MAX_SK_BYTES = 1024
+_MAX_NUMBER = 10**38
+
+MAIN = "main"
+AUDIT = "audit"
+TABLES = (MAIN, AUDIT)
 
 
 class ConditionFailedError(PermanentError):
@@ -42,6 +63,9 @@ class TransactionConflictError(TransientError):
     The in-memory and SQLite stores never raise it; a DynamoDB store does."""
 
 
+# --- scopes -----------------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class TeamScope:
     """The team a call acts for. Built by auth middleware from a verified identity."""
@@ -53,28 +77,59 @@ class TeamScope:
             raise TypeError(f"team must be a str, not {type(self.team).__name__}")
         if not self.team.strip():
             raise ValueError("team must not be blank")
+        if self.team != self.team.strip():
+            raise ValueError("team must not have surrounding whitespace")
+        if "#" in self.team:
+            # PLAN 11 keys are TEAM#t#pk: a '#' in t would let team "a" with pk "b#x" read
+            # the items of team "a#b".
+            raise ValueError("team must not contain '#'")
 
 
-def require_scope(scope: object) -> TeamScope:
+@dataclass(frozen=True)
+class PlatformScope:
+    """Partitions that belong to no team (ORG, REPO#r, MANIFEST#digest, HOOK#...). Using it is a
+    deliberate, visible choice; team data never goes through it."""
+
+
+PLATFORM = PlatformScope()
+Scope = TeamScope | PlatformScope
+
+
+def require_scope(scope: object) -> Scope:
     """Stores call this first, so a missing or wrong scope fails before any data is touched."""
-    if not isinstance(scope, TeamScope):
-        raise TypeError(f"a TeamScope is required, not {type(scope).__name__}")
+    if not isinstance(scope, TeamScope | PlatformScope):
+        raise TypeError(f"a TeamScope or PlatformScope is required, not {type(scope).__name__}")
     return scope
+
+
+# --- keys -------------------------------------------------------------------------------------
+
+
+def _check_part(label: str, part: object, max_bytes: int) -> None:
+    if not isinstance(part, str):
+        raise TypeError(f"key {label} must be a str, not {type(part).__name__}")
+    if not part:
+        raise ValueError(f"key {label} must not be empty")
+    if len(part.encode("utf-8", "surrogatepass")) > max_bytes:
+        raise ValueError(f"key {label} is longer than {max_bytes} bytes")
 
 
 @dataclass(frozen=True, order=True)
 class Key:
-    """Partition key and sort key within a team (PLAN 11, e.g. ``RUN#r`` / ``GATE#g#1``)."""
+    """Partition key and sort key within a scope and table (PLAN 11, e.g. ``RUN#r`` / ``GATE#g#1``).
+
+    The team prefix is added by the store, and is not counted in the byte limits here.
+    """
 
     pk: str
     sk: str
+    table: str = MAIN
 
     def __post_init__(self) -> None:
-        for label, part in (("pk", self.pk), ("sk", self.sk)):
-            if not isinstance(part, str):
-                raise TypeError(f"key {label} must be a str, not {type(part).__name__}")
-            if not part:
-                raise ValueError(f"key {label} must not be empty")
+        _check_part("pk", self.pk, MAX_PK_BYTES)
+        _check_part("sk", self.sk, MAX_SK_BYTES)
+        if self.table not in TABLES:
+            raise ValueError(f"unknown table {self.table!r}; use one of {TABLES}")
 
 
 @dataclass(frozen=True)
@@ -82,6 +137,105 @@ class Item:
     key: Key
     data: dict[str, Any]
     version: int
+
+
+@dataclass(frozen=True)
+class Page:
+    """One page of a query. ``cursor`` is opaque; pass it back to continue. ``None`` means no
+    more. A store may return a cursor on the last page, followed by an empty page."""
+
+    items: tuple[Item, ...]
+    cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class Addr:
+    """A fully resolved item address: what a store actually keys on. ``partition`` is
+    ``TEAM#<team>`` or ``PLATFORM``; a DynamoDB store prefixes team pks with it."""
+
+    partition: str
+    table: str
+    pk: str
+    sk: str
+
+
+def resolve(scope: Scope, key: Key, override: PlatformScope | None = None) -> Addr:
+    """Address of ``key`` for a call made with ``scope``; ``override`` redirects one operation
+    of a transaction to the platform partition."""
+    if override is not None:
+        scope = require_scope(override)
+    if isinstance(scope, TeamScope):
+        return Addr(f"TEAM#{scope.team}", key.table, key.pk, key.sk)
+    if key.pk.startswith("TEAM#"):  # would collide with a team's partition on a shared table
+        raise ValueError("platform partition keys must not start with 'TEAM#'")
+    return Addr("PLATFORM", key.table, key.pk, key.sk)
+
+
+def require_key(key: object) -> Key:
+    if not isinstance(key, Key):
+        raise TypeError(f"a Key is required, not {type(key).__name__}")
+    return key
+
+
+def encode_cursor(sk: str) -> str:
+    return base64.urlsafe_b64encode(sk.encode("utf-8")).decode("ascii")
+
+
+def decode_cursor(cursor: str) -> str:
+    try:
+        return base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+    except (binascii.Error, UnicodeError, AttributeError) as exc:
+        raise ValueError("invalid cursor") from exc
+
+
+# --- data -------------------------------------------------------------------------------------
+
+
+def _validate(value: object) -> None:
+    if value is None or isinstance(value, str | bool):
+        return
+    if isinstance(value, int):
+        if abs(value) >= _MAX_NUMBER:
+            raise TypeError("data must be plain JSON: number out of range")
+    elif isinstance(value, float):
+        if value != value or abs(value) >= _MAX_NUMBER:  # NaN, inf, out of range
+            raise TypeError("data must be plain JSON: number out of range")
+    elif isinstance(value, list | tuple):
+        for v in value:
+            _validate(v)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise TypeError("data must be plain JSON: object keys must be strings")
+            _validate(v)
+    else:
+        raise TypeError(f"data must be plain JSON, not {type(value).__name__}")
+
+
+def _numbers(value: Any) -> Any:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)  # DynamoDB has one number type: 1.0 and 1 are the same value
+    if isinstance(value, list):
+        return [_numbers(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _numbers(v) for k, v in value.items()}
+    return value
+
+
+def canonical_data(data: object) -> dict[str, Any]:
+    """The one stored form of ``data``: a fresh dict of plain JSON. Tuples become lists, str and
+    int subclasses (enums) become their plain value, integral floats become ints. Anything else
+    raises ``TypeError``. Stores compare conditions against this form."""
+    if not isinstance(data, dict):
+        raise TypeError(f"data must be a JSON object (dict), not {type(data).__name__}")
+    _validate(data)
+    result = _numbers(json.loads(json.dumps(data, allow_nan=False)))
+    assert isinstance(result, dict)
+    return result
+
+
+def _serialized_size(data: dict[str, Any]) -> int:
+    return len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
 # --- conditions -------------------------------------------------------------------------------
@@ -110,7 +264,11 @@ class VersionIs:
 
 @dataclass(frozen=True)
 class FieldEquals:
-    """The item exists and its top-level ``field`` equals ``value`` (e.g. a gate's status)."""
+    """The item exists and its top-level ``field`` equals ``value`` (e.g. a gate's status).
+
+    ``value`` is normalized like stored data, so a ``StrEnum`` matches its wire string and
+    ``1.0`` matches ``1``. Types are otherwise strict: ``1`` never equals ``True``.
+    """
 
     field: str
     value: str | int | bool | None
@@ -118,8 +276,11 @@ class FieldEquals:
     def __post_init__(self) -> None:
         if not isinstance(self.field, str) or not self.field:
             raise ValueError("field must be a non-empty str")
-        if not (self.value is None or isinstance(self.value, str | int | bool)):
+        value: Any = self.value.value if isinstance(self.value, Enum) else self.value
+        if not (value is None or isinstance(value, str | int | float)):  # bool is an int
             raise TypeError("value must be a str, int, bool or None")
+        _validate(value)
+        object.__setattr__(self, "value", _numbers(json.loads(json.dumps(value))))
 
 
 Condition = Absent | Exists | VersionIs | FieldEquals
@@ -133,17 +294,8 @@ def _check_condition(condition: object, *, required: bool) -> None:
 
 
 # --- operations -------------------------------------------------------------------------------
-
-
-def _check_json_object(data: object) -> None:
-    if not isinstance(data, dict):
-        raise TypeError(f"data must be a JSON object (dict), not {type(data).__name__}")
-    try:
-        json.dumps(data, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"data must be plain JSON: {exc}") from exc
-    if any(not isinstance(k, str) for k in data):
-        raise TypeError("data must be plain JSON: object keys must be strings")
+# ``scope`` on an operation redirects that one operation to the platform partition, so a
+# transaction can mix a team's items with ORG or REPO items and audit-table items.
 
 
 @dataclass(frozen=True)
@@ -153,10 +305,19 @@ class Put:
     key: Key
     data: dict[str, Any]
     when: Condition | None = None
+    scope: PlatformScope | None = None
+    size: int = field(init=False, default=0, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        _check_json_object(self.data)
+        require_key(self.key)
         _check_condition(self.when, required=False)
+        _check_op_scope(self.scope)
+        data = canonical_data(self.data)  # a private copy: later caller mutation cannot reach it
+        size = _serialized_size(data) + len(self.key.pk.encode()) + len(self.key.sk.encode())
+        if size > MAX_ITEM_BYTES:
+            raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
+        object.__setattr__(self, "data", data)
+        object.__setattr__(self, "size", size)
 
 
 @dataclass(frozen=True)
@@ -165,9 +326,12 @@ class Delete:
 
     key: Key
     when: Condition | None = None
+    scope: PlatformScope | None = None
 
     def __post_init__(self) -> None:
+        require_key(self.key)
         _check_condition(self.when, required=False)
+        _check_op_scope(self.scope)
 
 
 @dataclass(frozen=True)
@@ -176,32 +340,51 @@ class Check:
 
     key: Key
     when: Condition
+    scope: PlatformScope | None = None
 
     def __post_init__(self) -> None:
+        require_key(self.key)
         _check_condition(self.when, required=True)
+        _check_op_scope(self.scope)
 
 
 Op = Put | Delete | Check
 
 
-def validate_ops(ops: Sequence[Op]) -> None:
-    """Shape rules every store shares: DynamoDB refuses these, so the fast stores must too."""
+def _check_op_scope(scope: object) -> None:
+    if scope is not None and not isinstance(scope, PlatformScope):
+        raise TypeError("an operation's scope may only be a PlatformScope")
+
+
+def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Addr, ...]:
+    """Shape rules every store shares (DynamoDB refuses these, so the fast stores must too).
+    Returns each operation's resolved address."""
     if not ops:
         raise ValueError("a transaction needs at least one operation")
     if len(ops) > MAX_TRANSACTION_OPS:
         raise ValueError(f"a transaction takes at most {MAX_TRANSACTION_OPS} operations")
-    seen: set[Key] = set()
+    seen: set[Addr] = set()
+    total = 0
     for op in ops:
         if not isinstance(op, Put | Delete | Check):
             raise TypeError(f"not an operation: {op!r}")
-        if op.key in seen:
+        addr = resolve(scope, op.key, op.scope)
+        if addr in seen:
             raise ValueError(f"item {op.key} appears more than once in a transaction")
-        seen.add(op.key)
+        seen.add(addr)
+        if isinstance(op, Put):
+            total += op.size
+    if total > MAX_TRANSACTION_BYTES:
+        raise ValueError(f"transaction is {total} bytes; the limit is {MAX_TRANSACTION_BYTES}")
+    return tuple(resolve(scope, op.key, op.scope) for op in ops)
 
 
-def check_query_args(limit: int | None) -> None:
+def check_query_args(pk: object, limit: int | None, table: str) -> None:
+    _check_part("pk", pk, MAX_PK_BYTES)
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("limit must be a positive int")
+    if table not in TABLES:
+        raise ValueError(f"unknown table {table!r}; use one of {TABLES}")
 
 
 # --- the port ---------------------------------------------------------------------------------
@@ -211,25 +394,35 @@ def check_query_args(limit: int | None) -> None:
 class Store(Protocol):
     """Synchronous repository port. Reads are strongly consistent."""
 
-    def get(self, scope: TeamScope, key: Key) -> Item | None: ...
+    def get(self, scope: Scope, key: Key) -> Item | None: ...
 
     def query(
-        self, scope: TeamScope, pk: str, *, sk_prefix: str = "", limit: int | None = None
-    ) -> tuple[Item, ...]:
-        """Items of one partition in ascending sort-key order. ``sk_prefix`` is literal."""
+        self,
+        scope: Scope,
+        pk: str,
+        *,
+        table: str = MAIN,
+        sk_prefix: str = "",
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Page:
+        """Items of one partition in ascending sort-key order. ``sk_prefix`` is literal.
+        Without ``limit`` everything is returned; with it, at most ``limit`` items and a
+        ``cursor`` to continue. Paging by cursor neither skips nor repeats items that existed
+        throughout."""
         ...
 
-    def transact(self, scope: TeamScope, ops: Sequence[Op]) -> None:
+    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
         """Apply all ``ops`` or none. Raises ``ConditionFailedError`` if any condition fails."""
         ...
 
     def put(
         self,
-        scope: TeamScope,
+        scope: Scope,
         key: Key,
         data: Mapping[str, Any],
         *,
         when: Condition | None = None,
     ) -> None: ...
 
-    def delete(self, scope: TeamScope, key: Key, *, when: Condition | None = None) -> None: ...
+    def delete(self, scope: Scope, key: Key, *, when: Condition | None = None) -> None: ...

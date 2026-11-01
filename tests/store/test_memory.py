@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import threading
+import contextlib
+import time
 
 import pytest
-from store_contract import RUN, A, StoreContract
+from store_contract import StoreContract, race_claims
 
+from sto.store import memory
 from sto.store.memory import MemoryStore
-from sto.store.ports import ConditionFailedError, Put, Store, VersionIs
+from sto.store.ports import Store
 
 
 class TestMemoryStore(StoreContract):
@@ -17,21 +19,27 @@ class TestMemoryStore(StoreContract):
         return MemoryStore()
 
 
-def test_concurrent_claims_on_one_version_have_exactly_one_winner() -> None:
+@pytest.fixture
+def slow_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Widen the window between checking conditions and applying writes, so a missing lock
+    shows up on every run instead of once in a blue moon."""
+    real = memory._holds
+
+    def slow(*args: object) -> bool:
+        result = real(*args)  # type: ignore[arg-type]
+        time.sleep(0.0005)
+        return result
+
+    monkeypatch.setattr(memory, "_holds", slow)
+
+
+@pytest.mark.usefixtures("slow_conditions")
+def test_claims_stay_exclusive_even_when_checks_are_slow() -> None:
+    assert race_claims(MemoryStore(), rounds=10) == [1] * 10
+
+
+@pytest.mark.usefixtures("slow_conditions")
+def test_the_race_test_can_fail_when_the_lock_is_removed() -> None:
     store = MemoryStore()
-    store.put(A, RUN, {"owner": None})
-    wins: list[int] = []
-
-    def claim(n: int) -> None:
-        try:
-            store.transact(A, [Put(RUN, {"owner": n}, when=VersionIs(1))])
-            wins.append(n)
-        except ConditionFailedError:
-            pass
-
-    threads = [threading.Thread(target=claim, args=(n,)) for n in range(16)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert len(wins) == 1
+    store._lock = contextlib.nullcontext()  # type: ignore[assignment]
+    assert max(race_claims(store, rounds=10)) > 1
