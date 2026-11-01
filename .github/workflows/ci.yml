@@ -180,11 +180,12 @@ jobs:
       - run: npm test
         working-directory: infra
       # Schema check first, then synth. No AWS credentials are present: the app uses
-      # a dummy account and does no context lookups. A cdk-nag error fails the synth.
+      # a dummy account (STO_ACCOUNT unset) and `--no-lookups`. A cdk-nag error fails the synth.
       - run: npm run synth
         working-directory: infra
         env:
           STO_DEPLOYMENT: deployment.example.yaml
+          AWS_EC2_METADATA_DISABLED: "true" # no instance-profile lookup either
 
   # The only required check. Runs always, even when every work job was skipped
   # or failed. Add new work jobs to `needs` below; do not change the script.

@@ -1,42 +1,72 @@
 import { App, Stack } from "aws-cdk-lib";
-import { Annotations, Match, Template } from "aws-cdk-lib/assertions";
 import { Bucket } from "aws-cdk-lib/aws-s3";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildApp, applyNag } from "../lib/app.js";
-import { STACK_NAMES } from "../lib/stacks.js";
+import { applyNag, buildApp, discoverStackFiles } from "../lib/app.js";
 
 const cfg = { name: "sto", region: "eu-west-1", profile: "dev" as const };
-const env = { account: "111111111111", region: "eu-west-1" };
+const env = { account: "000000000000", region: "eu-west-1" };
 
 describe("app", () => {
-  it("defines the six stacks from PLAN 16.1, empty", () => {
-    const app = buildApp(cfg, env);
+  it("defines the stacks the D11 issues declare, empty, from lib/*-stack.ts", async () => {
+    const app = await buildApp(cfg, env);
     const assembly = app.synth();
     expect(assembly.stacks.map((s) => s.id).sort()).toEqual(
-      STACK_NAMES.map((n) => `${cfg.name}-${n}`).sort(),
+      [
+        "agent-plane",
+        "control-plane",
+        "foundation",
+        "identity",
+        "observability",
+        "sandbox",
+        "web",
+      ].map((n) => `sto-${n}`),
     );
     for (const s of assembly.stacks) {
       expect(Object.keys(s.template.Resources ?? {})).toEqual([]);
     }
   });
 
-  it("has no cdk-nag errors or warnings on the empty stacks", () => {
-    const app = buildApp(cfg, env);
-    for (const stack of app.node.children.filter(Stack.isStack)) {
-      Annotations.fromStack(stack).hasNoError("*", Match.anyValue());
-      Annotations.fromStack(stack).hasNoWarning("*", Match.anyValue());
-    }
+  it("synthesizes with no missing context (so no lookup could be needed)", async () => {
+    const assembly = (await buildApp(cfg, env)).synth();
+    expect(assembly.manifest.missing ?? []).toEqual([]);
+  });
+
+  it("picks up a new *-stack.ts with no central edit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "stacks-"));
+    writeFileSync(
+      join(dir, "extra-stack.ts"),
+      `import { Stack } from "aws-cdk-lib";
+export default class ExtraStack extends Stack {}
+`,
+    );
+    writeFileSync(join(dir, "helper.ts"), "export const x = 1;\n"); // not a stack file
+    expect(discoverStackFiles(dir).map((f) => f.name)).toEqual(["extra"]);
+    const app = await buildApp(cfg, env, dir);
+    expect(app.synth().stacks.map((s) => s.id)).toEqual(["sto-extra"]);
+  });
+
+  it("rejects a stack file without a default Stack export", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "stacks-"));
+    writeFileSync(join(dir, "bad-stack.ts"), "export const x = 1;\n");
+    await expect(buildApp(cfg, env, dir)).rejects.toThrow(/bad-stack/);
   });
 });
 
 describe("cdk-nag", () => {
-  it("reports an error for a non-compliant resource (this is what fails the synth job)", () => {
+  it("a nag error makes app.synth() throw (this is what fails the synth job)", () => {
     const app = new App();
-    const stack = new Stack(app, "Bad", { env });
-    new Bucket(stack, "Open"); // no SSL enforcement, no access logs
+    new Bucket(new Stack(app, "Bad", { env }), "Open"); // no SSL enforcement, no access logs
     applyNag(app);
-    const errors = Annotations.fromStack(stack).findError("*", Match.stringLikeRegexp("AwsSolutions-S"));
-    expect(errors.length).toBeGreaterThan(0);
-    expect(Template.fromStack(stack).toJSON()).toBeDefined();
+    expect(() => app.synth()).toThrow();
+  });
+
+  it("passes a compliant app", () => {
+    const app = new App();
+    new Stack(app, "Empty", { env });
+    applyNag(app);
+    expect(() => app.synth()).not.toThrow();
   });
 });

@@ -1,10 +1,12 @@
-import { loadDeployment } from "../lib/config.js";
 import { buildApp } from "../lib/app.js";
+import { loadDeployment } from "../lib/config.js";
 
-// No credentials or lookups: the account is a fixed dummy unless the caller
-// (a real deploy) provides CDK_DEFAULT_ACCOUNT.
+// The CDK CLI fills CDK_DEFAULT_ACCOUNT from whatever host credentials resolve,
+// which could bind a real account into a synth. So it is ignored: the account is
+// an explicit STO_ACCOUNT, defaulting to a dummy. Deploys pass it deliberately.
 const cfg = loadDeployment(process.env.STO_DEPLOYMENT ?? "deployment.yaml");
-buildApp(cfg, {
-  account: process.env.CDK_DEFAULT_ACCOUNT ?? "000000000000",
+const app = await buildApp(cfg, {
+  account: process.env.STO_ACCOUNT ?? "000000000000",
   region: cfg.region,
-}).synth();
+});
+app.synth();
