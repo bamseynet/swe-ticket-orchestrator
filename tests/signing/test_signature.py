@@ -82,3 +82,14 @@ def test_dotted_algorithm_refused_at_construction() -> None:
 def test_invalid_fields_refused(key_id: str, algorithm: str, value: Any) -> None:
     with pytest.raises(SigningError):
         Signature(key_id=key_id, algorithm=algorithm, value=value)
+
+
+@pytest.mark.parametrize("key_id", ["k\nforged log line", "k\x00", "k\r", "k\x1b[31m", "k\x7f"])
+def test_control_characters_in_key_id_refused(key_id: str) -> None:
+    with pytest.raises(SigningError):
+        Signature(key_id=key_id, algorithm="HS256", value=b"x")
+
+
+def test_control_characters_in_algorithm_refused() -> None:
+    with pytest.raises(SigningError):
+        Signature(key_id="k", algorithm="HS\n256", value=b"x")

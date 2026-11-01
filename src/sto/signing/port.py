@@ -37,17 +37,27 @@ class SigningError(PermanentError):
 
 @dataclass(frozen=True)
 class Signature:
-    """A signature plus the ID of the key and the JOSE algorithm that produced it."""
+    """A signature plus the ID of the key and the JOSE algorithm that produced it.
+
+    ``value`` is the raw signature bytes. Only ``HS256`` and ``RS256`` are defined for now; an
+    algorithm with a different raw layout (ES256 as JOSE ``r||s``) needs its own issue.
+    """
 
     key_id: str
     algorithm: str
     value: bytes
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key_id, str) or not self.key_id:
-            raise SigningError("signature key_id must be a non-empty string")
-        if not isinstance(self.algorithm, str) or not self.algorithm or "." in self.algorithm:
-            raise SigningError("signature algorithm must be a non-empty string without dots")
+        # Printable only: key IDs reach logs, so control characters would allow log injection.
+        if not isinstance(self.key_id, str) or not self.key_id or not self.key_id.isprintable():
+            raise SigningError("signature key_id must be a non-empty printable string")
+        if (
+            not isinstance(self.algorithm, str)
+            or not self.algorithm
+            or "." in self.algorithm
+            or not self.algorithm.isprintable()
+        ):
+            raise SigningError("signature algorithm must be printable, non-empty and have no dots")
         if not isinstance(self.value, bytes) or not self.value:
             raise SigningError("signature value must be non-empty bytes")
 

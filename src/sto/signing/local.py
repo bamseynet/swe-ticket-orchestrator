@@ -1,8 +1,10 @@
 """Local signer: HMAC-SHA256 (JOSE ``HS256``) from the standard library. For tests and single host.
 
 The key is symmetric, so there is no public key to publish and it must never leave this process.
-The object refuses ``repr`` of key material, pickling and copying, and keeps keys in a slot rather
-than ``vars()``. That limits accidents; it is not a defence against code in the same process.
+Error messages never include key IDs or secrets (a swapped argument would put a secret in a key
+ID). The object refuses pickling and copying, shows only key IDs in ``repr``, and keeps keys in a
+slot rather than ``vars()``. That limits accidents; it does not defend against code in the
+same process.
 """
 
 from __future__ import annotations
@@ -22,9 +24,9 @@ def _check(key_id: object, secret: object) -> None:
     if not isinstance(key_id, str) or not key_id:
         raise SigningError("key_id must be a non-empty string")
     if not isinstance(secret, bytes):
-        raise SigningError(f"secret for key {key_id!r} must be bytes")
+        raise SigningError("secret must be bytes")
     if len(secret) < MIN_SECRET_BYTES:
-        raise SigningError(f"secret for key {key_id!r} must be at least {MIN_SECRET_BYTES} bytes")
+        raise SigningError(f"secret must be at least {MIN_SECRET_BYTES} bytes")
 
 
 class LocalSigner:
@@ -36,9 +38,12 @@ class LocalSigner:
         self, *, key_id: str, secret: bytes, retired: Mapping[str, bytes] | None = None
     ) -> None:
         _check(key_id, secret)
-        keys = dict(retired or {})
+        try:
+            keys = dict(retired or {})
+        except (TypeError, ValueError) as exc:
+            raise SigningError("retired must be a mapping of key ID to secret") from exc
         if key_id in keys:
-            raise SigningError(f"retired keys must not include the current key {key_id!r}")
+            raise SigningError("retired keys must not include the current key")
         for rid, rsecret in keys.items():
             _check(rid, rsecret)
         keys[key_id] = secret
