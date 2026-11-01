@@ -14,6 +14,7 @@ Label rules (kept deliberately simple, see ``infer_*``):
   live       stage is D12/D14 or the title says "live"; otherwise ``offline``
   needs:peter  live issues, plus D0-05 (bot account) and D4-24 (GitHub App)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,6 +39,7 @@ SLEEP_AFTER_WRITE = 1.0
 
 
 # ---------------------------------------------------------------- parsing
+
 
 @dataclass
 class Stage:
@@ -112,8 +114,12 @@ def parse_ac(text: str) -> list[str]:
 def _para(lines: list[str], start: int) -> str:
     """Text from lines[start] until a blank line or the next bold field line."""
     out = [lines[start]]
-    for ln in lines[start + 1:]:
-        if not ln.strip() or re.match(r"\*\*[A-Z][^*]*:\*\*", ln) or ln.startswith(("#", "<!--", "|")):
+    for ln in lines[start + 1 :]:
+        if (
+            not ln.strip()
+            or re.match(r"\*\*[A-Z][^*]*:\*\*", ln)
+            or ln.startswith(("#", "<!--", "|"))
+        ):
             break
         out.append(ln)
     return "\n".join(out)
@@ -168,7 +174,9 @@ def parse(text: str) -> Doc:
             j += 1
 
     # issues
-    heads = [(i, m) for i, ln in enumerate(lines) if (m := re.match(rf"^#### ({ID_RE}): (.+?)\s*$", ln))]
+    heads = [
+        (i, m) for i, ln in enumerate(lines) if (m := re.match(rf"^#### ({ID_RE}): (.+?)\s*$", ln))
+    ]
     seen: set[str] = set()
     for k, (i, m) in enumerate(heads):
         iid, title = m.group(1), m.group(2)
@@ -187,23 +195,26 @@ def parse(text: str) -> Doc:
         owner = [sid for si, sid in stage_idx if si < i]
         if owner and owner[-1] != stage:
             doc.warnings.append(f"{iid}: appears under section {owner[-1]}")
-        body = lines[i + 1:end]
+        body = lines[i + 1 : end]
         ac_i = next((x for x, ln in enumerate(body) if ln.startswith("**AC:**")), None)
         if ac_i is None:
             doc.warnings.append(f"{iid}: no **AC:** line")
             continue
         desc = "\n".join(body[:ac_i]).strip()
-        ac_text = body[ac_i][len("**AC:**"):].strip()
+        ac_text = body[ac_i][len("**AC:**") :].strip()
         issue = Issue(iid, title, stage, desc, parse_ac(ac_text), line=i + 1)
         if not desc:
             doc.warnings.append(f"{iid}: empty description")
         if not issue.ac:
             doc.warnings.append(f"{iid}: empty acceptance criteria")
-        meta = next((ln for ln in body[ac_i + 1:] if ln.startswith("**Deps:**")), None)
+        meta = next((ln for ln in body[ac_i + 1 :] if ln.startswith("**Deps:**")), None)
         if meta is None:
             doc.warnings.append(f"{iid}: no **Deps:** line")
         else:
-            dm = re.match(r"\*\*Deps:\*\*\s*(.*?)\.\s*\*\*Size:\*\*\s*(\S+?)\.\s*\*\*Run:\*\*\s*(\S+?)\.\s*\*\*Files:\*\*\s*(.*)$", meta)
+            dm = re.match(
+                r"\*\*Deps:\*\*\s*(.*?)\.\s*\*\*Size:\*\*\s*(\S+?)\.\s*\*\*Run:\*\*\s*(\S+?)\.\s*\*\*Files:\*\*\s*(.*)$",
+                meta,
+            )
             if not dm:
                 doc.warnings.append(f"{iid}: cannot parse Deps/Size/Run/Files line")
             else:
@@ -239,16 +250,42 @@ def parse(text: str) -> Doc:
 
 # ---------------------------------------------------------------- inference
 
+
 def infer_type(i: Issue) -> str:
     t = i.title.lower()
     files = i.files
-    if re.search(r"secret|hostile|supply chain|threat|redaction|deny list|rotation|browser security|separation of duties", t):
+    if re.search(
+        r"secret|hostile|supply chain|threat|redaction|deny list|rotation"
+        r"|browser security|separation of duties",
+        t,
+    ):
         return "security"
-    if files and all(f.startswith("docs/") or f.endswith(".md") for f in files) or re.search(r"\bdocs\b|contribution rules|release checklist|close out|runbook", t):
+    if (
+        files
+        and all(f.startswith("docs/") or f.endswith(".md") for f in files)
+        or re.search(r"\bdocs\b|contribution rules|release checklist|close out|runbook", t)
+    ):
         return "docs"
-    if files and all(f.startswith("tests/") for f in files) or re.search(r"suite|\btests?\b|conformance|soak|corpus|end to end|rehearsal|chaos|scale|journey|verify|verification|eval set|simulator", t):
+    if (
+        files
+        and all(f.startswith("tests/") for f in files)
+        or re.search(
+            r"suite|\btests?\b|conformance|soak|corpus|end to end|rehearsal|chaos|scale"
+            r"|journey|verify|verification|eval set|simulator",
+            t,
+        )
+    ):
         return "test"
-    if files and all(f.startswith(("infra/", ".github/", "deploy/", "docker")) or "/infra/" in f for f in files) or re.search(r"\bstack\b|deploy|\bci\b|cdk|synth|bootstrap|spike|cost guard|ruleset|images?\b", t):
+    if (
+        files
+        and all(
+            f.startswith(("infra/", ".github/", "deploy/", "docker")) or "/infra/" in f
+            for f in files
+        )
+        or re.search(
+            r"\bstack\b|deploy|\bci\b|cdk|synth|bootstrap|spike|cost guard|ruleset|images?\b", t
+        )
+    ):
         return "infra"
     return "feature"
 
@@ -257,13 +294,20 @@ def infer_live(i: Issue) -> bool:
     if i.stage in LIVE_STAGES:
         return True
     # "Live updates hook" / "Live nudge" are UI features, not live-service suites
-    return bool(re.search(r"\blive\b", i.title, re.I)) and not re.match(r"live (updates|nudge)", i.title, re.I)
+    return bool(re.search(r"\blive\b", i.title, re.I)) and not re.match(
+        r"live (updates|nudge)", i.title, re.I
+    )
 
 
 def labels_for(i: Issue) -> list[str]:
     live = infer_live(i)
-    out = [f"stage:{i.stage}", f"size:{i.size}", f"type:{infer_type(i)}", f"mode:{i.run}",
-           "live" if live else "offline"]
+    out = [
+        f"stage:{i.stage}",
+        f"size:{i.size}",
+        f"type:{infer_type(i)}",
+        f"mode:{i.run}",
+        "live" if live else "offline",
+    ]
     if live or i.id in NEEDS_PETER_IDS:
         out.append("needs:peter")
     return out
@@ -297,6 +341,7 @@ def is_managed(label: str) -> bool:
 
 # ---------------------------------------------------------------- bodies
 
+
 def stages_url(repo: str, anchor: str = "") -> str:
     return f"https://github.com/{repo}/blob/main/docs/STAGES.md" + (f"#{anchor}" if anchor else "")
 
@@ -320,17 +365,21 @@ def render_body(i: Issue, doc: Doc, repo: str, refs: dict[str, int], old_body: s
         f"- **Stage:** {stage}{wave}\n"
         f"- **Spec:** [STAGES.md, {i.id}]({link})\n\n"
         f"Depends on: {deps}\n\n"
-        f"_Standing acceptance criteria in STAGES.md apply to every issue. This body is generated by "
+        f"_Standing acceptance criteria in STAGES.md apply to every issue. "
+        f"This body is generated by "
         f"`tools/backlog/sync_issues.py`; edit the spec, not this text._\n"
     )
 
 
 def milestone_description(st: Stage, repo: str) -> str:
-    return (f"**Goal:** {st.goal}\n\n**Exit criteria:** {st.exit_criteria}\n\n"
-            f"Spec: {stages_url(repo, github_slug(f'{st.id}: {st.name}'))}")
+    return (
+        f"**Goal:** {st.goal}\n\n**Exit criteria:** {st.exit_criteria}\n\n"
+        f"Spec: {stages_url(repo, github_slug(f'{st.id}: {st.name}'))}"
+    )
 
 
 # ---------------------------------------------------------------- gh wrapper
+
 
 class GH:
     def __init__(self, dry_run: bool):
@@ -349,8 +398,13 @@ class GH:
                     time.sleep(SLEEP_AFTER_WRITE)
                 return p.stdout
             err = p.stderr + p.stdout
-            if re.search(r"\b(403|429)\b|rate limit|secondary|abuse|retry", err, re.I) and attempt < 6:
-                print(f"  rate limited, sleeping {delay:.0f}s: {err.strip()[:120]}", file=sys.stderr)
+            if (
+                re.search(r"\b(403|429)\b|rate limit|secondary|abuse|retry", err, re.I)
+                and attempt < 6
+            ):
+                print(
+                    f"  rate limited, sleeping {delay:.0f}s: {err.strip()[:120]}", file=sys.stderr
+                )
                 time.sleep(delay)
                 delay = min(delay * 2, 300)
                 continue
@@ -367,6 +421,7 @@ class GH:
 
 # ---------------------------------------------------------------- sync
 
+
 @dataclass
 class Counts:
     labels: int = 0
@@ -381,7 +436,10 @@ class Counts:
 
 
 def sync_labels(gh: GH, repo: str, doc: Doc, c: Counts) -> None:
-    existing = {x["name"] for x in gh.json(["label", "list", "-R", repo, "--limit", "1000", "--json", "name"]) or []}
+    existing = {
+        x["name"]
+        for x in gh.json(["label", "list", "-R", repo, "--limit", "1000", "--json", "name"]) or []
+    }
     wanted = sorted({lb for i in doc.issues for lb in labels_for(i)})
     for lb in wanted:
         if lb in existing:
@@ -393,7 +451,9 @@ def sync_labels(gh: GH, repo: str, doc: Doc, c: Counts) -> None:
 
 def sync_milestones(gh: GH, repo: str, doc: Doc, c: Counts) -> dict[str, str]:
     """Returns stage id -> milestone title."""
-    ms = gh.ndjson(["api", f"repos/{repo}/milestones?state=all&per_page=100", "--paginate", "--jq", ".[]"])
+    ms = gh.ndjson(
+        ["api", f"repos/{repo}/milestones?state=all&per_page=100", "--paginate", "--jq", ".[]"]
+    )
     by_title = {m["title"]: m for m in ms}
     out = {}
     for st in doc.stages.values():
@@ -402,25 +462,64 @@ def sync_milestones(gh: GH, repo: str, doc: Doc, c: Counts) -> dict[str, str]:
         m = by_title.get(st.title)
         if m is None:
             print(f"milestone: create {st.title}")
-            gh.run(["api", f"repos/{repo}/milestones", "-f", f"title={st.title}", "-f", f"description={desc}"], write=True)
+            gh.run(
+                [
+                    "api",
+                    f"repos/{repo}/milestones",
+                    "-f",
+                    f"title={st.title}",
+                    "-f",
+                    f"description={desc}",
+                ],
+                write=True,
+            )
             c.milestones += 1
         elif (m.get("description") or "") != desc:
             print(f"milestone: update {st.title}")
-            gh.run(["api", "-X", "PATCH", f"repos/{repo}/milestones/{m['number']}", "-f", f"description={desc}"], write=True)
+            gh.run(
+                [
+                    "api",
+                    "-X",
+                    "PATCH",
+                    f"repos/{repo}/milestones/{m['number']}",
+                    "-f",
+                    f"description={desc}",
+                ],
+                write=True,
+            )
             c.milestones_updated += 1
     return out
 
 
 def list_issues(gh: GH, repo: str) -> dict[str, dict]:
-    rows = gh.json(["issue", "list", "-R", repo, "--state", "all", "--limit", "2000",
-                    "--json", "number,title,body,labels,milestone,url,state"]) or []
+    rows = (
+        gh.json(
+            [
+                "issue",
+                "list",
+                "-R",
+                repo,
+                "--state",
+                "all",
+                "--limit",
+                "2000",
+                "--json",
+                "number,title,body,labels,milestone,url,state",
+            ]
+        )
+        or []
+    )
     found: dict[str, dict] = {}
     for r in rows:
         m = re.match(rf"^\[({ID_RE})\]", r["title"])
         if not m:
             continue
         if m.group(1) in found:
-            print(f"WARNING: duplicate GitHub issues for {m.group(1)}: #{found[m.group(1)]['number']} and #{r['number']}", file=sys.stderr)
+            print(
+                f"WARNING: duplicate GitHub issues for {m.group(1)}: "
+                f"#{found[m.group(1)]['number']} and #{r['number']}",
+                file=sys.stderr,
+            )
             # keep the lowest number
             if r["number"] > found[m.group(1)]["number"]:
                 continue
@@ -432,7 +531,9 @@ def ordered(doc: Doc) -> list[Issue]:
     return sorted(doc.issues, key=lambda i: (int(i.stage[1:]), int(i.id.split("-")[1])))
 
 
-def sync_issues(gh: GH, repo: str, doc: Doc, ms_titles: dict[str, str], c: Counts) -> dict[str, dict]:
+def sync_issues(
+    gh: GH, repo: str, doc: Doc, ms_titles: dict[str, str], c: Counts
+) -> dict[str, dict]:
     found = list_issues(gh, repo)
     issues = ordered(doc)
     # phase 1: create missing
@@ -440,17 +541,33 @@ def sync_issues(gh: GH, repo: str, doc: Doc, ms_titles: dict[str, str], c: Count
         if i.id in found:
             continue
         print(f"issue: create {i.full_title}")
-        args = ["issue", "create", "-R", repo, "--title", i.full_title, "--body-file", "-",
-                "--milestone", ms_titles[i.stage]]
+        args = [
+            "issue",
+            "create",
+            "-R",
+            repo,
+            "--title",
+            i.full_title,
+            "--body-file",
+            "-",
+            "--milestone",
+            ms_titles[i.stage],
+        ]
         for lb in labels_for(i):
             args += ["--label", lb]
         out = gh.run(args, stdin=render_body(i, doc, repo, {}), write=True)
         c.issues += 1
         if not gh.dry_run:
             url = out.strip().splitlines()[-1]
-            found[i.id] = {"number": int(url.rsplit("/", 1)[1]), "url": url, "title": i.full_title,
-                           "body": render_body(i, doc, repo, {}), "labels": [{"name": l} for l in labels_for(i)],
-                           "milestone": {"title": ms_titles[i.stage]}, "state": "OPEN"}
+            found[i.id] = {
+                "number": int(url.rsplit("/", 1)[1]),
+                "url": url,
+                "title": i.full_title,
+                "body": render_body(i, doc, repo, {}),
+                "labels": [{"name": label} for label in labels_for(i)],
+                "milestone": {"title": ms_titles[i.stage]},
+                "state": "OPEN",
+            }
     # phase 2: rewrite with resolved numbers; fix drifted title / labels / milestone
     refs = {iid: r["number"] for iid, r in found.items()}
     for i in issues:
@@ -459,8 +576,8 @@ def sync_issues(gh: GH, repo: str, doc: Doc, ms_titles: dict[str, str], c: Count
             continue  # dry-run, not yet created
         want_body = render_body(i, doc, repo, refs, r.get("body") or "")
         want_labels = set(labels_for(i))
-        have = {l["name"] for l in r.get("labels", [])}
-        have_managed = {l for l in have if is_managed(l)}
+        have = {label["name"] for label in r.get("labels", [])}
+        have_managed = {label for label in have if is_managed(label)}
         args = []
         if (r.get("body") or "").strip() != want_body.strip():
             args += ["--body-file", "-"]
@@ -475,24 +592,39 @@ def sync_issues(gh: GH, repo: str, doc: Doc, ms_titles: dict[str, str], c: Count
         if not args:
             continue
         print(f"issue: update #{r['number']} {i.id}")
-        gh.run(["issue", "edit", str(r["number"]), "-R", repo, *args],
-               stdin=want_body if "--body-file" in args else None, write=True)
+        gh.run(
+            ["issue", "edit", str(r["number"]), "-R", repo, *args],
+            stdin=want_body if "--body-file" in args else None,
+            write=True,
+        )
         c.issues_updated += 1
     return found
 
 
-def sync_project(gh: GH, repo: str, owner: str, title: str, doc: Doc, found: dict[str, dict], c: Counts) -> str:
-    projects = (gh.json(["project", "list", "--owner", owner, "--format", "json", "--limit", "100"]) or {}).get("projects", [])
+def sync_project(
+    gh: GH, repo: str, owner: str, title: str, doc: Doc, found: dict[str, dict], c: Counts
+) -> str:
+    projects = (
+        gh.json(["project", "list", "--owner", owner, "--format", "json", "--limit", "100"]) or {}
+    ).get("projects", [])
     proj = next((p for p in projects if p["title"] == title), None)
     if proj is None:
         print(f"project: create {title!r}")
         if gh.dry_run:
             return "(would be created)"
-        proj = json.loads(gh.run(["project", "create", "--owner", owner, "--title", title, "--format", "json"], write=True))
+        proj = json.loads(
+            gh.run(
+                ["project", "create", "--owner", owner, "--title", title, "--format", "json"],
+                write=True,
+            )
+        )
         c.project_created += 1
     num = str(proj["number"])
     # link to repo (idempotent: check first)
-    q = 'query($o:String!,$n:String!){repository(owner:$o,name:$n){projectsV2(first:50){nodes{number}}}}'
+    q = (
+        "query($o:String!,$n:String!){repository(owner:$o,name:$n)"
+        "{projectsV2(first:50){nodes{number}}}}"
+    )
     o, n = repo.split("/")
     linked = gh.json(["api", "graphql", "-f", f"query={q}", "-f", f"o={o}", "-f", f"n={n}"])
     nums = {x["number"] for x in linked["data"]["repository"]["projectsV2"]["nodes"]}
@@ -500,26 +632,65 @@ def sync_project(gh: GH, repo: str, owner: str, title: str, doc: Doc, found: dic
         print("project: link to repo")
         gh.run(["project", "link", num, "--owner", owner, "--repo", repo], write=True)
 
-    fields = (gh.json(["project", "field-list", num, "--owner", owner, "--format", "json", "--limit", "100"]) or {}).get("fields", [])
+    fields = (
+        gh.json(
+            ["project", "field-list", num, "--owner", owner, "--format", "json", "--limit", "100"]
+        )
+        or {}
+    ).get("fields", [])
     byname = {f["name"]: f for f in fields}
     stage_ids = sorted(doc.stages, key=lambda s: int(s[1:]))
     if "Stage" not in byname:
         print("project: create field Stage")
-        gh.run(["project", "field-create", num, "--owner", owner, "--name", "Stage", "--data-type", "SINGLE_SELECT",
-                "--single-select-options", ",".join(stage_ids)], write=True)
+        gh.run(
+            [
+                "project",
+                "field-create",
+                num,
+                "--owner",
+                owner,
+                "--name",
+                "Stage",
+                "--data-type",
+                "SINGLE_SELECT",
+                "--single-select-options",
+                ",".join(stage_ids),
+            ],
+            write=True,
+        )
         c.fields += 1
     if "Wave" not in byname and any(i.wave is not None for i in doc.issues):
         print("project: create field Wave")
-        gh.run(["project", "field-create", num, "--owner", owner, "--name", "Wave", "--data-type", "NUMBER"], write=True)
+        gh.run(
+            [
+                "project",
+                "field-create",
+                num,
+                "--owner",
+                owner,
+                "--name",
+                "Wave",
+                "--data-type",
+                "NUMBER",
+            ],
+            write=True,
+        )
         c.fields += 1
     if c.fields and not gh.dry_run:
-        fields = gh.json(["project", "field-list", num, "--owner", owner, "--format", "json", "--limit", "100"])["fields"]
+        fields = gh.json(
+            ["project", "field-list", num, "--owner", owner, "--format", "json", "--limit", "100"]
+        )["fields"]
         byname = {f["name"]: f for f in fields}
     stage_field = byname.get("Stage")
     wave_field = byname.get("Wave")
     stage_opts = {o["name"]: o["id"] for o in (stage_field or {}).get("options", [])}
 
-    items = (gh.json(["project", "item-list", num, "--owner", owner, "--format", "json", "--limit", "1000"]) or {}).get("items", [])
+    items = (
+        gh.json(
+            ["project", "item-list", num, "--owner", owner, "--format", "json", "--limit", "1000"]
+        )
+        or {}
+    ).get("items", [])
     by_num = {it["content"]["number"]: it for it in items if it.get("content", {}).get("number")}
     pid = proj["id"]
     for i in ordered(doc):
@@ -530,37 +701,83 @@ def sync_project(gh: GH, repo: str, owner: str, title: str, doc: Doc, found: dic
         it = by_num.get(r["number"])
         if it is None:
             print(f"project: add #{r['number']} {i.id}")
-            out = gh.run(["project", "item-add", num, "--owner", owner, "--url", r["url"], "--format", "json"], write=True)
+            out = gh.run(
+                [
+                    "project",
+                    "item-add",
+                    num,
+                    "--owner",
+                    owner,
+                    "--url",
+                    r["url"],
+                    "--format",
+                    "json",
+                ],
+                write=True,
+            )
             c.project_items += 1
             if gh.dry_run:
                 continue
             it = json.loads(out)
-        if stage_field and it.get("stage") != i.stage:
-            if i.stage in stage_opts:
-                gh.run(["project", "item-edit", "--id", it["id"], "--project-id", pid, "--field-id", stage_field["id"],
-                        "--single-select-option-id", stage_opts[i.stage]], write=True)
-                c.field_values += 1
+        if stage_field and it.get("stage") != i.stage and i.stage in stage_opts:
+            gh.run(
+                [
+                    "project",
+                    "item-edit",
+                    "--id",
+                    it["id"],
+                    "--project-id",
+                    pid,
+                    "--field-id",
+                    stage_field["id"],
+                    "--single-select-option-id",
+                    stage_opts[i.stage],
+                ],
+                write=True,
+            )
+            c.field_values += 1
         if wave_field and i.wave is not None and it.get("wave") != i.wave:
-            gh.run(["project", "item-edit", "--id", it["id"], "--project-id", pid, "--field-id", wave_field["id"],
-                    "--number", str(i.wave)], write=True)
+            gh.run(
+                [
+                    "project",
+                    "item-edit",
+                    "--id",
+                    it["id"],
+                    "--project-id",
+                    pid,
+                    "--field-id",
+                    wave_field["id"],
+                    "--number",
+                    str(i.wave),
+                ],
+                write=True,
+            )
             c.field_values += 1
     return proj.get("url", "")
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--stages", type=Path, default=STAGES_PATH)
     ap.add_argument("--project-title", default=DEFAULT_PROJECT_TITLE)
-    ap.add_argument("--dry-run", action="store_true", help="read GitHub, print what would change, write nothing")
-    ap.add_argument("--parse-only", action="store_true", help="parse STAGES.md and report; no GitHub access")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="read GitHub, print what would change, write nothing"
+    )
+    ap.add_argument(
+        "--parse-only", action="store_true", help="parse STAGES.md and report; no GitHub access"
+    )
     ap.add_argument("--no-project", action="store_true")
     a = ap.parse_args(argv)
 
     doc = parse(a.stages.read_text())
     for w in doc.warnings:
         print(f"WARNING: {w}", file=sys.stderr)
-    print(f"parsed {len(doc.stages)} stages, {len(doc.issues)} issues, {len(doc.warnings)} warnings")
+    print(
+        f"parsed {len(doc.stages)} stages, {len(doc.issues)} issues, {len(doc.warnings)} warnings"
+    )
     if a.parse_only:
         return 1 if doc.warnings else 0
     if doc.warnings:

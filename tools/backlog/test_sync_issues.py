@@ -1,4 +1,5 @@
 """Targeted tests for the STAGES.md parser and body/label rendering."""
+
 from __future__ import annotations
 
 import sys
@@ -73,7 +74,9 @@ def test_issue_fields():
     a, b, c = d.issues
     assert a.description == "Create `src/sto` and `pyproject.toml`.\nSecond line."
     assert a.ac == ["`make test-fast` passes", "a socket test fails (as `a; b`)", "done"]
-    assert a.deps == [] and a.size == "S" and a.run == "serial"
+    assert a.deps == []
+    assert a.size == "S"
+    assert a.run == "serial"
     assert a.files == ["pyproject.toml", "tests/conftest.py"]
     assert (a.wave, b.wave, c.wave) == (1, 2, 1)
     assert b.deps == ["D0-01", "D1-01"]
@@ -100,15 +103,21 @@ def test_real_doc_has_244_issues_and_no_warnings():
 
 
 def test_github_slug():
-    assert s.github_slug("D4-16: Fake GitHub: auth and webhooks") == "d4-16-fake-github-auth-and-webhooks"
+    assert (
+        s.github_slug("D4-16: Fake GitHub: auth and webhooks")
+        == "d4-16-fake-github-auth-and-webhooks"
+    )
 
 
 def test_labels():
     d = s.parse(FIXTURE)
     a, b, c = d.issues
     assert s.labels_for(a)[:2] == ["stage:D0", "size:S"]
-    assert "mode:serial" in s.labels_for(a) and "offline" in s.labels_for(a)
-    assert "type:docs" in s.labels_for(b) and "live" in s.labels_for(b) and "needs:peter" in s.labels_for(b)
+    assert "mode:serial" in s.labels_for(a)
+    assert "offline" in s.labels_for(a)
+    assert "type:docs" in s.labels_for(b)
+    assert "live" in s.labels_for(b)
+    assert "needs:peter" in s.labels_for(b)
     assert "needs:peter" not in s.labels_for(c)
 
 
@@ -117,7 +126,8 @@ def test_body_resolves_deps_and_keeps_ticks():
     a, b, _ = d.issues
     old = "- [x] done\n- [ ] done too"
     body = s.render_body(a, d, "o/r", {}, old)
-    assert "- [x] done\n" in body and "- [ ] `make test-fast` passes" in body
+    assert "- [x] done\n" in body
+    assert "- [ ] `make test-fast` passes" in body
     assert "Depends on: none" in body
     body = s.render_body(b, d, "o/r", {"D0-01": 7, "D1-01": 9})
     assert "Depends on: #7 (D0-01), #9 (D1-01)" in body

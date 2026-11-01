@@ -1,0 +1,31 @@
+.DEFAULT_GOAL := help
+BASE ?= origin/main
+.PHONY: help test-fast test test-changed lint typecheck
+
+help: ## List targets
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
+
+test-fast: ## Hermetic unit tests, no Docker, no network (seconds)
+	uv run pytest -q
+
+test: ## Run a chosen target: make test T=tests/test_guards.py
+	@test -n "$(T)" || { echo "usage: make test T=<path-or-nodeid>"; exit 2; }
+	uv run pytest -q $(T)
+
+test-changed: ## Run the direct tests of files changed vs main (D0-08 refines selection)
+	@targets=$$( { git diff --name-only $(BASE)...HEAD; git diff --name-only HEAD; git ls-files -o --exclude-standard; } 2>/dev/null | sort -u | while read -r f; do \
+	  case "$$f" in \
+	    tests/conftest.py|tests/*/conftest.py) echo "$$(dirname "$$f")";; \
+	    tests/*.py|tools/*/test_*.py|tools/test_*.py) echo "$$f";; \
+	    src/sto/*.py) r=$${f#src/sto/}; echo "tests/$$(dirname "$$r")/test_$$(basename "$$r")"; echo "tests/$${r%.py}";; \
+	    tools/*.py) echo "$$(dirname "$$f")/test_$$(basename "$$f")";; \
+	  esac; done | sort -u | while read -r t; do [ -e "$$t" ] && echo "$$t"; done ); \
+	if [ -z "$$targets" ]; then echo "test-changed: no direct tests for the changed files"; \
+	else uv run pytest -q $$targets; fi
+
+lint: ## Ruff lint and format check
+	uv run ruff check .
+	uv run ruff format --check .
+
+typecheck: ## mypy strict
+	uv run mypy
