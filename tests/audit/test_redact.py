@@ -97,8 +97,6 @@ def test_assignments_headers_urls_and_unterminated_keys_are_removed(text: str) -
         "a bearer of good news",
         "bearer authentication works",
         "auth: failed twice",
-        "the cookie: chocolate chip",
-        "authorization: pending",
         "jwt: see the RFC",
     ],
 )
@@ -107,8 +105,8 @@ def test_ordinary_prose_is_not_over_redacted(text: str) -> None:
 
 
 def test_text_around_a_removed_pair_is_kept() -> None:
-    assert redact_text("before password=hunter2hunter2, after") == (
-        f"before password={REDACTED}, after"
+    assert redact_text("before password=hunter2hunter2 after") == (
+        f"before password={REDACTED} after"
     )
     assert redact_text("see https://bob:pw12345@h.io/x now") == f"see https://{REDACTED}@h.io/x now"
     assert redact_text("a\n-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nb") == (
@@ -181,8 +179,14 @@ def test_redaction_is_linear_on_hostile_input() -> None:
         "  'token' + ' ' * 1000 * 100, 'token=\"' * 50000, \"token='a\\\" \" * 30000,\n"
         "  'password\\\\\": ' * 30000, 'cookie:' * 50000, 'Cookie: ' + 'a' * 400000,\n"
         "  'authorization: ' * 30000, 'auth=' * 60000, 'jwt:' * 60000, 'basic ' * 60000,\n"
+        "  'xeyJaaaa' * 40000, 'eyJaaaaa.bbbbb-' * 25000,\n"
+        "  'Bearer%20' * 40000, 'password%3D' * 40000,\n"
+        "  'https://' * 40000, 'redis://:' * 40000, 'cookie=' * 50000, 'secret' + ' ' * 100000,\n"
+        "  (chr(92) + chr(34)) * 100000, ('password=' + chr(92) + chr(34)) * 40000,\n"
         "  'a' * 800000, 'password' * 100000, 'password: ' * 60000]\n"
-        "worst = 0.0\n"
+        "keys = {'ghp_%030d' % i: i for i in range(20000)}\n"
+        "t = time.perf_counter(); r.redact(keys)\n"
+        "worst = time.perf_counter() - t\n"
         "for s in shapes:\n"
         "    t = time.perf_counter(); r.redact_text(s)\n"
         "    worst = max(worst, time.perf_counter() - t)\n"
@@ -249,3 +253,162 @@ def test_tokens_alone_is_a_count_but_secrets_and_passwords_are_secret() -> None:
         "secrets": REDACTED,
         "passwords": REDACTED,
     }
+
+
+# --- pass 3 -------------------------------------------------------------------------------------
+
+JWT2 = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.c2lnbmF0dXJlX2hlcmU"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Authorization: Token abc123def456abc123", "abc123def456"),
+        ("Authorization: ApiKey abc123def456abc123", "abc123def456"),
+        ("Authorization: Digest username=bob, response=abc123def456", "abc123def456"),
+        ("Authorization: Basic abc123", "abc123"),
+        ('{"Authorization": "Token abc123def456abc123"}', "abc123def456"),
+        ('{\\"Authorization\\": \\"Token abc123def456abc123\\"}', "abc123def456"),
+        ("Authorization%3A%20Bearer%20abc123def456", "abc123def456"),
+        ('{"Cookie": "sid=abc123def456"}', "abc123def456"),
+        ('{"cookie":"sid=abc123def456"}', "abc123def456"),
+        ("cookie=sid123456789", "sid123456"),
+        ("Cookie: abc123def456", "abc123def456"),
+        ("redis://:hunter2hunter2@host:6379", "hunter2"),
+        ("https://hunter2hunter2@host/x", "hunter2"),
+        ("postgres://me@corp.com:hunter2hunter2@host/db", "hunter2"),
+        ("https://u:pa/ss1234567@host", "ss1234567"),
+        ("s3://AKIAkeyname:hunter2hunter2@bucket", "hunter2"),
+        ("secrets=abc123def456", "abc123def456"),
+        ("passwords: hunter2hunter2", "hunter2"),
+        ('{"passwords":["hunter2hunter2"]}', "hunter2"),
+        ("pass=hunter2hunter2", "hunter2"),
+        ('"pass": "hunter2hunter2"', "hunter2"),
+        ("api key: abc123def456", "abc123def456"),
+        ("password=abc,defghi123", "defghi123"),
+        ("password=abc;defghi123", "defghi123"),
+        ("password=it'ssecret123", "ssecret123"),
+        ("password=pass}word123", "word123"),
+        ('password="abc\\"defghi123"', "defghi123"),
+        ("password = 'abc\\'defghi123'", "defghi123"),
+        ("password='single quoted words'", "quoted words"),
+        ("password='unterminated single words", "single words"),
+        ("passphrase=correcthorsebattery", "correcthorse"),
+        ("pwd=correcthorsebattery", "correcthorse"),
+        ("passwd=correcthorsebattery", "correcthorse"),
+        ("credentials=correcthorsebattery", "correcthorse"),
+        ("credential: correcthorsebattery", "correcthorse"),
+        ("private_key=correcthorsebattery", "correcthorse"),
+        ("private-key: correcthorsebattery", "correcthorse"),
+        ("password%3Dhunter2hunter2", "hunter2"),
+        ("token%3Ahunter2hunter2", "hunter2"),
+        (
+            "-----BEGIN PRIVATE KEY BLOCK-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY BLOCK-----",
+            "MIIEvQ",
+        ),
+        ("-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIEvQIBADANBgkq", "MIIEvQ"),
+        ("xapp-1-A012-abc123def456", "abc123def456"),
+        ("AIzaSyA1234567890abcdefghijklmnopqrstuv", "AIzaSyA1"),
+        ("npm_abcdefghijklmnopqrstuvwxyz0123456789", "npm_abc"),
+        ("hf_abcdefghijklmnopqrstuvwxyz012345", "hf_abc"),
+        ("pypi-AgEIcHlwaS5vcmcCabc123456789012345", "AgEIcHlw"),
+    ],
+)
+def test_pass_3_shapes_are_removed(text: str, secret: str) -> None:
+    out = redact_text(text)
+    assert secret not in out
+    assert REDACTED in out
+    assert redact_text(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x" + JWT2,
+        "token_" + JWT2,
+        "id-" + JWT2,
+        "Bearer%20" + JWT2,
+        "access_token%3D" + JWT2,
+        "next=%2Fcb%3Faccess_token%3D" + JWT2 + "%26x%3D1",
+        "s%3A" + JWT2,
+        JWT2 + "." + JWT2,
+    ],
+)
+def test_glued_and_encoded_jwts_are_removed(text: str) -> None:
+    out = redact_text(text)
+    assert JWT2[:20] not in out
+    assert "c2lnbmF0dXJlX2hlcmU" not in out
+
+
+def test_prose_after_token_colon_is_redacted_by_decision() -> None:
+    """A word after ``token:`` is taken for a value. Pinned so a change is deliberate."""
+    assert redact_text("the token: looks wrong") == f"the token: {REDACTED} wrong"
+
+
+def test_the_ordinary_url_and_time_shapes_are_left_alone() -> None:
+    for text in [
+        "https://github.com/o/r/pull/285",
+        "https://github.com/o/r@v1.2",
+        "http://localhost:8080/x",
+        "https://github.com:443/org/repo@main",
+        "email me: a@b.com at 10:30",
+        "time: 12:30:45",
+        "user:pass@host",
+        "a basic approach to this",
+    ]:
+        assert redact_text(text) == text, text
+
+
+def test_pass_is_a_secret_only_with_an_equals_sign_or_as_a_quoted_key() -> None:
+    assert redact_text("pass: through the gate") == "pass: through the gate"
+    assert redact_text("a bypass=enabled flag") == "a bypass=enabled flag"
+    assert redact_text("compass=northeast") == "compass=northeast"
+
+
+def test_a_certificate_block_is_not_a_private_key_but_the_key_after_it_is() -> None:
+    text = "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\n"
+    key = "-----BEGIN PRIVATE KEY-----\nMIIBkey\n-----END PRIVATE KEY-----"
+    assert redact_text(text) == text
+    assert redact_text(text + key) == text + REDACTED
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "APIToken", "AWSSecret", "JWTSecret", "APISecret", "accesstoken", "apitoken", "authtoken",
+        "sessiontoken", "refreshtoken", "clientsecret", "client_secret", "privatekey",
+        "private_key",
+        "secretkey", "sshkey", "SSHKey", "password1", "password_old", "token2", "token_value",
+        "secret_value", "pass", "Pass", "passwd", "pwd", "signing_key", "signingKey",
+        "encryption_key", "access_key", "apiKey", "api_key", "secret_new", "password_current",
+        "APIPass", "DBPwd", "AWSAuth",
+    ],
+)  # fmt: skip
+def test_secret_names_match_at_the_end_of_the_normalised_name(name: str) -> None:
+    assert redact({name: "hunter2hunter2"}) == {name: REDACTED}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tokens_used", "token_budget", "secret_ref", "tokens", "token_count", "max_tokens",
+        "foo_key", "key", "monkey", "bypass", "compass", "passthrough", "authorized",
+        "auth_method", "cookie_policy", "password_changed_at", "subject_digest", "decision",
+    ],
+)  # fmt: skip
+def test_names_that_are_not_secrets_are_kept(name: str) -> None:
+    assert redact({name: "keepme"}) == {name: "keepme"}
+
+
+def test_redacted_key_collisions_get_a_counter_not_a_search() -> None:
+    out = redact({f"ghp_{i:030d}": i for i in range(50)})
+    assert len(out) == 50
+    assert sorted(out.values()) == list(range(50))
+    assert REDACTED in out
+    assert f"{REDACTED}#1" in out
+    assert f"{REDACTED}#49" in out
+
+
+def test_a_real_key_that_looks_like_a_counter_does_not_lose_a_value() -> None:
+    out = redact({f"{REDACTED}#1": 3, "ghp_" + "a" * 30: 1, "ghp_" + "b" * 30: 2})
+    assert sorted(out.values()) == [1, 2, 3]

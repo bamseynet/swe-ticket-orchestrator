@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any
@@ -21,6 +21,7 @@ __all__ = [
     "check_checkpoints",
     "check_entries",
     "verify_run",
+    "verify_run_detail",
     "verify_team",
     "walk_run",
 ]
@@ -84,49 +85,45 @@ def check_against_checkpoints(
             if head.run_id != run_id:
                 continue
             at = cp.checkpoint.at
-            if head.count > last:
-                if to_tip:
-                    kind = "missing" if last == 0 else "fewer entries than"
+            if head.count in hashes:
+                if hashes[head.count] != head.hash:
                     raise AuditVerificationError(
-                        f"run {run_id} is {kind} its checkpoint: {last} entries, "
-                        f"checkpoint at {at} has {head.count}"
+                        f"run {run_id} differs from the checkpoint at {at}: "
+                        f"entry {head.count} has another hash"
                     )
-            elif head.count in hashes and hashes[head.count] != head.hash:
+            elif head.count > last and to_tip:
+                kind = "missing" if last == 0 else "fewer entries than"
                 raise AuditVerificationError(
-                    f"run {run_id} differs from the checkpoint at {at}: "
-                    f"entry {head.count} has another hash"
+                    f"run {run_id} is {kind} its checkpoint: {last} entries, "
+                    f"checkpoint at {at} has {head.count}"
                 )
-
-
-def _upto(entries: Iterator[Mapping[str, Any]], limit: int | None) -> Iterable[Mapping[str, Any]]:
-    return entries if limit is None else islice(entries, limit)
 
 
 def _walk(store: Store, scope: Scope, run_id: RunId, page_size: int) -> list[tuple[int, str]]:
     """Read the head first, then verify entries up to ``head.seq`` and the hash there. A gate
     that commits meanwhile adds entries past the head we read, which are not examined, so a
-    concurrent commit is not mistaken for tampering."""
+    concurrent commit is not mistaken for tampering. One more item is read after them: if there
+    is one and the head has not moved forward, something sits past the head (a rolled-back head,
+    junk, a gap), and that is refused."""
     log = StoreAuditLog(store, page_size=page_size)
     for _ in range(2):
         head = log.head(scope, run_id)
-        walked = check_entries(
-            _upto(log.entries(scope, run_id), None if head is None else head.seq),
-            str(run_id),
-            team_of(scope),
-        )
+        stream = log.entries(scope, run_id)
         if head is None:
+            walked = check_entries(stream, str(run_id), team_of(scope))
             if not walked:
                 return []
             continue  # entries but no head: the first commit may have landed in between
+        items = list(islice(stream, head.seq))
+        extra = next(stream, None)
+        walked = check_entries(items, str(run_id), team_of(scope))
         if len(walked) != head.seq or walked[-1][1] != head.hash:
             raise AuditVerificationError(
                 f"audit chain broken for run {run_id}: head does not match the last entry"
             )
-        if log.has_entry(scope, run_id, head.seq + 1):
-            # Either a commit landed after we read the head (the head has moved on), or entries
-            # sit past a head that was rolled back or never moved.
-            moved = log.head(scope, run_id)
-            if moved is None or moved.seq == head.seq:
+        if extra is not None:
+            moved = log.head(scope, run_id)  # a commit after our head read moves it forward
+            if moved is None or moved.seq <= head.seq:
                 raise AuditVerificationError(
                     f"audit chain broken for run {run_id}: entries past the chain head"
                 )
@@ -140,6 +137,24 @@ def walk_run(
     """Verify a run's chain and head. Returns ``(count, last hash)``."""
     walked = _walk(store, scope, run_id, page_size)
     return walked[-1] if walked else (0, GENESIS_HASH)
+
+
+def verify_run_detail(
+    store: Store,
+    scope: Scope,
+    run_id: RunId,
+    checkpoints: Sequence[SignedCheckpoint],
+    page_size: int = DEFAULT_PAGE,
+) -> tuple[int, str]:
+    """``(count, last hash)`` of a run whose chain and head verify and agree with ``checkpoints``
+    (already checked for signature and team). One walk, so a caller that needs the head hash too
+    does not read the run twice."""
+    walked = _walk(store, scope, run_id, page_size)
+    count, last = walked[-1] if walked else (0, GENESIS_HASH)
+    check_against_checkpoints(
+        str(run_id), dict(walked), last=count, to_tip=True, checkpoints=checkpoints
+    )
+    return count, last
 
 
 def verify_run(
@@ -165,12 +180,7 @@ def _verify_run(
     checkpoints: Sequence[SignedCheckpoint],
     page_size: int = DEFAULT_PAGE,
 ) -> int:
-    walked = _walk(store, scope, run_id, page_size)
-    count = walked[-1][0] if walked else 0
-    check_against_checkpoints(
-        str(run_id), dict(walked), last=count, to_tip=True, checkpoints=checkpoints
-    )
-    return count
+    return verify_run_detail(store, scope, run_id, checkpoints, page_size)[0]
 
 
 @dataclass(frozen=True)

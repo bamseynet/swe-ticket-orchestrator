@@ -453,3 +453,103 @@ def test_verify_team_checks_each_signature_once() -> None:
     cps = [create_checkpoint(store, TEAM, signer(), runs, at=i, previous=[]) for i in range(3)]
     verify_team(store, TEAM, runs, checkpoints=cps, verifier=Counting())
     assert Counting.calls == 3
+
+
+# --- pass 3: past the head, and a head that moves ----------------------------------------------
+
+
+def test_junk_further_past_the_head_than_the_next_slot_is_not_clean() -> None:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3, 4, 5])
+    store.transact(TEAM, [Put(Key(f"RUN#{RUN}", f"{7:012d}", AUDIT), {"junk": "x"}, Absent())])
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        verify_run(store, TEAM, RUN)
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+
+
+class ScriptedHead:
+    """Reads go to ``inner``, but the chain head answers from a script: one value per read."""
+
+    def __init__(self, inner: MemoryStore, answers: list[int | None]) -> None:
+        self.inner, self.answers = inner, list(answers)
+
+    def query(self, *a: Any, **k: Any) -> Any:
+        return self.inner.query(*a, **k)
+
+    def get(self, scope: Any, key: Key) -> Any:
+        item = self.inner.get(scope, key)
+        if key.sk != "CHAIN" or item is None:
+            return item
+        seq = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if seq is None:
+            return None
+        from dataclasses import replace
+
+        return replace(item, data={"seq": seq, "hash": audit_items(self.inner)[seq - 1]["hash"]})
+
+
+def eight() -> MemoryStore:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3, 4, 5, 6, 7, 8])
+    return store
+
+
+@pytest.mark.parametrize(("answers", "ok"), [([5, 6], True), ([7, 8], True), ([5, 5], False),
+                                              ([5, 4], False), ([5, 1], False)])  # fmt: skip
+def test_a_head_that_has_not_moved_forward_does_not_excuse_entries_past_it(
+    answers: list[int | None], ok: bool
+) -> None:
+    store = ScriptedHead(eight(), answers)
+    if ok:
+        assert verify_run(store, TEAM, RUN)  # type: ignore[arg-type]
+    else:
+        with pytest.raises(AuditVerificationError, match="past the chain head"):
+            verify_run(store, TEAM, RUN)  # type: ignore[arg-type]
+
+
+def test_a_head_deleted_while_we_verify_is_not_excused() -> None:
+    store = ScriptedHead(eight(), [5, None])
+    with pytest.raises(AuditVerificationError, match="past the chain head"):
+        verify_run(store, TEAM, RUN)  # type: ignore[arg-type]
+
+
+def test_create_checkpoint_reads_each_run_once() -> None:
+    class Counting(MemoryStore):
+        head_reads = 0
+        entry_queries = 0
+
+        def get(self, scope: Any, key: Key) -> Any:
+            self.head_reads += key.sk == "CHAIN"
+            return super().get(scope, key)
+
+        def query(self, scope: Any, pk: str, **kw: Any) -> Any:
+            self.entry_queries += kw.get("table") == AUDIT
+            return super().query(scope, pk, **kw)
+
+    store = Counting()
+    append(store, RUN, [1, 2, 3])
+    store.head_reads = store.entry_queries = 0
+    create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+    assert store.head_reads == 1
+    assert store.entry_queries == 1
+
+
+def test_create_checkpoint_checks_the_signatures_and_team_of_the_checkpoints_it_builds_on() -> None:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3])
+    good = create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+    bad = SignedCheckpoint(good.checkpoint, good.signature[:-2] + "AA")
+    with pytest.raises(AuditVerificationError, match="signature"):
+        create_checkpoint(store, TEAM, signer(), [RUN], at=2, previous=[bad])
+    with pytest.raises(AuditVerificationError, match="another team"):
+        create_checkpoint(store, TEAM, signer(), [RUN], at=2, previous=[foreign_checkpoint()])
+
+
+def test_create_checkpoint_compares_the_store_with_the_checkpoints_it_builds_on() -> None:
+    store = MemoryStore()
+    append(store, RUN, [1, 2, 3])
+    first = create_checkpoint(store, TEAM, signer(), [RUN], at=1, previous=[])
+    cut = forged_copy(store, [RUN], lambda _r, e: e[:2])
+    with pytest.raises(AuditVerificationError, match="fewer"):
+        create_checkpoint(cut, TEAM, signer(), [RUN], at=2, previous=[first])

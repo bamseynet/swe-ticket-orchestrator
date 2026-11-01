@@ -21,10 +21,11 @@ from sto.audit.redact import redact, redact_text
 from sto.domain import RunId
 from sto.domain.errors import InvalidIdError
 from sto.gates.hooks import CHAIN_SK, ReadOnly, audit_pk, run_pk
-from sto.store.ports import AUDIT, Absent, Key, Put, Scope, Store
+from sto.store.ports import AUDIT, Absent, ConditionFailedError, Key, Put, Scope, Store
 
 DEFAULT_PAGE = 500
 REFUSED_METRIC = "audit.refused_write_failed"
+REFUSED_DEGRADED_METRIC = "audit.refused_write_degraded"
 MAX_FIELD_CHARS = 1_024  # actor, action, reason, after redaction
 MAX_TEXT_SLICE = 4_096  # what redaction reads of a text field
 MAX_DATA_BYTES = 64 * 1_024  # of the serialised data, well under the item limit
@@ -64,9 +65,6 @@ class StoreAuditLog:
             if cursor is None:
                 return
 
-    def has_entry(self, scope: Scope, run_id: RunId, seq: int) -> bool:
-        return self._view.get(scope, Key(audit_pk(run_id), f"{seq:012d}", AUDIT)) is not None
-
     def head(self, scope: Scope, run_id: RunId) -> ChainHead | None:
         item = self._view.get(scope, Key(run_pk(run_id), CHAIN_SK))
         if item is None:
@@ -78,8 +76,12 @@ class StoreAuditLog:
 
 
 def _plain(value: object) -> str:
-    """Text the store can hold: a lone surrogate (which cannot be encoded) becomes ``?``."""
-    return str(value).encode("utf-8", "replace").decode("utf-8")
+    """Text the store can hold: a lone surrogate (which cannot be encoded) becomes ``?``, and a
+    value whose ``str`` raises (or a 5,000-digit int) becomes a marker."""
+    try:
+        return str(value).encode("utf-8", "replace").decode("utf-8")
+    except Exception:
+        return f"[unprintable {type(value).__name__}]"
 
 
 def _field(value: object) -> str:
@@ -96,6 +98,7 @@ def _field(value: object) -> str:
     return out
 
 
+MAX_KEY_CHARS = 200
 _MAX_NODES = 5_000
 _MAX_DEPTH = 20  # the store allows 32 for the whole item
 _MAX_NUMBER = 10**15
@@ -115,25 +118,57 @@ def _storable(value: Any, depth: int, budget: list[int]) -> Any:
         ok = value == value and abs(value) < _MAX_NUMBER
         return value if ok else "[number out of range]"
     if isinstance(value, Mapping):
-        return {
-            _plain(k)[:200]: _storable(v, depth + 1, budget)
-            for k, v in islice(value.items(), _MAX_NODES)
-        }
+        mapped: dict[str, Any] = {}
+        for k, v in islice(value.items(), _MAX_NODES):
+            if budget[0] < 0:
+                break  # stop pulling items once the budget is spent
+            mapped[_plain(k)] = _storable(v, depth + 1, budget)  # whole key: redacted, then clipped
+        return mapped
     if isinstance(value, list | tuple):
-        return [_storable(v, depth + 1, budget) for v in islice(value, _MAX_NODES)]
+        items: list[Any] = []
+        for v in islice(value, _MAX_NODES):
+            if budget[0] < 0:
+                break
+            items.append(_storable(v, depth + 1, budget))
+        return items
     if isinstance(value, bytes | bytearray):
         return f"[{len(value)} bytes]"
     return f"[unstorable {type(value).__name__}]"
 
 
+def _clip_keys(value: Any) -> Any:
+    """Bound dict keys after redaction, so a secret in a long key is never cut first. Keys that
+    collide once clipped get a counter."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            new_k = k if len(k) <= MAX_KEY_CHARS else k[:MAX_KEY_CHARS] + "...[truncated]"
+            n = 0
+            base = new_k
+            while new_k in out:
+                n += 1
+                new_k = f"{base}#{n}"
+            out[new_k] = _clip_keys(v)
+        return out
+    if isinstance(value, list):
+        return [_clip_keys(v) for v in value]
+    return value
+
+
 class RefusedAttempts:
     """A refused attempt cannot be written in the transaction that failed (PLAN 4.9), so it goes
     here: its own write, outside any run's chain, that never raises. If the write fails the
-    caller's refusal still stands and ``counter`` gets ``audit.refused_write_failed``.
+    caller's refusal still stands and ``counter`` gets ``audit.refused_write_failed``; a record
+    that had to be degraded to a marker counts ``audit.refused_write_degraded``.
 
-    Whatever is passed in, the record is kept: text is made storable and bounded, odd data becomes
-    markers, oversized data is replaced by its size (no preview: a preview of a secret is a
-    secret), and if the store still refuses, a second write keeps only the bounded text fields."""
+    ``actor`` is redacted here, unlike in the chain: in a refused attempt it is whatever the
+    caller sent (the identity was never verified), so it is free text and may hold a secret. In
+    the chain the actor is a verified identity and stays readable.
+
+    Whatever is passed in, the record is kept: text is made storable and bounded, odd data
+    becomes markers, oversized data is replaced by its size (no preview: a preview of a secret is
+    a secret), and if the store refuses the record as invalid, a second write keeps only the
+    bounded text fields. A transient failure is retried with the same record instead."""
 
     def __init__(self, store: Store, counter: Callable[[str], None]) -> None:
         self._store = store
@@ -165,16 +200,31 @@ class RefusedAttempts:
             if claimed is not None:
                 body["claimed_run"] = claimed
             key = Key(f"REFUSED#{partition}", f"{body['at']:016d}#{secrets.token_hex(6)}", AUDIT)
-            try:
-                self._store.transact(
-                    scope, [Put(key, {**body, "data": self._bounded(data)}, Absent())]
-                )
-            except Exception:
-                marker = {**body, "data": {"unstorable": True}}
-                self._store.transact(scope, [Put(key, marker, Absent())])
+            self._write(scope, key, body, data)
         except Exception:
             with contextlib.suppress(Exception):  # best effort all the way down
                 self._counter(REFUSED_METRIC)
+
+    def _write(self, scope: Scope, key: Key, body: dict[str, Any], data: object) -> None:
+        """One write. A store that refuses the record (a validation error) gets a second write of
+        the bounded text with ``{"unstorable": true}``, counted as degraded. Anything else (a
+        throttle, a timeout) is retried once with the same record; a retry that finds the item
+        already there succeeded the first time."""
+        full = {**body, "data": self._bounded(data)}
+        try:
+            self._store.transact(scope, [Put(key, full, Absent())])
+        except (ValueError, TypeError):
+            with contextlib.suppress(Exception):
+                self._counter(REFUSED_DEGRADED_METRIC)
+            self._store.transact(
+                scope, [Put(key, {**body, "data": {"unstorable": True}}, Absent())]
+            )
+        except Exception:
+            try:
+                self._store.transact(scope, [Put(key, full, Absent())])
+            except ConditionFailedError:
+                return  # the first attempt did commit
+            # anything else propagates to record(), which counts it
 
     @staticmethod
     def _bounded(data: object) -> dict[str, Any]:
@@ -183,7 +233,7 @@ class RefusedAttempts:
         clean = _storable(data, 0, [_MAX_NODES])
         size = len(json.dumps(clean))
         if size <= MAX_DATA_BYTES:
-            out: dict[str, Any] = redact(clean)
+            out: dict[str, Any] = _clip_keys(redact(clean))
             if len(json.dumps(out)) <= MAX_DATA_BYTES:
                 return out
         return {"truncated": True, "bytes": size}

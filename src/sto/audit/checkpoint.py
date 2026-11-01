@@ -105,23 +105,15 @@ def create_checkpoint(
     """Sign the current head of every run in ``run_ids`` and of every run an earlier checkpoint
     named. ``previous`` is required (pass ``[]`` for the first one): the store is first verified
     against it, so a checkpoint is never signed over a table that already lost data."""
-    from sto.audit.verify import verify_team, walk_run
+    from sto.audit.verify import check_checkpoints, verify_run_detail
 
     if not isinstance(scope, TeamScope):
         raise ValueError("checkpoints are per team")
+    check_checkpoints(scope.team, previous, signer)  # the first checkpoint has none: that is fine
     ids = {str(r) for r in run_ids} | {h.run_id for cp in previous for h in cp.checkpoint.runs}
-    verify_team(
-        store,
-        scope,
-        [RunId.parse(i) for i in ids],
-        checkpoints=previous,
-        verifier=signer,
-        allow_unanchored=True,  # the first checkpoint has nothing to be anchored to
-        allow_uncovered=True,  # new runs are what this checkpoint is for
-    )
     heads = []
-    for run in sorted(ids):
-        count, last = walk_run(store, scope, RunId.parse(run))
+    for run in sorted(ids):  # one walk per run: verified against `previous`, and its head read
+        count, last = verify_run_detail(store, scope, RunId.parse(run), previous)
         if count:
             heads.append(RunHead(run, count, last))
     cp = Checkpoint(scope.team, at, tuple(heads))
