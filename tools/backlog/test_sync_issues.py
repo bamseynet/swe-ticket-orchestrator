@@ -96,9 +96,9 @@ def test_orphan_issue_after_stage_flagged():
     assert any("D9-99" in w for w in d.warnings)
 
 
-def test_real_doc_has_247_issues_and_no_warnings():
+def test_real_doc_has_249_issues_and_no_warnings():
     d = s.parse(s.STAGES_PATH.read_text())
-    assert len(d.issues) == 247
+    assert len(d.issues) == 249
     assert d.warnings == []
 
 
