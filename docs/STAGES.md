@@ -241,7 +241,7 @@ Stopping the process and restarting keeps a waiting gate. The first gate tests a
 | 2 | D1-07, D1-12 | D1-06 |
 | 3 | - | D1-03 |
 | 4 | D1-11 | D1-08 |
-| 5 | D1-09 | - |
+| 5 | D1-09, D1-14 | - |
 | 6 | - | D1-10 |
 
 #### D1-01: Store port and in-memory store
@@ -307,7 +307,7 @@ It shows simulated writes as simulated, and renders all model and ticket text as
 #### D1-10: Demo and end-to-end test
 `make dev` starts the whole local stack with demo tickets and no Docker, and CI's e2e job drives it through both gates.
 The README states the status plainly, including "never deployed".
-**AC:** works from a fresh clone with no credentials or Docker; the e2e covers approve-approve and reject at each gate; README is accurate.
+**AC:** works from a fresh clone with no credentials or Docker; the e2e covers approve-approve and reject at each gate; README is accurate. `make dev` starts only the API today, and the landing page has no route to `/runs`. CI's `ui-browser` job sets up Node in `ci.yml`, so the browser test stops building inside the test.
 **Deps:** D1-05, D1-08, D1-09, D0-09. **Size:** M. **Run:** serial. **Files:** `README.md`, `tests/e2e/test_skeleton.py`, `scripts/dev.py`.
 
 #### D1-11: Gate suite v1
@@ -321,6 +321,11 @@ A single signer port with a local implementation, used by audit checkpoints, ste
 It exists early so that two workers do not invent two ports.
 **AC:** sign and verify round-trip; a key ID is part of the result, for rotation; no private key is logged.
 **Deps:** D0-07. **Size:** S. **Run:** parallel. **Files:** `src/sto/signing/`, `tests/signing/`.
+
+#### D1-14: Public driver accessors
+The API runtime reads the local driver's private `_load` and `_release`. Give the driver public accessors for the command log and the lease, and move the runtime to them, so a driver can change without breaking the API.
+**AC:** `src/sto/api/runtime.py` reads no private driver attribute, by a test that scans for it; behaviour is unchanged, by the existing API suite.
+**Deps:** D1-03, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/api/runtime.py`, `tests/api/test_v0.py`.
 
 ---
 
@@ -355,19 +360,19 @@ There is deliberately no `auto_approve` key, and unknown keys are refused.
 #### D2-18: Agent profile manifest
 Declare each agent profile's outcomes, tool allowlist and default tier as data, so the validator can check them before any agent exists.
 D5 and D8 implement these profiles, and a test fails if code and manifest differ.
-**AC:** V2 and V9 can read it; all profiles in PLAN.md section 8.3 are listed; the effect catalog gives each effect's class, outcomes, key scope, typed `with` and hold default, including a push effect and `pr.ensure_draft`.
+**AC:** V2 and V9 can read it; all profiles in PLAN.md section 8.3 are listed; the effect catalog gives each effect's class, outcomes, key scope, typed `with` and hold default, including a push effect and `pr.ensure_draft`. A check keeps `EFFECT_OUTCOMES` in `src/sto/config/` in sync with this catalog.
 **Deps:** D2-01. **Size:** S. **Run:** parallel. **Files:** `catalog/profiles.yaml`, `catalog/effects.yaml`, `src/sto/config/manifest.py`, `tests/config/test_manifest.py`.
 
 #### D2-02: Overlays and flattening
 Apply a `WorkflowOverlay` to its pinned template with JSON Merge Patch on the stage map, and flatten at publish, with provenance for each value.
 Maps merge, lists replace and `null` removes. A value below a floor gets an error naming the floor.
-**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal.
+**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal. Flatten must not use `exclude_none`, which drops removals, and re-validates the result. Dump a template with `exclude_unset`: a plain `model_dump` of a `Workflow` is refused on re-validation. `fail_closed: null` is a floor error, not a fall back to `False`. Flatten and `load_document` agree on nulls nested in `with`.
 **Deps:** D2-01, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/overlays.py`, `tests/config/test_overlays.py`.
 
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`.
 **Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `tests/config/test_validate_structure.py`.
 
 #### D2-04: Gate dominance proof
@@ -391,7 +396,7 @@ It replaces the hard-coded path, with no behaviour change to the gate suite. `wa
 #### D2-07: Publishing and pinning
 Publishing stores a flattened, immutable version with a manifest digest over workflow, profiles, effects and prompts, and a run pins that digest at start.
 Old manifests stay addressable by hash, so a changed profile cannot strand a run.
-**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too.
+**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too. Publish has a document size limit, because the loader has none.
 **Deps:** D2-02, D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/publish.py`, `tests/config/test_publish.py`.
 
 #### D2-08: Subject and rounds
@@ -410,7 +415,7 @@ This is the most dangerous logic in the product, and it implements invariant G13
 Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt. This issue owns a person's Retry of a blocked effect: it writes the audit record and calls `EffectExecutor.retry_blocked` (D1-07 has no caller for it).
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
 Carried from D1-03: the local driver retries a persistent `TransientError` with capped backoff but no limit on total time, so cap it, and classify permanent errors that arrive as transient.
-**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited. A head that moves during the QA step blocks the run; today it wedges with `RunWedgedError` and no merge.
+**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited. A head that moves during the QA step blocks the run; today it wedges with `RunWedgedError` and no merge. A run whose drive gave up is re-driven in the background, not only when someone next asks about it.
 **Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
 
 #### D2-11: Cancel v1
@@ -418,7 +423,7 @@ Add the `CANCELLING` state from any active state, with a timeout and alarm, void
 Carried from D1-03: add the stuck-stop alarm for a dead run whose `stop` or `reconcile` keeps failing; a blocked effect on a stopped run shows only as a refused event, so show it plainly. The lease heartbeat shares the default thread pool with handler calls, and a saturated pool can delay a renewal: give it its own. A heartbeat's first load is unguarded, so a store error there aborts the command. `WAITING_EXTERNAL` needs to be idle-allowed when a handler first uses it.
 Carried from D1-07: a stalled worker past its lease can still send a request after reconcile voided the effect, and a lookup handler that returns `Written` for `pr.merge` must supply the frozen subject.
 Stopping model calls mid-step and session stopping arrive in D10-06.
-**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`. `void_planned` after CONFIRMED reports the landed merge rather than staying silent (`effects/core.py:684-689`); the test uses a real Stop through the driver.
+**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`. `void_planned` after CONFIRMED reports the landed merge rather than staying silent (`effects/core.py:684-689`); the test uses a real Stop through the driver. A step-level stop exists (`end(2)` then `register(3)` stays live today) and ends the old visit's attempt. SCM reads have timeouts, so a hung read cannot starve the API thread pool. `void_planned` no longer silently does nothing after 8 `TransactionConflictError`s with no backoff (`effects/core.py:675-690`). A Stop never reports a false empty result.
 **Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `tests/engine/test_cancel.py`, `tests/adapters/test_fake.py`.
 
 #### D2-12: Timers and business calendar
@@ -546,7 +551,7 @@ Email matching alone is refused, links expire, and an unlinked account can never
 #### D3-05: Separation of duties
 Evaluate SoD at decision time from push receipts, with the floors from PLAN.md section 9.4, including two distinct humans, a frozen `author` union and an intake-derived `requester`. Unresolvable terms fail closed.
 An admin who changed a mapping, attributed a commit or cleared an exclusion is ineligible for the affected round.
-**AC:** G7's whole matrix; a forged bot author on a pushed commit blocks; platform commits do not block; service identities are never eligible; T8 covered.
+**AC:** G7's whole matrix; a forged bot author on a pushed commit blocks; platform commits do not block; service identities are never eligible; T8 covered. Narrowing or omitting `separation_of_duties` cannot drop the platform floor; D2-02 only covers an explicit null.
 **Deps:** D3-02, D1-06, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/gates/sod.py`, `tests/gates/test_sod.py`.
 
 #### D3-06: Quorum and veto
@@ -576,20 +581,20 @@ Write an audit entry for each of those state changes in the same transaction. A 
 
 #### D3-08b: Decision comments and refused attempts
 Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLAN.md 4.9's redaction before anything is stored, comments have no size cap, and nothing calls the refused-attempt path.
-**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record.
+**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record. A surrogate in a comment does not raise `UnicodeEncodeError`. Refused records have a named reader. Add token shapes `AIza`, `npm_`, `pypi-`, `hf_`, `ya29.` and `xapp-` to redaction.
 **Deps:** D3-08, D3-06. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_comment_redaction.py`.
 
 #### D3-09: DynamoDB store
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
 Atomicity uses `TransactWriteItems` with conditions.
 **AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction.
-**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`.
+**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`.
 
 #### D3-10: Indexed queries
 "My approvals", run lists, ticket lookup and PR lookup, all through indexes with pagination.
 This removes the PoC's read-everything list.
-**AC:** a test asserts no scans on these paths; pagination is stable; duplicate active run for a ticket is refused atomically.
-**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/store/queries.py`, `tests/store/test_queries.py`.
+**AC:** a test asserts no scans on these paths; pagination is stable; duplicate active run for a ticket is refused atomically. The `{pk, sk, v, d}` item from D3-09 has no top-level attributes, and GSI keys and TTL can't read `d.x`, so this issue owns promoting the indexed and TTL attributes in the store and the port, for every GSI and TTL row in PLAN section 11, before anything depends on them.
+**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/store/queries.py`, `tests/store/test_queries.py`, `src/sto/store/dynamodb.py`, `src/sto/store/ports.py`, `src/sto/store/memory.py`, `src/sto/store/sqlite.py`.
 
 #### D3-11: Outbox relay
 Deliver committed signals to the driver, retrying until delivered, treating "already closed" as success after a reconcile.
@@ -630,7 +635,7 @@ This plugs into the D1-06 hook points.
 #### D3-17: Write conflicts and concurrency
 A write conflict while a gate is open retries instead of returning a false `409`, on every store, with 50 concurrent decisions.
 Runs on DynamoDB Local in CI, because the fast stores may not model `TransactionConflict`.
-**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3, G5 and G6 also pass in the integration job.
+**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3, G5 and G6 also pass in the integration job. Retry paths handle `TransactionOutcomeUnknownError`: a decision whose write landed must not return a 409 for the person's own vote, and `LocalDriver.submit` must not queue an event twice. Reconcile by re-reading. Stop being offered on a 409 survives a read conflict from `can_stop`.
 **Deps:** D3-06, D3-09. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/retry.py`, `tests/integration/test_gate_concurrency.py`.
 
 #### D3-18: First org admin
@@ -688,25 +693,25 @@ It is written once, and every adapter in every later stage runs it.
 #### D4-16: Fake GitHub: auth and webhooks
 First part of an in-process fake: App auth, tokens, signatures, deliveries, pagination, rate limits and errors.
 Each behaviour is documented with its source URL, and the live suite later proves it.
-**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every fake then passes its port's sections.
-**Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`.
+**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every fake then passes its port's sections. Checks in `tests/contract/suite.py`, which this issue may change: the running adapter must be a class really defined under `sto.`, and an adapter with no port exposes none of the ports' write methods (naming a different real class stays a known limit); `forge()` is consistent across kinds, so signatures differ, the truncated MAC is a prefix of the genuine one and the blank one is empty; harness self-checks catch a no-op `restart()` or `plant_foreign_marker`; a silent page cap of 34 or more fails, seeding deeper as needed; a declared vendor must match the adapter's module path. Dedupe does not expire for this fake, as D4-03 rules.
+**Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-02: Credential broker and GitHub auth port
 `CredentialBroker` port on the signer port from D1-13. No human step and no real App, so no offline work waits on a person.
 Tokens are narrowed per call, cached under an hour, never logged, and refused for a repo not bound to the team.
-**AC:** a token request names repos and permissions; an unbound repo is refused; T15 covered at this layer.
+**AC:** a token request names repos and permissions; an unbound repo is refused; T15 covered at this layer. The ports gain a real auth error class, so `is_auth_error` stops accepting any unrelated `PermanentError`.
 **Deps:** D4-16, D3-14, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/credentials/`, `src/sto/adapters/github/auth.py`, `tests/adapters/github/test_auth.py`.
 
 #### D4-03: Webhook ingest core
 Generic ingest: verify on the raw body, dedupe, enqueue, respond inside the vendor's deadline.
 Consumers treat the delivery as a nudge and re-read state.
-**AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries. This issue owns the `WebhookVerifier` port and the queue failure path, and the port says a delivery ID outside the signature does not stop an attacker, so a decision-shaped delivery must re-read.
+**AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries. This issue owns the `WebhookVerifier` port and the queue failure path, and the port says a delivery ID outside the signature does not stop an attacker, so a decision-shaped delivery must re-read. Header names are normalised. For a vendor with no signed timestamp the dedupe record is the only replay bound, so it does not expire; the TTL on `SEEN` applies only to vendors with signed timestamps (PLAN.md section on the data model).
 **Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
 
 #### D4-04: GitHub webhooks
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
 Installation and permission events update connection state.
-**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading.
+**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading. The dedupe record does not expire, as D4-03 rules. The constant-time static check covers every signature comparison under `src/sto/adapters/`, not only this one, so Jira and Slack are held to it.
 **Deps:** D4-03, D4-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
 
 #### D4-05: GitHub issues as tickets
@@ -773,7 +778,7 @@ The revert goes through normal review, and the run ends `done_with_incident`.
 #### D4-15: Live GitHub conformance
 Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** before a human approves it.
 It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow. The worker identity is not on that reviewer list.
-**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself. The network guard has a live exemption that a typo in the target variable cannot enable by accident; a transport shim provokes `crash`, `swallow` and rate limits on demand; live keys are unique per run.
+**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself. The network guard has a live exemption that a typo in the target variable cannot enable by accident; a transport shim provokes `crash`, `swallow` and rate limits on demand; live keys are unique per run. A live suite needs a module-level `pytestmark`: `-m live` deselects a shared `{fake, live}` class, and `@pytest.mark.live` on a class exits 4. Correct the example at `suite.py:16-18`.
 **Deps:** D4-24, D4-05, D4-08, D4-26, D4-27. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
 
 #### D4-17: CI trust report
@@ -902,13 +907,13 @@ It matches the AgentCore command model, so tests stay meaningful.
 #### D5-07: Patch flow
 Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then hand-off to `branch.push` by effect, held in S3 until allowed. The harness checkpoints a patch at each worker turn, and caps commands per step.
 The sandbox never sees an SCM token.
-**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint.
+**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint. `ExecResult` is decoded text and the sandbox has no network, so capture with `git diff --binary | base64` through `exec`, never a raw diff or a presigned PUT. Capture arguments do not trust `.gitattributes` from the sandbox. Decide with D11-12 whether `start` takes a snapshot reference, since bytes hold up to 256 MB in memory. A command that exits normally is never swept, so `setsid daemon &` can outlive it: confirm nothing else is running before capture, using the provider's host-side count.
 **Deps:** D5-06, D5-05, D4-07, D4-27. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/patch.py`, `src/sto/agents/tools/workspace.py`, `tests/workspace/test_patch.py`.
 
 #### D5-08: Triage, refine and plan profiles
 Profiles and prompts for the three early stages, with workers, each with declared outcomes.
 The plan is a tool call, because text between tool calls may be hidden on Opus.
-**AC:** each outcome is reachable with scripted models; a plan arrives through `record_plan`; missing acceptance criteria route correctly. The system prompt includes `FRAME_GUIDANCE`, and `record()` is written into run records; the D5-09 profiles follow the same rule.
+**AC:** each outcome is reachable with scripted models; a plan arrives through `record_plan`; missing acceptance criteria route correctly. The system prompt includes `FRAME_GUIDANCE`, and `record()` is written into run records; the D5-09 profiles follow the same rule. This issue owns screening ticket and comment text into prompts: `render` does not call `screen`.
 **Deps:** D5-02, D5-03, D5-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/profiles/triage.py`, `src/sto/agents/profiles/refiner.py`, `src/sto/agents/profiles/planner.py`, `src/sto/agents/prompts/early/`, `tests/agents/test_early_profiles.py`.
 
 #### D5-09: Implementer profile
@@ -926,7 +931,7 @@ Reviewers never see the implementer's reasoning.
 #### D5-11: Telemetry
 OTel for agents, models and tools from Strands, plus engine, gate and effect spans, with attributes per PLAN.md section 14.5.
 It asserts on real SDK output, because the docs page could not be retrieved at research time.
-**AC:** O1 passes with an in-memory exporter; ticket and code text is absent by default; worker spans nest in the stage trace.
+**AC:** O1 passes with an in-memory exporter; ticket and code text is absent by default; worker spans nest in the stage trace. This issue owns wiring D5-04's `SecretScreeningFilter` into the app's logging.
 **Deps:** D5-02. **Size:** M. **Run:** parallel. **Files:** `src/sto/observability/telemetry.py`, `tests/observability/test_telemetry.py`.
 
 #### D5-12: Bedrock model and catalog
@@ -950,7 +955,7 @@ The engine's `wait` stage holds the human wait, with no session alive.
 #### D5-15: Dispatch and result handling
 Dispatcher stores the token and fence, delivers a per-attempt secret, and invokes a runtime port. The result handler checks the signature and fence. Retry stops the previous attempt first.
 The task token never enters the session. Commands travel in a versioned envelope.
-**AC:** G17: a stale attempt is discarded; a result without the attempt's signature is refused; a malformed result fails the step; a heartbeat gap stops attempt 1 before starting attempt 2; the local runtime port runs in-process.
+**AC:** G17: a stale attempt is discarded; a result without the attempt's signature is refused; a malformed result fails the step; a heartbeat gap stops attempt 1 before starting attempt 2; the local runtime port runs in-process. The dispatcher clamps the first token to the deadline and ends the old visit's attempt. The harness refreshes well before expiry and handles a tool call blocking past the TTL.
 **Deps:** D2-10, D1-03. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/dispatch.py`, `src/sto/engine/results.py`, `tests/engine/test_dispatch.py`.
 
 #### D5-16: Hostile corpus
@@ -1049,7 +1054,7 @@ Includes a stale ticket during a gate.
 #### D6-08: Jira live suite, ready to run
 Tag the same tests for a real site, with a setup guide and a cleanup step.
 It stays skipped until D12-11 supplies a site.
-**AC:** one setting points tests at a real site; skipped cleanly otherwise; guide lists required scopes. Same live exemption, transport shim and unique keys as D4-15.
+**AC:** one setting points tests at a real site; skipped cleanly otherwise; guide lists required scopes. Same live exemption, transport shim and unique keys as D4-15. A live suite needs a module-level `pytestmark`, as D4-15 says.
 **Deps:** D6-07. **Size:** S. **Run:** parallel. **Files:** `tests/live/jira/`, `docs/JIRA.md`.
 
 #### D6-09: Fake Jira: workflow features
@@ -1122,7 +1127,7 @@ Scopes are minimal, and documented with a reason each.
 #### D7-08: Slack end to end and live suite
 Conformance on the fake, an end-to-end decision on the local stack, and a live-tagged suite for later.
 It stays skipped until D12-12 supplies a workspace.
-**AC:** conformance passes; one setting targets a real workspace; a setup guide exists; a stale linked identity is refused end to end. Same live exemption, transport shim and unique keys as D4-15.
+**AC:** conformance passes; one setting targets a real workspace; a setup guide exists; a stale linked identity is refused end to end. Same live exemption, transport shim and unique keys as D4-15. A live suite needs a module-level `pytestmark`, as D4-15 says.
 **Deps:** D7-04, D7-05, D7-06, D7-07. **Size:** M. **Run:** parallel. **Files:** `tests/contract/test_slack.py`, `tests/e2e/test_slack_gate.py`, `tests/live/slack/`, `docs/SLACK.md`.
 
 ---
@@ -1168,7 +1173,7 @@ The AgentCore side is tested by stubs until D12-09. A tool-level check alone doe
 #### D8-04: Code Interpreter port
 Port for QA scripts, with a local container provider and an AgentCore provider, floored at VPC mode with DNS filtering for QA, since the agent reads both untrusted pages and `pr.diff`.
 Documents the language limits, and is never presented as a build environment.
-**AC:** a fake provider gives local tests the same port with no Docker; the container provider runs in CI; timeouts and output caps hold; no credentials reach it; Public mode is refused for QA.
+**AC:** a fake provider gives local tests the same port with no Docker; the container provider runs in CI; timeouts and output caps hold; no credentials reach it; Public mode is refused for QA. Correct ADR-0012, which lists `code_interpreter` under `WorkspaceProvider`, while this issue gives it its own port.
 **Deps:** D5-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/qa/code_interpreter.py`, `src/sto/agents/tools/code_interpreter.py`, `tests/qa/test_code_interpreter.py`.
 
 #### D8-05: QA agent and evidence
@@ -1254,13 +1259,13 @@ AA. Keyboard-only gate decisions work. XSS fixtures do nothing.
 #### D9-01: App shell and sign-in
 Layout, navigation, tokens for light and dark themes, sign-in by PKCE, and a dev-token mode for local use.
 PKCE runs only on HTTPS, so LAN mode over HTTP still works with the dev token.
-**AC:** routes are guarded by role; session expiry prompts sign-in, with no silent failure; LAN mode works without `crypto.subtle` (H4).
+**AC:** routes are guarded by role; session expiry prompts sign-in, with no silent failure; LAN mode works without `crypto.subtle` (H4). Real sign-in replaces the bundled token, and the simulated banner derives from the mode the API reports.
 **Deps:** D1-09, D3-01. **Size:** M. **Run:** serial. **Files:** `web/src/shell/`, `web/src/auth/`.
 
 #### D9-02: Generated API client
 Generate a TypeScript client from OpenAPI, with a test that fails on drift.
 Everything in `web/` uses it, and no page writes its own fetch.
-**AC:** a changed API without regeneration fails CI; idempotency keys are sent on POST; errors are typed.
+**AC:** a changed API without regeneration fails CI; idempotency keys are sent on POST; errors are typed. POSTs carry idempotency keys.
 **Deps:** D1-09. **Size:** S. **Run:** parallel. **Files:** `web/src/api/`, `scripts/gen_client.py`, `tests/api/test_client_drift.py`.
 
 #### D9-03: Team APIs
@@ -1284,7 +1289,7 @@ Only auditors and org admins can reach them, by role.
 #### D9-04: Live updates hook
 Cursor-based event reading with backoff, and an optional nudge channel port.
 If the socket fails, polling continues with no user-visible error.
-**AC:** a drop resumes without gaps or duplicates; a page on a throttled connection keeps responding to input; two open tabs both show the same events, in order.
+**AC:** a drop resumes without gaps or duplicates; a page on a throttled connection keeps responding to input; two open tabs both show the same events, in order. The live hook backs off on errors and pauses on a hidden tab.
 **Deps:** D9-02. **Size:** S. **Run:** parallel. **Files:** `web/src/live/`.
 
 #### D9-05: My work page
@@ -1308,7 +1313,7 @@ Effect status shows only receipts, and simulated writes are labelled.
 #### D9-08: Review gate page
 Full layout from PLAN.md section 4.1: attention list first, matrix, findings, CI and rationale, using the diff component.
 Text is inert, and a blocked gate says why and who can clear it.
-**AC:** decision carries the digest seen; a stale subject explains itself; keyboard decisions work; ticket-edit acknowledgement is enforced; "evidence from an older base" is shown.
+**AC:** decision carries the digest seen; a stale subject explains itself; keyboard decisions work; ticket-edit acknowledgement is enforced; "evidence from an older base" is shown. Pin the digest first seen and require a re-look if it changes, rather than a poll replacing it silently; a stale subject explains itself and refreshes.
 **Deps:** D9-01, D2-08, D5-10, D9-21. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/review-gate/`.
 
 #### D9-09: QA gate page and evidence viewer
@@ -1362,13 +1367,13 @@ Every action is audited, and available only to org admins.
 #### D9-17: Journey and a11y suite
 Playwright journeys for each persona, plus an automated accessibility audit on all pages.
 It runs in CI's `ui_browser` job for `web/` changes, never on the laptop.
-**AC:** every persona journey passes; no serious a11y violations; focus order on gate pages is tested.
+**AC:** every persona journey passes; no serious a11y violations; focus order on gate pages is tested. Tests cover focus order after a decision.
 **Deps:** D9-05, D9-06, D9-07, D9-08, D9-09, D9-10, D9-11, D9-12, D9-13, D9-14, D9-15, D9-16, D9-18. **Size:** M. **Run:** serial. **Files:** `web/e2e/`.
 
 #### D9-18: Browser security
 Strict CSP, escaped rendering everywhere, link allowlist and hostile display fixtures.
 Model text can never produce active content.
-**AC:** T13: XSS fixtures do nothing on every page that shows ticket, model or PR text; CSP has no `unsafe-inline` for scripts.
+**AC:** T13: XSS fixtures do nothing on every page that shows ticket, model or PR text; CSP has no `unsafe-inline` for scripts. A CSP is set.
 **Deps:** D9-07, D9-08, D9-09. **Size:** S. **Run:** parallel. **Files:** `web/e2e/security/`, `web/src/lib/safe-text/`.
 
 #### D9-21: Diff component
@@ -1424,7 +1429,7 @@ A failed reservation is an expected result, not an error.
 #### D10-03: Budget hook
 Strands hook reserves before each model call by the D10-13 policy, and settles after, including worker calls, through the budget broker.
 If the ledger is unreachable, the call does not happen.
-**AC:** B2: outage stops calls; a call over budget never reaches the model, counted at the stub; usage from real SDK events is accurate.
+**AC:** B2: outage stops calls; a call over budget never reaches the model, counted at the stub; usage from real SDK events is accurate. Settle with D11-04 what the ledger means.
 **Deps:** D10-02, D5-02, D10-13, D5-19. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/hooks/budget.py`, `tests/agents/test_budget_hook.py`.
 
 #### D10-04: Budget behaviour
@@ -1436,13 +1441,13 @@ Monthly team and org limits queue new runs.
 #### D10-05: Concurrency leases
 DynamoDB lease semaphore per team and org, with expiry, used at dispatch.
 Lambda reserved concurrency is not used for this.
-**AC:** a limit holds under concurrency; a crashed holder's lease expires; a queued run starts when a slot frees.
+**AC:** a limit holds under concurrency; a crashed holder's lease expires; a queued run starts when a slot frees. Bound the number of concurrent drives, and startup redelivery, which is sequential today.
 **Deps:** D3-09. **Size:** S. **Run:** parallel. **Files:** `src/sto/budget/concurrency.py`, `tests/budget/test_concurrency.py`.
 
 #### D10-06: Full cancel
 Add the ordered steps from PLAN.md section 14.3: a flag polled inside the stream loop, a tool layer that refuses calls for a dead step, then session stop through ports, dequeue, and a report of what was written.
 Latency is measured and exposed as a metric.
-**AC:** C1, C2, C3 and C6 with all ports; no session leaks after cancel in any state; a late sandbox call is refused rather than recreating a session; the UI lists writes already made.
+**AC:** C1, C2, C3 and C6 with all ports; no session leaks after cancel in any state; a late sandbox call is refused rather than recreating a session; the UI lists writes already made. A late sandbox call must be refused in `ensure_session` as well. A reaper uses the `sto.workspace=1` label, because a crashed host leaves `sleep infinity` containers with no lifetime limit.
 **Deps:** D2-11, D5-13, D5-06, D8-03, D8-04, D10-03, D4-22. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/cancel_sessions.py`, `tests/engine/test_cancel_sessions.py`.
 
 #### D10-07: Kill switch
@@ -1536,7 +1541,7 @@ Record what stays unproven for `TestState` in D12-07.
 #### D11-04: Lambda entrypoints
 Thin handlers for API, ingest, Slack ack, advance, dispatch, results, effects, relay, timers, reconcile and the **agent broker** for ledger, flags and token refresh, with packaging.
 The Slack function stays small, and each role's imports are bounded.
-**AC:** each handler has a local invocation test; package size is checked; no handler holds business logic; the broker checks the step token on every call.
+**AC:** each handler has a local invocation test; package size is checked; no handler holds business logic; the broker checks the step token on every call. The dispatcher takes `now` from a clock, not the request, and caps secret size. The broker refreshes through a dispatcher reissuer given token and secret, and holds no signer. Settle with D10-03 what the ledger means. This issue owns the DynamoDB client factory: timeouts, retry mode and `max_pool_connections` are unset today, so botocore's defaults would apply.
 **Deps:** D5-15, D4-13, D7-02, D5-19. **Size:** M. **Run:** serial. **Files:** `src/sto/lambdas/`, `tests/lambdas/`.
 
 #### D11-05: Control plane stack
@@ -1566,7 +1571,7 @@ It has no route to control plane APIs. **Provisional until the AWS spike (D12-18
 #### D11-20: Sandbox images and egress proxy
 Base images for Python, Node, Java and Go, and an allowlist proxy image, each under the 2 GB limit.
 All builds and container tests run in CI only.
-**AC:** each image builds and runs a sample test suite in CI's integration job; size is checked; the proxy refuses a non-allowlisted host and any method but GET and HEAD, in that job.
+**AC:** each image builds and runs a sample test suite in CI's integration job; size is checked; the proxy refuses a non-allowlisted host and any method but GET and HEAD, in that job. The entrypoint shim keeps a defined keeper running: D5-06's sweep and `sleep infinity` rely on it. If the shim starts a helper before the keeper, record the keeper's identity, because D5-06's sweep takes the lowest PID above 1.
 **Deps:** D5-06, D0-09. **Size:** M. **Run:** parallel. **Files:** `images/sandbox/`, `images/egress-proxy/`, `tests/integration/test_images.py`.
 
 #### D11-09: Gateway tools
@@ -1590,7 +1595,7 @@ GitHub stays on the KMS broker, as ADR-0010 explains.
 #### D11-12: AgentCore providers
 `agentcore_sandbox`, `code_interpreter` and Browser implementations, and session stop, tested with Stubber.
 Each lists what it cannot prove offline.
-**AC:** request shapes validate against botocore's model; command limits are enforced client-side; a change to a team's `test_domains` recreates its custom browser; unknowns are listed for D12.
+**AC:** request shapes validate against botocore's model; command limits are enforced client-side; a change to a team's `test_domains` recreates its custom browser; unknowns are listed for D12. One provider instance means one image, so a factory per registered image is needed; check AgentCore's session ID rules against `_SESSION_ID`.
 **Deps:** D5-06, D8-03, D8-04, D10-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/agentcore_sandbox.py`, `src/sto/qa/browser/agentcore.py`, `src/sto/qa/code_interpreter_agentcore.py`, `tests/workspace/test_agentcore_providers.py`.
 
 #### D11-13: Web stack
@@ -1621,7 +1626,7 @@ A late or repeated firing is safe.
 DynamoDB stream to S3 Object Lock, verifying the chain as it copies, a scheduled KMS-signed checkpoint, and iterator age alarms well under 24 hours.
 IAM denies mutation by app roles, and Object Lock defaults to compliance mode for regulated deployments.
 The verifier loads every checkpoint from the locked bucket, never from a caller or an export, and finds a team's runs itself, so a run removed whole is still noticed. Decide and record whether signing keys are per team.
-**AC:** template asserts Object Lock mode, deny policies and the alarm; replay is idempotent; a broken chain or removed tail alarms; verifying a run with live writes raises no false alarm; a verifier holding two teams' keys refuses a checkpoint signed with the wrong team's key, if keys are per team.
+**AC:** template asserts Object Lock mode, deny policies and the alarm; replay is idempotent; a broken chain or removed tail alarms; verifying a run with live writes raises no false alarm; a verifier holding two teams' keys refuses a checkpoint signed with the wrong team's key, if keys are per team. Compare the table with the locked copy before signing a checkpoint, call `verify_team`, and alarm on checkpoint age. `verify_audit_chain` (`gates/service.py:392-412`) walks the chain and then reads the head, so a live append raises a false alarm on every store: read the head first.
 **Deps:** D3-08, D11-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/lambdas/audit_stream.py`, `infra/lib/audit.ts`, `tests/lambdas/test_audit_stream.py`.
 
 #### D11-18: Deploy config and guide
@@ -1651,7 +1656,7 @@ The step that stores a task token reads gate status and signals at once if alrea
 #### D11-23: Step token issuer on AWS
 KMS-signed step tokens, with a JWKS endpoint the Gateway can trust, on the signer port from D5-19. **Provisional until the AWS spike (D12-18),** which proves Gateway accepts it.
 If it does not, the alternative is a Gateway interceptor or a per-stage role, decided then.
-**AC:** template asserts only the dispatcher can sign; tokens verify against the published JWKS in a local test; rotation is documented.
+**AC:** template asserts only the dispatcher can sign; tokens verify against the published JWKS in a local test; rotation is documented. Only the dispatcher reissues; the broker holds no signer, as D11-04 says.
 **Deps:** D5-19, D11-01, D4-02. **Size:** S. **Run:** parallel. **Files:** `src/sto/adapters/credentials/kms_step_signer.py`, `infra/lib/step-token.ts`, `tests/adapters/test_kms_step_signer.py`.
 
 ---
