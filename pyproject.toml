@@ -4,7 +4,9 @@ version = "0.0.0"
 description = "Orchestrator-workers platform for SWE tickets, with configurable stages and human gates."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "strands-agents~=1.63",
+]
 
 [dependency-groups]
 dev = [
