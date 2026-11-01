@@ -11,6 +11,7 @@ cancellation reasons) use a wrapper around the client and only run on moto.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import threading
 from collections.abc import Callable, Iterator
@@ -300,13 +301,6 @@ class DynamoServerTests:
         with pytest.raises(ConditionFailedError):
             env.store.put(A, RUN, {"a": "x"}, when=FieldEquals("missing", ""))
 
-    def test_empty_object_keys_are_refused_because_dynamodb_cannot_hold_them(
-        self, env: Env
-    ) -> None:
-        with pytest.raises(ValueError, match="empty"):
-            env.store.put(A, RUN, {"outer": {"": 1}})
-        assert env.store.get(A, RUN) is None
-
     def test_floats_round_trip_exactly(self, env: Env) -> None:
         values = [0.1, 0.5, -2.75, 1e-7, 1.2345678901234567e-5, 3.141592653589793, 1.5e-37, 1e-100]
         env.store.put(A, RUN, {"f": values, "big": 10**38 - 1, "neg": -(10**37), "one": 1.0})
@@ -479,32 +473,29 @@ def test_any_5xx_even_a_gateways_html_error_is_retryable(env: Env, op: str, stat
     assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
 
 
-@pytest.mark.parametrize("op", OPERATIONS)
-def test_a_lost_answer_after_the_request_was_sent_is_unknown_for_writes(env: Env, op: str) -> None:
-    method, call = OPERATIONS[op]
-    for exc in (
-        ReadTimeoutError(endpoint_url="http://x"),
-        ConnectionClosedError(endpoint_url="http://x"),
-        HTTPClientError(error=OSError("boom")),
-    ):
-        env.client.fail(method, exc)
-        with pytest.raises(TransactionConflictError) as info:
-            call(env.store)
-        assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
-        assert info.value.__cause__ is exc
+TRANSPORT_FAILURES: list[Callable[[], BaseException]] = [
+    lambda: ReadTimeoutError(endpoint_url="http://x"),
+    lambda: ConnectionClosedError(endpoint_url="http://x"),
+    lambda: HTTPClientError(error=OSError("boom")),
+    lambda: ConnectTimeoutError(endpoint_url="http://x"),  # the SDK may have retried a landed write
+    lambda: EndpointConnectionError(endpoint_url="http://x"),
+    lambda: SSLError(endpoint_url="http://x", error=OSError("tls while reading the answer")),
+    lambda: ProxyConnectionError(proxy_url="http://p"),
+]
 
 
+@pytest.mark.parametrize("make", TRANSPORT_FAILURES)
 @pytest.mark.parametrize("op", OPERATIONS)
-def test_a_failure_before_anything_was_sent_is_a_plain_conflict(env: Env, op: str) -> None:
+def test_every_transport_failure_on_a_write_is_unknown_and_on_a_read_a_plain_conflict(
+    env: Env, op: str, make: Callable[[], BaseException]
+) -> None:
     method, call = OPERATIONS[op]
-    for exc in (
-        SSLError(endpoint_url="http://x", error=OSError("tls")),
-        ProxyConnectionError(proxy_url="http://p"),
-    ):
-        env.client.fail(method, exc)
-        with pytest.raises(TransactionConflictError) as info:
-            call(env.store)
-        assert not isinstance(info.value, TransactionOutcomeUnknownError)
+    exc = make()
+    env.client.fail(method, exc)
+    with pytest.raises(TransactionConflictError) as info:
+        call(env.store)
+    assert isinstance(info.value, TransactionOutcomeUnknownError) == (op in WRITES)
+    assert info.value.__cause__ is exc
 
 
 def test_a_write_that_landed_before_the_timeout_says_so_and_a_reread_reconciles(
@@ -519,19 +510,6 @@ def test_a_write_that_landed_before_the_timeout_says_so_and_a_reread_reconciles(
     assert (landed.data, landed.version) == ({"n": 1}, 2)  # it did apply
     with pytest.raises(ConditionFailedError):  # a blind retry would now lose to its own success
         env.store.put(A, RUN, {"n": 1}, when=VersionIs(1))
-
-
-@pytest.mark.parametrize("op", OPERATIONS)
-def test_a_dropped_connection_is_retryable_too(env: Env, op: str) -> None:
-    method, call = OPERATIONS[op]
-    for exc in (
-        EndpointConnectionError(endpoint_url="http://x"),
-        ConnectTimeoutError(endpoint_url="http://x"),
-    ):
-        env.client.fail(method, exc)
-        with pytest.raises(TransactionConflictError) as info:
-            call(env.store)
-        assert not isinstance(info.value, TransactionOutcomeUnknownError)  # nothing was sent
 
 
 @pytest.mark.parametrize(
@@ -726,17 +704,6 @@ def test_a_prefix_query_asks_for_a_literal_prefix_in_the_key_condition(env: Env)
 # --- values DynamoDB cannot hold ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", [1e-200, -1e-131, 5e-324])
-def test_numbers_below_dynamodbs_range_are_refused_without_writing(env: Env, value: float) -> None:
-    with pytest.raises(ValueError, match="range"):
-        env.store.put(A, RUN, {"x": value})
-    with pytest.raises(ValueError, match="range"):
-        env.store.transact(A, [Put(Key("OK", "1"), {"a": 1}), Put(RUN, {"nested": [{"x": value}]})])
-    with pytest.raises(ValueError, match="range"):
-        env.store.put(A, RUN, {"a": 1}, when=FieldEquals("x", value))  # type: ignore[arg-type]
-    assert env.client.named("transact_write_items") == []
-
-
 def test_the_smallest_number_dynamodb_holds_works(env: Env) -> None:
     env.store.put(A, RUN, {"x": 1e-130})
     got = env.store.get(A, RUN)
@@ -776,6 +743,10 @@ def test_the_size_estimate_follows_the_documented_rules() -> None:
     assert estimate_item_bytes({"a": [1, 2]}) - base == 1 + (3 + 2 * (2 + 1)) + 1
     assert estimate_item_bytes({"a": {"b": "c"}}) - base == 1 + (3 + (1 + 1 + 1)) + 1
     assert estimate_item_bytes({"a": 0}) - base == 1 + 2 + 1  # zero is one byte plus one
+    assert estimate_item_bytes({"a": -12345}) - base == 1 + (3 + 1 + 1) + 1  # a sign: one more
+    assert estimate_item_bytes({"a": 1200}) == estimate_item_bytes({"a": 12})  # zeros are free
+    exact = 10**37 + 1  # 38 digits: normalize() under the default 28-digit context would round
+    assert estimate_item_bytes({"a": exact}) - base == 1 + (19 + 1) + 1
     assert estimate_item_bytes({"a": 10**30}) < estimate_item_bytes({"a": 123456789 * 10**20})
 
 
@@ -929,3 +900,93 @@ def test_a_validation_failure_beats_a_lost_condition(env: Env) -> None:
     )
     with pytest.raises(ValueError, match="too big"):
         env.store.transact(A, THREE)
+
+
+# --- the SDK's own retries (real botocore, not scripted around it) -------------------------------
+
+SECOND_ATTEMPT: dict[str, Callable[[], Any]] = {
+    "connect timeout": lambda: (None, ConnectTimeoutError(endpoint_url="http://x")),
+    "endpoint unreachable": lambda: (None, EndpointConnectionError(endpoint_url="http://x")),
+    "throttled": lambda: (_throttled_response(), None),
+}
+
+
+def _throttled_response() -> Any:
+    from botocore.awsrequest import AWSResponse
+
+    class Raw(io.BytesIO):
+        def stream(self, *_: Any, **__: Any) -> Iterator[bytes]:
+            yield self.read()
+
+    body = b'{"__type":"ThrottlingException","message":"slow down"}'
+    http = AWSResponse("https://x", 400, {}, Raw(body))  # type: ignore[arg-type]
+    parsed = {
+        "Error": {"Code": "ThrottlingException", "Message": "slow down"},
+        "ResponseMetadata": {"HTTPStatusCode": 400, "HTTPHeaders": {}},
+    }
+    return http, parsed
+
+
+@pytest.mark.parametrize("second", SECOND_ATTEMPT)
+def test_a_write_that_landed_on_the_first_attempt_is_unknown_whatever_the_retry_hits(
+    second: str,
+) -> None:
+    """Attempt 1 is applied by the server and its answer is lost; the SDK retries and attempt 2
+    fails differently. The caller must not be told nothing was applied."""
+    with mock_aws():
+        client = boto3.client(
+            "dynamodb",
+            region_name="us-east-1",
+            aws_access_key_id="t",
+            aws_secret_access_key="t",
+            config=Config(retries={"total_max_attempts": 2, "mode": "standard"}),
+        )
+        create_tables(client, main_table=MAIN_TABLE, audit_table=AUDIT_TABLE)
+        store = DynamoDbStore(client, main_table=MAIN_TABLE, audit_table=AUDIT_TABLE)
+        store.put(A, RUN, {"n": 0})
+        endpoint = client._endpoint  # type: ignore[attr-defined]
+        real = endpoint._do_get_response
+        tokens: list[str] = []
+
+        def flaky(request: Any, operation_model: Any, context: Any) -> Any:
+            if operation_model.name != "TransactWriteItems":
+                return real(request, operation_model, context)
+            tokens.append(json.loads(request.body)["ClientRequestToken"])
+            if len(tokens) == 1:
+                real(request, operation_model, context)  # the server applies it
+                return None, ReadTimeoutError(endpoint_url="http://x")
+            return SECOND_ATTEMPT[second]()
+
+        endpoint._do_get_response = flaky
+        try:
+            with pytest.raises(TransactionOutcomeUnknownError):
+                store.put(A, RUN, {"n": 1}, when=VersionIs(1))
+        finally:
+            endpoint._do_get_response = real
+        assert len(tokens) == 2
+        assert len(set(tokens)) == 1  # the same token, so a replay is safe for the SDK
+        landed = store.get(A, RUN)
+        assert landed is not None
+        assert (landed.data, landed.version) == ({"n": 1}, 2)
+        with pytest.raises(ConditionFailedError):  # what a blind retry would have hit
+            store.put(A, RUN, {"n": 1}, when=VersionIs(1))
+
+
+def test_a_server_refusal_after_sdk_retries_is_unknown_for_a_write_but_not_a_read(
+    env: Env,
+) -> None:
+    after_retries = client_error("ThrottlingException")
+    after_retries.response["ResponseMetadata"] = {"HTTPStatusCode": 400, "RetryAttempts": 2}
+    env.client.fail("transact_write_items", after_retries)
+    with pytest.raises(TransactionOutcomeUnknownError):
+        env.store.put(A, RUN, {"n": 1})
+    env.client.fail("get_item", after_retries)
+    with pytest.raises(TransactionConflictError) as info:
+        env.store.get(A, RUN)
+    assert not isinstance(info.value, TransactionOutcomeUnknownError)
+    verdict = cancelled("TransactionConflict")  # a verdict on the transaction itself
+    verdict.response["ResponseMetadata"] = {"HTTPStatusCode": 400, "RetryAttempts": 2}
+    env.client.fail("transact_write_items", verdict)
+    with pytest.raises(TransactionConflictError) as info:
+        env.store.put(A, RUN, {"n": 1})
+    assert not isinstance(info.value, TransactionOutcomeUnknownError)

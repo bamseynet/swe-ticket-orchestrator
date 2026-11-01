@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 import pytest
+from _pytest.mark.expression import Expression
 from botocore.config import Config
 from store_contract import StoreContract
 from test_dynamodb import DynamoServerTests, Env, SpyClient
@@ -40,11 +41,23 @@ if TYPE_CHECKING:
 executed: list[str] = []
 
 
+def _only_integration(name: str, /, **_: str | int | bool | None) -> bool:
+    return name == "integration"
+
+
+def _integration_selected(markexpr: object) -> bool:
+    """True when ``-m`` selects a test carrying only the ``integration`` marker. ``-m contract``
+    and ``-m "not integration"`` do not, whatever text they contain."""
+    if not markexpr:
+        return False
+    return bool(Expression.compile(str(markexpr)).evaluate(_only_integration))
+
+
 @pytest.fixture
 def env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
     # The class inherits StoreContract's `contract` marker, so `-m contract` collects it; only
     # the integration job (which has DynamoDB Local) may run it.
-    if "integration" not in (request.config.getoption("markexpr") or ""):
+    if not _integration_selected(request.config.getoption("markexpr")):
         pytest.skip("needs DynamoDB Local: runs in the integration job only")
 
     def loopback_only(host: str, port: int, *_: object, **__: object) -> list[Any]:
@@ -83,6 +96,7 @@ class TestDynamoDbStoreOnDynamoDbLocal(StoreContract, DynamoServerTests):
         return env.store
 
 
+@pytest.mark.integration
 def test_concurrent_transactions_on_one_item_really_conflict_and_say_so(env: Env) -> None:
     """Nothing serializes calls here (``serialize=False``), so DynamoDB itself must refuse some
     overlapping transactions. Each refusal must surface as a plain TransactionConflictError: not a
@@ -113,12 +127,31 @@ def test_concurrent_transactions_on_one_item_really_conflict_and_say_so(env: Env
     assert not any(isinstance(c, TransactionOutcomeUnknownError) for c in conflicts)
 
 
-def test_the_whole_contract_suite_ran_on_dynamodb_local() -> None:
+@pytest.mark.integration
+def test_the_whole_contract_suite_ran_on_dynamodb_local(request: pytest.FixtureRequest) -> None:
     """Last in the file: the skip in ``env`` must not hide a run that executed nothing."""
-    if not executed:
-        pytest.skip("needs DynamoDB Local: runs in the integration job only")
+    assert _integration_selected(request.config.getoption("markexpr")), "not an integration run"
+    assert executed, "nothing ran on DynamoDB Local: the suite was deselected or skipped"
     expected = {
         n for cls in (StoreContract, DynamoServerTests) for n in dir(cls) if n.startswith("test_")
     }
     ran = {name for name in executed if name.removesuffix("]") in expected}
     assert len(ran) == len(expected), f"not run on DynamoDB Local: {sorted(expected - ran)}"
+
+
+@pytest.mark.parametrize(
+    ("expr", "selected"),
+    [
+        ("integration", True),
+        ("integration or e2e", True),
+        ("contract", False),
+        ("not integration", False),
+        ("contract and not integration", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_the_marker_check_reads_the_expression_not_the_text(
+    expr: str | None, selected: bool
+) -> None:
+    assert _integration_selected(expr) is selected

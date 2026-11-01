@@ -10,8 +10,9 @@ Tenancy lives in the key. A team's ``pk`` is ``TEAM#<team>#<pk>`` (exactly ``TEA
 another's. Platform partitions keep their own pk (``ORG``, ``REPO#r``, ...), which no team pk can
 equal because team pks always start ``TEAM#``. Every call goes through ``resolve`` first.
 
-Atomicity is ``TransactWriteItems``: a ``Put`` is an ``Update`` that sets ``v = v + 1`` and
-replaces ``d`` under the operation's condition, a ``Check`` is a ``ConditionCheck``. Every
+Atomicity is ``TransactWriteItems``: on the main table a ``Put`` is an ``Update`` that sets
+``v = v + 1`` and replaces ``d`` under the operation's condition (on the audit table it is a
+native ``Put``, see below), a ``Check`` is a ``ConditionCheck``. Every
 expression uses ``ExpressionAttributeNames`` for names and values, so reserved words and odd
 characters in data are never parsed.
 
@@ -37,12 +38,12 @@ page), which the port promises. Queries follow ``LastEvaluatedKey`` (DynamoDB cu
 
 Limits the in-memory stores cannot show are checked before anything is sent: 100 operations, one
 per item, 4 MB per transaction, 400 KB per item (by DynamoDB's own accounting, not JSON size),
-numbers within DynamoDB's range, UTF-8 text, and no empty object keys. The server is still the
+UTF-8 text (the port checks number range and empty keys). The server is still the
 authority: its size and validation refusals are mapped to ``ValueError`` too.
 
-Known limits, refused here but accepted by the in-memory stores: numbers below 1E-130 and empty
-object keys. Not here: GSI and TTL attributes (the ``{pk, sk, v, d}`` item cannot serve an index;
-D3-10 owns that) and the client factory.
+Numbers below 1E-130 and empty object keys, which DynamoDB cannot hold, are refused by the port
+for every store. Not here: GSI and TTL attributes (the ``{pk, sk, v, d}`` item cannot serve an
+index; D3-10 owns that) and the client factory.
 
 The audit table gets a native ``PutItem``-style ``Put`` (not an ``Update``), because its role may
 only be allowed to create items (ADR-0017); the main table uses ``Update``.
@@ -120,9 +121,6 @@ __all__ = [
 
 _PLATFORM = "PLATFORM"
 _MAX_QUERY_LIMIT = 2**31 - 1
-# DynamoDB numbers: 38 digits, magnitude from 1E-130 to 9.99...E+125. The port already refuses
-# magnitudes of 1E+38 and over; nothing here is that large, but tiny floats get through the port.
-_MIN_MAGNITUDE = Decimal("1E-130")
 
 # Nothing was applied: the request was refused or never got through.
 _NOTHING_APPLIED_CODES = frozenset(
@@ -149,9 +147,15 @@ _MAYBE_APPLIED_CODES = frozenset(
 _RETRYABLE_REASONS = frozenset(
     {"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"}
 )
-_NOT_SENT_ERRORS = (EndpointConnectionError, ConnectTimeoutError, SSLError, ProxyConnectionError)
-_MAYBE_SENT_ERRORS = (ReadTimeoutError, ConnectionClosedError, HTTPClientError)
-_TRANSPORT_ERRORS = _NOT_SENT_ERRORS + _MAYBE_SENT_ERRORS
+_TRANSPORT_ERRORS = (
+    EndpointConnectionError,
+    ConnectTimeoutError,
+    SSLError,
+    ProxyConnectionError,
+    ReadTimeoutError,
+    ConnectionClosedError,
+    HTTPClientError,
+)
 
 _SER = TypeSerializer()
 _DESER = TypeDeserializer()
@@ -208,24 +212,35 @@ def _unsure(write: bool, message: str) -> TransactionConflictError:
 
 
 def _translate(exc: BaseException, *, write: bool) -> BaseException:
-    """The port's error for a failed call, or ``exc`` itself when nothing maps."""
-    if isinstance(exc, _NOT_SENT_ERRORS):
-        return _Conflict(f"DynamoDB was unreachable: {exc}")
-    if isinstance(exc, _MAYBE_SENT_ERRORS):
-        return _unsure(write, f"the connection failed after the request was sent: {exc}")
+    """The port's error for a failed call, or ``exc`` itself when nothing maps.
+
+    On a write every transport error is outcome-unknown, connect failures included: the SDK may
+    have retried, and an earlier attempt can have landed with its answer lost. For the same reason
+    a retryable server answer that came after SDK retries (``RetryAttempts > 0``) is unknown too;
+    only a ``TransactionCanceledException`` is a verdict on the transaction itself, because a
+    replay of an applied token would have returned success."""
+    if isinstance(exc, _TRANSPORT_ERRORS):
+        return _unsure(write, f"DynamoDB transport failure: {exc}")
     if not isinstance(exc, ClientError):
         return exc
     error = exc.response.get("Error", {})
     code, message = str(error.get("Code", "")), str(error.get("Message", ""))
-    status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
-    if code in _NOTHING_APPLIED_CODES:
-        return _Conflict(f"{code}: {message}")
-    if code in _MAYBE_APPLIED_CODES or status >= 500:
-        return _unsure(write, f"{code} (HTTP {status}): {message}")
-    if code == "ValidationException":
-        return ValueError(message)
+    meta = exc.response.get("ResponseMetadata", {})
+    status = int(meta.get("HTTPStatusCode") or 0)
+    retried = int(meta.get("RetryAttempts") or 0) > 0
     if code == "TransactionCanceledException":
         return _translate_cancellation(exc, message)
+    if code in _MAYBE_APPLIED_CODES or status >= 500:
+        return _unsure(write, f"{code} (HTTP {status}): {message}")
+    if code in _NOTHING_APPLIED_CODES:
+        text = f"{code}: {message}"
+        return (
+            _unsure(write, f"{text} (after {meta.get('RetryAttempts')} retries)")
+            if retried
+            else _Conflict(text)
+        )
+    if code == "ValidationException":
+        return ValueError(message)
     return exc
 
 
@@ -268,8 +283,6 @@ def _utf8(text: str, what: str) -> None:
 
 def _number(value: float | int) -> Decimal:
     number = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
-    if number != 0 and abs(number) < _MIN_MAGNITUDE:
-        raise ValueError(f"number {value!r} is outside DynamoDB's range (smallest is 1E-130)")
     return number
 
 
@@ -287,8 +300,6 @@ def _to_wire(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if not k:
-                raise ValueError("DynamoDB cannot hold an empty object key")
             _utf8(k, "object key")
             out[k] = _to_wire(v)
         return out
@@ -318,13 +329,13 @@ def _size(value: Any) -> int:
     if isinstance(value, str):
         return len(value.encode("utf-8", "surrogatepass"))
     if isinstance(value, int | float):
-        digits = len(
-            Decimal(repr(value) if isinstance(value, float) else value)
-            .normalize()
-            .as_tuple()
-            .digits
-        )
-        return math.ceil(digits / 2) + 1
+        # Significant digits, exactly (no context rounding): trailing zeros do not count, and a
+        # negative number takes one more byte.
+        number = Decimal(repr(value) if isinstance(value, float) else value)
+        digits = list(number.as_tuple().digits)
+        while len(digits) > 1 and digits[-1] == 0:
+            digits.pop()
+        return math.ceil(len(digits) / 2) + 1 + (1 if number < 0 else 0)
     if isinstance(value, list):
         return 3 + sum(_size(v) + 1 for v in value)
     if isinstance(value, dict):
