@@ -74,9 +74,10 @@ jobs:
             # Docs that tests read count as code (tools/backlog parses STAGES.md).
             spec:
               - 'docs/STAGES.md'
-            # One brace pattern, because `every` would AND separate patterns.
+            # One brace pattern, because `every` would AND separate patterns. Shared files
+            # (CI, Makefile, Python lockfile, .nvmrc) run the UI job too.
             web:
-              - '{web,.github}/**'
+              - '{web/**,.github/**,Makefile,uv.lock,.nvmrc}'
 
   lint:
     name: lint
@@ -147,6 +148,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
+          # TODO(D0-02): switch to `node-version-file: .nvmrc` once that file lands.
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json

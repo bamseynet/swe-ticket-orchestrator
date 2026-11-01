@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { findRoute, routesFromModules } from "./lib/routes";
+import { findRoute, routesFromModules, type Params } from "./lib/routes";
 
-// Discovered at build time: adding src/pages/<name>/index.tsx adds a route with no other edit.
+// Discovered at build time: adding src/pages/**/index.tsx adds a route with no other edit.
 const routes = routesFromModules(
-  import.meta.glob<{ default: React.ComponentType }>("./pages/*/index.tsx", { eager: true }),
+  import.meta.glob<{ default: React.ComponentType<{ params: Params }> }>("./pages/**/index.tsx", {
+    eager: true,
+  }),
 );
 
 export function App() {
@@ -17,7 +19,13 @@ export function App() {
       window.removeEventListener("popstate", onPop);
     };
   }, []);
-  const route = findRoute(routes, pathname);
-  if (!route) return <main><h1>Not found</h1></main>;
-  return <route.Component />;
+  const match = findRoute(routes, pathname);
+  if (!match) {
+    return (
+      <main>
+        <h1>Not found</h1>
+      </main>
+    );
+  }
+  return <match.route.Component params={match.params} />;
 }
