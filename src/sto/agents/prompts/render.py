@@ -9,8 +9,8 @@ framed. A bare ``str`` is rejected, so safe is the default.
 
 A frame is ``<untrusted-HEX source="...">`` ... ``</untrusted-HEX>`` where HEX is the first
 ``TAG_HEX_DIGITS`` (16) hex digits of the sha256 of the text. It is deterministic, and hostile
-text cannot contain the hash of itself, so it cannot forge its own closer however it is encoded. That guarantee is computational
-(it rests on sha256), and it covers the tag only: the neutraliser is still needed so ordinary
+text cannot contain the hash of itself, so it cannot forge its own closer however it is
+encoded. That guarantee is computational (it rests on sha256), and it covers the tag only: the neutraliser is still needed so ordinary
 ``</untrusted>`` text, and a closer for a *different* block, stays visibly inert. Identical values
 share a tag; each block ends at the first closer carrying its tag. A system prompt names the frame
 with ``FRAME_GUIDANCE``.
