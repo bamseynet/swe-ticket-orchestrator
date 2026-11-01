@@ -591,8 +591,8 @@ stateDiagram-v2
 There is exactly one retry layer per external call: inner clients are set to `total_max_attempts=1`.
 
 **A run that merged code and ends without a QA approval of it ends `done_with_incident`,** whichever terminal it reaches, **including Stop**, so a cancelled run's code cannot sit unqualified in a later release range. The
-engine alerts, and opens a revert PR for each such merge as an implicit scoped effect. `done_with_incident` is `DONE` with an
-incident flag.
+engine alerts, and opens a revert PR for each such merge as an implicit scoped effect. `done_with_incident` is an incident flag on
+the run's terminal status: usually `DONE`, but a stopped run stays `CANCELLED` with the flag.
 
 **Retry and spent loops:** Retry resumes the blocked step at a new attempt, after stopping any earlier attempt, and does not reset
 loop counters. A loop at its cap goes to `BLOCKED(loop_exhausted)`, and a team admin can grant extra rounds, which is audited.
@@ -774,7 +774,7 @@ stages:
     timeout: duration
     # kind: gate
     gate:
-      type: review | qa | custom
+      type: review | qa | custom | pre_push
       eligible_roles: [ role ]     # the only authority on who may decide
       quorum: [ { role: role, count: integer } ]    # default one approval from any eligible role
       path_owners: none | codeowners               # also require owners of changed paths
