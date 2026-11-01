@@ -224,8 +224,10 @@ def test_reject_at_the_second_gate_ends_the_run(api: Api) -> None:
 
 @pytest.mark.e2e
 def test_make_dev_seeds_one_demo_run_waiting_at_the_first_gate(seeded_api: Api) -> None:
-    status, body = seeded_api.call("GET", "/runs")
-    assert status == 200
-    assert [r["ticket"] for r in body["runs"]] == ["DEMO-1"]
-    run = body["runs"][0]["id"]
+    # /healthz answers before dev.py has seeded, so wait for the run to appear.
+    body = seeded_api.until(
+        "the demo run", lambda: seeded_api.call("GET", "/runs")[1]["runs"] or None
+    )
+    assert [r["ticket"] for r in body] == ["DEMO-1"]
+    run = body[0]["id"]
     assert seeded_api.gate(run, "review_gate", 1)["status"] == "OPEN"
