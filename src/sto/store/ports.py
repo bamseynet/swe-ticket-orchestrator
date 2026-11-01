@@ -70,7 +70,8 @@ class ConditionFailedError(PermanentError):
 class TransactionConflictError(TransientError):
     """The backend could not serialize concurrent transactions (DynamoDB
     ``TransactionCanceled`` for a conflict, not for a failed condition). Retry with backoff.
-    The in-memory and SQLite stores never raise it; a DynamoDB store does."""
+    A DynamoDB store raises it, and so does the SQLite store when its busy wait expires. The
+    in-memory store never does."""
 
 
 # --- scopes -----------------------------------------------------------------------------------
