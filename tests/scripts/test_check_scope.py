@@ -27,19 +27,11 @@ Body.
 #### D0-11: Something parallel
 **Deps:** D0-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/store/memory.py`, `web/src/pages/runs/`, `README.md`.
 
+#### D0-11a: Follow-up
+**Deps:** D0-11. **Size:** S. **Run:** parallel. **Files:** `src/sto/store/follow.py`.
+
 #### D1-02: Reducer
 **Deps:** none. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/commands.py`, `tests/engine/test_reducer.py`.
-"""
-
-ISSUE_BODY = """\
-## Spec
-
-- **Files:** `scripts/other.py`, `src/sto/thing/`
-- **Size:** S
-- **Mode:** parallel
-- **Stage:** D0: Foundations
-
-_generated_
 """
 
 
@@ -53,22 +45,18 @@ class FakeApi:
         events: list[dict[str, Any]] | None = None,
         labels: list[str] | None = None,
         stages: str | None = STAGES,
+        title: str = "[D0-10] Declared-files check",
     ) -> None:
+        self.title = title
         self.body = body
         self.files = files if files is not None else ["scripts/check_scope.py"]
-        self.issues = issues or {
-            11: {
-                "title": "[D0-10] Declared-files check",
-                "body": ISSUE_BODY,
-                "labels": ["mode:serial"],
-            }
-        }
+        self.issues = issues or {11: issue("[D0-10] Declared-files check")}
         self.events = events or []
         self.labels = labels or []
         self.stages = stages
 
     def pr(self) -> dict[str, Any]:
-        return {"body": self.body, "labels": self.labels}
+        return {"title": self.title, "body": self.body, "labels": self.labels}
 
     def pr_files(self) -> list[str]:
         return self.files
@@ -81,6 +69,10 @@ class FakeApi:
 
     def stages_text(self) -> str | None:
         return self.stages
+
+
+def issue(title: str, state: str = "open") -> dict[str, Any]:
+    return {"title": title, "state": state}
 
 
 def ev(action: str, actor: str, label: str = "scope-override") -> dict[str, Any]:
@@ -100,6 +92,8 @@ def ev(action: str, actor: str, label: str = "scope-override") -> dict[str, Any]
         ("Closes #11\nResolves #12\n", [11, 12]),
         ("see Closes #11 in prose", []),
         ("<!-- Closes #99 -->\nCloses #11", [11]),
+        ("Closes #11\r\n", [11]),
+        ("intro\r\n\r\nCloses #11\r\nResolves #12\r\n", [11, 12]),
         ("Closes #", []),
         ("", []),
         (None, []),
@@ -111,6 +105,7 @@ def test_parse_closing_issues(body: str | None, expected: list[int]) -> None:
 
 def test_issue_id_from_title() -> None:
     assert cs.issue_id_from_title("[D0-10] Declared-files check") == "D0-10"
+    assert cs.issue_id_from_title("[D4-24a] Follow-up") == "D4-24a"
     assert cs.issue_id_from_title("no id here") is None
 
 
@@ -127,15 +122,9 @@ def test_declared_from_stages_reads_files_and_run() -> None:
     assert d2 is not None
     assert d2.serial is False
     assert cs.declared_from_stages(STAGES, "D9-99") is None
-
-
-def test_declared_from_issue_body_uses_generated_format() -> None:
-    d = cs.declared_from_issue_body(ISSUE_BODY)
-    assert d is not None
-    assert d.files == ["scripts/other.py", "src/sto/thing/"]
-    assert d.serial is False
-    assert cs.declared_from_issue_body("nothing") is None
-    assert cs.declared_from_issue_body(None) is None
+    d3 = cs.declared_from_stages(STAGES, "D0-11a")
+    assert d3 is not None
+    assert d3.files == ["src/sto/store/follow.py"]
 
 
 # ---------------------------------------------------------------- matching
@@ -157,9 +146,9 @@ def declared(*files: str, serial: bool = False) -> Any:
         "pyproject.toml",
         "Makefile",
         "web/package.json",
-        "docs/adr/0001.md",
+        "docs/PLAN.md",
+        "docs/sub/notes.md",
         "README.md",
-        "CONTRIBUTING.md",
     ],
 )
 def test_allowed_paths(path: str) -> None:
@@ -170,6 +159,12 @@ def test_allowed_paths(path: str) -> None:
 @pytest.mark.parametrize(
     "path",
     [
+        "docs/STAGES.md",
+        "docs/adr/0001-x.md",
+        "CONTRIBUTING.md",
+        "CLAUDE.md",
+        "src/notes.md",
+        "web/README.md",
         "scripts/b.py",
         "src/sto/store/other.py",
         "web/src/pages/runsx/a.tsx",
@@ -282,12 +277,10 @@ def test_deletions_and_renames_count_as_touched_paths() -> None:
 
 
 def test_serial_area_needs_serial_issue() -> None:
-    issues = {
-        12: {"title": "[D0-11] Something parallel", "body": "", "labels": ["mode:parallel"]},
-    }
     api = FakeApi(
         body="Closes #12",
-        issues=issues,
+        title="[D0-11] Something parallel",
+        issues={12: issue("[D0-11] Something parallel")},
         files=["src/sto/store/memory.py", ".github/workflows/ci.yml"],
     )
     r = run(api)
@@ -299,48 +292,60 @@ def test_serial_issue_may_touch_declared_serial_area() -> None:
     assert r.errors == []
 
 
-def test_serial_area_declared_but_issue_not_serial_still_fails() -> None:
+def test_serial_comes_from_stages_not_labels() -> None:
     stages = STAGES.replace(
         "**Run:** serial. **Files:** `scripts", "**Run:** parallel. **Files:** `scripts"
     )
-    r = run(
-        FakeApi(
-            stages=stages,
-            files=[".github/workflows/ci.yml"],
-            issues={11: {"title": "[D0-10] x", "body": "", "labels": ["mode:serial"]}},
-        )
-    )
+    issues = {11: {**issue("[D0-10] x"), "labels": ["mode:serial"]}}
+    r = run(FakeApi(stages=stages, files=[".github/workflows/ci.yml"], issues=issues))
     assert any("serial" in e for e in r.errors)
 
 
-def test_falls_back_to_issue_body_when_not_in_stages() -> None:
-    issues = {7: {"title": "[D9-99] New", "body": ISSUE_BODY, "labels": []}}
-    ok = run(
-        FakeApi(body="Closes #7", issues=issues, files=["scripts/other.py", "src/sto/thing/a.py"])
+def test_issue_not_in_stages_fails_even_if_its_body_declares_files() -> None:
+    # The live issue body is editable by workers, so it is never trusted.
+    issues = {7: {**issue("[D9-99] New"), "body": "- **Files:** `scripts/other.py`\n"}}
+    r = run(
+        FakeApi(body="Closes #7", title="[D9-99] New", issues=issues, files=["scripts/other.py"])
     )
-    assert ok.errors == []
-    bad = run(FakeApi(body="Closes #7", issues=issues, files=["scripts/zzz.py"]))
-    assert "#7" in bad.errors[0]
-
-
-def test_issue_without_any_declaration_fails() -> None:
-    issues = {7: {"title": "plain title", "body": "no files", "labels": []}}
-    r = run(FakeApi(body="Closes #7", issues=issues))
-    assert r.errors
+    assert len(r.errors) == 1
     assert "#7" in r.errors[0]
+    assert "add it to STAGES.md first" in r.errors[0]
 
 
-def test_stages_authority_beats_issue_body() -> None:
-    # An issue body (editable by others) cannot widen what STAGES.md declares.
-    issues = {
-        11: {
-            "title": "[D0-10] x",
-            "body": "- **Files:** `src/sto/rogue.py`\n",
-            "labels": ["mode:serial"],
-        }
-    }
-    r = run(FakeApi(issues=issues, files=["src/sto/rogue.py"]))
-    assert r.errors
+def test_stages_unreadable_fails() -> None:
+    r = run(FakeApi(stages=None))
+    assert any("STAGES.md" in e for e in r.errors)
+
+
+def test_follow_up_id_resolves() -> None:
+    api = FakeApi(
+        body="Closes #20",
+        title="[D0-11a] Follow-up",
+        issues={20: issue("[D0-11a] Follow-up")},
+        files=["src/sto/store/follow.py"],
+    )
+    assert run(api).errors == []
+
+
+def test_closed_issue_fails() -> None:
+    api = FakeApi(issues={11: issue("[D0-10] Declared-files check", state="closed")})
+    r = run(api)
+    assert any("not open" in e and "#11" in e for e in r.errors)
+
+
+def test_issue_without_id_fails() -> None:
+    r = run(FakeApi(issues={11: issue("Declared-files check")}))
+    assert any("ID" in e for e in r.errors)
+
+
+@pytest.mark.parametrize("title", ["[D0-11] Other", "No id", "[D0-10a] Follow-up"])
+def test_pr_title_id_must_equal_issue_id(title: str) -> None:
+    r = run(FakeApi(title=title))
+    assert any("title" in e and "D0-10" in e for e in r.errors)
+
+
+def test_crlf_body_from_web_editor_links_the_issue() -> None:
+    assert run(FakeApi(body="Summary\r\n\r\nCloses #11\r\n")).errors == []
 
 
 def test_override_by_listed_human_passes_with_note() -> None:
@@ -360,6 +365,14 @@ def test_override_by_worker_is_ignored() -> None:
     assert r.errors
 
 
+def test_empty_actor_list_disables_override() -> None:
+    api = FakeApi(
+        files=["src/sto/rogue.py"], labels=["scope-override"], events=[ev("labeled", "peter")]
+    )
+    assert cs.check(api).errors
+    assert run(api, actors=set()).errors
+
+
 def test_override_label_without_event_is_ignored() -> None:
     api = FakeApi(files=["src/sto/rogue.py"], labels=["scope-override"], events=[])
     assert run(api).errors
@@ -374,6 +387,22 @@ def test_main_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
     assert "#11" in capsys.readouterr().out
 
 
+def test_parse_actors() -> None:
+    assert cs.parse_actors(" Peter, ,alice ,") == {"peter", "alice"}
+    assert cs.parse_actors("") == frozenset()
+    assert cs.parse_actors(None) == frozenset()
+
+
+def test_main_reads_override_actors_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = FakeApi(
+        files=["src/sto/rogue.py"], labels=["scope-override"], events=[ev("labeled", "peter")]
+    )
+    monkeypatch.delenv("SCOPE_OVERRIDE_ACTORS", raising=False)
+    assert cs.main([], api=api) == 1  # empty variable: nobody can override
+    monkeypatch.setenv("SCOPE_OVERRIDE_ACTORS", "peter")
+    assert cs.main([], api=api) == 0
+
+
 def test_main_requires_environment_without_injected_api(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -381,3 +410,88 @@ def test_main_requires_environment_without_injected_api(
         monkeypatch.delenv(var, raising=False)
     assert cs.main([]) == 2
     assert "GITHUB_TOKEN" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- workflow and ruleset
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _scope_workflow() -> dict[str, Any]:
+    import yaml
+
+    data = yaml.safe_load((ROOT / ".github/workflows/scope.yml").read_text())
+    assert isinstance(data, dict)
+    return data
+
+
+def _scope_run_script() -> str:
+    steps = _scope_workflow()["jobs"]["scope"]["steps"]
+    return str(next(st["run"] for st in steps if "run" in st))
+
+
+def _run_step(base: Path, script_exit: int | None) -> Any:
+    """Run the workflow's shell step in a fake base checkout; the script, if present, exits ``script_exit``."""
+    import subprocess
+
+    if script_exit is not None:
+        (base / "scripts").mkdir()
+        (base / "scripts" / "check_scope.py").write_text(
+            f"import sys\nprint('REAL CHECK RAN')\nsys.exit({script_exit})\n"
+        )
+    return subprocess.run(  # noqa: S603 - fixed local interpreter, no network
+        ["bash", "-ec", _scope_run_script()],  # noqa: S607
+        cwd=base,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_bootstrap_skip_only_while_base_lacks_the_script(tmp_path: Path) -> None:
+    r = _run_step(tmp_path, None)
+    assert r.returncode == 0
+    assert "skipping" in r.stdout
+    assert "REAL CHECK RAN" not in r.stdout
+
+
+def test_once_base_has_the_script_it_runs_and_its_failure_fails_the_job(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    ok = _run_step(tmp_path / "a", 0)
+    assert ok.returncode == 0
+    assert "REAL CHECK RAN" in ok.stdout
+    assert "skipping" not in ok.stdout
+    (tmp_path / "b").mkdir()
+    bad = _run_step(tmp_path / "b", 1)
+    assert bad.returncode == 1
+    assert "REAL CHECK RAN" in bad.stdout
+
+
+def test_scope_workflow_shape() -> None:
+    wf = _scope_workflow()
+    triggers: dict[str, Any] = wf.get("on") or wf[True]  # type: ignore[index]  # YAML 1.1 parses a bare `on` as True
+    assert set(triggers) == {"pull_request"}  # never pull_request_target
+    assert {"labeled", "unlabeled", "edited"} <= set(triggers["pull_request"]["types"])
+    job = wf["jobs"]["scope"]
+    assert job["permissions"] == {"contents": "read", "issues": "read", "pull-requests": "read"}
+    steps = job["steps"]
+    checkout = next(st for st in steps if "uses" in st)
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
+    run_step = next(st for st in steps if "run" in st)
+    assert run_step["env"]["SCOPE_OVERRIDE_ACTORS"] == "${{ vars.SCOPE_OVERRIDE_ACTORS }}"
+    assert "secrets." not in (ROOT / ".github/workflows/scope.yml").read_text()
+
+
+def test_ci_yml_does_not_carry_the_scope_job_or_label_triggers() -> None:
+    text = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "labeled" not in text
+    assert "check_scope" not in text
+
+
+def test_ruleset_requires_scope_as_a_second_check() -> None:
+    import json
+
+    rules = json.loads((ROOT / "deploy/ruleset-main.json").read_text())["rules"]
+    params = next(r for r in rules if r["type"] == "required_status_checks")["parameters"]
+    checks = {c["context"]: c["integration_id"] for c in params["required_status_checks"]}
+    assert checks == {"ci-required": 15368, "scope": 15368}
