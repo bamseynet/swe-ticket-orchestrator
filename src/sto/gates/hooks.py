@@ -111,7 +111,11 @@ class AuditEntry:
 
 class AuditWriter(Protocol):
     """Turns an entry into ops for the caller's transaction. It never writes by itself, so an
-    audit record cannot exist without its decision, or the reverse."""
+    audit record cannot exist without its decision, or the reverse.
+
+    Every writer must move ``RUN#r/CHAIN`` in the same transaction as the gate open or decision it
+    records: the effect claim (``effects/core.py``) checks that item to notice a gate round that
+    skips numbers, which no per-key check can see."""
 
     def ops(self, reader: Reader, scope: Scope, entry: AuditEntry) -> Sequence[Op]: ...
 

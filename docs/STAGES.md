@@ -407,16 +407,17 @@ This is the most dangerous logic in the product, and it implements invariant G13
 **Deps:** D2-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/gates/carry_over.py`, `tests/gates/test_carry_over.py`.
 
 #### D2-10: Failure classes and retry
-Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt.
+Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt. This issue owns a person's Retry of a blocked effect: it writes the audit record and calls `EffectExecutor.retry_blocked` (D1-07 has no caller for it).
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
 **AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited.
 **Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
 
 #### D2-11: Cancel v1
-Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert.
+Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert. To tell that a merge landed, add a read-only `find_merge(pr)` to `ScmProvider` and the fake, since D1-07's `reconcile` only dequeues. D4-06 implements it for GitHub.
+Carried from D1-07: a stalled worker past its lease can still send a request after reconcile voided the effect, and a lookup handler that returns `Written` for `pr.merge` must supply the frozen subject.
 Stopping model calls mid-step and session stopping arrive in D10-06.
 **AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`.
-**Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `tests/engine/test_cancel.py`.
+**Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `tests/engine/test_cancel.py`, `tests/adapters/test_fake.py`.
 
 #### D2-12: Timers and business calendar
 Timer port, a local implementation, and business-time maths from `TeamConfig` calendars.
@@ -561,6 +562,7 @@ Escalation notifies, but grants nothing. The way out of a stuck gate is D3-20.
 #### D3-08: Audit chain and checkpoints
 Hash-chain audit events through a chain head item, on the `AuditWriter` seam, with signed checkpoints through the signer port, a verifier and an export.
 Secrets are redacted before storing. Refused attempts go through a separate, best-effort path.
+The writer must move `RUN#r/CHAIN` in the same transaction as the gate open or decision it records, because the D1-07 effect claim's `Check` on that item is how it notices a gate round that skips numbers. A claim that writes an audit entry drops that `Check`, since its `Put` on the chain head carries the same condition and a transaction holds one op per item. A conformance test holds every writer to this.
 **AC:** every state change produces an audit event, asserted across a template run; editing, reordering or **removing a tail or a whole run** fails verification against a checkpoint; T14 covered; update and delete are unavailable in the port.
 **Deps:** D1-06, D1-07, D1-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/audit/`, `tests/audit/`.
 
@@ -709,6 +711,7 @@ All reads are by SHA, so results do not drift.
 #### D4-07: SCM writes
 Create a commit object and record its SHA as intent, then move the ref without force, on `sto/<run>`, `sto/<run>/<n>`, `sto-approved/<run>` or `sto-revert/*`. Ensure, close or mark ready a draft PR, all idempotently.
 Only those branches can be written, and these receipts are what SoD relies on.
+Look up before creating, and keep the effect lease longer than every adapter timeout (D1-07).
 **AC:** a crash after each step gives one commit and one PR; a concurrent human push makes the move fail cleanly; other branch names are refused in code; a second round does not open a second PR; each receipt is read back.
 **Deps:** D4-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/scm_write.py`, `tests/adapters/github/test_scm_write.py`.
 
@@ -1193,7 +1196,7 @@ Our own merge must not supersede the QA gate.
 
 #### D8-11: Release effect
 `release.trigger` dispatches the team's deploy workflow with the release SHA and the effect key as required inputs, shows the key in `run-name`, and reads back the run. The range check requires a QA approval for each run-merged commit since the last release, read from the deploy workflow's run history.
-A crash can lose the run ID, so retry looks up by key, and ambiguity means `BLOCKED`, never a second deploy.
+A crash can lose the run ID, so retry looks up by key, and ambiguity means `BLOCKED`, never a second deploy. As with any real adapter behind D1-07, look up before creating, and keep the effect lease longer than every adapter timeout.
 **AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; a tested SHA that is an ancestor of the last release finishes as "already released"; a blocked good run takes `stale` back to QA; an alarm fires on hold age; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake.
 **Deps:** D4-11, D4-20. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/release.py`, `tests/effects/test_release.py`.
 
