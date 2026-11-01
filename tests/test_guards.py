@@ -180,3 +180,17 @@ def test_subprocesses_are_guarded() -> None:
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert proc.returncode != 0
     assert "network sockets are blocked" in proc.stderr
+
+
+def test_guards_cover_tests_outside_tests_dir(tmp_path: Path) -> None:
+    # e.g. ``pytest tools/...``: the repo's pytest config must load the guards itself.
+    repo = CONFTEST.parent.parent
+    probe = tmp_path / "test_probe.py"
+    probe.write_text("import socket\n\ndef test_probe():\n    socket.socket(socket.AF_INET)\n")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-c", str(repo / "pyproject.toml"),
+         "--rootdir", str(repo), "-p", "no:cacheprovider", str(probe)],
+        capture_output=True, text=True, check=False, cwd=tmp_path,
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stdout
+    assert "network sockets are blocked" in proc.stdout

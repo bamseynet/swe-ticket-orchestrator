@@ -1,4 +1,5 @@
 .DEFAULT_GOAL := help
+BASE ?= origin/main
 .PHONY: help test-fast test test-changed lint typecheck
 
 help: ## List targets
@@ -12,7 +13,7 @@ test: ## Run a chosen target: make test T=tests/test_guards.py
 	uv run pytest -q $(T)
 
 test-changed: ## Run the direct tests of files changed vs main (D0-08 refines selection)
-	@targets=$$( { git diff --name-only origin/main...HEAD; git diff --name-only HEAD; git ls-files -o --exclude-standard; } 2>/dev/null | sort -u | while read -r f; do \
+	@targets=$$( { git diff --name-only $(BASE)...HEAD; git diff --name-only HEAD; git ls-files -o --exclude-standard; } 2>/dev/null | sort -u | while read -r f; do \
 	  case "$$f" in \
 	    tests/conftest.py|tests/*/conftest.py) echo "$$(dirname "$$f")";; \
 	    tests/*.py|tools/*/test_*.py|tools/test_*.py) echo "$$f";; \

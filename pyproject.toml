@@ -37,6 +37,6 @@ mypy_path = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+addopts = ["-p", "conftest", "-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
