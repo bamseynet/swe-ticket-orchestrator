@@ -302,7 +302,7 @@ Everything is asynchronous, and no request holds work open.
 Run list, timeline and one gate page with Approve, Request changes and Reject.
 It shows simulated writes as simulated, and renders all model and ticket text as plain text.
 **AC:** a person can complete the demo in a browser; a required comment is enforced; a closed gate shows who closed it.
-**Deps:** D1-08, D0-03. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/runs/`, `web/src/pages/gate/`, `web/src/lib/`.
+**Deps:** D1-08, D0-03. **Size:** M. **Run:** parallel. **Files:** `web/src/pages/runs/`, `web/src/pages/gate/`, `web/src/lib/`, `web/vite.config.ts`, `tests/ui/test_ui_v0.py`.
 
 #### D1-10: Demo and end-to-end test
 `make dev` starts the whole local stack with demo tickets and no Docker, and CI's e2e job drives it through both gates.
