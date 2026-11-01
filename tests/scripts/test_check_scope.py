@@ -22,7 +22,7 @@ STAGES = """\
 #### D0-10: Declared-files check
 Body.
 **AC:** x.
-**Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `scripts/check_scope.py`, `tests/scripts/test_check_scope.py`, `.github/workflows/ci.yml`.
+**Deps:** D0-08. **Size:** S. **Run:** serial. **Files:** `scripts/tool_x.py`, `tests/scripts/test_tool_x.py`, `.github/workflows/ci.yml`.
 
 #### D0-11: Something parallel
 **Deps:** D0-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/store/memory.py`, `web/src/pages/runs/`, `README.md`.
@@ -49,7 +49,7 @@ class FakeApi:
     ) -> None:
         self.title = title
         self.body = body
-        self.files = files if files is not None else ["scripts/check_scope.py"]
+        self.files = files if files is not None else ["scripts/tool_x.py"]
         self.issues = issues or {11: issue("[D0-10] Declared-files check")}
         self.events = events or []
         self.labels = labels or []
@@ -113,8 +113,8 @@ def test_declared_from_stages_reads_files_and_run() -> None:
     d = cs.declared_from_stages(STAGES, "D0-10")
     assert d is not None
     assert d.files == [
-        "scripts/check_scope.py",
-        "tests/scripts/test_check_scope.py",
+        "scripts/tool_x.py",
+        "tests/scripts/test_tool_x.py",
         ".github/workflows/ci.yml",
     ]
     assert d.serial is True
@@ -234,8 +234,8 @@ def test_clean_pr_passes() -> None:
     r = run(
         FakeApi(
             files=[
-                "scripts/check_scope.py",
-                "tests/scripts/test_check_scope.py",
+                "scripts/tool_x.py",
+                "tests/scripts/test_tool_x.py",
                 ".github/workflows/ci.yml",
             ]
         )
@@ -244,7 +244,7 @@ def test_clean_pr_passes() -> None:
 
 
 def test_undeclared_file_fails_naming_the_issue() -> None:
-    r = run(FakeApi(files=["scripts/check_scope.py", "src/sto/rogue.py"]))
+    r = run(FakeApi(files=["scripts/tool_x.py", "src/sto/rogue.py"]))
     assert len(r.errors) == 1
     assert "#11" in r.errors[0]
     assert "D0-10" in r.errors[0]
@@ -271,7 +271,7 @@ def test_missing_issue_fails() -> None:
 
 def test_deletions_and_renames_count_as_touched_paths() -> None:
     # The API reports both sides of a rename; the old path is touched too.
-    r = run(FakeApi(files=["scripts/check_scope.py", "src/sto/old_name.py", "src/sto/new_name.py"]))
+    r = run(FakeApi(files=["scripts/tool_x.py", "src/sto/old_name.py", "src/sto/new_name.py"]))
     assert "src/sto/old_name.py" in r.errors[0]
     assert "src/sto/new_name.py" in r.errors[0]
 
@@ -445,10 +445,9 @@ def test_fake_d0_10_issue_cannot_unlock_the_check_machinery(path: str) -> None:
 
 @pytest.mark.parametrize("path", GUARDED)
 def test_check_machinery_edit_needs_a_listed_humans_override(path: str) -> None:
-    labelled = {"labels": ["scope-override"]}
-    by_human = FakeApi(files=[path], events=[ev("labeled", "peter")], **labelled)
+    by_human = FakeApi(files=[path], events=[ev("labeled", "peter")], labels=["scope-override"])
     assert run(by_human).errors == []
-    by_worker = FakeApi(files=[path], events=[ev("labeled", "worker")], **labelled)
+    by_worker = FakeApi(files=[path], events=[ev("labeled", "worker")], labels=["scope-override"])
     assert run(by_worker).errors
     assert cs.check(by_human).errors  # empty actor list: nobody can override
 
