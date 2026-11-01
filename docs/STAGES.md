@@ -296,7 +296,7 @@ A gated effect refuses to run without a live approval, and reports only what a r
 FastAPI with runs, events by cursor, gates and decisions, using a dev token.
 Everything is asynchronous, and no request holds work open.
 **AC:** OpenAPI is generated; a decision returns `409` when closed; events resume from a cursor; dev auth refuses to start outside local mode.
-**Deps:** D1-03, D1-06, D1-07. **Size:** M. **Run:** serial. **Files:** `src/sto/api/__init__.py`, `src/sto/api/app.py`, `src/sto/api/runtime.py`, `src/sto/api/routers/__init__.py`, `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `tests/api/test_v0.py`.
+**Deps:** D1-03, D1-06, D1-07. **Size:** M. **Run:** serial. **Files:** `src/sto/api/app.py`, `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `tests/api/test_v0.py`.
 
 #### D1-09: UI v0
 Run list, timeline and one gate page with Approve, Request changes and Reject.
