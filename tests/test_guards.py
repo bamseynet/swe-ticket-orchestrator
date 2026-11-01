@@ -1,12 +1,13 @@
-"""Tests for the hermetic-test guards in ``conftest.py``.
+"""Tests for the hermetic-test guards in ``hermetic_guard.py``.
 
-Inner test files run in a child pytest (``pytester``) with a copy of the real conftest, so the
+Inner test files run in a child pytest (``pytester``) with a copy of the real plugin, so the
 guards are exercised exactly as every other test sees them, including the failing case.
 """
 
 from __future__ import annotations
 
 import _socket
+import os
 import socket
 import subprocess
 import sys
@@ -16,12 +17,13 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-CONFTEST = Path(__file__).with_name("conftest.py")
+PLUGIN = Path(__file__).with_name("hermetic_guard.py")
 
 
 @pytest.fixture
 def guarded(pytester: pytest.Pytester) -> pytest.Pytester:
-    pytester.makeconftest(CONFTEST.read_text())
+    pytester.makepyfile(hermetic_guard=PLUGIN.read_text())
+    pytester.makeconftest('pytest_plugins = ["hermetic_guard"]')
     return pytester
 
 
@@ -184,7 +186,7 @@ def test_subprocesses_are_guarded() -> None:
 
 def test_guards_cover_tests_outside_tests_dir(tmp_path: Path) -> None:
     # e.g. ``pytest tools/...``: the repo's pytest config must load the guards itself.
-    repo = CONFTEST.parent.parent
+    repo = PLUGIN.parent.parent
     probe = tmp_path / "test_probe.py"
     probe.write_text("import socket\n\ndef test_probe():\n    socket.socket(socket.AF_INET)\n")
     proc = subprocess.run(
@@ -194,3 +196,14 @@ def test_guards_cover_tests_outside_tests_dir(tmp_path: Path) -> None:
     )  # fmt: skip
     assert proc.returncode == 1, proc.stdout
     assert "network sockets are blocked" in proc.stdout
+
+
+def test_guard_plugin_configures_once_and_shares_its_error_class() -> None:
+    import hermetic_guard
+
+    assert hermetic_guard.configure_calls == 1
+    # The snapshot taken for restoring must be the host env, not the sandboxed one.
+    assert hermetic_guard.saved["env"].get("HOME") != os.environ["HOME"]
+    assert os.environ["UV_OFFLINE"] == "1"
+    with pytest.raises(hermetic_guard.SocketBlockedError):
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM)

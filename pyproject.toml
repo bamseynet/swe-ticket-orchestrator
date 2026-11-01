@@ -33,10 +33,10 @@ select = ["E", "F", "I", "B", "UP", "SIM", "PT"]
 python_version = "3.12"
 strict = true
 files = ["src", "tests"]
-mypy_path = "src"
+mypy_path = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
-addopts = ["-p", "conftest", "-ra", "--strict-markers", "--strict-config"]
+addopts = ["-p", "hermetic_guard", "-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
 pythonpath = ["src", "tests"]
