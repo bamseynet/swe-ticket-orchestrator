@@ -63,6 +63,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     web_log = tmp_path / "preview.log"
+    web_log_file = web_log.open("w")
     web = subprocess.Popen(  # noqa: S603 - fixed argv
         [
             "npx",
@@ -78,7 +79,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
         ],
         cwd=WEB,
         env={**node_env, "STO_API_PORT": str(api_port)},
-        stdout=web_log.open("w"),
+        stdout=web_log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # npx starts node: stop the whole group, not just npx
     )
@@ -110,6 +111,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
                 continue
         server.should_exit = True
         thread.join(10)
+        web_log_file.close()
         shutil.rmtree(tmp_path / "dist", ignore_errors=True)
 
 
