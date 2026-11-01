@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Set as AbstractSet
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -43,10 +42,10 @@ def subject(**kw: object) -> Subject:
 PRE_PUSH = {"head_sha": None, "base_sha": OLD, "evidence_digest": None, "attention_digest": None}
 
 
-def fake_containment(answers: dict[str, AbstractSet[str] | None]) -> Containment:
+def fake_containment(answers: dict[str, set[str] | frozenset[str] | None]) -> Containment:
     """A hermetic stand-in for D8-02's answer. A sha it has no entry for is unknown."""
 
-    def contained(tested_sha: str) -> AbstractSet[str] | None:
+    def contained(tested_sha: str) -> set[str] | frozenset[str] | None:
         return answers.get(tested_sha)
 
     return contained
@@ -108,7 +107,7 @@ def test_validity_table(
 
 
 def test_exact_and_same_patch_never_consult_containment() -> None:
-    def boom(_: str) -> AbstractSet[str] | None:
+    def boom(_: str) -> set[str] | frozenset[str] | None:
         raise AssertionError("containment must only be asked for contains_sha")
 
     assert check_evidence(ev_(Validity.EXACT_SHA), subject(), boom).valid
@@ -150,7 +149,7 @@ def test_contains_sha_table(answer: set[str], valid: bool, notes: tuple[str, ...
 def test_contains_sha_asks_about_the_tested_sha() -> None:
     asked: list[str] = []
 
-    def contained(sha: str) -> AbstractSet[str] | None:
+    def contained(sha: str) -> set[str] | frozenset[str] | None:
         asked.append(sha)
         return {MERGE}
 
@@ -169,7 +168,7 @@ def test_contains_sha_without_an_answer_is_refused_not_valid() -> None:
     # unknown and empty are different facts, and the reasons say so
     assert "not known" in unknown.reason
     assert "lacks" in empty.reason
-    assert no_resolver.reason
+    assert "no containment answer" in no_resolver.reason
     assert unknown.reason != empty.reason
     assert empty.reason != no_resolver.reason
     assert unknown.reason != no_resolver.reason
@@ -177,7 +176,17 @@ def test_contains_sha_without_an_answer_is_refused_not_valid() -> None:
 
 def test_contains_sha_before_a_merge_is_refused() -> None:
     contained = fake_containment({STAGING: {MERGE}})
-    assert not check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(), contained).valid
+    verdict = check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(), contained)
+    assert not verdict.valid
+    assert "no merge_sha" in verdict.reason
+
+
+def test_refusal_reasons_are_pinned() -> None:
+    pre_push = subject(**PRE_PUSH)
+    assert "no head_sha" in check_evidence(ev_(Validity.EXACT_SHA), pre_push).reason
+    assert "no containment answer" in (
+        check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(**MERGED)).reason
+    )
 
 
 def test_squash_merge_frozen_subject_works_with_contains_sha() -> None:
@@ -190,7 +199,8 @@ def test_squash_merge_frozen_subject_works_with_contains_sha() -> None:
     stale = ev_(Validity.CONTAINS_SHA, OLD, "squashed")  # a pre-merge deployment
     refused = check_evidence(stale, frozen, fake_containment({OLD: {HEAD}, STAGING: {MERGE}}))
     assert not refused.valid
-    # The head sha is not the merge sha, so the other validities would not have held it.
+    # exact_sha is refused because the tested sha is not the head sha; same_patch because the
+    # squashed patch differs from the subject's.
     assert not check_evidence(replace(staging, validity=Validity.EXACT_SHA), frozen).valid
     assert not check_evidence(replace(staging, validity=Validity.SAME_PATCH), frozen).valid
 
@@ -278,7 +288,10 @@ def test_records_are_frozen() -> None:
 MERGED_BAD_ANSWERS = [
     pytest.param(f"deployment does NOT contain {MERGE}", id="error-text-string"),
     pytest.param(MERGE, id="bare-sha-string"),
-    pytest.param(iter([EXTRA, MERGE, NEW]), id="generator"),
+    pytest.param((s for s in [EXTRA, MERGE, NEW]), id="generator"),
+    pytest.param({MERGE: True, EXTRA: True}, id="dict"),
+    pytest.param({MERGE: False}, id="dict-merge-false"),
+    pytest.param(MERGE.encode(), id="bytes"),
     pytest.param([MERGE, EXTRA], id="list"),
     pytest.param((MERGE, EXTRA), id="tuple"),
     pytest.param({MERGE, None}, id="none-member"),
@@ -319,7 +332,7 @@ class Boom(Exception):
 
 
 def test_a_raising_containment_answer_propagates() -> None:
-    def contained(_: str) -> AbstractSet[str] | None:
+    def contained(_: str) -> set[str] | frozenset[str] | None:
         raise Boom
 
     e = ev_(Validity.CONTAINS_SHA, STAGING)

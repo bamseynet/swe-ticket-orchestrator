@@ -21,7 +21,6 @@ After a squash merge the frozen subject carries ``merge_sha``, so staging QA che
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import assert_never
@@ -31,7 +30,7 @@ from sto.domain import Subject
 OLDER_BASE_NOTE = "evidence from an older base"
 
 # tested_sha -> the SHAs that deployment contains; None means "not known".
-Containment = Callable[[str], AbstractSet[str] | None]
+Containment = Callable[[str], set[str] | frozenset[str] | None]
 
 
 class Validity(StrEnum):
