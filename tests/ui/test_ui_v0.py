@@ -41,7 +41,6 @@ def free_port() -> int:
 
 @pytest.fixture
 def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
-    node_env = {**os.environ, "npm_config_engine_strict": "false"}  # the runner's Node may be older
     dist = WEB / "dist"
     assert (dist / "index.html").exists(), (
         "web/dist is missing: CI builds it before this test (cd web && npm ci && npm run build)"
@@ -72,7 +71,7 @@ def stack(tmp_path: Path, allow_loopback: None) -> Iterator[str]:
             "--strictPort",
         ],
         cwd=WEB,
-        env={**node_env, "STO_API_PORT": str(api_port)},
+        env={**os.environ, "STO_API_PORT": str(api_port)},
         stdout=web_log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # npx starts node: stop the whole group, not just npx

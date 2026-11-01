@@ -91,15 +91,22 @@ def seed_demo(port: int, token: str) -> str:
 
 
 def web_command() -> list[str]:
-    return ["npx", "vite"]
+    # --no-install: never fetch an unpinned vite. 127.0.0.1: the address this script advertises
+    # (plain "localhost" can resolve to ::1 first).
+    return ["npx", "--no-install", "vite", "--host", "127.0.0.1"]
 
 
 def npm_env(env: Mapping[str, str]) -> dict[str, str]:
     return {**env, "npm_config_engine_strict": "false"}
 
 
+def deps_installed() -> bool:
+    # npm writes this file last, so a half-finished `npm ci` does not count as installed.
+    return (WEB / "node_modules" / ".package-lock.json").exists()
+
+
 def ensure_web_deps(env: Mapping[str, str]) -> None:
-    if (WEB / "node_modules").exists():
+    if deps_installed():
         return
     print("dev: installing web dependencies (npm ci)", flush=True)
     subprocess.run(  # noqa: S603 - fixed argv
@@ -107,7 +114,30 @@ def ensure_web_deps(env: Mapping[str, str]) -> None:
     )
 
 
+def port_answers(port: int) -> bool:
+    """True if something already listens on the loopback port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def start_api(env: Mapping[str, str], port: int) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(  # noqa: S603 - fixed argv
+        [sys.executable, "-m", "sto.api.app", "--port", str(port)],
+        cwd=ROOT,
+        env=dict(env),
+        start_new_session=True,
+    )
+
+
+def start_web(env: Mapping[str, str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(  # noqa: S603 - fixed argv
+        web_command(), cwd=WEB, env=npm_env(env), start_new_session=True
+    )
+
+
 def stop(proc: subprocess.Popen[bytes]) -> None:
+    """Stop the child's whole process group (it runs in its own session): SIGTERM, then SIGKILL."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(proc.pid, sig)
@@ -120,6 +150,13 @@ def stop(proc: subprocess.Popen[bytes]) -> None:
             continue
 
 
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def _leave(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt  # one exit path for Ctrl-C, kill and a closed terminal
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the local stack: API, web UI, demo ticket.")
     parser.add_argument("--no-web", action="store_true", help="run only the API")
@@ -129,7 +166,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     api_port = int(os.environ.get("STO_API_PORT", "8710"))
     web_port = int(os.environ.get("STO_WEB_PORT", "5710"))
     token = os.environ.get("STO_DEV_TOKEN", DEFAULT_TOKEN)
-    env = {**os.environ, "STO_MODE": "local", "STO_API_PORT": str(api_port)}
+    env = {
+        **os.environ,
+        "STO_MODE": "local",
+        "STO_API_PORT": str(api_port),
+        "VITE_DEV_TOKEN": token,  # the UI sends the same token the API expects
+    }
+
+    wanted = [("API", api_port)] + ([] if args.no_web else [("web", web_port)])
+    for name, port in wanted:
+        if port_answers(port):
+            print(
+                f"dev: port {port} ({name}) is already in use, perhaps by another `make dev`; "
+                "stop it first, or set STO_API_PORT / STO_WEB_PORT",
+                file=sys.stderr,
+            )
+            return 1
 
     if not args.no_web:
         if shutil.which("npx") is None:
@@ -139,14 +191,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         ensure_web_deps(env)
 
+    previous = {sig: signal.signal(sig, _leave) for sig in STOP_SIGNALS}
     procs: list[subprocess.Popen[bytes]] = []
+    code = 1
     try:
-        api = subprocess.Popen(  # noqa: S603 - fixed argv
-            [sys.executable, "-m", "sto.api.app", "--port", str(api_port)],
-            cwd=ROOT,
-            env=env,
-            start_new_session=True,
-        )
+        api = start_api(env, api_port)
         procs.append(api)
         if not wait_for_api(api_port, 60, lambda: api.poll() is None):
             print("dev: the API did not come up; see its output above", file=sys.stderr)
@@ -154,13 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.no_seed:
             print(f"dev: {seed_demo(api_port, token)}", flush=True)
         if not args.no_web:
-            web = subprocess.Popen(  # noqa: S603 - fixed argv
-                web_command(),
-                cwd=WEB,
-                env=npm_env(env),
-                start_new_session=True,
-            )
-            procs.append(web)
+            procs.append(start_web(env))
             print(
                 f"dev: UI http://127.0.0.1:{web_port}/  API http://127.0.0.1:{api_port}/docs",
                 flush=True,
@@ -170,12 +213,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         while all(p.poll() is None for p in procs):
             time.sleep(0.5)
         print("dev: a process exited; stopping the rest", file=sys.stderr)
-        return 1
     except KeyboardInterrupt:
-        return 0
+        code = 0
     finally:
+        for sig in STOP_SIGNALS:  # a second Ctrl-C must not interrupt the cleanup
+            signal.signal(sig, signal.SIG_IGN)
         for p in procs:
             stop(p)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return code
 
 
 if __name__ == "__main__":

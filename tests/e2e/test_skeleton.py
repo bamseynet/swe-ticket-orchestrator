@@ -8,6 +8,7 @@ the dev token. No Docker, no credentials, no network beyond loopback. The browse
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -111,25 +112,38 @@ class Api:
         return str(self.until("the gate to close", probe))
 
 
-@pytest.fixture
-def api(tmp_path: Path, allow_loopback: None) -> Iterator[Api]:
-    tmp = tmp_path
-    env = {
-        **os.environ,
-        "STO_DB": str(tmp / "dev.db"),
-        "STO_POLL_INTERVAL": "0.2",
-    }
+def children_of(pid: int) -> list[int]:
+    """Direct children of a process (Linux ``/proc``)."""
+    found: list[int] = []
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        found += [int(c) for c in (task / "children").read_text().split()]
+    return found
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def launch(tmp: Path, *flags: str) -> Iterator[Api]:
+    """``scripts/dev.py --no-web`` as a subprocess. On exit it is sent SIGTERM (only it, not its
+    group) and every process it started must be gone: a leaked API keeps its port."""
+    env = {**os.environ, "STO_DB": str(tmp / "dev.db"), "STO_POLL_INTERVAL": "0.2"}
     log = (tmp / "dev.log").open("w")
     port = free_port()
     env["STO_API_PORT"] = str(port)
     proc = subprocess.Popen(  # noqa: S603 - fixed argv
-        [sys.executable, str(ROOT / "scripts" / "dev.py"), "--no-web", "--no-seed"],
+        [sys.executable, str(ROOT / "scripts" / "dev.py"), "--no-web", *flags],
         cwd=ROOT,
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    kids: list[int] = []
     try:
         client = Api(port)
 
@@ -142,19 +156,30 @@ def api(tmp_path: Path, allow_loopback: None) -> Iterator[Api]:
                 return False
 
         client.until("the API to answer /healthz", up)
+        kids = children_of(proc.pid)
+        assert kids, "dev.py has no child: where is the API?"
         yield client
     finally:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(proc.pid, sig)
-            except ProcessLookupError:
-                break
-            try:
-                proc.wait(10)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        try:
+            os.kill(proc.pid, signal.SIGTERM)
+            proc.wait(30)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+        leaked = [pid for pid in kids if alive(pid)]
+        with contextlib.suppress(ProcessLookupError):  # the backstop, after the check
+            os.killpg(proc.pid, signal.SIGKILL)
         log.close()
+        assert not leaked, f"dev.py left processes behind after SIGTERM: {leaked}"
+
+
+@pytest.fixture
+def api(tmp_path: Path, allow_loopback: None) -> Iterator[Api]:
+    yield from launch(tmp_path, "--no-seed")
+
+
+@pytest.fixture
+def seeded_api(tmp_path: Path, allow_loopback: None) -> Iterator[Api]:
+    yield from launch(tmp_path)  # as `make dev` does: with the demo run
 
 
 @pytest.mark.e2e
@@ -182,7 +207,7 @@ def test_reject_at_the_first_gate_ends_the_run(api: Api) -> None:
     assert body["error"]["code"] == "comment_required"
     api.decide(run, review, "reject", "not this")
     assert api.closed_as(run, review) == "REJECTED by dev"
-    api.until("the run to end", lambda: api.run_status(run) in {"FAILED", "CANCELLED", "REJECTED"})
+    api.until("the run to end", lambda: api.run_status(run) == "REJECTED")
     assert api.call("GET", f"/runs/{run}/gates")[1]["gates"][-1]["name"] == "review_gate"
 
 
@@ -194,4 +219,13 @@ def test_reject_at_the_second_gate_ends_the_run(api: Api) -> None:
     qa = api.gate(run, "qa_gate", 1)
     api.decide(run, qa, "reject", "qa says no")
     assert api.closed_as(run, qa) == "REJECTED by dev"
-    api.until("the run to end", lambda: api.run_status(run) in {"FAILED", "CANCELLED", "REJECTED"})
+    api.until("the run to end", lambda: api.run_status(run) == "REJECTED")
+
+
+@pytest.mark.e2e
+def test_make_dev_seeds_one_demo_run_waiting_at_the_first_gate(seeded_api: Api) -> None:
+    status, body = seeded_api.call("GET", "/runs")
+    assert status == 200
+    assert [r["ticket"] for r in body["runs"]] == ["DEMO-1"]
+    run = body["runs"][0]["id"]
+    assert seeded_api.gate(run, "review_gate", 1)["status"] == "OPEN"
