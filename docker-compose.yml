@@ -1,0 +1,15 @@
+# CI-only services for the integration and e2e tiers (D0-09). Nothing here is needed to
+# develop locally: `make dev` runs with no Docker (ADR-0019). Images are pinned by tag; bump
+# deliberately. The port is dedicated (STO_DDB_PORT) so it cannot collide with other projects.
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:3.1.0
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "127.0.0.1:${STO_DDB_PORT:-8720}:8000"
+    healthcheck:
+      # The image has no curl; a bare TCP connect through bash is enough for "listening".
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8000"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
