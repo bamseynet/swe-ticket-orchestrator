@@ -1,0 +1,112 @@
+# Agent profiles (PLAN.md section 8.3). Data, not code: the validator (V2, V9) reads this
+# before any agent exists, and D5 and D8 carry a test that fails if their code differs.
+# role: orchestrator runs a stage and declares its outcomes. worker is called by one.
+# The review_panel workers may hold only the llm_review tool set, and must hold record_finding.
+# Tools are the allowlist. No agent has a write tool to GitHub, Jira or Slack.
+profiles:
+  triage:
+    role: orchestrator
+    default_tier: fast
+    outcomes: [ready, needs_info, not_actionable]
+    tools: [ticket.read, ticket.search_similar, repo.tree, memory.read]
+  refiner:
+    role: orchestrator
+    default_tier: standard
+    outcomes: [ready, needs_info]
+    tools: [ticket.read, ticket.search_similar, repo.tree, memory.read, repo.read_file, repo.search, ask_human]
+  planner:
+    role: orchestrator
+    default_tier: deep
+    outcomes: [ready, needs_info]
+    tools: [ticket.read, ticket.search_similar, repo.tree, memory.read, repo.read_file, repo.search, ask_human, repo.log, repo.blame, record_plan]
+  implementer:
+    role: orchestrator
+    default_tier: deep
+    outcomes: [ready, blocked]
+    tools: [ticket.read, ticket.search_similar, repo.tree, memory.read, repo.read_file, repo.search, ask_human, repo.log, repo.blame, record_plan, workspace.read, workspace.write, workspace.exec, workspace.diff]
+  qa_agent:
+    role: orchestrator
+    default_tier: standard
+    outcomes: [pass, fail, inconclusive]
+    tools: [browser.*, code_interpreter.run, env.info, record_evidence, pr.diff]
+  notifier:
+    role: orchestrator
+    default_tier: fast
+    outcomes: [done]
+    tools: []
+
+  # refine workers
+  ac_writer:
+    role: worker
+    orchestrator: refiner
+    default_tier: standard
+    tools: [ticket.read, repo.tree, repo.read_file, repo.search]
+  ambiguity_finder:
+    role: worker
+    orchestrator: refiner
+    default_tier: standard
+    tools: [ticket.read, ticket.search_similar, repo.tree, repo.read_file, repo.search]
+  # plan workers
+  code_explorer:
+    role: worker
+    orchestrator: planner
+    default_tier: standard
+    tools: [repo.tree, repo.read_file, repo.search, repo.log, repo.blame]
+  risk_assessor:
+    role: worker
+    orchestrator: planner
+    default_tier: standard
+    tools: [ticket.read, repo.tree, repo.read_file, repo.search, repo.log, repo.blame]
+  # implement workers
+  coder:
+    role: worker
+    orchestrator: implementer
+    default_tier: standard
+    tools: [repo.tree, repo.read_file, repo.search, workspace.read, workspace.write, workspace.exec, workspace.diff]
+  test_writer:
+    role: worker
+    orchestrator: implementer
+    default_tier: standard
+    tools: [repo.tree, repo.read_file, repo.search, workspace.read, workspace.write, workspace.exec, workspace.diff]
+  fixer:
+    role: worker
+    orchestrator: implementer
+    default_tier: standard
+    tools: [repo.tree, repo.read_file, repo.search, workspace.read, workspace.write, workspace.exec, workspace.diff]
+  # llm_review panel: the stage kind is review_panel, so these declare no agent outcomes
+  correctness_reviewer:
+    role: worker
+    orchestrator: review_panel
+    default_tier: deep
+    tools: [repo.read_file, repo.search, pr.diff, checks.read, record_finding]
+  security_reviewer:
+    role: worker
+    orchestrator: review_panel
+    default_tier: deep
+    tools: [repo.read_file, repo.search, pr.diff, checks.read, record_finding]
+  test_reviewer:
+    role: worker
+    orchestrator: review_panel
+    default_tier: standard
+    tools: [repo.read_file, repo.search, pr.diff, checks.read, record_finding]
+  compliance_reviewer:
+    role: worker
+    orchestrator: review_panel
+    default_tier: deep
+    tools: [repo.read_file, repo.search, pr.diff, checks.read, record_finding]
+  # qa_agentic workers
+  test_planner:
+    role: worker
+    orchestrator: qa_agent
+    default_tier: standard
+    tools: [env.info, pr.diff]
+  explorer:
+    role: worker
+    orchestrator: qa_agent
+    default_tier: standard
+    tools: [browser.*, env.info, record_evidence]
+  verifier:
+    role: worker
+    orchestrator: qa_agent
+    default_tier: standard
+    tools: [browser.*, code_interpreter.run, env.info, record_evidence, pr.diff]
