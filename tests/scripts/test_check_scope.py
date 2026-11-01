@@ -412,6 +412,28 @@ def test_main_requires_environment_without_injected_api(
     assert "GITHUB_TOKEN" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("path", [".github/workflows/scope.yml", "scripts/check_scope.py"])
+def test_check_machinery_is_editable_only_by_d0_10(path: str) -> None:
+    # Even an issue whose STAGES entry declares the file cannot touch the check itself.
+    stages = STAGES + f"\n#### D0-12: Declares it\n**Run:** serial. **Files:** `{path}`.\n"
+    api = FakeApi(
+        body="Closes #12",
+        title="[D0-12] Declares it",
+        issues={12: issue("[D0-12] Declares it")},
+        files=[path],
+        stages=stages,
+    )
+    r = run(api)
+    assert any("D0-10" in e and path in e and "#12" in e for e in r.errors)
+
+
+def test_check_machinery_editable_by_d0_10_itself() -> None:
+    api = FakeApi(files=[".github/workflows/scope.yml", "scripts/check_scope.py"])
+    stages = STAGES.replace("`.github/workflows/ci.yml`.", "`.github/workflows/scope.yml`.", 1)
+    api.stages = stages
+    assert run(api).errors == []
+
+
 # ---------------------------------------------------------------- workflow and ruleset
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -469,17 +491,25 @@ def test_once_base_has_the_script_it_runs_and_its_failure_fails_the_job(tmp_path
 
 def test_scope_workflow_shape() -> None:
     wf = _scope_workflow()
-    triggers: dict[str, Any] = wf.get("on") or wf[True]  # type: ignore[index]  # YAML 1.1 parses a bare `on` as True
-    assert set(triggers) == {"pull_request"}  # never pull_request_target
-    assert {"labeled", "unlabeled", "edited"} <= set(triggers["pull_request"]["types"])
+    triggers: dict[str, Any] = wf.get("on") or wf[True]  # type: ignore[index]  # YAML 1.1: `on` is True
+    # pull_request_target runs the BASE copy of this file, so a PR cannot switch the check off.
+    assert set(triggers) == {"pull_request_target"}
+    assert {"labeled", "unlabeled", "edited"} <= set(triggers["pull_request_target"]["types"])
+    assert wf["permissions"] == {"contents": "read"}
     job = wf["jobs"]["scope"]
     assert job["permissions"] == {"contents": "read", "issues": "read", "pull-requests": "read"}
     steps = job["steps"]
-    checkout = next(st for st in steps if "uses" in st)
-    assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
+    checkouts = [st for st in steps if "uses" in st]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
+    assert checkouts[0]["with"]["persist-credentials"] is False
+    text = (ROOT / ".github/workflows/scope.yml").read_text()
+    assert "pull_request.head" not in text  # never the PR head ref or sha
+    assert "github.head_ref" not in text
+    assert "refs/pull" not in text
+    assert "${{ secrets" not in text
     run_step = next(st for st in steps if "run" in st)
     assert run_step["env"]["SCOPE_OVERRIDE_ACTORS"] == "${{ vars.SCOPE_OVERRIDE_ACTORS }}"
-    assert "secrets." not in (ROOT / ".github/workflows/scope.yml").read_text()
 
 
 def test_ci_yml_does_not_carry_the_scope_job_or_label_triggers() -> None:

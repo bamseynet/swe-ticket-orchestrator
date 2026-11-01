@@ -4,15 +4,17 @@
 # `edited` (an override label, a fixed `Closes #N`), and those triggers would re-run all of CI.
 # The `scope` job is a SECOND required check (deploy/ruleset-main.json), next to `ci-required`.
 #
-# Security: `pull_request` (never `pull_request_target`), read-only token, no secrets, so fork PRs
-# work. The script is taken from the BASE commit, so a PR cannot edit the rule it is judged by;
-# nothing from the PR is checked out or executed. Declared files come from docs/STAGES.md at the
-# base commit, read through the API. Override actors: repo variable SCOPE_OVERRIDE_ACTORS
+# Security: `pull_request_target`, so GitHub runs THIS file as it is on the base branch and a PR
+# cannot rewrite the step to switch the check off. That is only safe because the job never
+# checks out or runs PR code: it checks out the BASE commit, reads the changed-file list through
+# the API, has a read-only token and no secrets. Never add a checkout of the PR head ref or sha.
+# Declared files come from docs/STAGES.md at the base commit, read through the API. Because the
+# base copy runs, a PR that adds or edits this file is not checked by its own version. Override actors: repo variable SCOPE_OVERRIDE_ACTORS
 # (comma-separated logins; empty means no override is possible).
 name: Scope
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled, edited]
 

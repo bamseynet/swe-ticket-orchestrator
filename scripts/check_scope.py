@@ -40,6 +40,9 @@ SERIAL_AREAS = (
     "src/sto/domain/",
     "src/sto/gates/service.py",
 )
+# The check and its workflow: only D0-10 itself may edit them, whatever any declaration says.
+PROTECTED = (".github/workflows/scope.yml", "scripts/check_scope.py")
+PROTECTED_OWNER = "D0-10"
 ALLOW_EXACT = frozenset({"pyproject.toml", "Makefile", "uv.lock", "web/package.json", "README.md"})
 ALLOW_NAMES = frozenset({"package-lock.json", "uv.lock"})  # lockfiles anywhere
 # Docs are free, except the spec the check itself trusts and the decision records.
@@ -239,6 +242,13 @@ def check(api: Api, override_actors: set[str] | frozenset[str] = frozenset()) ->
             f"Files outside the declared list of issue {name}: {listing}. "
             "Declare them in docs/STAGES.md, split the PR, or ask a maintainer for the "
             f"`{OVERRIDE_LABEL}` label."
+        )
+    owner = issue_id_from_title(str((api.issue(closing[0]) or {}).get("title", "")))
+    guarded = [p for p in touched if p in PROTECTED]
+    if guarded and owner != PROTECTED_OWNER:
+        fail(
+            f"PR touches {', '.join(guarded)}, which only issue {PROTECTED_OWNER} may edit "
+            f"(this PR closes issue {name})."
         )
     shared = serial_areas_touched(touched)
     if shared and not declared.serial:
