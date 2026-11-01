@@ -11,6 +11,7 @@ dev = [
     "hypothesis>=6.100",
     "mypy>=1.13",
     "pytest>=8.3",
+    "pytest-cov>=7.1.0",
     "pyyaml>=6.0.3",
     "ruff>=0.8",
     "types-pyyaml>=6.0.12.20261030",
@@ -39,6 +40,15 @@ mypy_path = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
-addopts = ["-p", "hermetic_guard", "-ra", "--strict-markers", "--strict-config"]
+addopts = ["-p", "hermetic_guard", "-p", "tier_guard", "-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
 pythonpath = ["src", "tests"]
+
+[tool.coverage.run]
+source = ["sto"]
+branch = true
+
+[tool.coverage.report]
+# Global floor for now. Per-package floors (engine, gates, effects, budget highest) are added
+# with those packages.
+fail_under = 90
