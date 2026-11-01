@@ -41,6 +41,8 @@ concurrency:
 
 env:
   UV_VERSION: "0.13.6"
+  # Tests run with a sandboxed HOME, so the browsers live at an explicit path.
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
 
 jobs:
   filter:
@@ -241,12 +243,81 @@ jobs:
       - run: uv sync --locked
       - run: make coverage
 
+  integration:
+    name: integration
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: docker compose up -d --wait dynamodb-local
+      - run: uv run pytest -q -m integration tests/integration
+      - if: failure()
+        run: docker compose logs dynamodb-local
+
+  ui-browser:
+    name: ui-browser
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --group browser
+      - id: pw-version
+        run: echo "v=$(uv run python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+      - id: pw-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .pw-browsers
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.v }}
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -q -m ui_browser
+
+  e2e:
+    name: e2e
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: docker compose up -d --wait dynamodb-local
+      # Whole local stack up, then the e2e tests (selected by path; no e2e marker until D0-09a). D1-10 adds the real journey under tests/e2e/.
+      - run: uv run pytest -q -m integration tests/e2e
+      - if: failure()
+        run: docker compose logs
+
   # The only required check. Runs always, even when every work job was skipped
   # or failed. Add new work jobs to `needs` below; do not change the script.
   ci-required:
     name: ci-required
     if: ${{ always() }}
-    needs: [filter, lint, typecheck, unit, ui, synth, contract, gate-integrity, coverage]
+    needs: [filter, lint, typecheck, unit, ui, synth, contract, gate-integrity, coverage, integration, ui-browser, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
