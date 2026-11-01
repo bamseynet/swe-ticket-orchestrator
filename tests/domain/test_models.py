@@ -226,7 +226,7 @@ def test_gate_rules_and_advance() -> None:
         with pytest.raises(ValueError, match="gate"):
             gate(**bad)
     assert gate(type="qa").type is GateType.QA
-    assert {t.value for t in GateType} == {"review", "qa", "custom"}
+    assert {t.value for t in GateType} == {"review", "qa", "custom", "pre_push"}
 
 
 def test_effect_gated_requires_gates_and_coerces() -> None:
@@ -311,3 +311,115 @@ def test_models_serialize_ids_as_ulid_strings() -> None:
     json.dumps(wire)
     w = to_wire(effect())
     assert w["requires_gates"] == ["review_gate"]
+
+
+# pass 2 -------------------------------------------------------------------------------------
+
+
+def test_pre_push_gate_type() -> None:
+    assert GateType.PRE_PUSH.value == "pre_push"
+    pp = Subject.pre_push(base_sha="b", patch_id="p", ticket_revision="t")
+    g = gate(type="pre_push", subject=pp)
+    assert g.type is GateType.PRE_PUSH
+    with pytest.raises(ValueError, match="pre_push"):
+        gate(type=GateType.PRE_PUSH)  # head subject on a pre_push gate
+
+
+@pytest.mark.parametrize("terminal", [s for s in RunStatus if s.is_terminal])
+def test_incident_on_any_terminal_status(terminal: RunStatus) -> None:
+    assert Run(id=RID, team="t", status=terminal, incident=True).incident
+
+
+def test_incident_on_stop_path() -> None:
+    # PLAN 6.2 (the "whichever terminal it reaches, including Stop" paragraph) is wider than its
+    # next sentence ("DONE with an incident flag"); we follow the wider one. No new edge.
+    run = Run(id=RID, team="t", status=RunStatus.RUNNING)
+    stopped = run.advance(RunStatus.CANCELLING).advance(RunStatus.CANCELLED, incident=True)
+    assert stopped.incident
+    assert stopped.status is RunStatus.CANCELLED
+    with pytest.raises(InvalidTransitionError):
+        run.advance(RunStatus.CANCELLING).advance(RunStatus.DONE)
+    with pytest.raises(ValueError, match="incident"):
+        Run(id=RID, team="t", status=RunStatus.RUNNING, incident=True)
+
+
+@pytest.mark.parametrize(
+    "status", [s for s in EffectStatus if s not in (EffectStatus.PLANNED, EffectStatus.VOIDED)]
+)
+def test_gated_effect_past_claim_needs_decision_and_digest(status: EffectStatus) -> None:
+    rcpt = Receipt("1", "u", True)
+    kw: dict[str, object] = {
+        "status": status,
+        "receipt": rcpt if status is EffectStatus.CONFIRMED else None,
+    }
+    with pytest.raises(ValueError, match="decision_ids"):
+        effect(subject_digest="d", **kw)
+    with pytest.raises(ValueError, match="subject_digest"):
+        effect(decision_ids=(DecisionId.from_parts(9, bytes(10)),), **kw)
+    effect(decision_ids=(DecisionId.from_parts(9, bytes(10)),), subject_digest="d", **kw)
+
+
+@pytest.mark.parametrize("status", [EffectStatus.PLANNED, EffectStatus.VOIDED])
+def test_planned_and_voided_gated_effects_are_exempt(status: EffectStatus) -> None:
+    assert effect(status=status).decision_ids == ()
+
+
+def test_scoped_effect_needs_no_decision() -> None:
+    effect(klass=EffectClass.SCOPED, requires_gates=(), status=EffectStatus.ATTEMPTING)
+
+
+def test_effect_attempts_intent_frozen_subject() -> None:
+    e = effect(attempts=2, intent="abc123", frozen_subject=head(merge_sha="m"))
+    assert (e.attempts, e.intent) == (2, "abc123")
+    assert e.frozen_subject is not None
+    assert e.frozen_subject.merge_sha == "m"
+    with pytest.raises(ValueError, match="attempts"):
+        effect(attempts=-1)
+    with pytest.raises(TypeError, match="frozen_subject"):
+        effect(frozen_subject={"x": 1})
+    with pytest.raises(ValueError, match="intent"):
+        effect(intent=" ")
+
+
+def test_step_can_fail_before_running() -> None:
+    s = Step(key=StepKey(run_id=RID, stage="s", visit=1))
+    assert s.advance(StepStatus.FAILED).status is StepStatus.FAILED
+
+
+def test_receipt_flag_must_be_a_real_bool() -> None:
+    with pytest.raises(TypeError, match="read_back_verified"):
+        Receipt("1", "u", "false")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="simulated"):
+        Receipt("1", "u", True, simulated=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="external_id"):
+        Receipt("  ", "u", True)
+
+
+def test_whitespace_only_required_strings_rejected() -> None:
+    with pytest.raises(ValueError, match="actor"):
+        decision(actor="  ")
+    with pytest.raises(ValueError, match="subject_digest"):
+        decision(subject_digest=" ")
+    with pytest.raises(TypeError, match="comment"):
+        decision(comment=None)
+    for f in ("patch_id", "ticket_revision", "head_sha", "evidence_digest"):
+        with pytest.raises(ValueError, match="subject"):
+            head(**{f: " "})
+    with pytest.raises(ValueError, match="closed_by"):
+        gate(status=GateStatus.APPROVED, closed_by=" ")
+    with pytest.raises(ValueError, match="team"):
+        Run(id=RID, team=" ")
+    with pytest.raises(ValueError, match="stage"):
+        effect(stage=" ")
+
+
+def test_step_usage_cannot_be_negative() -> None:
+    with pytest.raises(ValueError, match="usage"):
+        Step(key=StepKey(run_id=RID, stage="s", visit=1), usage=(("tokens", -1),))
+
+
+def test_numeric_fields_reject_bool_and_non_int() -> None:
+    with pytest.raises(TypeError, match="version"):
+        Run(id=RID, team="t", version=True)
+    with pytest.raises(TypeError, match="round"):
+        gate(round="1")

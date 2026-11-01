@@ -69,6 +69,7 @@ EFFECT_EDGES = {
 STEP_EDGES = {
     (S.PENDING, S.RUNNING),
     (S.PENDING, S.CANCELLED),
+    (S.PENDING, S.FAILED),  # a runtime may refuse before any session runs (401/403)
     (S.RUNNING, S.SUCCEEDED),
     (S.RUNNING, S.FAILED),
     (S.RUNNING, S.CANCELLED),
@@ -98,6 +99,7 @@ def test_terminal_flags() -> None:
     assert {s for s in R if s.is_terminal} == {R.DONE, R.REJECTED, R.CLOSED, R.EXPIRED, R.CANCELLED}
     assert {s for s in G if s.is_terminal} == set(G) - {G.OPEN, G.APPROVED}
     assert {s for s in E if s.is_terminal} == {E.CONFIRMED, E.FAILED, E.VOIDED}
+    assert {s for s in S if s.is_terminal} == {S.SUCCEEDED, S.FAILED, S.CANCELLED}
 
 
 def test_only_open_gate_is_open() -> None:

@@ -26,7 +26,7 @@ from .models import (
     effect_key,
 )
 from .registry import BLOCKED_REASONS, COMMANDS, EVENTS, Registry
-from .serialize import to_wire
+from .serialize import from_wire, to_wire
 from .states import (
     EffectStatus,
     GateStatus,
@@ -73,6 +73,7 @@ __all__ = [
     "Ulid",
     "can_transition",
     "effect_key",
+    "from_wire",
     "to_wire",
     "transition",
 ]

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# NOTE: the test.* names below are permanent on the shared registries for the whole pytest
+# process, so no test may assert the exact contents of EVENTS.names() and friends.
 from sto.domain import BLOCKED_REASONS, COMMANDS, EVENTS
 
 

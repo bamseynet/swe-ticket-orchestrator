@@ -138,7 +138,8 @@ _EDGES: dict[type[Enum], dict[Enum, frozenset[Enum]]] = {
         E.VOIDED: frozenset(),
     },
     StepStatus: {
-        S.PENDING: frozenset({S.RUNNING, S.CANCELLED}),
+        # PENDING -> FAILED: a runtime may refuse before any session runs (permanent 401/403).
+        S.PENDING: frozenset({S.RUNNING, S.CANCELLED, S.FAILED}),
         S.RUNNING: frozenset({S.SUCCEEDED, S.FAILED, S.CANCELLED}),
         S.SUCCEEDED: frozenset(),
         S.FAILED: frozenset(),
