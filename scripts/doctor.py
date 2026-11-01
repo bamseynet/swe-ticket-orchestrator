@@ -9,6 +9,7 @@ Ports default to 8710 (API) and 5710 (web), and can be overridden with ``STO_API
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import shutil
 import socket
@@ -21,6 +22,7 @@ from typing import Protocol
 DEFAULT_API_PORT = 8710
 DEFAULT_WEB_PORT = 5710
 MIN_PYTHON = (3, 12)
+MIN_PORT = 1024
 NODE_MAJOR = 24
 
 
@@ -49,18 +51,58 @@ class RealHost:
             )
         except (OSError, subprocess.SubprocessError):
             return None
+        if proc.returncode != 0:
+            return None
         return (proc.stdout or proc.stderr).strip() or None
 
     def port_free(self, port: int) -> bool:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        """Free only if it can be bound on both IPv4 and IPv6 loopback.
+
+        Vite and Node often listen on ``::1``, so checking 127.0.0.1 alone misses them. A family
+        the host lacks (no IPv6) is skipped.
+        """
+        for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
             try:
-                sock.bind(("127.0.0.1", port))
+                sock = socket.socket(family, socket.SOCK_STREAM)
             except OSError:
-                return False
+                continue
+            with sock:
+                try:
+                    if family == socket.AF_INET6:
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    sock.bind((address, port))
+                except OSError as exc:
+                    if exc.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+                        continue
+                    return False
         return True
 
     def python_version(self) -> tuple[int, int]:
-        return sys.version_info[0], sys.version_info[1]
+        """The running python3, or a uv-managed 3.12+ if python3 is too old."""
+        running = (sys.version_info[0], sys.version_info[1])
+        if running >= MIN_PYTHON or shutil.which("uv") is None:
+            return running
+        try:
+            found = subprocess.run(
+                ["uv", "python", "find", f">={MIN_PYTHON[0]}.{MIN_PYTHON[1]}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if found.returncode != 0 or not found.stdout.strip():
+                return running
+            out = subprocess.run(
+                [found.stdout.strip(), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout.split()
+            major, minor = out[1].split(".")[:2]
+            return int(major), int(minor)
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+            return running
 
 
 def _port(value: str, source: str) -> int:
@@ -68,8 +110,8 @@ def _port(value: str, source: str) -> int:
         port = int(value)
     except ValueError:
         port = 0
-    if not 1 <= port <= 65535:
-        raise SystemExit(f"doctor: {source} must be a port number 1-65535, got {value!r}")
+    if not MIN_PORT <= port <= 65535:
+        raise SystemExit(f"doctor: {source} must be a port number {MIN_PORT}-65535, got {value!r}")
     return port
 
 
@@ -149,6 +191,8 @@ def run_checks(host: Host, env: Mapping[str, str], argv: Sequence[str]) -> list[
 
     api = pick(args.api_port, "STO_API_PORT", DEFAULT_API_PORT)
     web = pick(args.web_port, "STO_WEB_PORT", DEFAULT_WEB_PORT)
+    if api == web:
+        raise SystemExit(f"doctor: the API and web ports must be different, both are {api}")
     return [
         _check_python(host),
         _check_uv(host),
