@@ -170,6 +170,7 @@ def create_app(
 
 # --- the local stack ----------------------------------------------------------------------------
 
+DEFAULT_DB = ".sto/dev.db"
 DEMO_REPO = RepoRef("acme", "demo")
 
 
@@ -189,11 +190,15 @@ class SimulatedSteps:
 
 
 def keep_out_of_git(directory: Path) -> None:
-    """A directory made for local state ignores itself (``*``), so the dev database is never
-    committed and no one has to edit the repository's ``.gitignore``."""
+    """The default ``.sto`` directory, when this code created it, ignores itself (``*``), so the
+    dev database is never committed and no one edits the repository's ``.gitignore``. A
+    directory the user chose (``STO_DB``) or already had is never written to."""
     marker = directory / ".gitignore"
-    if not marker.exists():
-        marker.write_text("*\n")
+    try:
+        if not marker.exists():
+            marker.write_text("*\n")
+    except OSError as e:  # a read-only directory must not stop the server from starting
+        log.warning("could not write %s: %r", marker, e)
 
 
 def land_pending(scm: FakeScm, landed: int) -> int:
@@ -217,9 +222,11 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
         raise DevAuthRefusedError(
             f"dev auth only runs in local mode (STO_MODE=local); STO_MODE is {mode!r}"
         )
-    path = Path(env.get("STO_DB", ".sto/dev.db"))
+    path = Path(env.get("STO_DB", DEFAULT_DB))
+    made = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    keep_out_of_git(path.parent)
+    if made and "STO_DB" not in env:  # only the directory this code made for itself
+        keep_out_of_git(path.parent)
     scope = TeamScope("local")
     store = SqliteStore(path)  # a waiting gate survives a restart
     scm = FakeScm()

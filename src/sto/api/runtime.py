@@ -75,6 +75,7 @@ log = logging.getLogger("sto.api")
 API_INDEX = "RUNS_API"  # the API's own list of runs: the driver's index drops finished ones
 _STORE_ATTEMPTS = 8
 _DRIVE_ATTEMPTS = 6
+_COOLDOWN_CAP = 30.0
 _RUN: contextvars.ContextVar[RunId | None] = contextvars.ContextVar("sto_api_run", default=None)
 
 MergeFactory = Callable[[Effect], EffectHandler]
@@ -259,11 +260,14 @@ class Runtime:
         lease_seconds: float = 30.0,
         backoff: float = 0.01,
         api_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        cooldown: float = 1.0,
+        mono: Callable[[], float] = time.monotonic,
     ) -> None:
         load_handlers()  # before anything stored is decoded (the driver needs the registries)
         self.store, self.scope, self._wf = store, scope, workflow
         self._gates = gates
         self._api_sleep, self._backoff = api_sleep, backoff
+        self._cooldown, self._mono = cooldown, mono
         self._wake: dict[RunId, asyncio.Event] = {}
         self._tasks: dict[RunId, asyncio.Task[None]] = {}
         self._again: set[RunId] = set()
@@ -272,6 +276,8 @@ class Runtime:
         self._delivery_errors: dict[RunId, str] = {}
         self._redeliveries: dict[RunId, asyncio.Task[None]] = {}
         self._startup_failed = False
+        self._startup_task: asyncio.Task[None] | None = None
+        self._cool: dict[RunId, tuple[float, float]] = {}
         self._lease_wait = lease_seconds
         self._started = False
 
@@ -306,19 +312,32 @@ class Runtime:
         """Bring the runs back from the store alone: for every unfinished run, redeliver a
         decision that was recorded but never queued (retried in the background until it works,
         and shown on the run meanwhile), then drive it. Each run is driven on its own, so a run
-        that polls cannot hide another's failure, which is reported as soon as that run ends."""
+        that polls cannot hide another's failure, which is reported as soon as that run ends.
+        If the runs cannot be listed, that is retried in the background (and shown as
+        ``degraded``) until it works; nothing resumes before then."""
         if self._started:
             return
         self._started = True
         load_handlers()
+        try:
+            await self._list_and_resume()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # not listing the runs is not fatal: keep trying in the background
+            self._startup_task = asyncio.get_running_loop().create_task(
+                self._retry_until_done(self._list_and_resume, "listing the runs"), name="startup"
+            )
+
+    async def _list_and_resume(self) -> None:
         try:
             run_ids = await self.driver.active_runs()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self._startup_failed = True
-            log.exception("listing the unfinished runs failed: %r", e)
-            return
+            log.error("listing the unfinished runs failed: %r", e, exc_info=e)
+            raise
+        self._startup_failed = False
         for run_id in run_ids:
             try:
                 await self.redeliver(run_id)
@@ -334,29 +353,34 @@ class Runtime:
         log.error("redelivering the decision of run %s failed: %r", run_id, error, exc_info=error)
         if run_id not in self._redeliveries:
             task = asyncio.get_running_loop().create_task(
-                self._redeliver_until_done(run_id), name=f"redeliver:{run_id}"
+                self._retry_until_done(
+                    lambda: self.redeliver(run_id), f"redelivery for run {run_id}"
+                ),
+                name=f"redeliver:{run_id}",
             )
             self._redeliveries[run_id] = task
+            task.add_done_callback(lambda _t: self._redeliveries.pop(run_id, None))
 
-    async def _redeliver_until_done(self, run_id: RunId) -> None:
+    async def _retry_until_done(self, attempt: Callable[[], Awaitable[object]], what: str) -> None:
+        """Try again, doubling the wait up to a cap, until it works (shared by the start-up
+        listing and by redelivery)."""
         delay = self._backoff
-        try:
-            while True:
-                await self._api_sleep(delay)
-                try:
-                    await self.redeliver(run_id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:  # the error is already on the run; keep trying
-                    log.warning("redelivery for run %s failed again: %r", run_id, e)
-                    delay = min(delay * 2, 5.0)
-                else:
-                    return
-        finally:
-            self._redeliveries.pop(run_id, None)
+        while True:
+            await self._api_sleep(delay)
+            try:
+                await attempt()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("%s failed again: %r", what, e)
+                delay = min(delay * 2, 5.0)
+            else:
+                return
 
     async def close(self) -> None:
         tasks = [*self._tasks.values(), *self._redeliveries.values()]
+        if self._startup_task is not None:
+            tasks.append(self._startup_task)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -375,7 +399,10 @@ class Runtime:
 
     def background_tasks(self) -> list[asyncio.Task[None]]:
         """Every task still running for the API (drives, and redelivery retries)."""
-        return [t for t in [*self._tasks.values(), *self._redeliveries.values()] if not t.done()]
+        tasks = [*self._tasks.values(), *self._redeliveries.values()]
+        if self._startup_task is not None:
+            tasks.append(self._startup_task)
+        return [t for t in tasks if not t.done()]
 
     # --- driving ------------------------------------------------------------------------------
 
@@ -398,8 +425,13 @@ class Runtime:
                     raise
                 except Exception as e:
                     self._report(run_id, e)
+                    self._cool_down(run_id)
                 else:
                     self._errors.pop(run_id, None)
+                    if self.driver.held(run_id) is None:
+                        self._cool.pop(run_id, None)
+                    else:
+                        self._cool_down(run_id)  # a held command is not retried by a poll
         finally:
             # No await between the loop test and here, so a kick cannot slip in unseen.
             self._tasks.pop(run_id, None)
@@ -427,6 +459,51 @@ class Runtime:
                     await self._api_sleep(delay)
                     delay = min(delay * 2, 1.0)
                     break
+
+    def _cool_down(self, run_id: RunId) -> None:
+        """After a failed drive, requests that would only *re-drive* wait: the first for one
+        cool-down, then twice as long each time, up to ``_COOLDOWN_CAP``; a success resets it.
+        Without this, a client polling a failing run would re-execute its step on every poll."""
+        if self._cooldown <= 0:
+            return
+        previous = self._cool.get(run_id, (0.0, self._cooldown / 2))[1]
+        delay = min(previous * 2, _COOLDOWN_CAP)
+        self._cool[run_id] = (self._mono() + delay, delay)
+
+    async def _ensure_driven(self, run_id: RunId, *, force: bool = False) -> None:
+        """Drive the run if it has work and nobody is driving it. Called by every per-run
+        request, so a run whose drive died is picked up again by whoever asks about it, subject
+        to the cool-down (``force`` skips it: a Stop must always get through). Never raises: a
+        read must not fail because this could not tell."""
+
+        def may_drive() -> bool:
+            cooling = self._cool.get(run_id)
+            return run_id not in self._tasks and (
+                force or cooling is None or self._mono() >= cooling[0]
+            )
+
+        if not may_drive():
+            return
+        try:
+            busy = await self._store(self._has_work, run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("could not tell whether run %s has work: %r", run_id, e)
+            return
+        # Looked again after the read: many requests at once all pass the first check, and only
+        # the first may start a drive (a kick on a live drive would make it run twice more).
+        if busy and may_drive():
+            self.kick(run_id)
+
+    def _has_work(self, run_id: RunId) -> bool:
+        """Is something queued (an event not applied, a command not done)? The driver has no
+        public accessor for the command log, so this reads its record (a D1-03 follow-up)."""
+        try:
+            rec = self.driver._load(run_id)
+        except KeyError:
+            return False
+        return bool(rec.inbox or rec.pending)
 
     def _report(self, run_id: RunId, error: BaseException) -> None:
         self._errors[run_id] = f"{type(error).__name__}: {error}"
@@ -518,6 +595,8 @@ class Runtime:
         }
 
     async def get_run(self, run_id: RunId) -> dict[str, Any]:
+        await self._ensure_driven(run_id)
+
         def read() -> dict[str, Any] | None:
             return self._view(run_id, self.store.get(self.scope, Key(API_INDEX, str(run_id))))
 
@@ -540,6 +619,7 @@ class Runtime:
     async def events(self, run_id: RunId, after: int, limit: int) -> list[dict[str, Any]]:
         """Timeline entries with ``seq`` above ``after``, oldest first."""
         await self._astate(run_id)  # 404 for an unknown run
+        await self._ensure_driven(run_id)
         everything = await self._store(self.driver.timeline, run_id)
         return [e for e in everything if e["seq"] > after][:limit]
 
@@ -556,7 +636,7 @@ class Runtime:
         if status.is_terminal or status is RunStatus.CANCELLING:
             # A Stop whose drive died leaves the run CANCELLING with the StopRun queued: the
             # repeat is refused, but it still gets the run driven again.
-            self.kick(run_id)
+            await self._ensure_driven(run_id, force=True)  # a Stop always gets through
             raise RunFinishedError(f"run {run_id} is already {status.value}")
         await self.submit(run_id, CancelRequested(run_id))
 
@@ -567,6 +647,7 @@ class Runtime:
 
     async def gates(self, run_id: RunId) -> list[Gate]:
         await self._astate(run_id)
+        await self._ensure_driven(run_id)
 
         def read() -> list[Gate]:
             found: list[Gate] = []
@@ -620,8 +701,8 @@ class Runtime:
                     except Exception as d:  # the delivery is what failed, not the decision
                         log.error("redelivery for run %s failed: %r", run_id, d)
                         raise DeliveryFailedError(d) from d
-                    # Whatever is queued for this run must not wait for a drive that died.
-                    self.kick(run_id)
+                # Whatever is queued for this run must not wait for a drive that died.
+                await self._ensure_driven(run_id)
                 raise
             event = _closed_event(decided.gate, decided.decision)
             try:
@@ -665,7 +746,7 @@ class Runtime:
 
         event = await self._store(missing)
         if event == "queued":
-            self.kick(run_id)  # whatever is queued must not wait for a drive that already died
+            await self._ensure_driven(run_id)  # queued work must not wait for a dead drive
             return False
         if event is None:
             return False

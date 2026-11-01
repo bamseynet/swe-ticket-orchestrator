@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RepoRef
 from sto.api.app import DevAuthRefusedError, build_local, create_app, main
-from sto.api.runtime import Runtime, scm_merge_factory
+from sto.api.runtime import Runtime, StoreConflictError, scm_merge_factory
 from sto.domain import DecisionKind, RunId, RunStatus, StepKey, Subject, Surface
 from sto.effects.core import EffectExecutor
 from sto.engine.commands import RunStep
@@ -170,6 +170,7 @@ class World:
         kw.setdefault("poll_interval", 0.01)
         kw.setdefault("lease_seconds", 1.0)
         kw.setdefault("backoff", 0.001)
+        kw.setdefault("cooldown", 0.0)  # tests that are about the cool-down turn it on
         return Runtime(
             self.store,
             SCOPE,
@@ -1503,13 +1504,15 @@ def test_a_run_left_with_queued_work_is_finished_after_a_restart() -> None:
     run(body())
 
 
-def test_a_repeated_stop_drives_a_run_that_has_nothing_else_to_say() -> None:
+def test_a_repeated_stop_on_a_finished_run_starts_no_drive() -> None:
     async def body() -> None:
         w = World(MemoryStore())
         async with w.up() as api:
             run_id = await api.new_run()
             await api.wait_for(run_id, "WAITING_HUMAN", "review_gate")
-            rid = RunId.parse(run_id)
+            await api.call("POST", f"/runs/{run_id}/cancel")
+            await api.wait_for(run_id, "CANCELLED")
+            await api.quiet()
             real = api.rt.driver.run_until_idle
             calls: list[int] = []
 
@@ -1518,14 +1521,10 @@ def test_a_repeated_stop_drives_a_run_that_has_nothing_else_to_say() -> None:
                 return await real(r)
 
             api.rt.driver.run_until_idle = counting  # type: ignore[method-assign,assignment]
-            await api.quiet()
-            await api.call("POST", f"/runs/{run_id}/cancel")
-            await api.wait_for(run_id, "CANCELLED")
-            calls.clear()
             again = await api.call("POST", f"/runs/{run_id}/cancel")
             assert (again.status_code, code_of(again)) == (409, "run_finished")
-            await until("the repeat to drive the run", lambda: calls)
-            assert rid
+            await asyncio.sleep(0.05)
+            assert calls == [], "nothing is queued, so nothing is driven"
 
     run(body())
 
@@ -1675,12 +1674,14 @@ def test_a_blank_subject_digest_is_a_422_and_so_is_every_other_refused_field() -
             r = await api.call("POST", f"{base}/review_gate/1/decisions", json=veto)
             assert r.status_code == 202, r.text  # a veto needs no digest
 
-            def boom(*a: Any, **k: Any) -> Any:
-                raise ValueError("a field this route did not foresee")
+            def corrupt(*a: Any, **k: Any) -> Any:
+                raise ValueError("unexpected fields for Gate: {'secret_internal': 1}")
 
-            w.gates.decide = boom  # type: ignore[method-assign]
+            w.gates.decide = corrupt  # type: ignore[method-assign]
             r = await api.call("POST", f"{base}/qa_gate/1/decisions", json={**veto, "comment": "x"})
-            assert (r.status_code, code_of(r)) == (422, "invalid_decision")
+            assert (r.status_code, code_of(r)) == (500, "internal_error")
+            assert "secret_internal" not in r.text, "stored data must not leak to the client"
+            assert "unexpected fields" not in r.text
 
     run(body())
 
@@ -1768,13 +1769,40 @@ def test_closing_survives_a_store_that_cannot_list_the_runs() -> None:
     run(body())
 
 
-def test_the_local_state_directory_ignores_itself(tmp_path: Path) -> None:
-    env = {"STO_MODE": "local", "STO_DB": str(tmp_path / ".sto" / "dev.db")}
-    build_local(env)
-    assert (tmp_path / ".sto" / ".gitignore").read_text() == "*\n"
-    (tmp_path / ".sto" / ".gitignore").write_text("*\n!keep\n")
-    build_local(env)  # an existing file is left alone
-    assert (tmp_path / ".sto" / ".gitignore").read_text() == "*\n!keep\n"
+def test_the_default_state_directory_ignores_itself_but_no_other_directory_is_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    build_local({"STO_MODE": "local"})  # the default .sto, made by the code
+    marker = tmp_path / ".sto" / ".gitignore"
+    assert marker.exists(), "the directory the code made must ignore itself"
+    assert marker.read_text() == "*\n"
+    marker.write_text("*\n!keep\n")
+    build_local({"STO_MODE": "local"})  # now it exists: left alone
+    assert marker.read_text() == "*\n!keep\n"
+
+    existing = tmp_path / "data"
+    existing.mkdir()
+    build_local({"STO_MODE": "local", "STO_DB": str(existing / "dev.db")})
+    assert not (existing / ".gitignore").exists(), "a directory the user had is not written to"
+    fresh = tmp_path / "mine" / "deeper"
+    build_local({"STO_MODE": "local", "STO_DB": str(fresh / "dev.db")})
+    assert not (fresh / ".gitignore").exists(), "a directory the user chose is not written to"
+
+
+def test_a_read_only_state_directory_does_not_stop_the_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    real = Path.write_text
+
+    def refuse(self: Path, *a: Any, **k: Any) -> int:
+        if self.name == ".gitignore":
+            raise PermissionError("read-only")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    assert build_local({"STO_MODE": "local"}) is not None  # must not raise
 
 
 def test_no_store_call_runs_on_the_event_loop_while_a_run_is_driven() -> None:
@@ -1814,6 +1842,280 @@ def test_no_store_call_runs_on_the_event_loop_while_a_run_is_driven() -> None:
                 lander.cancel()
         assert spy.threads
         assert loop_thread not in spy.threads, "a store call ran on the event loop"
+
+    run(body())
+
+
+# --- review pass 3 ------------------------------------------------------------------------------
+
+
+class Mono:
+    """A clock the test moves by hand (the runtime's monotonic time)."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_a_run_whose_open_gate_never_ran_is_re_driven_by_whoever_asks() -> None:
+    async def body() -> None:
+        clock = Mono()
+        w = World(MemoryStore())
+        real_open = w.gates.open_gate
+        opens: list[int] = []
+
+        def failing(scope: Any, cmd: Any) -> Any:
+            opens.append(1)
+            raise OSError("disk went away")
+
+        w.gates.open_gate = failing  # type: ignore[method-assign]
+        async with w.up(w.runtime(cooldown=1.0, mono=clock)) as api:
+            run_id = await api.new_run()
+            rid = RunId.parse(run_id)
+            await until("the drive to die", lambda: api.rt.driver_error(rid))
+            await api.quiet()
+            assert (await api.run(run_id))["status"] == "WAITING_HUMAN"  # with no gate yet
+            w.gates.open_gate = real_open  # type: ignore[method-assign]
+            # a decision for a gate that does not exist: 404, and (once the cool-down is over)
+            # it drives the run
+            clock.t += 1.5
+            r = await api.call(
+                "POST",
+                f"/runs/{run_id}/gates/review_gate/1/decisions",
+                json={"kind": "approve", "subject_digest": "x"},
+            )
+            assert (r.status_code, code_of(r)) == (404, "gate_not_found")
+            # looked at in the store, not through a GET (which would drive the run itself)
+            await until(
+                "the decision to have driven the run",
+                lambda: w.store.get(SCOPE, Key(f"RUN#{run_id}", "GATE#review_gate#1")),
+            )
+            assert len(opens) == 1
+
+    run(body())
+
+
+def test_a_run_that_died_in_its_first_step_is_re_driven_by_a_read() -> None:
+    async def body() -> None:
+        clock = Mono()
+        w = World(MemoryStore())
+        w.steps.boom = RuntimeError("implement broke")
+        async with w.up(w.runtime(cooldown=1.0, mono=clock)) as api:
+            run_id = await api.new_run()
+            rid = RunId.parse(run_id)
+            await until("the drive to die", lambda: api.rt.driver_error(rid))
+            await api.quiet()
+            before = len(w.steps.calls)
+            w.steps.boom = None
+            clock.t += 1.5
+            assert (await api.call("GET", f"/runs/{run_id}")).status_code == 200
+            await api.wait_for(run_id, "WAITING_HUMAN", "review_gate")
+            assert len(w.steps.calls) > before
+
+    run(body())
+
+
+def test_polling_a_failing_run_does_not_re_execute_its_step_faster_than_the_cool_down() -> None:
+    async def body() -> None:
+        clock = Mono()
+        w = World(MemoryStore())
+        w.steps.boom = RuntimeError("always broken")
+        async with w.up(w.runtime(cooldown=1.0, mono=clock)) as api:
+            run_id = await api.new_run()
+            rid = RunId.parse(run_id)
+            await until("the drive to die", lambda: api.rt.driver_error(rid))
+            await api.quiet()
+            base = len(w.steps.calls)
+
+            async def poll(n: int) -> None:
+                await asyncio.gather(*(api.call("GET", f"/runs/{run_id}") for _ in range(n)))
+                await api.quiet()
+
+            await poll(200)
+            assert len(w.steps.calls) == base, "polling inside the cool-down must not re-run it"
+            clock.t += 1.1  # the first cool-down is 1s
+            await poll(200)
+            assert len(w.steps.calls) == base + 1
+            clock.t += 1.1  # the second is 2s: not over yet
+            await poll(200)
+            assert len(w.steps.calls) == base + 1
+            clock.t += 1.0
+            await poll(200)
+            assert len(w.steps.calls) == base + 2
+            for _ in range(8):  # the cool-down doubles up to its cap and no further
+                clock.t += 31.0
+                await poll(20)
+            assert len(w.steps.calls) == base + 10
+
+    run(body())
+
+
+def test_a_repeated_decision_waits_out_the_cool_down() -> None:
+    async def body() -> None:
+        clock = Mono()
+        store = Faulty(MemoryStore())
+        w = World(store)
+        async with w.up(w.runtime(cooldown=1000.0, mono=clock)) as api:
+            run_id = await _qa_pending_with_dead_drive(w, store, api)
+            before = len(w.steps.calls)
+            store.allow = None
+            again = await api.decide(run_id, "review_gate")  # inside the cool-down
+            assert (again.status_code, code_of(again)) == (409, "gate_closed")
+            await api.quiet()
+            assert len(w.steps.calls) == before, "a repeated decision waits out the cool-down"
+            clock.t += 2000.0
+            await api.decide(run_id, "review_gate")
+            await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+
+    run(body())
+
+
+def test_a_repeated_stop_is_not_held_by_the_cool_down() -> None:
+    async def body() -> None:
+        clock = Mono()
+        store = Faulty(MemoryStore())
+        w = World(store)
+        async with w.up(w.runtime(cooldown=1000.0, mono=clock)) as api:
+            run_id = await api.to_review_gate()
+            rid = RunId.parse(run_id)
+            await api.quiet()
+            store.allow = 3
+            assert (await api.call("POST", f"/runs/{run_id}/cancel")).status_code == 202
+            await until("the drive to give up", lambda: api.rt.driver_error(rid))
+            store.allow = None
+            again = await api.call("POST", f"/runs/{run_id}/cancel")
+            assert (again.status_code, code_of(again)) == (409, "run_finished")
+            await api.wait_for(run_id, "CANCELLED")  # at once, with the cool-down still running
+
+    run(body())
+
+
+def test_listing_the_runs_at_start_up_is_retried_and_shown_until_it_works() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        w.steps.queue = ["hold"]
+        async with w.up() as api:
+            run_id = await api.new_run()
+            await until("the step to start", lambda: w.steps.calls)
+        w.steps.modes.clear()
+        rt = w.runtime(owner="second")
+        real = rt.driver.active_runs
+        failures = [OSError("throttled"), OSError("throttled")]
+
+        async def flaky() -> Any:
+            if failures:
+                raise failures.pop()
+            return await real()
+
+        rt.driver.active_runs = flaky  # type: ignore[method-assign]
+        async with w.up(rt) as api2:
+            health = (await api2.c.get("/healthz")).json()
+            assert (health["ok"], health["degraded"]) == (True, True)
+            await api2.wait_for(run_id, "WAITING_HUMAN", "review_gate")  # resumed afterwards
+            await until("the flag to clear", lambda: not rt.degraded())
+            assert (await api2.c.get("/healthz")).json()["degraded"] is False
+
+    run(body())
+
+
+def test_retrying_a_redelivery_backs_off() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+            _close_directly(w, run_id, await api.gate(run_id, "review_gate"), DecisionKind.APPROVE)
+        sleeps: list[float] = []
+
+        async def nap(s: float) -> None:
+            sleeps.append(s)
+            await asyncio.sleep(0)
+
+        rt = w.runtime(owner="second", api_sleep=nap)
+        real = rt.redeliver
+        failures = 6
+
+        async def flaky(r: RunId) -> bool:
+            nonlocal failures
+            if failures:
+                failures -= 1
+                raise OSError("unreadable")
+            return await real(r)
+
+        rt.redeliver = flaky  # type: ignore[method-assign,assignment]
+        async with w.up(rt) as api2:
+            await api2.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
+            retries = sleeps[:5]  # the sleeps before attempts 1..5 (the 6th fails too)
+            assert retries == pytest.approx([0.001 * 2**i for i in range(5)]), retries
+
+    run(body())
+
+
+def test_a_lease_that_stays_live_is_waited_for_only_so_long() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        w.steps.queue = ["hold"]
+        async with w.up() as api:  # the first process keeps working, so its lease is renewed
+            run_id = await api.new_run()
+            await until("the step to start", lambda: w.steps.calls)
+            second = w.runtime(owner="second")
+            async with w.up(second):
+                rid = RunId.parse(run_id)
+                err = await until("the wait to give up", lambda: second.driver_error(rid), 10)
+                assert "LeaseHeldError" in err
+                assert len(w.steps.calls) == 1, "the second process must not run the step"
+            w.steps.released.set()
+            assert api
+
+    run(body())
+
+
+def test_a_409_is_still_a_409_when_the_stop_option_cannot_be_checked() -> None:
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+            await api.decide(run_id, "review_gate")
+
+            async def busy(rid: RunId) -> bool:
+                raise StoreConflictError("busy")
+
+            api.rt.can_stop = busy  # type: ignore[method-assign,assignment]
+            r = await api.decide(run_id, "review_gate")
+            assert (r.status_code, code_of(r)) == (409, "gate_closed")
+            assert "stop" not in r.json()["error"]
+
+    run(body())
+
+
+def test_a_success_resets_the_cool_down() -> None:
+    async def body() -> None:
+        clock = Mono()
+        w = World(MemoryStore())
+        w.steps.boom = RuntimeError("broken once")
+        async with w.up(w.runtime(cooldown=1.0, mono=clock)) as api:
+            run_id = await api.new_run()
+            rid = RunId.parse(run_id)
+            await until("the first failure", lambda: api.rt.driver_error(rid))
+            await api.quiet()
+            clock.t += 1.5
+            await api.call("GET", f"/runs/{run_id}")  # fails again: the cool-down is now 2s
+            await api.quiet()
+            clock.t += 2.5
+            w.steps.boom = None
+            await api.call("GET", f"/runs/{run_id}")  # succeeds: the cool-down resets
+            await api.wait_for(run_id, "WAITING_HUMAN", "review_gate")
+            await api.quiet()
+            w.steps.boom = RuntimeError("broken again")
+            await api.decide(run_id, "review_gate")
+            await until("the new failure", lambda: api.rt.driver_error(rid))
+            await api.quiet()
+            before = len(w.steps.calls)
+            clock.t += 1.5  # more than the reset cool-down (1s), less than a doubled one (4s)
+            await api.call("GET", f"/runs/{run_id}")
+            await api.quiet()
+            assert len(w.steps.calls) == before + 1
 
     run(body())
 

@@ -3,6 +3,7 @@ service (ADR-0005 #7); this file only maps its answers to HTTP."""
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Path
@@ -30,6 +31,7 @@ from sto.gates.service import (
 )
 from sto.store.ports import ConditionFailedError
 
+log = logging.getLogger("sto.api")
 router = APIRouter(tags=["gates"])
 
 _RETRY = {"Retry-After": "1"}
@@ -180,7 +182,11 @@ async def decide(
             "status": e.status.value,
             "closed_by": e.closed_by,
         }
-        if await rt.can_stop(parse_run_id(run_id)):
+        try:
+            stop_offered = await rt.can_stop(parse_run_id(run_id))
+        except StoreConflictError:
+            stop_offered = False  # the 409 is true whether or not we can say who can stop it
+        if stop_offered:
             extra["stop"] = {"method": "POST", "href": f"/runs/{run_id}/cancel"}
         raise ApiError(
             409,
@@ -193,8 +199,11 @@ async def decide(
             if isinstance(e, kind):
                 raise ApiError(status, e.code, str(e)) from e
         raise ApiError(400, e.code, str(e)) from e
-    except ValueError as e:  # a field the domain refuses and this route did not foresee
-        raise ApiError(422, "invalid_decision", str(e)) from e
+    except (ValueError, TypeError) as e:
+        # Every field of the request is checked above, so this is stored data the domain
+        # refuses (a corrupt gate): a server fault, logged here and not described to the client.
+        log.error("deciding gate %s of run %s hit corrupt data: %r", name, run_id, e, exc_info=e)
+        raise ApiError(500, "internal_error", "the server could not process this request") from e
     except ConditionFailedError as e:
         # The gate service ran out of retries on a gate that is still open (D3-06 reworks this).
         raise ApiError(
