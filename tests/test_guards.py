@@ -207,3 +207,66 @@ def test_guard_plugin_configures_once_and_shares_its_error_class() -> None:
     assert os.environ["UV_OFFLINE"] == "1"
     with pytest.raises(hermetic_guard.SocketBlockedError):
         socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+
+def test_allow_loopback_bind_permits_only_loopback(guarded: pytest.Pytester) -> None:
+    guarded.makepyfile(
+        """
+        import socket
+        import pytest
+        from hermetic_guard import SocketBlockedError, allow_loopback_bind
+
+        def test_loopback_only():
+            with allow_loopback_bind():
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server.bind(("127.0.0.1", 0))
+                server.listen()
+                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client.connect(server.getsockname())
+                client.close()
+                server.close()
+                other = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                with pytest.raises(SocketBlockedError):
+                    other.connect(("1.1.1.1", 80))
+                with pytest.raises(SocketBlockedError):
+                    other.connect_ex(("1.1.1.1", 80))
+                with pytest.raises(SocketBlockedError):
+                    other.bind(("0.0.0.0", 0))
+                other.close()
+                with pytest.raises(SocketBlockedError):
+                    socket.create_connection(("1.1.1.1", 80))
+                with pytest.raises(SocketBlockedError):
+                    socket.getaddrinfo("localhost", 80)
+            with pytest.raises(SocketBlockedError):
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """
+    )
+    guarded.runpytest_subprocess().assert_outcomes(passed=1)
+
+
+def test_allow_loopback_bind_reaches_guarded_subprocesses(guarded: pytest.Pytester) -> None:
+    guarded.makepyfile(
+        """
+        import subprocess, sys
+        from hermetic_guard import allow_loopback_bind
+
+        CODE = (
+            "import socket\\n"
+            "s = socket.socket(socket.AF_INET); s.bind(('127.0.0.1', 0))\\n"
+            "try:\\n"
+            "    s.connect(('1.1.1.1', 80))\\n"
+            "except RuntimeError as e:\\n"
+            "    print('blocked')\\n"
+        )
+
+        def test_child():
+            with allow_loopback_bind():
+                out = subprocess.run([sys.executable, "-c", CODE], capture_output=True, text=True)
+            assert out.stdout.strip() == "blocked", out.stderr
+            bad = subprocess.run(
+                [sys.executable, "-c", "import socket; socket.socket()"], capture_output=True
+            )
+            assert bad.returncode != 0
+        """
+    )
+    guarded.runpytest_subprocess().assert_outcomes(passed=1)

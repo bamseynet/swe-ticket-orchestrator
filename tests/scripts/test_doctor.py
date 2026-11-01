@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -143,25 +142,8 @@ def test_same_port_for_api_and_web_is_rejected() -> None:
 
 
 # --- RealHost and the entrypoint -------------------------------------------------------------
-# The hermetic guard blocks all internet sockets, so these tests put the real socket classes
-# back for loopback only, inside the test.
-
-
-@pytest.fixture
-def real_sockets() -> Iterator[None]:
-    import _socket
-    import socket
-
-    import hermetic_guard
-
-    guarded = (socket.__dict__.copy(), _socket.__dict__.copy())
-    socket.__dict__.update(hermetic_guard.saved["sockets"][0])
-    _socket.__dict__.update(hermetic_guard.saved["sockets"][1])
-    try:
-        yield
-    finally:
-        socket.__dict__.update(guarded[0])
-        _socket.__dict__.update(guarded[1])
+# The hermetic guard blocks all internet sockets, so these tests use the ``allow_loopback``
+# fixture, which permits bind/listen/connect on 127.0.0.1 and ::1 only.
 
 
 def _listen(family: int, host: str) -> tuple[Any, int]:
@@ -179,7 +161,7 @@ def _listen(family: int, host: str) -> tuple[Any, int]:
     return sock, int(sock.getsockname()[1])
 
 
-@pytest.mark.usefixtures("real_sockets")
+@pytest.mark.usefixtures("allow_loopback")
 def test_real_port_free_for_unused_port() -> None:
     import socket
 
@@ -188,7 +170,7 @@ def test_real_port_free_for_unused_port() -> None:
     assert doctor.RealHost().port_free(port)
 
 
-@pytest.mark.usefixtures("real_sockets")
+@pytest.mark.usefixtures("allow_loopback")
 def test_real_port_taken_on_ipv4_loopback() -> None:
     import socket
 
@@ -199,7 +181,7 @@ def test_real_port_taken_on_ipv4_loopback() -> None:
         sock.close()
 
 
-@pytest.mark.usefixtures("real_sockets")
+@pytest.mark.usefixtures("allow_loopback")
 def test_real_port_taken_on_ipv6_loopback() -> None:
     import socket
 
@@ -242,18 +224,36 @@ def test_python_version_without_uv_reports_running_interpreter(
     assert doctor.RealHost().python_version() == (3, 10)
 
 
-@pytest.mark.usefixtures("real_sockets")
-def test_entrypoint_without_uv_on_path_prints_fix(tmp_path: Path) -> None:
+def _free_port() -> int:
+    import socket
+
+    sock, port = _listen(socket.AF_INET, "127.0.0.1")
+    sock.close()
+    return port
+
+
+@pytest.mark.usefixtures("allow_loopback")
+def test_entrypoint_without_uv_on_path_prints_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
     import subprocess
 
-    env = {"PATH": str(tmp_path), "HOME": str(tmp_path)}  # no uv, node or docker
-    proc = subprocess.run(
-        [sys.executable, str(_PATH)], env=env, capture_output=True, text=True, check=False
+    # Keep the guard's PYTHONPATH and sandbox variables; drop only the PATH dirs holding uv.
+    path = os.pathsep.join(
+        d for d in os.environ["PATH"].split(os.pathsep) if not (Path(d) / "uv").exists()
     )
+    api, web = _free_port(), _free_port()
+    proc = subprocess.run(
+        [sys.executable, str(_PATH), "--api-port", str(api), "--web-port", str(web)],
+        env={**os.environ, "PATH": path},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "Traceback" not in proc.stderr
     assert proc.returncode == 1
     assert "[FAIL] uv" in proc.stdout
     assert "astral.sh/uv" in proc.stdout
-    assert "Traceback" not in proc.stderr
+    assert f"port {api} (api): free" in proc.stdout
 
 
 def test_make_doctor_does_not_need_uv() -> None:
@@ -267,4 +267,5 @@ def test_make_doctor_does_not_need_uv() -> None:
         check=True,
     ).stdout
     assert "python3 scripts/doctor.py" in out
+    assert "command -v python3" in out
     assert "uv run" not in out
