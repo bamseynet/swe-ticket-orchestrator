@@ -11,8 +11,14 @@
 * An approval carries the subject digest the person saw and is refused if the subject has moved;
   a negative decision is exempt, so nothing can delay a veto (ADR-0005 #1, #2).
 
-v0 is single-approver: the first valid decision closes the gate. Quorum, eligibility and
-separation of duties arrive through the hooks (D3).
+v0 is single-approver: the first valid decision closes the gate. Hooks add ops to the
+transaction (and can refuse); they do not change who may close or when. Quorum (D3-06) replaces
+the close path in ``decide`` itself, with its own tests.
+
+Rounds of one gate are ordered: a new round opens only after every lower round is closed, a
+round with a newer sibling can no longer be decided, and a non-approved close voids only
+*earlier* approved rounds (ADR-0005 #8). The number of rounds per gate is capped so that voiding
+them all always fits in one transaction (ADR-0017: 100 operations).
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from sto.gates.hooks import (
 )
 from sto.store.ports import (
     AUDIT,
+    MAX_TRANSACTION_OPS,
     Absent,
     ConditionFailedError,
     Item,
@@ -60,12 +67,16 @@ from sto.store.ports import (
     Put,
     Scope,
     Store,
+    TeamScope,
     TransactionConflictError,
     VersionIs,
     require_scope,
 )
 
 MAX_ATTEMPTS = 25
+# A close writes gate, decision, outbox and audit (5 ops with the chain head) plus one per earlier
+# approved round. Rounds are capped so that worst case is 5 + 89 and leaves room for hooks.
+MAX_ROUNDS_PER_GATE = 90
 SYSTEM_ACTOR = "system"
 
 _CLOSES_AS = {
@@ -110,6 +121,18 @@ class GateNotFoundError(GateError):
 
 class DecisionNotAllowedError(GateError):
     code = "decision_not_allowed"
+
+
+class StaleRoundError(GateError):
+    """A newer round of this gate exists, so this round can no longer be decided."""
+
+    code = "stale_round"
+
+
+class GateRoundLimitError(GateError):
+    """Too many rounds, or a transaction that would pass the store's operation cap."""
+
+    code = "gate_round_limit"
 
 
 class GateConflictError(GateError):
@@ -157,6 +180,18 @@ class GateService:
                         f"gate {cmd.name!r} round {cmd.round} already exists with another subject"
                     )
                 return gate
+            siblings = self._rounds(scope, cmd.run_id, cmd.name)
+            if len(siblings) >= MAX_ROUNDS_PER_GATE:
+                raise GateRoundLimitError(
+                    f"gate {cmd.name!r} already has {len(siblings)} rounds; "
+                    f"the limit is {MAX_ROUNDS_PER_GATE} rounds"
+                )
+            for _, other in siblings:
+                if other.round < cmd.round and other.is_open:
+                    raise GateConflictError(
+                        f"cannot open round {cmd.round} of gate {cmd.name!r}: "
+                        f"round {other.round} is still open"
+                    )
             gate = Gate(GateId.new(), cmd.run_id, cmd.name, cmd.type, cmd.round, cmd.subject)
             entry = AuditEntry(
                 cmd.run_id,
@@ -176,8 +211,9 @@ class GateService:
                 *self._audit.ops(self._reader, scope, entry),
             ]
             hook_ops = self._hooks.open_ops(OpenContext(self._reader, scope, gate))
+            ops = _within_cap([*own, *hook_ops])
             try:
-                self._store.transact(scope, [*own, *hook_ops])
+                self._store.transact(scope, ops)
             except ConditionFailedError as err:
                 _raise_if_only_hooks(err, len(own))
                 last = err
@@ -229,16 +265,25 @@ class GateService:
                 raise StaleSubjectError(
                     f"the subject of gate {gate!r} round {round} changed; review it again"
                 )
+            if any(g.round > round for _, g in self._rounds(scope, run_id, gate)):
+                raise StaleRoundError(
+                    f"gate {gate!r} round {round} was superseded by a newer round"
+                )
             closed = current.advance(_CLOSES_AS[kind], closed_by=actor)
-            invalidated = (
-                [] if kind is DecisionKind.APPROVE else self._earlier_approvals(scope, current)
-            )
+            invalidated = self._earlier_approvals(scope, current, kind)
             own = self._close_ops(scope, item, closed, decision, invalidated)
+            # The audit chain head was read inside _close_ops. Confirm the set of approvals to
+            # void is still the same now: any later change to a round also moves the head.
+            if [g.round for _, g in self._earlier_approvals(scope, current, kind)] != [
+                g.round for _, g in invalidated
+            ]:
+                continue
             hook_ops = self._hooks.decide_ops(
                 DecideContext(self._reader, scope, current, closed, decision)
             )
+            ops = _within_cap([*own, *hook_ops])
             try:
-                self._store.transact(scope, [*own, *hook_ops])
+                self._store.transact(scope, ops)
             except ConditionFailedError as err:
                 _raise_if_only_hooks(err, len(own))
                 last = err  # re-read: closed now -> gate_closed above; still open -> try again
@@ -252,19 +297,23 @@ class GateService:
 
     # --- internals --------------------------------------------------------------------------
 
-    def _earlier_approvals(self, scope: Scope, closing: Gate) -> list[tuple[Item, Gate]]:
-        """Approved instances of the same gate, in this run, that this close voids (rule 3)."""
-        page = self._store.query(scope, run_pk(closing.run_id), sk_prefix=f"GATE#{closing.name}#")
-        found = []
-        for item in page.items:
-            other = from_wire(Gate, item.data)
-            if (
-                other.name == closing.name
-                and other.round != closing.round
-                and other.status is GateStatus.APPROVED
-            ):
-                found.append((item, other))
-        return found
+    def _rounds(self, scope: Scope, run_id: RunId, name: str) -> list[tuple[Item, Gate]]:
+        page = self._store.query(scope, run_pk(run_id), sk_prefix=f"GATE#{name}#")
+        gates = [(item, from_wire(Gate, item.data)) for item in page.items]
+        return [(item, g) for item, g in gates if g.name == name]  # "qa" is not "qa#2"'s prefix
+
+    def _earlier_approvals(
+        self, scope: Scope, closing: Gate, kind: DecisionKind
+    ) -> list[tuple[Item, Gate]]:
+        """Approved EARLIER rounds of the same gate that this close voids (rule 3). An approval
+        voids nothing."""
+        if kind is DecisionKind.APPROVE:
+            return []
+        return [
+            (item, g)
+            for item, g in self._rounds(scope, closing.run_id, closing.name)
+            if g.round < closing.round and g.status is GateStatus.APPROVED
+        ]
 
     def _close_ops(
         self,
@@ -296,6 +345,7 @@ class GateService:
                 "gate_id": str(closed.id),
                 "decision": decision.kind.value,
                 "decision_id": str(decision.id),
+                "surface": decision.surface.value,
                 "status": closed.status.value,
                 "subject_digest": decision.subject_digest,
                 "comment": decision.comment,
@@ -332,6 +382,9 @@ def verify_audit_chain(store: Store | ReadOnly, scope: Scope, run_id: RunId) -> 
     for item in store.query(scope, audit_pk(run_id), table=AUDIT).items:
         body = {k: v for k, v in item.data.items() if k != "hash"}
         count += 1
+        team = scope.team if isinstance(scope, TeamScope) else ""
+        if body.get("run") != str(run_id) or body.get("team") != team:
+            raise ValueError(f"audit chain broken at entry {count}: wrong run or team")
         if body.get("seq") != count or body.get("prev") != prev:
             raise ValueError(f"audit chain broken at entry {count}: sequence or link")
         if entry_hash(body) != item.data.get("hash"):
@@ -343,6 +396,14 @@ def verify_audit_chain(store: Store | ReadOnly, scope: Scope, run_id: RunId) -> 
     ):
         raise ValueError("audit chain broken: head does not match the last entry")
     return count
+
+
+def _within_cap(ops: list[Op]) -> list[Op]:
+    if len(ops) > MAX_TRANSACTION_OPS:
+        raise GateRoundLimitError(
+            f"the change needs {len(ops)} operations; the store takes {MAX_TRANSACTION_OPS}"
+        )
+    return ops
 
 
 def _check_name(name: str) -> None:

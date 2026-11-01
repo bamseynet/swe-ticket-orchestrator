@@ -6,6 +6,7 @@ between the service's read and its write, and many threads released together.
 
 from __future__ import annotations
 
+import random
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -26,22 +27,28 @@ from sto.domain import (
     Subject,
     Surface,
     from_wire,
+    to_wire,
 )
 from sto.engine.commands import OpenGate
 from sto.gates.hooks import (
     AuditEntry,
+    ChainedAuditWriter,
     DecideContext,
     GateHooks,
     OpenContext,
     Reader,
+    ReadOnly,
     audit_pk,
 )
 from sto.gates.service import (
+    MAX_ROUNDS_PER_GATE,
     DecisionNotAllowedError,
     GateClosedError,
     GateConflictError,
     GateNotFoundError,
+    GateRoundLimitError,
     GateService,
+    StaleRoundError,
     StaleSubjectError,
     verify_audit_chain,
 )
@@ -104,6 +111,8 @@ def audit(store: MemoryStore) -> list[Item]:
 
 @pytest.fixture
 def store() -> MemoryStore:
+    """The one place a store is chosen, so another implementation (SQLite, D1-12) can be
+    parametrized in here. Tests that subclass a store to inject races stay on MemoryStore."""
     return MemoryStore()
 
 
@@ -195,12 +204,127 @@ def test_open_with_a_different_subject_for_the_same_triple_is_refused(
         svc.open_gate(TEAM, open_cmd(tag="b"))
 
 
-def test_new_round_is_a_new_gate(store: MemoryStore, svc: GateService) -> None:
+def test_new_round_is_a_new_gate_once_the_earlier_round_is_closed(
+    store: MemoryStore, svc: GateService
+) -> None:
     g1 = svc.open_gate(TEAM, open_cmd(round=1))
-    g2 = svc.open_gate(TEAM, open_cmd(round=2))
+    decide(svc, DecisionKind.REQUEST_CHANGES, gate=g1, comment="again")
+    g2 = svc.open_gate(TEAM, open_cmd(round=2, tag="b"))
     assert g1.id != g2.id
-    assert gate_of(store, round=1).is_open
     assert gate_of(store, round=2).is_open
+
+
+def test_a_new_round_is_refused_while_a_lower_round_is_open(
+    store: MemoryStore, svc: GateService
+) -> None:
+    svc.open_gate(TEAM, open_cmd(round=1))
+    with pytest.raises(GateConflictError, match="round 1"):
+        svc.open_gate(TEAM, open_cmd(round=2, tag="b"))
+    assert len(store.query(TEAM, f"RUN#{RUN}", sk_prefix="GATE#").items) == 1
+
+
+def test_replaying_an_earlier_round_open_still_works_after_a_later_round_exists(
+    svc: GateService,
+) -> None:
+    g1 = svc.open_gate(TEAM, open_cmd(round=1))
+    decide(svc, DecisionKind.REJECT, gate=g1, comment="no")
+    svc.open_gate(TEAM, open_cmd(round=2, tag="b"))
+    assert svc.open_gate(TEAM, open_cmd(round=1)).id == g1.id
+
+
+def _plant(store: MemoryStore, name: str, round: int, status: str, tag: str = "a") -> Gate:
+    """Write a gate straight into the store, as an older version or a bug might have left it."""
+    gate = Gate(
+        GateId.new(), RUN, name, GateType.REVIEW, round, head_subject(tag), GateStatus(status)
+    )
+    data = to_wire(gate)
+    if gate.status is not GateStatus.OPEN:
+        data["closed_by"] = "planted"
+    store.put(TEAM, Key(f"RUN#{RUN}", f"GATE#{name}#{round}"), data)
+    return from_wire(Gate, data)
+
+
+def test_an_older_round_cannot_be_decided_after_a_newer_one_exists(
+    store: MemoryStore, svc: GateService
+) -> None:
+    """ADR-0005 #8: an older approval must not close after a later veto."""
+    old = _plant(store, "review", 1, "OPEN")
+    _plant(store, "review", 2, "CHANGES_REQUESTED", tag="b")
+    for kind in (DecisionKind.APPROVE, DecisionKind.REJECT):
+        with pytest.raises(StaleRoundError) as err:
+            decide(svc, kind, gate=old, comment="x")
+        assert err.value.code == "stale_round"
+    assert gate_of(store, round=1).is_open
+    assert ledger(store) == []
+
+
+def test_closing_an_older_round_never_invalidates_a_newer_one(
+    store: MemoryStore, svc: GateService
+) -> None:
+    """Only EARLIER rounds are voided. (A newer round cannot exist beside an open older one
+    through the service, so this is planted to pin the < comparison.)"""
+    _plant(store, "review", 2, "APPROVED", tag="b")
+    older = _plant(store, "review", 1, "OPEN")
+    with pytest.raises(StaleRoundError):
+        decide(svc, DecisionKind.REJECT, gate=older, comment="x")
+    assert gate_of(store, round=2).status is GateStatus.APPROVED
+
+
+class _FlipBetweenReads(MemoryStore):
+    """On the second ``GATE#`` query, approve round 1 behind the service's back: the state
+    changed between its first look and the moment it reads the audit chain head."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.queries = 0
+        self.armed = False
+
+    def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
+        if self.armed and kw.get("sk_prefix", "").startswith("GATE#"):
+            self.queries += 1
+            if self.queries == 2:
+                item = gate_item(self, round=1)
+                MemoryStore.put(self, TEAM, item.key, {**item.data, "status": "APPROVED"})
+        return super().query(scope, pk, **kw)
+
+
+def test_invalidation_set_is_confirmed_after_the_audit_chain_head_is_read() -> None:
+    store = _FlipBetweenReads()
+    service = GateService(store)
+    _plant(store, "review", 1, "OPEN")  # planted: round 2 beside an open round 1
+    g2 = _plant(store, "review", 2, "OPEN", tag="b")
+    store.armed = True
+    decide(service, DecisionKind.REJECT, gate=g2, comment="no")
+    assert gate_of(store, round=1).status is GateStatus.INVALIDATED
+    assert gate_of(store, round=2).status is GateStatus.REJECTED
+
+
+def test_round_limit_keeps_a_veto_inside_the_transaction_cap() -> None:
+    """ADR-0017: transactions cap at 100 ops. Closing a round voids every earlier approved
+    round in the same transaction, so rounds per gate are bounded to keep a veto possible."""
+    store = MemoryStore()
+    service = GateService(store)
+    for r in range(1, MAX_ROUNDS_PER_GATE):
+        g = service.open_gate(TEAM, open_cmd(round=r, tag=str(r)))
+        decide(service, DecisionKind.APPROVE, gate=g)
+    last = service.open_gate(TEAM, open_cmd(round=MAX_ROUNDS_PER_GATE, tag="last"))
+    with pytest.raises(GateRoundLimitError, match="rounds"):
+        service.open_gate(TEAM, open_cmd(round=MAX_ROUNDS_PER_GATE + 1, tag="over"))
+    # the worst case still commits: a veto that voids every earlier approval
+    decide(service, DecisionKind.REJECT, gate=last, comment="no")
+    assert gate_of(store, round=1).status is GateStatus.INVALIDATED
+    assert gate_of(store, round=MAX_ROUNDS_PER_GATE - 1).status is GateStatus.INVALIDATED
+    assert gate_of(store, round=MAX_ROUNDS_PER_GATE).status is GateStatus.REJECTED
+
+
+def test_too_many_ops_fails_clearly_not_with_a_store_value_error() -> None:
+    """Hooks add ops too; if the total would pass the cap the decision is refused by name."""
+    hooks = GateHooks()
+    hooks.on_decide(lambda ctx: [Put(Key(f"RUN#{RUN}", f"BULK#{i}"), {}) for i in range(100)])
+    service = GateService(MemoryStore(), hooks=hooks)
+    gate = service.open_gate(TEAM, open_cmd())
+    with pytest.raises(GateRoundLimitError, match="operations"):
+        decide(service, DecisionKind.APPROVE, gate=gate)
 
 
 # --- decide: the three outcomes ---------------------------------------------------------------
@@ -239,6 +363,9 @@ def test_decision_closes_the_gate_with_ledger_audit_and_outbox(
 
     actions = [a.data["action"] for a in audit(store)]
     assert actions == ["gate.opened", "gate.decided"]
+    decided = audit(store)[1].data
+    assert decided["data"]["surface"] == "ui"  # PLAN 4.9: surface reaches the locked audit log
+    assert decided["data"]["decision"] == kind.value
 
 
 def test_approval_outbox_carries_the_approved_subject(store: MemoryStore, svc: GateService) -> None:
@@ -344,14 +471,17 @@ def _closes_gate(sk: str = "GATE#review#1") -> Callable[[Sequence[Op]], bool]:
 
 
 def test_close_is_a_conditional_write_not_a_blind_overwrite() -> None:
-    """Approver reads an open gate; a reject commits before the approver writes. The approver
-    must lose. A service that writes unconditionally would flip REJECTED to APPROVED."""
+    """Approver reads an open gate; before it writes, the gate record alone is closed by a
+    rival (no ledger, audit or chain change, so only the gate's own condition can notice).
+    The approver must lose. A service that writes the gate unconditionally would flip
+    REJECTED to APPROVED."""
 
-    def rival_rejects() -> None:
-        rival = GateService(_Bypass(racing))
-        decide(rival, DecisionKind.REJECT, gate=gate_of(racing), actor="rival", comment="veto")
+    def rival_closes_the_record() -> None:
+        item = gate_item(racing)
+        closed = {**item.data, "status": "REJECTED", "closed_by": "rival"}
+        MemoryStore.put(racing, TEAM, item.key, closed)
 
-    racing = InterleavingStore(_closes_gate(), rival_rejects)
+    racing = InterleavingStore(_closes_gate(), rival_closes_the_record)
     service = GateService(racing)
     gate = service.open_gate(TEAM, open_cmd())
 
@@ -361,6 +491,39 @@ def test_close_is_a_conditional_write_not_a_blind_overwrite() -> None:
     assert err.value.closed_by == "rival"
     assert err.value.status is GateStatus.REJECTED
     assert gate_of(racing).status is GateStatus.REJECTED
+    assert ledger(racing) == []
+
+
+def test_a_veto_that_loses_the_commit_race_gets_gate_closed() -> None:
+    """Rule 3/5: order is decided by commit. If the approval commits first, the late reject is
+    refused (and points at Stop), not merged into the result."""
+
+    def rival_approves() -> None:
+        rival = GateService(_Bypass(racing))
+        decide(rival, DecisionKind.APPROVE, gate=gate_of(racing), actor="rival")
+
+    racing = InterleavingStore(_closes_gate(), rival_approves)
+    service = GateService(racing)
+    gate = service.open_gate(TEAM, open_cmd())
+    with pytest.raises(GateClosedError) as err:
+        decide(service, DecisionKind.REJECT, gate=gate, actor="bob", comment="late veto")
+    assert err.value.status is GateStatus.APPROVED
+    assert err.value.closed_by == "rival"
+    assert gate_of(racing).status is GateStatus.APPROVED
+    assert [e.data["kind"] for e in ledger(racing)] == ["approve"]
+
+
+def test_a_rival_full_decision_between_read_and_write_also_wins() -> None:
+    def rival_rejects() -> None:
+        rival = GateService(_Bypass(racing))
+        decide(rival, DecisionKind.REJECT, gate=gate_of(racing), actor="rival", comment="veto")
+
+    racing = InterleavingStore(_closes_gate(), rival_rejects)
+    service = GateService(racing)
+    gate = service.open_gate(TEAM, open_cmd())
+    with pytest.raises(GateClosedError) as err:
+        decide(service, DecisionKind.APPROVE, gate=gate, actor="alice")
+    assert err.value.closed_by == "rival"
     assert [e.data["actor"] for e in ledger(racing)] == ["rival"]
     assert len(outbox(racing)) == 1
 
@@ -463,13 +626,15 @@ def _race(
 
 
 def test_racing_approve_and_reject_close_exactly_once() -> None:
-    for _ in range(25):
+    rng = random.Random(7)
+    for _ in range(40):
         store = MemoryStore()
         gate = GateService(store).open_gate(TEAM, open_cmd())
         jobs: list[tuple[DecisionKind, str, str | None]] = [
             *((DecisionKind.APPROVE, f"a{i}", None) for i in range(4)),
             *((DecisionKind.REJECT, f"r{i}", None) for i in range(4)),
         ]
+        rng.shuffle(jobs)  # the thread that starts first is random, so either kind can win
         results = _race(store, gate, jobs)
         winners = [r for r in results if r[2] == "won"]
         assert len(winners) == 1
@@ -534,6 +699,7 @@ def test_stale_approvals_cannot_beat_a_racing_veto() -> None:
     """Many stale approvals and one reject, released together: the reject always closes the
     gate. If the digest check were skipped, a stale approval could win some of these runs; if
     the veto needed a matching digest, the reject would be refused."""
+    rng = random.Random(11)
     for _ in range(25):
         store = MemoryStore()
         gate = GateService(store).open_gate(TEAM, open_cmd())
@@ -541,6 +707,7 @@ def test_stale_approvals_cannot_beat_a_racing_veto() -> None:
             *((DecisionKind.APPROVE, f"a{i}", "stale") for i in range(6)),
             (DecisionKind.REJECT, "veto", "stale"),
         ]
+        rng.shuffle(jobs)
         results = _race(store, gate, jobs)
         assert [r for r in results if r[2] == "won"] == [(DecisionKind.REJECT, "veto", "won")]
         assert gate_of(store).status is GateStatus.REJECTED
@@ -874,3 +1041,30 @@ def test_audit_entry_and_ids_are_plain_values() -> None:
     assert entry.action == "x"
     assert DecisionId.new() != DecisionId.new()
     assert replace(entry, at=6).at == 6
+
+
+def test_audit_hash_survives_values_the_store_canonicalizes() -> None:
+    """1.0 is stored as 1; the hash must be over the canonical form or verification fails."""
+    store = MemoryStore()
+    service = GateService(store)
+    service.open_gate(TEAM, open_cmd())
+    writer = ChainedAuditWriter()
+    entry = AuditEntry(RUN, "x", "alice", {"ratio": 1.0, "t": (1, 2)}, 5)
+    store.transact(TEAM, list(writer.ops(ReadOnly(store), TEAM, entry)))
+    assert verify_audit_chain(store, TEAM, RUN) == 2
+
+
+def test_audit_chain_is_bound_to_its_run_and_team() -> None:
+    store = MemoryStore()
+    GateService(store).open_gate(TEAM, open_cmd())
+    # copy the whole chain to another run, and to another team
+    other_run = RunId.parse("01J00000000000000000000002")
+    other_team = TeamScope("t2")
+    for scope, run in ((TEAM, other_run), (other_team, RUN)):
+        moved = MemoryStore()
+        for item in store.query(TEAM, f"RUN#{RUN}", table=AUDIT).items:
+            moved.transact(scope, [Put(Key(f"RUN#{run}", item.key.sk, AUDIT), item.data, Absent())])
+        for item in store.query(TEAM, f"RUN#{RUN}", sk_prefix="CHAIN").items:
+            moved.put(scope, Key(f"RUN#{run}", "CHAIN"), item.data)
+        with pytest.raises(ValueError, match="audit chain"):
+            verify_audit_chain(moved, scope, run)

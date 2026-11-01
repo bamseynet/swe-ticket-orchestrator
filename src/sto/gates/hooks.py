@@ -33,7 +33,9 @@ from sto.store.ports import (
     Put,
     Scope,
     Store,
+    TeamScope,
     VersionIs,
+    canonical_data,
 )
 
 GENESIS_HASH = "0" * 64
@@ -115,7 +117,11 @@ class AuditWriter(Protocol):
 
 
 def entry_hash(body: dict[str, Any]) -> str:
-    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Hash of the *stored* form: 1.0 is stored as 1 and tuples as lists, so hash that, or a
+    verifier reading the item back computes a different value."""
+    blob = json.dumps(
+        canonical_data(body), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
@@ -132,6 +138,9 @@ class ChainedAuditWriter:
         seq = 1 if head is None else int(head.data["seq"]) + 1
         prev = GENESIS_HASH if head is None else str(head.data["hash"])
         body = {
+            # run and team are in the hash, so a valid chain cannot be moved to another run
+            "run": str(entry.run_id),
+            "team": scope.team if isinstance(scope, TeamScope) else "",
             "seq": seq,
             "at": entry.at,
             "action": entry.action,
@@ -139,7 +148,7 @@ class ChainedAuditWriter:
             "data": entry.data,
             "prev": prev,
         }
-        digest = entry_hash(json.loads(json.dumps(body)))
+        digest = entry_hash(body)
         return [
             Put(
                 Key(audit_pk(entry.run_id), f"{seq:012d}", AUDIT),
