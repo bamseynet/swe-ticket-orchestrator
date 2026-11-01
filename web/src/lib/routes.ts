@@ -22,14 +22,17 @@ function compare(a: string, b: string): number {
  * - `pages/runs` is `/runs`
  * - `pages/home` (top level only) is `/`
  * - a `[name]` folder is a path parameter: `pages/run/[id]` is `/run/:id`
+ *   (letters, digits, `_` and `-` in the name)
+ * - ANY nested folder with an `index.tsx` becomes a route; prefix a folder with `_`
+ *   (`pages/_shared`, `pages/runs/_parts`) to keep it out of routing
  */
 export function routesFromModules(modules: PageModules): PageRoute[] {
   const routes: PageRoute[] = [];
   for (const [file, mod] of Object.entries(modules)) {
     const folder = /\/pages\/(.+)\/index\.tsx$/.exec(file)?.[1];
-    if (folder === undefined) continue;
+    if (folder === undefined || folder.split("/").some((seg) => seg.startsWith("_"))) continue;
     const path =
-      folder === "home" ? "/" : "/" + folder.replace(/\[(\w+)\]/g, (_, name: string) => `:${name}`);
+      folder === "home" ? "/" : "/" + folder.replace(/\[([\w-]+)\]/g, (_, name: string) => `:${name}`);
     routes.push({ path, Component: mod.default });
   }
   return routes.sort((a, b) => compare(a.path, b.path));
@@ -51,7 +54,11 @@ export function findRoute(routes: PageRoute[], pathname: string): Match | undefi
       const got = parts[i] ?? "";
       if (!seg.startsWith(":")) return seg === got;
       if (got === "") return false;
-      params[seg.slice(1)] = decodeURIComponent(got);
+      try {
+        params[seg.slice(1)] = decodeURIComponent(got);
+      } catch {
+        return false; // malformed escape such as %E0%A4%A: not a match, so the 404 shows
+      }
       return true;
     });
     if (ok) return { route, params };

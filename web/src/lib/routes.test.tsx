@@ -42,4 +42,23 @@ describe("routesFromModules", () => {
     expect(findRoute(routes, "/run/new")?.route.path).toBe("/run/new");
     expect(findRoute(routes, "/run")).toBeUndefined();
   });
+
+  it("treats a malformed escape as no match instead of throwing", () => {
+    const routes = routesFromModules({ "./pages/run/[id]/index.tsx": mod });
+    expect(findRoute(routes, "/run/%E0%A4%A")).toBeUndefined();
+  });
+
+  it("accepts hyphens in parameter names", () => {
+    const routes = routesFromModules({ "./pages/run/[run-id]/index.tsx": mod });
+    expect(routes.map((r) => r.path)).toEqual(["/run/:run-id"]);
+    expect(findRoute(routes, "/run/7")?.params).toEqual({ "run-id": "7" });
+  });
+
+  it("does not route folders starting with _ (private helpers)", () => {
+    const routes = routesFromModules({
+      "./pages/_shared/index.tsx": mod,
+      "./pages/runs/_parts/index.tsx": mod,
+    });
+    expect(routes).toEqual([]);
+  });
 });
