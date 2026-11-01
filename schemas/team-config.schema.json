@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "Budgets": {
+      "additionalProperties": false,
+      "properties": {
+        "run_usd": {
+          "exclusiveMinimum": 0,
+          "title": "Run Usd",
+          "type": "number"
+        },
+        "session_seconds_per_run": {
+          "minimum": 1,
+          "title": "Session Seconds Per Run",
+          "type": "integer"
+        },
+        "stage_usd": {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z][a-z0-9_]*$": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            }
+          },
+          "title": "Stage Usd",
+          "type": "object"
+        },
+        "team_monthly_usd": {
+          "exclusiveMinimum": 0,
+          "title": "Team Monthly Usd",
+          "type": "number"
+        }
+      },
+      "required": [
+        "run_usd",
+        "team_monthly_usd"
+      ],
+      "title": "Budgets",
+      "type": "object"
+    },
+    "Calendar": {
+      "additionalProperties": false,
+      "properties": {
+        "holidays": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Holidays",
+          "type": "string"
+        },
+        "hours": {
+          "title": "Hours",
+          "type": "string"
+        },
+        "timezone": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "workdays": {
+          "items": {
+            "enum": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri",
+              "sat",
+              "sun"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Workdays",
+          "type": "array"
+        }
+      },
+      "required": [
+        "timezone",
+        "workdays",
+        "hours"
+      ],
+      "title": "Calendar",
+      "type": "object"
+    },
+    "ChangeWindows": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_only": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Allow Only",
+          "type": "string"
+        },
+        "deny": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DenyWindow"
+          },
+          "title": "Deny",
+          "type": "array"
+        }
+      },
+      "title": "ChangeWindows",
+      "type": "object"
+    },
+    "CustomProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Base",
+          "type": "string"
+        },
+        "prompt_addendum": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Prompt Addendum",
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "base"
+      ],
+      "title": "CustomProfile",
+      "type": "object"
+    },
+    "DenyWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "format": "date-time",
+          "title": "From",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "to": {
+          "format": "date-time",
+          "title": "To",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "reason"
+      ],
+      "title": "DenyWindow",
+      "type": "object"
+    },
+    "QaConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "test_domains": {
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Test Domains",
+          "type": "array"
+        }
+      },
+      "required": [
+        "test_domains"
+      ],
+      "title": "QaConfig",
+      "type": "object"
+    },
+    "TeamMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "team": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
+          "title": "Team",
+          "type": "string"
+        }
+      },
+      "required": [
+        "team"
+      ],
+      "title": "TeamMetadata",
+      "type": "object"
+    },
+    "TeamSprint": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "format": "date",
+          "title": "Anchor",
+          "type": "string"
+        },
+        "cadence": {
+          "enum": [
+            "1w",
+            "2w",
+            "3w",
+            "4w"
+          ],
+          "title": "Cadence",
+          "type": "string"
+        },
+        "merge_freeze_before_end": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Merge Freeze Before End",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cadence",
+        "anchor"
+      ],
+      "title": "TeamSprint",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Editor hints only. This schema is looser than the loader: it cannot express that a date is real, a timezone or branch name is valid, which outcomes an effect has, or that an instant carries an offset. A document that validates here may still be refused by sto.config.schema.load_document, which is the authority.",
+  "properties": {
+    "apiVersion": {
+      "const": "sto/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "budgets": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "calendar": {
+      "$ref": "#/$defs/Calendar"
+    },
+    "change_windows": {
+      "$ref": "#/$defs/ChangeWindows"
+    },
+    "custom_profiles": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "$ref": "#/$defs/CustomProfile"
+        }
+      },
+      "title": "Custom Profiles",
+      "type": "object"
+    },
+    "kind": {
+      "const": "TeamConfig",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/TeamMetadata"
+    },
+    "qa": {
+      "$ref": "#/$defs/QaConfig"
+    },
+    "sprint": {
+      "$ref": "#/$defs/TeamSprint"
+    },
+    "wip_limit": {
+      "minimum": 1,
+      "title": "Wip Limit",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "budgets"
+  ],
+  "title": "TeamConfig",
+  "type": "object"
+}
