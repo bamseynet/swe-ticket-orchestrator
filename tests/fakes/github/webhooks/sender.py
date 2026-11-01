@@ -12,10 +12,11 @@ What it models, and where GitHub documents it:
   https://docs.github.com/en/webhooks/webhook-events-and-payloads#delivery-headers
 * No timestamp is signed or sent, so no time header may be trusted for replay (the suite's
   ``signed_timestamp=False`` for GitHub).
-* A redelivery carries the same GUID, headers and bytes as the original.
-  https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries
-  Real GitHub only redelivers for three days. This fake never expires a delivery: the receiver's
-  seen-ID table must not lean on a lapse (D4-03, dedupe does not expire for GitHub).
+* Redelivery. https://docs.github.com/en/webhooks/using-webhooks/redelivering-webhooks says real
+  GitHub redelivers for three days. That a redelivery carries the same GUID, headers and bytes as
+  the original is unsourced, observed behaviour to prove live. This fake never expires a
+  delivery: the receiver's seen-ID table must not lean on a lapse (D4-03, dedupe does not expire
+  for GitHub).
 * GitHub also sends the SHA-1 ``X-Hub-Signature``. The fake omits it: it is legacy, and a
   receiver must use the SHA-256 one.
 """
@@ -43,11 +44,12 @@ def _default_body(revision: int, delivery_id: str) -> bytes:
     return json.dumps(
         {
             "action": "edited",
-            "issue": {"number": 1, "title": "synthetic", "revision": revision},
+            "issue": {"number": 1, "title": "synthétique ✓", "revision": revision},
             "repository": {"full_name": "acme/app"},
             "sender": {"login": "alice"},
             "installation": {"id": 200002},
-        }
+        },
+        ensure_ascii=False,
     ).encode()
 
 

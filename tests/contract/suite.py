@@ -38,13 +38,19 @@ Known limits, deliberate routes the suite does not stop:
   module path, but the suite cannot tell it from the class the test means to exercise).
 * Header names are matched case-sensitively (fails closed).
 * Nothing requires a real adapter to HAVE a conformance subclass.
-* A silent page cap above 50 pages is not seen: the marker is 5,100 objects (51 pages) from each
-  end, and the absent-key walk is about 200 pages including the read-back walk. A cap of 34 pages
-  or more, up to 50, fails.
+* A silent page cap above about 150 pages is not seen: the marker is 5,100 objects (51 pages at
+  100 a page) from each end, and the absent-key walk covers about 150 pages including the read-back
+  walk (measured: a cap up to 153 fails, 154 passes). A cap of 34 pages or more, up to that, fails.
+* ``forge()`` is checked for consistency across kinds (they differ from each other and from the
+  genuine one, the truncated MAC is a prefix, the blank one is empty), but the suite cannot know
+  the secret: a ``forge(EMPTY_KEY)`` signed with some OTHER secret passes the check, and an
+  adapter that also accepts an empty key then passes the suite. The fake pins its own forgeries
+  (``tests/fakes/github/webhooks/test_webhooks.py``); a new fake must do the same.
 * A ``::`` argument narrows the completeness check to the classes it names.
 
-What a fake server must provide for the suite to be meaningful: it must page at 100 items (the
-page size the suite assumes), and a rate-limit answer must ask for at least ``SHAPE_RETRY_AFTER``
+What a fake server must provide for the suite to be meaningful: it must page at no more than 100
+items and honour ``per_page=100`` (the page size the suite assumes; an adapter must ask for it, as
+GitHub's default is 30), and a rate-limit answer must ask for at least ``SHAPE_RETRY_AFTER``
 (30 seconds for a ``Retry-After`` shape, 45 for ``x-ratelimit-reset`` shape), since the suite
 requires an adapter to pass on at least that wait.
 
@@ -55,9 +61,15 @@ Ports, vendors and sections
 ---------------------------
 Which sections a target must pass comes from the PORT the adapter implements (``PORT_SECTIONS``),
 and the port is VERIFIED: an adapter that implements ``TicketSource``, ``ScmProvider`` or
-``Notifier`` (checked with ``isinstance``) cannot claim a narrower port. Only adapters defined in
-``contract.test_suite``, the reference and its known-bad variants, implement no real port and are
-exempt. A target names a ``Vendor``; the suite owns that vendor's ``Capabilities`` (signed
+``Notifier`` (checked with ``isinstance``) cannot claim a narrower port. Only the reference and its
+known-bad variants, defined in ``contract.test_suite``, are exempt from the rest. Every other
+adapter must be a class really defined under ``sto.`` whose module path has the declared vendor as
+a segment, and one that implements no port exposes none of the ports' write methods.
+``sto.adapters.fake.*`` (``FakeTicketSource``, ``FakeScm``, ``FakeNotifier``) are port doubles,
+not conformance targets: they name no vendor, so they are refused. A vendor's fake SERVER lives
+under ``tests/fakes/`` and is driven through a real or reference adapter.
+
+A target names a ``Vendor``; the suite owns that vendor's ``Capabilities`` (signed
 timestamp, rate-limit shapes, auth refresh) and there is no default. A vendor never removes a
 control: it selects which assertion a mandatory test makes.
 
@@ -126,7 +138,7 @@ DEFAULT_TARGET = "fake"  # the only name whose receipts may be simulated
 MAX_REPLAY_WINDOW = 300.0  # seconds; set here, a target cannot raise it
 FAR_FUTURE = 10.0**10  # seconds; longer than any finite window an adapter could sensibly use
 PAGE_SIZE = 100  # GitHub's maximum; the server pages at this size
-DEEP = 5100  # objects on each side of a marker: past any page cap up to 50 pages
+DEEP = 5100  # objects on each side of a marker (51 pages); caps up to about 150 pages are seen
 RETRIES = 5
 FAKE_MODULE = "sto.adapters.fake"
 STO_MODULE = "sto"
@@ -371,6 +383,10 @@ class Target:
 
     def stored_id_for(self, key: str) -> str | None:
         raise _unset("stored_id_for")
+
+    def foreign_marked(self, key: str) -> bool:
+        """Whether an object by ANOTHER author carries this adapter's marker for ``key``."""
+        raise _unset("foreign_marked")
 
     def listed(self) -> int:
         """How many objects the server lists in all, whoever stored them."""
@@ -950,7 +966,7 @@ class AdapterConformance:
         if seen[ForgeKind.BLANK_HEADER] != "":
             raise HarnessError("forge(BLANK_HEADER) must leave the header present and empty")
         truncated = seen[ForgeKind.TRUNCATED_MAC]
-        if not (real.startswith(truncated) and len(truncated) < len(real)):
+        if not real.startswith(truncated):  # not the genuine one (checked above): a proper prefix
             raise HarnessError("forge(TRUNCATED_MAC) must be a proper prefix of the genuine one")
         if len(seen[ForgeKind.EMPTY_MAC]) > len(truncated):
             raise HarnessError("forge(EMPTY_MAC) must carry less than the truncated MAC")
@@ -965,8 +981,17 @@ class AdapterConformance:
         target.deliver(target.emit(1, "d-1"))
         adapter, verifier, queued = target.adapter, target.verifier, target.queued()
         target.restart()
-        if target.adapter is adapter or target.verifier is verifier:
+        if target.adapter is adapter:
             raise HarnessError("restart() left the same adapter in place")
+        if target.verifier is verifier:
+            raise HarnessError("restart() left the same verifier in place")
+        shared = sorted(
+            n
+            for n, v in vars(adapter).items()
+            if isinstance(v, (list, dict, set)) and v is vars(target.adapter).get(n)
+        )
+        if shared:
+            raise HarnessError(f"restart() kept in-memory state of the old adapter: {shared}")
         if target.queued() != queued:
             raise HarnessError("restart() lost the durable queue")
 
@@ -1333,6 +1358,10 @@ class AdapterConformance:
         target.plant_foreign_marker("k-plant")
         if target.listed() != before + 1:
             raise HarnessError("plant_foreign_marker() added no object to the server")
+        if not target.foreign_marked("k-plant"):
+            raise HarnessError(
+                "plant_foreign_marker() planted an object with no marker for the key"
+            )
         if target.stored_ids() != ours or target.stored_id_for("k-plant") is not None:
             raise HarnessError("plant_foreign_marker() planted an object by our own principal")
 
@@ -1340,8 +1369,8 @@ class AdapterConformance:
     def test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk(
         self, target: Target
     ) -> None:
-        """The marker sits 1100 objects from each end, at a page size of 100, on a server that
-        lists newest first and on one that lists oldest first: an adapter that reads only the
+        """The marker sits DEEP (5100) objects from each end, at a page size of 100, on a server
+        that lists newest first and on one that lists oldest first: an adapter that reads only the
         head, only the tail, or stops at a page cap writes twice. An absent key is a full walk."""
         target.require(Control.CRASH, Control.RESTART, Control.LOOKUP)
         for i, order in enumerate(("newest_first", "oldest_first")):

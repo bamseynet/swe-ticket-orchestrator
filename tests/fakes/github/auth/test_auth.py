@@ -6,11 +6,16 @@ is documented, with its source URL, in ``server.py``; the live suite later prove
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from fakes.github.auth import (
     APP_ID,
+    CLIENT_ID,
     INSTALLATION_ID,
+    INSTALLATION_PERMISSIONS,
+    INSTALLATION_REPOS,
     FakeGitHubAuth,
     RateShape,
     Response,
@@ -94,6 +99,36 @@ def test_the_app_jwt_is_not_an_installation_token(gh: FakeGitHubAuth) -> None:
     assert gh.handle("read", gh.app_jwt()).status == 401
 
 
+def test_an_app_jwt_may_name_the_app_by_client_id_or_by_app_id_as_text_or_number(
+    gh: FakeGitHubAuth,
+) -> None:
+    for iss in (APP_ID, int(APP_ID), CLIENT_ID):
+        assert gh.create_installation_token(gh.app_jwt(app_id=iss), INSTALLATION_ID).status == 201
+
+
+@pytest.mark.parametrize("alg", ["HS256", "none", "RS512", ""])
+def test_an_app_jwt_must_say_alg_rs256(gh: FakeGitHubAuth, alg: str) -> None:
+    assert gh.create_installation_token(gh.app_jwt(alg=alg), INSTALLATION_ID).status == 401
+
+
+def test_an_app_jwt_header_that_is_not_an_object_is_refused(gh: FakeGitHubAuth) -> None:
+    good = gh.app_jwt().split(".")
+    for header in (b"[]", b"null", b'"RS256"'):
+        import base64
+
+        forged = base64.urlsafe_b64encode(header).rstrip(b"=").decode()
+        jwt = ".".join([forged, good[1], good[2]])
+        assert gh.create_installation_token(jwt, INSTALLATION_ID).status == 401
+
+
+def test_the_jwt_time_boundaries_are_exact(gh: FakeGitHubAuth) -> None:
+    mint = gh.create_installation_token
+    assert mint(gh.app_jwt(iat_offset=0), INSTALLATION_ID).status == 201
+    assert mint(gh.app_jwt(iat_offset=1), INSTALLATION_ID).status == 401
+    assert mint(gh.app_jwt(ttl=1), INSTALLATION_ID).status == 201
+    assert mint(gh.app_jwt(ttl=0), INSTALLATION_ID).status == 401
+
+
 def test_the_app_id_is_synthetic() -> None:
     assert APP_ID == "100001"
     assert INSTALLATION_ID == 200002
@@ -130,13 +165,13 @@ def test_revoke_auth_rejects_every_request_or_one_operation_until_restored(
     good = installation_token(gh)
     gh.revoke_auth("read")
     assert gh.handle("read", good).status == 401
-    assert gh.handle("lookup", good, page=0).status == 200
+    assert gh.handle("lookup", good, page=1).status == 200
     gh.restore_auth()
     assert gh.handle("read", good).status == 200
     gh.revoke_auth()
-    assert gh.handle("lookup", good, page=0).status == 401
+    assert gh.handle("lookup", good, page=1).status == 401
     gh.restore_auth()
-    assert gh.handle("lookup", good, page=0).status == 200
+    assert gh.handle("lookup", good, page=1).status == 200
 
 
 def test_expire_token_makes_the_held_token_stop_working_and_a_new_one_work(
@@ -171,40 +206,95 @@ def test_an_unknown_operation_is_a_programming_error_not_a_response(gh: FakeGitH
         gh.handle("write", installation_token(gh), body="x")
 
 
-# --- pagination ------------------------------------------------------------------------------
+# --- pagination: GitHub's, one-based, and the link header says where the rest is --------------
 
 
-def test_a_list_pages_at_a_hundred_and_says_where_the_next_page_is(gh: FakeGitHubAuth) -> None:
+def link(response: Response) -> dict[str, int]:
+    """The page numbers of each rel in the link header (what a client must follow)."""
+    found = re.findall(
+        r"<[^>]*[?&]page=(\d+)[^>]*>; rel=\"(\w+)\"", response.headers.get("link", "")
+    )
+    return {rel: int(number) for number, rel in found}
+
+
+def walk(gh: FakeGitHubAuth, token: str, **kw: object) -> list[str]:
+    """Follow rel=next from the first page, as a client that never counts pages would."""
+    ids: list[str] = []
+    page = 1
+    while True:
+        response = gh.handle("lookup", token, page=page, **kw)
+        ids += [i["id"] for i in response.body["items"]]
+        nxt = link(response).get("next")
+        if nxt is None:
+            return ids
+        page = nxt
+
+
+def test_a_list_pages_at_the_requested_size_and_the_link_header_says_where_next_is(
+    gh: FakeGitHubAuth,
+) -> None:
     good = installation_token(gh)
     gh.seed(250, "alice")
-    pages = [gh.handle("lookup", good, page=n) for n in range(3)]
+    pages = [gh.handle("lookup", good, page=n, per_page=100) for n in (1, 2, 3)]
     assert [len(p.body["items"]) for p in pages] == [100, 100, 50]
-    assert [p.body["next"] for p in pages] == [1, 2, None]
-    assert 'rel="next"' in pages[0].headers["link"]
-    assert 'rel="last"' in pages[0].headers["link"]
-    assert 'rel="next"' not in pages[2].headers["link"]
-    assert 'rel="prev"' in pages[2].headers["link"]
-    assert 'rel="first"' in pages[2].headers["link"]
-    ids = [i["id"] for p in pages for i in p.body["items"]]
-    assert len(set(ids)) == 250
+    assert link(pages[0]) == {"next": 2, "last": 3}
+    assert link(pages[1]) == {"prev": 1, "next": 3, "first": 1, "last": 3}
+    assert link(pages[2]) == {"prev": 2, "first": 1}
+    assert len(set(walk(gh, good, per_page=100))) == 250
 
 
-def test_per_page_is_capped_at_a_hundred(gh: FakeGitHubAuth) -> None:
+def test_the_body_carries_no_next_field_only_the_link_header_does(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.seed(250, "alice")
+    assert set(gh.handle("lookup", good, page=1).body) == {"items"}
+
+
+def test_omitting_page_means_page_one_and_per_page_defaults_to_thirty(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.seed(250, "alice")
+    first = gh.handle("lookup", good)
+    assert len(first.body["items"]) == 30
+    assert link(first) == {"next": 2, "last": 9}
+    assert first.body == gh.handle("lookup", good, page=1).body
+    assert len(walk(gh, good)) == 250  # following rel=next from the default reaches every item
+
+
+def test_following_next_from_any_page_reaches_the_rest(gh: FakeGitHubAuth) -> None:
+    good = installation_token(gh)
+    gh.seed(250, "alice")
+    second = gh.handle("lookup", good, page=2, per_page=100)
+    third = gh.handle("lookup", good, page=link(second)["next"], per_page=100)
+    assert len(third.body["items"]) == 50
+    assert [i["id"] for i in third.body["items"]] == [
+        i["id"] for i in gh.handle("lookup", good, page=3, per_page=100).body["items"]
+    ]
+
+
+def test_per_page_is_capped_at_a_hundred_and_floored_at_one(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.seed(150, "alice")
-    assert len(gh.handle("lookup", good, page=0, per_page=1000).body["items"]) == 100
-    assert len(gh.handle("lookup", good, page=0, per_page=30).body["items"]) == 30
-
-
-def test_a_single_page_has_no_link_header(gh: FakeGitHubAuth) -> None:
-    gh.seed(5, "alice")
-    assert "link" not in gh.handle("lookup", installation_token(gh), page=0).headers
+    assert len(gh.handle("lookup", good, page=1, per_page=1000).body["items"]) == 100
+    assert len(gh.handle("lookup", good, page=1, per_page=30).body["items"]) == 30
+    assert len(gh.handle("lookup", good, page=1, per_page=0).body["items"]) == 1
 
 
 def test_an_exact_multiple_of_the_page_size_has_no_empty_last_page(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.seed(200, "alice")
-    assert gh.handle("lookup", good, page=1).body["next"] is None
+    first = gh.handle("lookup", good, page=1, per_page=100)
+    assert link(first) == {"next": 2, "last": 2}
+    assert link(gh.handle("lookup", good, page=2, per_page=100)).get("next") is None
+
+
+def test_a_single_page_has_no_link_header(gh: FakeGitHubAuth) -> None:
+    gh.seed(5, "alice")
+    assert "link" not in gh.handle("lookup", installation_token(gh), page=1).headers
+
+
+def test_link_urls_are_absolute_on_a_reserved_host(gh: FakeGitHubAuth) -> None:
+    gh.seed(60, "alice")
+    header = gh.handle("lookup", installation_token(gh), page=1).headers["link"]
+    assert header.startswith('<https://api.github.test/items?page=2&per_page=30>; rel="next"')
 
 
 def test_a_page_past_the_end_is_empty(gh: FakeGitHubAuth) -> None:
@@ -212,30 +302,31 @@ def test_a_page_past_the_end_is_empty(gh: FakeGitHubAuth) -> None:
     gh.seed(5, "alice")
     past = gh.handle("lookup", good, page=9)
     assert past.status == 200
-    assert past.body == {"items": [], "next": None}
+    assert past.body == {"items": []}
+    assert "link" not in past.headers
 
 
 def test_the_list_runs_newest_first_or_oldest_first(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     first = gh.add("alice", "first")
     last = gh.add("alice", "last")
-    assert [i["id"] for i in gh.handle("lookup", good, page=0).body["items"]] == [last.id, first.id]
+    assert [i["id"] for i in gh.handle("lookup", good, page=1).body["items"]] == [last.id, first.id]
     gh.order = "oldest_first"
-    assert [i["id"] for i in gh.handle("lookup", good, page=0).body["items"]] == [first.id, last.id]
+    assert [i["id"] for i in gh.handle("lookup", good, page=1).body["items"]] == [first.id, last.id]
 
 
 def test_older_objects_go_to_the_far_end(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     mid = gh.add("alice", "mid")
     old = gh.add("alice", "old", older=True)
-    ids = [i["id"] for i in gh.handle("lookup", good, page=0).body["items"]]
+    ids = [i["id"] for i in gh.handle("lookup", good, page=1).body["items"]]
     assert ids == [mid.id, old.id]
 
 
 def test_every_object_lists_its_author_and_body(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.add("mallory", "hello")
-    assert gh.handle("lookup", good, page=0).body["items"][0] == {
+    assert gh.handle("lookup", good, page=1).body["items"][0] == {
         "id": "c-1",
         "author": "mallory",
         "body": "hello",
@@ -300,7 +391,7 @@ def test_a_limit_can_be_restricted_to_one_operation(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.rate_limit_next(1, RateShape.PRIMARY_429, "lookup")
     assert gh.handle("read", good).status == 200
-    assert gh.handle("lookup", good, page=0).status == 429
+    assert gh.handle("lookup", good, page=1).status == 429
 
 
 def test_authentication_is_checked_before_the_limit(gh: FakeGitHubAuth) -> None:
@@ -364,9 +455,9 @@ def test_a_timeout_fault_raises_and_applies_nothing(gh: FakeGitHubAuth) -> None:
 def test_a_fault_can_wait_for_a_page_or_skip_requests(gh: FakeGitHubAuth) -> None:
     good = installation_token(gh)
     gh.seed(250, "alice")
-    gh.fault_next("lookup", "5xx", page=1)
-    assert gh.handle("lookup", good, page=0).status == 200
-    assert gh.handle("lookup", good, page=1).status == 503
+    gh.fault_next("lookup", "5xx", page=2)
+    assert gh.handle("lookup", good, page=1).status == 200
+    assert gh.handle("lookup", good, page=2).status == 503
     gh.fault_next("read", "5xx", after=2)
     assert [gh.handle("read", good).status for _ in range(4)] == [200, 200, 503, 200]
 
@@ -381,4 +472,167 @@ def test_a_5xx_is_not_counted_as_a_rate_limit(gh: FakeGitHubAuth) -> None:
 def test_the_fake_holds_no_real_looking_secret() -> None:
     gh = FakeGitHubAuth()
     token = installation_token(gh)
-    assert len(token) < 20, "a real installation token is ghs_ plus 36 characters"
+    assert len(token) < 20, "short and plainly fake, so no secret scanner mistakes it for a token"
+
+
+# --- narrowing the token: repositories and permissions ------------------------------------------
+
+
+def test_a_token_asked_for_nothing_in_particular_gets_all_the_installations(
+    gh: FakeGitHubAuth,
+) -> None:
+    body = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID).body
+    assert body["permissions"] == dict(INSTALLATION_PERMISSIONS)
+    assert body["repository_selection"] == "all"
+    assert "repositories" not in body
+
+
+def test_a_token_can_be_narrowed_to_repositories_and_the_answer_says_what_was_granted(
+    gh: FakeGitHubAuth,
+) -> None:
+    response = gh.create_installation_token(
+        gh.app_jwt(), INSTALLATION_ID, repositories=["acme/app"], permissions={"contents": "read"}
+    )
+    assert response.status == 201
+    assert response.body["permissions"] == {"contents": "read"}
+    assert response.body["repository_selection"] == "selected"
+    assert response.body["repositories"] == [{"full_name": "acme/app"}]
+    grant = gh.grant(str(response.body["token"]))
+    assert grant is not None
+    assert grant.repositories == ("acme/app",)
+    assert grant.permissions == {"contents": "read"}
+
+
+def test_a_narrowed_token_cannot_reach_another_repository(gh: FakeGitHubAuth) -> None:
+    body = gh.create_installation_token(
+        gh.app_jwt(), INSTALLATION_ID, repositories=["acme/app"]
+    ).body
+    token = str(body["token"])
+    assert gh.handle("read", token, repo="acme/app").status == 200
+    other = gh.handle("read", token, repo="acme/lib")
+    assert other.status == 404
+    assert other.body == {"message": "Not Found"}
+    assert gh.handle("read", token).status == 200  # no repository named: nothing to refuse
+
+
+def test_an_unnarrowed_token_reaches_every_repository_of_the_installation(
+    gh: FakeGitHubAuth,
+) -> None:
+    token = installation_token(gh)
+    for repo in INSTALLATION_REPOS:
+        assert gh.handle("read", token, repo=repo).status == 200
+
+
+def test_a_repository_outside_the_installation_is_a_422(gh: FakeGitHubAuth) -> None:
+    for repos in (["acme/other"], ["acme/app", "acme/other"]):
+        response = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=repos)
+        assert response.status == 422
+        assert "repository" in response.body["message"]
+    assert gh.counts["installation_token"] == 2
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        {"contents": "admin"},
+        {"administration": "read"},
+        {"metadata": "write"},
+        {"contents": "bogus"},
+    ],
+)
+def test_a_permission_beyond_the_installations_is_a_422(
+    gh: FakeGitHubAuth, permissions: dict[str, str]
+) -> None:
+    response = gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, permissions=permissions)
+    assert response.status == 422
+    assert "permissions" in response.body["message"]
+
+
+def test_a_lower_level_than_the_installations_is_fine(gh: FakeGitHubAuth) -> None:
+    response = gh.create_installation_token(
+        gh.app_jwt(), INSTALLATION_ID, permissions={"contents": "read", "checks": "write"}
+    )
+    assert response.status == 201
+
+
+def test_a_refused_narrowing_issues_no_token(gh: FakeGitHubAuth) -> None:
+    gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID, repositories=["acme/other"])
+    assert gh.grant("ghs_fake_1") is None
+
+
+# --- the same controls reach the mint ---------------------------------------------------------
+
+
+def mint(gh: FakeGitHubAuth) -> Response:
+    return gh.create_installation_token(gh.app_jwt(), INSTALLATION_ID)
+
+
+@pytest.mark.parametrize(("mode", "status"), [("5xx", 503), ("429", 429), ("401", 401)])
+def test_a_fault_reaches_the_mint(gh: FakeGitHubAuth, mode: str, status: int) -> None:
+    gh.fault_next("installation_token", mode)
+    assert mint(gh).status == status
+    assert mint(gh).status == 201
+
+
+def test_a_timeout_fault_reaches_the_mint(gh: FakeGitHubAuth) -> None:
+    gh.fault_next("installation_token", "timeout")
+    with pytest.raises(TimeoutError):
+        mint(gh)
+    assert mint(gh).status == 201
+
+
+def test_a_rate_limit_reaches_the_mint(gh: FakeGitHubAuth) -> None:
+    gh.rate_limit_next(1, RateShape.SECONDARY_403, "installation_token")
+    assert mint(gh).status == 403
+    assert gh.counts["limited"] == 1
+    assert mint(gh).status == 201
+
+
+def test_a_limit_for_another_operation_does_not_reach_the_mint(gh: FakeGitHubAuth) -> None:
+    gh.rate_limit_next(1, RateShape.PRIMARY_429, "read")
+    assert mint(gh).status == 201
+
+
+def test_revoke_auth_reaches_the_mint(gh: FakeGitHubAuth) -> None:
+    gh.revoke_auth("installation_token")
+    assert mint(gh).status == 401
+    assert gh.counts["unauthorized"] == 1
+    gh.restore_auth()
+    assert mint(gh).status == 201
+    gh.revoke_auth()
+    assert mint(gh).status == 401
+
+
+def test_a_plain_answer_reaches_the_mint(gh: FakeGitHubAuth) -> None:
+    gh.respond_next("installation_token", 403)
+    assert mint(gh).status == 403
+    assert mint(gh).status == 201
+
+
+def test_a_bad_jwt_is_counted_unauthorized_and_not_limited(gh: FakeGitHubAuth) -> None:
+    gh.rate_limit_next(1, RateShape.PRIMARY_429)
+    gh.create_installation_token("garbage", INSTALLATION_ID)
+    assert gh.counts["unauthorized"] == 1
+    assert gh.counts["limited"] == 0
+
+
+def test_the_mint_does_not_spend_the_installations_budget(gh: FakeGitHubAuth) -> None:
+    gh.budget = 1
+    mint(gh)
+    mint(gh)
+    token = installation_token(gh)
+    assert gh.handle("read", token).status == 200
+
+
+def test_the_429_fault_asks_for_a_wait(gh: FakeGitHubAuth) -> None:
+    token = installation_token(gh)
+    gh.fault_next("read", "429")
+    assert gh.handle("read", token).headers["retry-after"] == "30"
+
+
+def test_running_out_of_budget_is_counted_as_limited(gh: FakeGitHubAuth) -> None:
+    token = installation_token(gh)
+    gh.budget = 1
+    gh.handle("read", token)
+    gh.handle("read", token)
+    assert gh.counts["limited"] == 1

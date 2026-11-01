@@ -12,7 +12,8 @@ import re
 
 import pytest
 
-from fakes.github.webhooks import SECRET, FakeWebhooks, ForgeKind
+from fakes.github.webhooks import SECRET, WRONG_SECRET, FakeWebhooks, ForgeKind
+from fakes.github.webhooks.sender import _sign
 
 SIG = "X-Hub-Signature-256"
 
@@ -180,3 +181,38 @@ def test_the_ledger_lists_every_genuine_delivery_in_order(hooks: FakeWebhooks) -
 def test_a_delivery_with_no_id_is_not_in_the_ledger(hooks: FakeWebhooks) -> None:
     hooks.without_id(1)
     assert hooks.deliveries == {}
+
+
+# --- each forgery is made the way its name says (the suite cannot check the secret) ---------------
+
+
+def test_each_forgery_is_signed_the_way_its_name_says(hooks: FakeWebhooks) -> None:
+    body = hooks.delivery(1, "d-1").body
+    assert hooks.forge(1, "d-1", ForgeKind.EMPTY_KEY).headers[SIG] == _sign(b"", body)
+    assert hooks.forge(1, "d-1", ForgeKind.WRONG_SECRET).headers[SIG] == _sign(WRONG_SECRET, body)
+    assert hooks.delivery(1, "d-1").headers[SIG] == _sign(SECRET, body)
+    assert WRONG_SECRET != SECRET != b""
+
+
+def test_the_truncated_forgery_keeps_exactly_eight_hex_digits(hooks: FakeWebhooks) -> None:
+    genuine = hooks.delivery(1, "d-1").headers[SIG]
+    truncated = hooks.forge(1, "d-1", ForgeKind.TRUNCATED_MAC).headers[SIG]
+    assert truncated == genuine[: len("sha256=") + 8]
+    assert len(genuine) - len(truncated) == 56
+
+
+def test_the_secret_it_is_given_is_the_one_it_signs_with(clock: list[float]) -> None:
+    ours = FakeWebhooks(lambda: clock[0])
+    theirs = FakeWebhooks(lambda: clock[0], secret=b"synthetic-another")
+    assert ours.delivery(1, "d-1").headers[SIG] != theirs.delivery(1, "d-1").headers[SIG]
+    assert theirs.delivery(1, "d-1").headers[SIG] == _sign(
+        b"synthetic-another", ours.delivery(1, "d-1").body
+    )
+
+
+def test_a_body_with_non_ascii_text_is_signed_over_its_utf8_bytes(hooks: FakeWebhooks) -> None:
+    raw = hooks.delivery(1, "d-1")
+    assert "synthétique ✓".encode() in raw.body
+    assert raw.headers[SIG] == _sign(SECRET, raw.body)
+    assert hooks.reserialise(raw).body != raw.body  # \u escapes: other bytes, same content
+    assert hooks.tamper(raw).body.decode().endswith("}" + " ")

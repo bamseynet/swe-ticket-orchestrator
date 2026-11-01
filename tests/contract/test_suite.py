@@ -592,6 +592,11 @@ class StubTarget(Target):
     def listed(self) -> int:
         return len(self.server.comments)
 
+    def foreign_marked(self, key: str) -> bool:
+        return any(
+            c.author != PRINCIPAL and f"<!-- sto:{key}:" in c.body for c in self.server.comments
+        )
+
     def calls(self, op: str) -> int:
         return self.server.counts[op]
 
@@ -2384,13 +2389,30 @@ def test_the_auth_webhook_port_needs_no_write_surface() -> None:
         assert "key" not in name
 
 
+def _port_methods(protocol: type) -> dict[str, Any]:
+    """Every method and the ``capabilities`` attribute: what ``isinstance`` wants of a port."""
+    methods: dict[str, Any] = {
+        n: (lambda self, *a, **k: None)
+        for n, v in vars(protocol).items()
+        if callable(v) and not n.startswith("_")
+    }
+    return {**methods, "capabilities": None}
+
+
 def test_the_port_is_verified_not_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """An adapter implementing a wider port cannot claim a narrower one."""
-    monkeypatch.setattr("contract.suite._vendor_matches", lambda cls, vendor: True)
+    from sto.adapters.ports import Notifier, TicketSource
+
     ticket_adapter = types.SimpleNamespace(
-        vendor=Vendor.GITHUB, adapter=FakeTicketSource(SpyWriter())
+        vendor=Vendor.GITHUB,
+        adapter=_sto_class(
+            monkeypatch, "sto.adapters.github.tickets", **_port_methods(TicketSource)
+        ),
     )
-    notifier_adapter = types.SimpleNamespace(vendor=Vendor.SLACK, adapter=FakeNotifier(SpyWriter()))
+    notifier_adapter = types.SimpleNamespace(
+        vendor=Vendor.SLACK,
+        adapter=_sto_class(monkeypatch, "sto.adapters.slack.notify", **_port_methods(Notifier)),
+    )
     with pytest.raises(PortClaimError, match="narrower"):
         validate_target(ticket_adapter, Port.WEBHOOK)  # type: ignore[arg-type]
     with pytest.raises(PortClaimError, match="narrower"):
@@ -3233,6 +3255,8 @@ class _ForgeVariant(StubTarget):
             value = genuine
         if self.fault == "empty_mac_is_blank" and how is ForgeKind.EMPTY_MAC:
             value = ""
+        if self.fault == "empty_mac_longer_than_truncated" and how is ForgeKind.EMPTY_MAC:
+            value = "sha256=" + "0" * 20
         if self.fault == "body_changed" and how is ForgeKind.EMPTY_KEY:
             return RawWebhook(good.headers, good.body + b" ")
         if self.fault == "header_changed" and how is ForgeKind.BLANK_HEADER:
@@ -3250,6 +3274,7 @@ class _ForgeVariant(StubTarget):
         "blank_missing",
         "empty_key_is_genuine",
         "empty_mac_is_blank",
+        "empty_mac_longer_than_truncated",
         "body_changed",
         "header_changed",
     ],
@@ -3285,6 +3310,39 @@ class _NoOpSeed(StubTarget):
         pass
 
 
+class _SeedsOneDirection(StubTarget):
+    def seed_others(self, n: int, newer: bool = True) -> None:
+        if newer:
+            super().seed_others(n, newer)
+
+
+class _SeedsOneShort(StubTarget):
+    def seed_others(self, n: int, newer: bool = True) -> None:
+        super().seed_others(n - 1, newer)
+
+
+class _PlantsNoMarker(StubTarget):
+    def plant_foreign_marker(self, key: str, variant: str = "a", author: str = "mallory") -> None:
+        self.server.add(author, "no marker here")
+
+
+class _CopiesTheAdapter(StubTarget):
+    """A restart by ``copy.copy``: a new object, but the old one's in-memory state."""
+
+    def restart(self) -> None:
+        import copy
+
+        self.adapter = copy.copy(self.adapter)
+        self.verifier = copy.copy(self.verifier)
+
+
+class _SharesTheVerifier(StubTarget):
+    def restart(self) -> None:
+        verifier = self.verifier
+        super().restart()
+        self.verifier = verifier
+
+
 class _PlantsAsUs(StubTarget):
     def plant_foreign_marker(self, key: str, variant: str = "a", author: str = "mallory") -> None:
         super().plant_foreign_marker(key, variant, PRINCIPAL)
@@ -3299,12 +3357,38 @@ def test_a_restart_that_changes_nothing_or_loses_the_stores_is_a_harness_error(
         assert type(error) is HarnessError, (factory.__name__, port, error)
 
 
-@pytest.mark.parametrize("factory", [_NoOpPlant, _NoOpSeed, _PlantsAsUs])
+@pytest.mark.parametrize(
+    "factory",
+    [_NoOpPlant, _NoOpSeed, _PlantsAsUs, _SeedsOneDirection, _SeedsOneShort, _PlantsNoMarker],
+)
 def test_a_plant_or_seed_that_does_nothing_is_a_harness_error(
     factory: Callable[[], Target],
 ) -> None:
     error = run_suite(factory)[SEED_CHECK]
     assert type(error) is HarnessError, (factory.__name__, error)
+
+
+class RememberingAdapter(Adapter):
+    """An honest adapter that keeps some in-memory state, as many do."""
+
+    def __init__(self, server: Stub, store: Store | None = None) -> None:
+        super().__init__(server, store)
+        self._memory: dict[str, str] = {}
+
+
+def test_a_restart_by_copying_keeps_the_old_in_memory_state_and_is_a_harness_error() -> None:
+    error = run_suite(lambda: _CopiesTheAdapter(RememberingAdapter), Port.WEBHOOK)[RESTART_CHECK]
+    assert type(error) is HarnessError
+    assert "in-memory" in str(error)
+
+
+def test_a_restart_that_keeps_the_verifier_says_so_and_not_that_the_adapter_stayed() -> None:
+    error = run_suite(_SharesTheVerifier, Port.WEBHOOK)[RESTART_CHECK]
+    assert type(error) is HarnessError
+    assert "verifier" in str(error)
+    error = run_suite(_NoOpRestart, Port.WEBHOOK)[RESTART_CHECK]
+    assert type(error) is HarnessError
+    assert "adapter" in str(error)
 
 
 def test_honest_restart_plant_and_seed_pass_their_checks() -> None:
@@ -3416,3 +3500,57 @@ def test_a_declared_vendor_must_match_the_adapters_module_path(
     sub = _sto_class(monkeypatch, "sto.adapters.githubish.ingest")
     with pytest.raises(PortClaimError, match="module path"):
         validate_target(types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=sub), Port.WEBHOOK)  # type: ignore[arg-type]
+
+
+# --- port doubles are not conformance targets; read methods are allowed --------------------------
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: FakeTicketSource(SpyWriter()),
+        lambda: FakeScm(SpyWriter()),
+        lambda: FakeNotifier(SpyWriter()),
+    ],
+    ids=["tickets", "scm", "notifier"],
+)
+def test_the_merged_port_doubles_are_refused_as_conformance_targets(
+    make: Callable[[], object],
+) -> None:
+    """``sto.adapters.fake.*`` name no vendor: they are doubles, not targets (D4-19, D4-05)."""
+    adapter = make()
+    assert is_fake(type(adapter))
+    for vendor in Vendor:
+        for port in Port:
+            target = types.SimpleNamespace(vendor=vendor, adapter=adapter)
+            with pytest.raises(PortClaimError):
+                validate_target(target, port)  # type: ignore[arg-type]
+
+
+READ_METHODS = [
+    "get",
+    "search",
+    "parse_event",
+    "current_sprint",
+    "snapshot",
+    "poll_merge",
+    "ci_trust",
+    "checks",
+    "parse_action",
+]
+
+
+def test_the_read_methods_are_exactly_these() -> None:
+    from contract.suite import PORT_READ_METHODS
+
+    assert set(READ_METHODS) == PORT_READ_METHODS
+
+
+@pytest.mark.parametrize("method", READ_METHODS)
+def test_an_adapter_with_no_port_may_keep_a_read_or_parse_method(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    adapter = _sto_class(monkeypatch, "sto.adapters.github.ingest", **{method: lambda self: None})
+    target = types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=adapter)
+    for port in (Port.WEBHOOK, Port.AUTH_WEBHOOK):
+        validate_target(target, port)  # type: ignore[arg-type]

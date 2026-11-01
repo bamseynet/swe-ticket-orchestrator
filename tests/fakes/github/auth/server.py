@@ -2,21 +2,20 @@
 
 This is a SERVER, not an adapter. It has no port, writes no verifier and holds no real credential:
 every ID, key and token is synthetic. An adapter under test talks to ``FakeGitHubAuth.handle`` as
-it would talk to the API. Each behaviour below names the page that documents it; the live suite
-(D12) later proves the fake against the real service, and when they disagree the fake is wrong.
+it would talk to the API. Each behaviour below names the page that documents it, or says
+"unsourced" where no page does; the live suite (D12) later proves all of it against the real
+service, and when they disagree the fake is wrong.
 
 Known departures, each deliberate:
 
-* GitHub signs App JWTs with RS256. The fake checks an HMAC-SHA256 under a synthetic key
-  instead (``APP_KEY``), so the tests need no RSA key and no crypto dependency. The claims it
-  checks, and the 401 for a bad one, are GitHub's.
+* GitHub signs App JWTs with RS256. The fake checks that the header says ``alg: RS256`` and then
+  an HMAC-SHA256 under a synthetic key (``APP_KEY``), so the tests need no RSA key and no crypto
+  dependency. The claims it checks are GitHub's.
 * The state read (``read``) returns a ``revision`` counter and the list (``lookup``) returns
-  objects with an ID, an author and a body. GitHub has no such endpoints; they stand in for "read
-  the object a webhook was about" and "list comments", which D4-19 and later issues replace with
-  the real routes.
-* The list takes a zero-based ``page`` and answers ``next`` in the body as well as in the
-  ``link`` header (one-based, as GitHub's). ``per_page`` defaults to 100, not GitHub's 30,
-  because the conformance suite assumes the server pages at 100.
+  ``{"items": [...]}`` of objects with an ID, an author and a body. GitHub has no such endpoints;
+  they stand in for "read the object a webhook was about" and "list comments", which D4-19 and
+  later issues replace with the real routes. Paging is GitHub's: one-based ``page`` (default 1),
+  ``per_page`` (default 30, at most 100), and the ``link`` header alone says where the rest is.
 * There is no write surface (``handle("write", ...)`` raises): writes belong to D4-19 and later.
 """
 
@@ -28,21 +27,37 @@ import hmac
 import json
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from contract.suite import RateShape
 
 APP_ID = "100001"  # synthetic
+CLIENT_ID = "Iv1.synthetic0001"  # synthetic; the docs accept the client ID or the App ID as `iss`
 INSTALLATION_ID = 200002  # synthetic
 APP_KEY = b"synthetic-app-key"  # stands in for the App's RSA private key; see the module docstring
+INSTALLATION_REPOS = ("acme/app", "acme/lib")  # the repositories this installation can reach
+INSTALLATION_PERMISSIONS: Mapping[str, str] = {
+    "checks": "write",
+    "contents": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+}
+_LEVELS = {"read": 1, "write": 2, "admin": 3}
 PAGE_SIZE = 100  # the maximum per_page
+DEFAULT_PER_PAGE = 30
 # https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
 JWT_MAX_TTL = 600.0  # seconds
 # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+# (alg RS256; iss; exp at most ten minutes ahead; iat a minute back for drift. The page lists no
+# error behaviour: the 401 and its messages below are unsourced, observed behaviour to prove live.)
 TOKEN_TTL = 3600.0  # seconds
 # https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+# (an hour; `repositories` and `permissions` narrow it; omitted, it gets all of the installation's.
+# The 404 for an unknown installation and the 422 for an outside repository or permission are
+# unsourced, observed behaviour to prove live.)
 RATE_WINDOW = 3600.0  # seconds
 DEFAULT_BUDGET = 5000
 # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
@@ -63,6 +78,15 @@ class Item:
     body: str
 
 
+@dataclass
+class Grant:
+    """What an installation token may do: its expiry, repositories (None: all) and permissions."""
+
+    expires: float
+    repositories: tuple[str, ...] | None
+    permissions: Mapping[str, str]
+
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -76,7 +100,7 @@ def _iso(seconds: float) -> str:
 
 
 def _unauthorized(message: str) -> Response:
-    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#401-unauthorized
+    # unsourced, observed behaviour to prove live: a 401 with this message
     return Response(401, {}, {"message": message})
 
 
@@ -92,7 +116,7 @@ class FakeGitHubAuth:
         self.counts: Counter[str] = Counter()
         self.items: list[Item] = []
         self._seq = 0
-        self._tokens: dict[str, float] = {}  # token -> expiry
+        self._tokens: dict[str, Grant] = {}
         self._issued = 0
         self._used, self._window_end = 0, 0.0
         self._faults: defaultdict[str, list[list[Any]]] = defaultdict(list)
@@ -109,11 +133,12 @@ class FakeGitHubAuth:
         iat_offset: float = -60.0,
         ttl: float = 540.0,
         key: bytes = APP_KEY,
-        app_id: str = APP_ID,
+        app_id: str | int = APP_ID,
+        alg: str = "RS256",
     ) -> str:
         """A JSON Web Token as the App would sign one: ``iat`` a minute back for clock drift,
         ``exp`` within ten minutes."""
-        header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+        header = _b64(json.dumps({"alg": alg, "typ": "JWT"}).encode())
         claims = {"iat": int(self.now + iat_offset), "exp": int(self.now + ttl), "iss": app_id}
         payload = _b64(json.dumps(claims).encode())
         sig = hmac.new(key, f"{header}.{payload}".encode(), hashlib.sha256).digest()
@@ -127,24 +152,18 @@ class FakeGitHubAuth:
             return undecodable
         try:
             claims = json.loads(_unb64(parts[1]))
-            json.loads(_unb64(parts[0]))
+            header = json.loads(_unb64(parts[0]))
             sent = _unb64(parts[2])
         except (ValueError, TypeError):
             return undecodable
         want = hmac.new(APP_KEY, f"{parts[0]}.{parts[1]}".encode(), hashlib.sha256).digest()
-        if not isinstance(claims, dict) or not hmac.compare_digest(sent, want):
+        if not isinstance(claims, dict) or not isinstance(header, dict):
+            return undecodable
+        if header.get("alg") != "RS256" or not hmac.compare_digest(sent, want):
             return undecodable
         return claims
 
-    def create_installation_token(self, jwt: str, installation_id: int) -> Response:
-        """``POST /app/installations/{id}/access_tokens``, authenticated by the App's JWT.
-
-        * ``exp`` is at most ten minutes ahead, ``iat`` is not in the future, and the JWT is not
-          expired; anything else is a 401 (generating-a-json-web-token-jwt-for-a-github-app).
-        * The token it returns lasts one hour (create-an-installation-access-token-for-an-app).
-        * An installation that is not this App's is a 404.
-        """
-        self.counts["installation_token"] += 1
+    def _jwt_refusal(self, jwt: str) -> Response | None:
         claims = self._jwt_claims(jwt)
         if isinstance(claims, str):
             return _unauthorized(claims)
@@ -159,25 +178,86 @@ class FakeGitHubAuth:
                 "'Expiration time' claim ('exp') must be a numeric value representing the "
                 "future time at which the assertion expires"
             )
-        if iss != APP_ID:
+        if str(iss) not in (APP_ID, CLIENT_ID):
             return _unauthorized("A JSON web token could not be decoded")
+        return None
+
+    def create_installation_token(
+        self,
+        jwt: str,
+        installation_id: int,
+        repositories: Sequence[str] | None = None,
+        permissions: Mapping[str, str] | None = None,
+    ) -> Response:
+        """``POST /app/installations/{id}/access_tokens``, authenticated by the App's JWT.
+
+        * ``exp`` at most ten minutes ahead, ``iat`` not in the future, ``alg`` RS256, not expired:
+          anything else is a 401 (generating-a-json-web-token-jwt-for-a-github-app).
+        * The token lasts one hour. ``repositories`` and ``permissions`` narrow it; left out, it
+          gets all the installation's, and the answer says what was granted
+          (create-an-installation-access-token-for-an-app).
+        * An installation that is not this App's is a 404; a repository or a permission beyond the
+          installation's is a 422 (unsourced, observed behaviour to prove live).
+        * The same faults, limits and 401s as any request apply to ``installation_token``.
+        """
+        op = "installation_token"
+        refused = self._jwt_refusal(jwt)
+        early = self._preflight(op, refused, None, metered=False)
+        if early is not None:
+            return early[0]
         if installation_id != INSTALLATION_ID:
             return Response(404, {}, {"message": "Not Found"})
+        outside = [r for r in repositories or () if r not in INSTALLATION_REPOS]
+        if outside:
+            return Response(
+                422,
+                {},
+                {
+                    "message": "There is at least one repository that does not exist or is not "
+                    "accessible to the parent installation."
+                },
+            )
+        asked = dict(permissions) if permissions is not None else dict(INSTALLATION_PERMISSIONS)
+        too_much = [
+            name
+            for name, level in asked.items()
+            if _LEVELS.get(level, 99) > _LEVELS.get(INSTALLATION_PERMISSIONS.get(name, ""), 0)
+        ]
+        if too_much:
+            return Response(
+                422,
+                {},
+                {"message": "The permissions requested are not granted to this installation."},
+            )
         self._issued += 1
         token = f"ghs_fake_{self._issued}"
-        self._tokens[token] = self.now + TOKEN_TTL
-        return Response(
-            201, {}, {"token": token, "expires_at": _iso(self.now + TOKEN_TTL), "permissions": {}}
-        )
+        repos = tuple(repositories) if repositories is not None else None
+        self._tokens[token] = Grant(self.now + TOKEN_TTL, repos, asked)
+        granted: dict[str, Any] = {
+            "token": token,
+            "expires_at": _iso(self.now + TOKEN_TTL),
+            "permissions": asked,
+            "repository_selection": "selected" if repos is not None else "all",
+        }
+        if repos is not None:
+            granted["repositories"] = [{"full_name": r} for r in repos]
+        return Response(201, {}, granted)
+
+    def grant(self, token: str) -> Grant | None:
+        """What this token was granted (the fake's own view; an adapter has no such call)."""
+        return self._tokens.get(token)
 
     # --- controls -------------------------------------------------------------------------
 
     def revoke(self, token: str) -> None:
-        """``DELETE /installation/token``: this token stops working at once."""
+        """``DELETE /installation/token``: this token stops working at once.
+        https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token"""
         self._tokens.pop(token, None)
 
     def expire_token(self, token: str) -> None:
-        self._tokens[token] = self.now
+        grant = self._tokens.get(token)
+        if grant is not None:
+            grant.expires = self.now
 
     def revoke_auth(self, op: str | None = None) -> None:
         """Reject every request (or just ``op``) with a 401."""
@@ -194,12 +274,13 @@ class FakeGitHubAuth:
         self._limited, self._shape, self._limit_op = times, shape, op
 
     def respond_next(self, op: str, status: int) -> None:
-        """The next ``op`` request is answered with a plain ``status`` (403 or 404)."""
+        """The next ``op`` request is answered with a plain ``status`` (403 or 404): unsourced,
+        observed behaviour to prove live."""
         self._plain[op].append(status)
 
     def fault_next(self, op: str, mode: str, page: int | None = None, after: int = 0) -> None:
-        """The next ``op`` request (after skipping ``after``, and only for ``page``) suffers
-        ``5xx``, ``timeout``, ``429`` or ``401``."""
+        """The next ``op`` request (after skipping ``after``, and only for ``page``, one-based)
+        suffers ``5xx``, ``timeout``, ``429`` or ``401``."""
         self._faults[op].append([mode, page, after])
 
     def add(self, author: str, body: str, *, older: bool = False) -> Item:
@@ -257,71 +338,90 @@ class FakeGitHubAuth:
             "x-ratelimit-resource": "core",
         }
 
-    def _authenticated(self, op: str, token: str) -> Response | None:
+    def _preflight(
+        self, op: str, refused: Response | None, page: int | None, *, metered: bool
+    ) -> tuple[Response, dict[str, str]] | None:
+        """What every request meets before its own work: counted, authenticated, limited, then
+        the planted plain answer or fault. ``None`` means "carry on", with the quota headers
+        left in ``self._quota()``. ``refused`` is the credential check the caller already made."""
+        self.counts[op] += 1
+        if refused is None and (not self._auth_ok or op in self._deny_ops):
+            refused = _unauthorized("Bad credentials")
+        if refused is not None:
+            self.counts["unauthorized"] += 1
+            return refused, {}
+        quota = self._quota() if metered else {}
+        if self._limited > 0 and self._limit_op in (None, op):
+            self._limited -= 1
+            self.counts["limited"] += 1
+            return self._limit_response(self._shape), quota
+        if metered:
+            if self._used >= self.budget:
+                self.counts["limited"] += 1
+                message = f"API rate limit exceeded for installation ID {INSTALLATION_ID}."
+                return Response(403, quota, {"message": message}), quota
+            self._used += 1
+            quota = self._quota()
+        if self._plain[op]:
+            return Response(self._plain[op].pop(0), quota, {"message": "plain error"}), quota
+        fault = self._fault(op, page)
+        if fault == "5xx":
+            return Response(503, quota, {}), quota
+        if fault == "429":
+            return Response(429, {**quota, "retry-after": "30"}, {}), quota
+        if fault == "401":
+            return _unauthorized("Bad credentials"), quota
+        if fault == "timeout":
+            raise TimeoutError("timed out")
+        return None
+
+    def _token_refusal(self, token: str) -> Response | None:
         if not token:
             return _unauthorized("Requires authentication")
-        expiry = self._tokens.get(token)
-        if expiry is None or expiry <= self.now or not self._auth_ok or op in self._deny_ops:
+        grant = self._tokens.get(token)
+        if grant is None or grant.expires <= self.now:
             return _unauthorized("Bad credentials")
         return None
 
     def handle(self, op: str, token: str, **kw: Any) -> Response:
-        """One authenticated request: ``read`` or ``lookup`` (with ``page``, ``per_page``)."""
+        """One authenticated request: ``read`` or ``lookup`` (with ``page``, ``per_page``), and
+        optionally ``repo``, which a token narrowed to other repositories cannot reach (404)."""
         if op not in ("read", "lookup"):
             raise AssertionError(f"unknown op {op!r}: this fake has no write surface")
-        self.counts[op] += 1
-        refused = self._authenticated(op, token)
-        if refused is not None:
-            self.counts["unauthorized"] += 1
-            return refused
+        page = int(kw.get("page", 1)) if op == "lookup" else None
+        early = self._preflight(op, self._token_refusal(token), page, metered=True)
+        if early is not None:
+            return early[0]
         quota = self._quota()
-        if self._limited > 0 and self._limit_op in (None, op):
-            self._limited -= 1
-            self.counts["limited"] += 1
-            return self._limit_response(self._shape)
-        if self._used >= self.budget:
-            self.counts["limited"] += 1
-            return Response(
-                403,
-                quota,
-                {"message": f"API rate limit exceeded for installation ID {INSTALLATION_ID}."},
-            )
-        self._used += 1
-        quota = self._quota()
-        page = int(kw["page"]) if op == "lookup" else None
-        if self._plain[op]:
-            return Response(self._plain[op].pop(0), quota, {"message": "plain error"})
-        fault = self._fault(op, page)
-        if fault == "5xx":
-            return Response(503, quota, {})
-        if fault == "429":
-            return Response(429, {**quota, "retry-after": "30"}, {})
-        if fault == "401":
-            return _unauthorized("Bad credentials")
-        if fault == "timeout":
-            raise TimeoutError("timed out")
+        grant = self._tokens[token]
+        repo = kw.get("repo")
+        if repo is not None and grant.repositories is not None and repo not in grant.repositories:
+            return Response(404, quota, {"message": "Not Found"})
         if op == "read":
             return Response(200, quota, {"revision": self.revision})
-        return self._list(quota, page or 0, int(kw.get("per_page", PAGE_SIZE)))
+        return self._list(
+            quota, page if page is not None else 1, int(kw.get("per_page", DEFAULT_PER_PAGE))
+        )
 
     def _list(self, quota: dict[str, str], page: int, per_page: int) -> Response:
         """A page of the list.
 
-        ``per_page`` is capped at 100 and the ``link`` header names the next, previous, first and
-        last pages, one-based. https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+        ``page`` is one-based and ``per_page`` defaults to 30 and is capped at 100; the ``link``
+        header names the next, previous, first and last pages and is the only way to find them.
+        https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
         """
         per_page = max(1, min(per_page, PAGE_SIZE))
         listing = list(reversed(self.items)) if self.order == "newest_first" else self.items
-        chunk = listing[page * per_page : (page + 1) * per_page]
-        more = len(listing) > (page + 1) * per_page
-        last = max(0, (len(listing) - 1) // per_page)
+        chunk = listing[(page - 1) * per_page : page * per_page]
+        more = len(listing) > page * per_page
+        last = max(1, -(-len(listing) // per_page))
 
         def url(number: int, rel: str) -> str:
-            return f'<{HOST}/items?page={number + 1}&per_page={per_page}>; rel="{rel}"'
+            return f'<{HOST}/items?page={number}&per_page={per_page}>; rel="{rel}"'
 
-        links = ([url(page - 1, "prev"), url(0, "first")] if page > 0 and chunk else []) + (
+        links = ([url(page - 1, "prev"), url(1, "first")] if page > 1 and chunk else []) + (
             [url(page + 1, "next"), url(last, "last")] if more else []
         )
         headers = {**quota, **({"link": ", ".join(links)} if links else {})}
         items = [{"id": c.id, "author": c.author, "body": c.body} for c in chunk]
-        return Response(200, headers, {"items": items, "next": page + 1 if more else None})
+        return Response(200, headers, {"items": items})
