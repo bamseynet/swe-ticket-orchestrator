@@ -1,0 +1,264 @@
+{
+  "$defs": {
+    "Floors": {
+      "additionalProperties": false,
+      "properties": {
+        "ci_without_secrets_waived_for": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "title": "Ci Without Secrets Waived For",
+          "type": "array"
+        },
+        "decision_surfaces": {
+          "additionalProperties": {
+            "items": {
+              "enum": [
+                "ui",
+                "slack",
+                "github"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "review",
+              "qa",
+              "custom",
+              "pre_push"
+            ]
+          },
+          "title": "Decision Surfaces",
+          "type": "object"
+        },
+        "hold_after_approval_min": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Hold After Approval Min",
+          "type": "string"
+        },
+        "identity_max_age": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Identity Max Age",
+          "type": "string"
+        },
+        "mandatory_gate_roles": {
+          "additionalProperties": {
+            "items": {
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "propertyNames": {
+            "enum": [
+              "pre_push",
+              "review",
+              "qa"
+            ]
+          },
+          "title": "Mandatory Gate Roles",
+          "type": "object"
+        },
+        "public_repo_intake": {
+          "default": false,
+          "title": "Public Repo Intake",
+          "type": "boolean"
+        },
+        "requester_excluded_from": {
+          "default": [
+            "review",
+            "pre_push"
+          ],
+          "items": {
+            "enum": [
+              "review",
+              "qa",
+              "custom",
+              "pre_push"
+            ],
+            "type": "string"
+          },
+          "title": "Requester Excluded From",
+          "type": "array"
+        },
+        "require_up_to_date": {
+          "default": true,
+          "title": "Require Up To Date",
+          "type": "boolean"
+        },
+        "require_up_to_date_waived_for": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "title": "Require Up To Date Waived For",
+          "type": "array"
+        },
+        "route_to_gate_allowed": {
+          "default": false,
+          "title": "Route To Gate Allowed",
+          "type": "boolean"
+        },
+        "single_human_allowed": {
+          "default": false,
+          "title": "Single Human Allowed",
+          "type": "boolean"
+        },
+        "waive_allowed": {
+          "default": false,
+          "title": "Waive Allowed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mandatory_gate_roles",
+        "decision_surfaces",
+        "hold_after_approval_min",
+        "identity_max_age"
+      ],
+      "title": "Floors",
+      "type": "object"
+    },
+    "RequiredGate": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "role": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Role",
+          "type": "string"
+        },
+        "when": {
+          "$ref": "#/$defs/RequiredGateWhen"
+        }
+      },
+      "required": [
+        "id",
+        "role"
+      ],
+      "title": "RequiredGate",
+      "type": "object"
+    },
+    "RequiredGateWhen": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "enum": [
+            "risk",
+            "issue_type",
+            "priority",
+            "component",
+            "label",
+            "repo_ci_trust"
+          ],
+          "title": "Field",
+          "type": "string"
+        },
+        "value": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "value"
+      ],
+      "title": "RequiredGateWhen",
+      "type": "object"
+    },
+    "TeamPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_carry_over": {
+          "items": {
+            "enum": [
+              "patch_id",
+              "none"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Allowed Carry Over",
+          "type": "array"
+        },
+        "min_quorum": {
+          "additionalProperties": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "review",
+              "qa",
+              "custom",
+              "pre_push"
+            ]
+          },
+          "title": "Min Quorum",
+          "type": "object"
+        },
+        "required_gates": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RequiredGate"
+          },
+          "title": "Required Gates",
+          "type": "array"
+        }
+      },
+      "title": "TeamPolicy",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Editor hints only. This schema is looser than the loader: it cannot express that a date is real, a timezone or branch name is valid, which outcomes an effect has, or that an instant carries an offset. A document that validates here may still be refused by sto.config.schema.load_document, which is the authority.",
+  "properties": {
+    "apiVersion": {
+      "const": "sto/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "floors": {
+      "$ref": "#/$defs/Floors"
+    },
+    "kind": {
+      "const": "OrgPolicy",
+      "title": "Kind",
+      "type": "string"
+    },
+    "teams": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_-]*$": {
+          "$ref": "#/$defs/TeamPolicy"
+        }
+      },
+      "title": "Teams",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "floors"
+  ],
+  "title": "OrgPolicy",
+  "type": "object"
+}

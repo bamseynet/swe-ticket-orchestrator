@@ -1,0 +1,942 @@
+{
+  "$defs": {
+    "AgentStage": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Agent",
+          "type": "string"
+        },
+        "kind": {
+          "const": "agent",
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_attempts": {
+          "minimum": 1,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "model_tier": {
+          "enum": [
+            "fast",
+            "standard",
+            "deep"
+          ],
+          "title": "Model Tier",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "agent",
+        "next"
+      ],
+      "title": "AgentStage",
+      "type": "object"
+    },
+    "ApproverOf": {
+      "additionalProperties": false,
+      "properties": {
+        "approver_of": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Approver Of",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approver_of"
+      ],
+      "title": "ApproverOf",
+      "type": "object"
+    },
+    "ChecksStage": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "checks",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        },
+        "required": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "const": "team_default",
+              "type": "string"
+            }
+          ],
+          "title": "Required"
+        },
+        "source": {
+          "enum": [
+            "ci",
+            "qa_suite",
+            "post_merge"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "timeout": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Timeout",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "required",
+        "timeout",
+        "next"
+      ],
+      "title": "ChecksStage",
+      "type": "object"
+    },
+    "DefinitionOfDone": {
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "enum": [
+            "ac_present",
+            "checks_green",
+            "coverage_at_least",
+            "no_findings_above"
+          ],
+          "title": "Check",
+          "type": "string"
+        },
+        "stage": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Stage",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "stage",
+        "check"
+      ],
+      "title": "DefinitionOfDone",
+      "type": "object"
+    },
+    "Edge": {
+      "additionalProperties": false,
+      "properties": {
+        "loop": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Loop",
+          "type": "string"
+        },
+        "to": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "To",
+          "type": "string"
+        }
+      },
+      "required": [
+        "to"
+      ],
+      "title": "Edge",
+      "type": "object"
+    },
+    "EffectStage": {
+      "additionalProperties": false,
+      "properties": {
+        "effect": {
+          "enum": [
+            "branch.push",
+            "branch.promote",
+            "pr.ensure_draft",
+            "pr.update_branch",
+            "pr.mark_ready",
+            "pr.merge",
+            "pr.open_revert",
+            "ticket.comment",
+            "ticket.transition",
+            "env.deploy_preview",
+            "release.trigger",
+            "notify"
+          ],
+          "title": "Effect",
+          "type": "string"
+        },
+        "kind": {
+          "const": "effect",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        },
+        "requires_gates": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Requires Gates",
+          "type": "array"
+        },
+        "with": {
+          "additionalProperties": true,
+          "title": "With",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "effect",
+        "next"
+      ],
+      "title": "EffectStage",
+      "type": "object"
+    },
+    "Gate": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_over": {
+          "default": "none",
+          "enum": [
+            "patch_id",
+            "none"
+          ],
+          "title": "Carry Over",
+          "type": "string"
+        },
+        "decision_surfaces": {
+          "items": {
+            "enum": [
+              "ui",
+              "slack",
+              "github"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Decision Surfaces",
+          "type": "array"
+        },
+        "decisions": {
+          "items": {
+            "enum": [
+              "approve",
+              "request_changes",
+              "reject",
+              "retest",
+              "waive"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Decisions",
+          "type": "array"
+        },
+        "eligible_roles": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Eligible Roles",
+          "type": "array"
+        },
+        "path_owners": {
+          "enum": [
+            "none",
+            "codeowners"
+          ],
+          "title": "Path Owners",
+          "type": "string"
+        },
+        "quorum": {
+          "items": {
+            "$ref": "#/$defs/Quorum"
+          },
+          "minItems": 1,
+          "title": "Quorum",
+          "type": "array"
+        },
+        "separation_of_duties": {
+          "$ref": "#/$defs/SeparationOfDuties"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts"
+        },
+        "type": {
+          "enum": [
+            "review",
+            "qa",
+            "custom",
+            "pre_push"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "eligible_roles",
+        "decisions",
+        "decision_surfaces"
+      ],
+      "title": "Gate",
+      "type": "object"
+    },
+    "GateStage": {
+      "additionalProperties": false,
+      "properties": {
+        "gate": {
+          "$ref": "#/$defs/Gate"
+        },
+        "kind": {
+          "const": "gate",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "gate",
+        "next"
+      ],
+      "title": "GateStage",
+      "type": "object"
+    },
+    "Intake": {
+      "additionalProperties": false,
+      "properties": {
+        "extra_filter": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Extra Filter",
+          "type": "string"
+        },
+        "issue_types": {
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Issue Types",
+          "type": "array"
+        },
+        "label": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Label",
+          "type": "string"
+        },
+        "project": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Project",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "github",
+            "jira",
+            "linear",
+            "azure_devops"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "sprint": {
+          "$ref": "#/$defs/Sprint"
+        }
+      },
+      "required": [
+        "source",
+        "project",
+        "label"
+      ],
+      "title": "Intake",
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "properties": {
+        "loops": {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z][a-z0-9_]*$": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "title": "Loops",
+          "type": "object"
+        },
+        "max_run_age": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Max Run Age",
+          "type": "string"
+        },
+        "max_steps_per_run": {
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Max Steps Per Run",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_steps_per_run",
+        "max_run_age"
+      ],
+      "title": "Limits",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "team": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
+          "title": "Team",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "team"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    },
+    "Quorum": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "minimum": 1,
+          "title": "Count",
+          "type": "integer"
+        },
+        "role": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "count"
+      ],
+      "title": "Quorum",
+      "type": "object"
+    },
+    "Repo": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+          "title": "Base",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "sandbox_image": {
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "title": "Sandbox Image",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "base",
+        "sandbox_image"
+      ],
+      "title": "Repo",
+      "type": "object"
+    },
+    "ReviewPanelStage": {
+      "additionalProperties": false,
+      "properties": {
+        "block_on": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Block On",
+          "type": "string"
+        },
+        "fail_closed": {
+          "default": false,
+          "title": "Fail Closed",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "review_panel",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        },
+        "required": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Required",
+          "type": "array"
+        },
+        "reviewers": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Reviewers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "reviewers",
+        "required",
+        "block_on",
+        "next"
+      ],
+      "title": "ReviewPanelStage",
+      "type": "object"
+    },
+    "RouteStage": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "enum": [
+            "risk",
+            "issue_type",
+            "priority",
+            "component",
+            "label",
+            "repo_ci_trust"
+          ],
+          "title": "Field",
+          "type": "string"
+        },
+        "kind": {
+          "const": "route",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        },
+        "order": {
+          "items": {
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Order",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "field",
+        "next"
+      ],
+      "title": "RouteStage",
+      "type": "object"
+    },
+    "SeparationOfDuties": {
+      "additionalProperties": false,
+      "properties": {
+        "not": {
+          "items": {
+            "anyOf": [
+              {
+                "enum": [
+                  "author",
+                  "requester",
+                  "committer"
+                ],
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/ApproverOf"
+              }
+            ]
+          },
+          "minItems": 1,
+          "title": "Not",
+          "type": "array"
+        }
+      },
+      "required": [
+        "not"
+      ],
+      "title": "SeparationOfDuties",
+      "type": "object"
+    },
+    "Sprint": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "any",
+            "active_only"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "Sprint",
+      "type": "object"
+    },
+    "TerminalStage": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "terminal",
+          "title": "Kind",
+          "type": "string"
+        },
+        "result": {
+          "enum": [
+            "done",
+            "rejected",
+            "closed",
+            "expired",
+            "done_with_incident"
+          ],
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "result"
+      ],
+      "title": "TerminalStage",
+      "type": "object"
+    },
+    "Timeouts": {
+      "additionalProperties": false,
+      "properties": {
+        "escalate_after": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Escalate After",
+          "type": "string"
+        },
+        "escalate_to": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Escalate To",
+          "type": "string"
+        },
+        "expire_after": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Expire After",
+          "type": "string"
+        },
+        "remind_after": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Remind After",
+          "type": "string"
+        }
+      },
+      "title": "Timeouts",
+      "type": "object"
+    },
+    "WaitStage": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "wait",
+          "title": "Kind",
+          "type": "string"
+        },
+        "next": {
+          "additionalProperties": false,
+          "minProperties": 1,
+          "patternProperties": {
+            "^[A-Za-z0-9_.-]+$": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/$defs/Edge"
+                }
+              ]
+            }
+          },
+          "title": "Next",
+          "type": "object"
+        },
+        "timeout": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Timeout",
+          "type": "string"
+        },
+        "wait_for": {
+          "enum": [
+            "human_answer",
+            "environment_ready"
+          ],
+          "title": "Wait For",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "wait_for",
+        "timeout",
+        "next"
+      ],
+      "title": "WaitStage",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Editor hints only. This schema is looser than the loader: it cannot express that a date is real, a timezone or branch name is valid, which outcomes an effect has, or that an instant carries an offset. A document that validates here may still be refused by sto.config.schema.load_document, which is the authority.",
+  "properties": {
+    "apiVersion": {
+      "const": "sto/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "definition_of_done": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/DefinitionOfDone"
+      },
+      "title": "Definition Of Done",
+      "type": "array"
+    },
+    "intake": {
+      "$ref": "#/$defs/Intake"
+    },
+    "kind": {
+      "const": "Workflow",
+      "title": "Kind",
+      "type": "string"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "on_external_commit": {
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "title": "On External Commit",
+      "type": "string"
+    },
+    "repo": {
+      "$ref": "#/$defs/Repo"
+    },
+    "stages": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "discriminator": {
+            "mapping": {
+              "agent": "#/$defs/AgentStage",
+              "checks": "#/$defs/ChecksStage",
+              "effect": "#/$defs/EffectStage",
+              "gate": "#/$defs/GateStage",
+              "review_panel": "#/$defs/ReviewPanelStage",
+              "route": "#/$defs/RouteStage",
+              "terminal": "#/$defs/TerminalStage",
+              "wait": "#/$defs/WaitStage"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AgentStage"
+            },
+            {
+              "$ref": "#/$defs/ReviewPanelStage"
+            },
+            {
+              "$ref": "#/$defs/ChecksStage"
+            },
+            {
+              "$ref": "#/$defs/GateStage"
+            },
+            {
+              "$ref": "#/$defs/EffectStage"
+            },
+            {
+              "$ref": "#/$defs/WaitStage"
+            },
+            {
+              "$ref": "#/$defs/RouteStage"
+            },
+            {
+              "$ref": "#/$defs/TerminalStage"
+            }
+          ]
+        }
+      },
+      "title": "Stages",
+      "type": "object"
+    },
+    "start": {
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "title": "Start",
+      "type": "string"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "limits",
+    "start",
+    "stages"
+  ],
+  "title": "Workflow",
+  "type": "object"
+}
