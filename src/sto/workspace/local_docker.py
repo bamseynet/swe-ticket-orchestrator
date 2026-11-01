@@ -17,6 +17,19 @@ AWS sandbox, so it is built to hold what that sandbox holds:
 The ``docker`` calls go through a ``runner`` so the argv this module builds can be tested without
 Docker. Tests that need a real container carry the ``integration`` marker and run in CI.
 
+A clean report from code inside the container is never trusted, because it runs as the same user
+as the hostile command. After a sweep, the host reads the container's task count from its cgroup
+(``docker stats``) and requires exactly PID 1 and the keeper, several times in a row; anything
+else, or any sweep failure, destroys the session.
+
+Stated limits (this provider is for development and tests, not for hostile production code):
+
+* Where Yama ``ptrace_scope`` is 0, code in the container can ptrace the sweep or inject into the
+  keeper, and the task count cannot see that. CI logs ``ptrace_scope`` so we know what it proved.
+  There is no seccomp profile here.
+* A hostile process can keep itself alive only by outrunning the sweep, and the repeated count
+  below makes that unlikely, not impossible.
+
 What is not classified: a command's own stderr. Whether a session still exists is asked of Docker
 (``docker ps``), never read out of what the command printed.
 """
@@ -29,8 +42,10 @@ import re
 import selectors
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 
 from .ports import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -66,51 +81,53 @@ _HOST_GRACE_S = 10  # host deadline sits this far above the in-container timeout
 _ADMIN_TIMEOUT_S = 60.0
 _PULL_TIMEOUT_S = 600.0
 _SWEEP_TIMEOUT_S = 30.0
+_READY = "/tmp/.sto-ready"  # noqa: S108 - written inside the container after the snapshot is unpacked
+_BASELINE_TASKS = 2  # PID 1 (init) and the keeper
+_QUIET_SAMPLES = 3  # consecutive host-side counts that must equal the baseline
+_MAX_SAMPLES = 15
+_SAMPLE_PAUSE_S = 0.2
+_STALE_START_S = 300.0  # an unfinished start older than this is a crashed one and is taken over
 _EXIT_TIMEOUT = 124  # `timeout` when the command timed out
 _EXIT_KILLED = 137  # 128 + SIGKILL, when `-k` had to escalate
 _WORKSPACE = "/workspace"
 _UID = "1000:1000"
 _CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
-_IMAGE = re.compile(r"[a-z0-9][A-Za-z0-9._/:@-]{0,254}")
+_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
 _MEMORY = re.compile(r"[1-9][0-9]*[kmg]?")
 _CPUS = re.compile(r"[0-9]+(\.[0-9]+)?")
 _TMPFS_OPTS = "rw,exec,nosuid,nodev,uid=1000,gid=1000"
 
-# The sweep runs inside the container as `sh -c PRELUDE+BODY`. The prelude names the /proc root and
-# the kill command, so a test can run the real body against a fake /proc tree with a stub `kill`.
-SWEEP_PRELUDE = 'PROC=/proc\nsto_kill() { kill "$@" 2>/dev/null; }\n'
+# The sweep runs inside the container as `sh -c PRELUDE+BODY`. The prelude names the /proc root,
+# the kill command and the pause between rounds, so a test can run the real body against a fake
+# /proc tree with stubs. It does not read process state: a zombie leader with live threads, or a
+# comm that imitates a stat line, must not be believed. It kills until only PID 1, the keeper and
+# this shell remain; orphaned zombies are reaped by the init, so the loop is bounded by time
+# (400 rounds of ~20 ms), not by a small count. Its report is only a hint: the host verifies.
+SWEEP_PRELUDE = 'PROC=/proc\nsto_kill() { kill "$@" 2>/dev/null; }\nsto_wait() { sleep 0.02; }\n'
 # Keeper = the lowest PID above 1 (PID 1 is the init from `--init`; the keeper is `sleep infinity`,
-# started first and never exiting). Everything else, except this shell and zombies, is stopped and
-# then killed, round after round, until a scan finds nothing. Stopping first means a fork loop
-# cannot outrun the kill. Builtins only: no subshell, so the sweep never sees or kills itself.
+# started first). Stopping before killing means a fork loop cannot outrun the kill. No subshell:
+# the sweep never sees or kills itself.
 SWEEP_BODY = r"""
 keeper=
 for d in "$PROC"/[0-9]*; do
   p=${d#"$PROC"/}
   if [ "$p" -gt 1 ] && { [ -z "$keeper" ] || [ "$p" -lt "$keeper" ]; }; then keeper=$p; fi
 done
-scan() {
+i=0
+while [ "$i" -lt 400 ]; do
   pids=
   for d in "$PROC"/[0-9]*; do
     p=${d#"$PROC"/}
     [ "$p" -gt 1 ] || continue
     [ "$p" = "$keeper" ] && continue
     [ "$p" = "$$" ] && continue
-    line=
-    read -r line 2>/dev/null < "$d/stat" || continue
-    state=${line##*\) }
-    state=${state%% *}
-    [ "$state" = Z ] && continue
     pids="$pids $p"
   done
-}
-i=0
-while [ "$i" -lt 100 ]; do
-  scan
   if [ -z "$pids" ]; then echo clean; exit 0; fi
   for p in $pids; do sto_kill -STOP "$p"; done
   for p in $pids; do sto_kill -KILL "$p"; done
   i=$((i + 1))
+  sto_wait
 done
 echo "survivors:$pids"
 exit 1
@@ -236,6 +253,9 @@ class LocalDockerProvider:
         cpus: str = "2",
         pids_limit: int = 512,
         clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        stale_start_s: float = _STALE_START_S,
     ) -> None:
         if not _IMAGE.fullmatch(image):
             raise WorkspaceError("image must be a plain image reference (no leading '-')")
@@ -252,6 +272,11 @@ class LocalDockerProvider:
         self._cpus = cpus
         self._pids = pids_limit
         self._clock = clock
+        self._wall = wall
+        self._sleep = sleep
+        self._stale = stale_start_s
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
 
     @staticmethod
     def container_name(session_id: str) -> str:
@@ -270,16 +295,30 @@ class LocalDockerProvider:
     def _state(self, session_id: str) -> str:
         """The container state from `docker ps`, or ``absent``. Raises if Docker is silent."""
         name = self.container_name(session_id)
+        pattern = f"^/{re.escape(name)}$"  # ids may contain '.', which must not match anything
         res = self._call(
-            "ps", "-a", "--no-trunc", "--filter", f"name=^/{name}$", "--format", "{{.State}}"
+            "ps", "-a", "--no-trunc", "--filter", f"name={pattern}", "--format", "{{.State}}"
         )
         if res.exit_code != 0 or res.timed_out:
             raise WorkspaceUnavailableError("the Docker daemon did not answer")
         states = res.stdout.split()
         return states[0] if states else "absent"
 
+    def _ready(self, name: str, session_id: str) -> bool:
+        """The readiness marker, written only after the snapshot is fully unpacked."""
+        res = self._call("exec", name, "test", "-e", _READY)
+        if res.exit_code == 0 and not res.timed_out:
+            return True
+        if res.exit_code == 1 and not res.timed_out:
+            self._state(session_id)  # raises if the daemon is the reason
+            return False
+        raise WorkspaceUnavailableError("could not check the workspace marker")
+
     def is_alive(self, session_id: str) -> bool:
-        return self._state(session_id) == "running"
+        """Running and fully unpacked. A half-made session is not alive."""
+        if self._state(session_id) != "running":
+            return False
+        return self._ready(self.container_name(session_id), session_id)
 
     def _remove(self, target: str, *, force: bool) -> bool:
         res = self._call("rm", *(["-f"] if force else []), "-v", target)
@@ -299,20 +338,47 @@ class LocalDockerProvider:
             return WorkspaceUnavailableError("the Docker daemon did not answer")
         return WorkspaceError(message)
 
-    def start(self, session_id: str, snapshot: bytes) -> None:
-        name = self.container_name(session_id)
-        plain = normalize_snapshot(snapshot)  # refuses anything unsafe before Docker is touched
-        state = self._state(session_id)
+    def _age_s(self, name: str) -> tuple[str, float]:
+        """The container id and its age, from `docker inspect`. Unparseable counts as brand new."""
+        res = self._call("inspect", "--type", "container", "-f", "{{.Id}} {{.Created}}", name)
+        if res.exit_code != 0:
+            raise WorkspaceUnavailableError("the Docker daemon did not answer")
+        cid, _, created = res.stdout.strip().partition(" ")
+        try:
+            when = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", created))
+            return cid, self._wall() - when.astimezone(UTC).timestamp()
+        except ValueError:
+            return cid, 0.0
+
+    def _clear_leftover(self, session_id: str, name: str, state: str) -> None:
+        """Make the name free, or say why not. Never touches a start that is still in progress."""
         if state in ("exited", "dead"):
             # A dead leftover. No `-f`: if it is not dead any more, someone else owns the name.
             if not self._remove(name, force=False) and self._state(session_id) != "absent":
                 raise SessionExistsError("session already exists")
-        elif state != "absent":
-            raise SessionExistsError(f"session already exists ({state}); stop() it first")
+            return
+        if state == "running" and self._ready(name, session_id):
+            raise SessionExistsError("session already exists")
+        # created / running but not unpacked / paused: a peer's start, or a crashed one.
+        cid, age = self._age_s(name)
+        if age < self._stale:
+            raise WorkspaceUnavailableError(f"a start of this session is in progress ({state})")
+        if not self._remove(cid, force=True):
+            raise WorkspaceUnavailableError("a crashed start could not be taken over")
+
+    def start(self, session_id: str, snapshot: bytes) -> None:
+        name = self.container_name(session_id)
+        plain = normalize_snapshot(snapshot)  # refuses anything unsafe before Docker is touched
+        state = self._state(session_id)
+        if state != "absent":
+            self._clear_leftover(session_id, name, state)
         created = self._call(*self._create_args(name), timeout_s=_PULL_TIMEOUT_S)
         cid = created.stdout.strip()
         if created.exit_code != 0 or not _CONTAINER_ID.fullmatch(cid):
-            # Nothing of ours exists, so nothing is removed: a name conflict means a peer won.
+            # Nothing of ours exists, so nothing is removed. If the name appeared since we looked,
+            # a peer won the race: that is "exists", which callers expect, not a failure.
+            if self._state(session_id) != "absent":
+                raise SessionExistsError("session was created by another caller")
             raise self._fail(f"could not create the workspace container: {created.stderr[:500]}")
         try:
             started = self._call("start", cid)
@@ -323,6 +389,9 @@ class LocalDockerProvider:
             )
             if extracted.exit_code != 0:
                 raise self._fail(f"could not unpack the snapshot: {extracted.stderr[:500]}")
+            marked = self._call("exec", cid, "touch", _READY)
+            if marked.exit_code != 0:
+                raise self._fail(f"could not mark the workspace ready: {marked.stderr[:500]}")
         except BaseException:
             # Only this call's own container, by id.
             with contextlib.suppress(WorkspaceError, WorkspaceUnavailableError):
@@ -383,6 +452,14 @@ class LocalDockerProvider:
     ) -> ExecResult:
         name = self.container_name(session_id)
         check_exec_args(command, timeout_s, max_output_bytes)
+        with self._guard:
+            lock = self._locks.setdefault(session_id, threading.Lock())
+        with lock:  # one command at a time: a sweep must never kill a neighbour
+            return self._exec_locked(session_id, name, command, timeout_s, max_output_bytes)
+
+    def _exec_locked(
+        self, session_id: str, name: str, command: str, timeout_s: float, max_output_bytes: int
+    ) -> ExecResult:
         started = self._clock()
         res = self._run(
             [
@@ -412,12 +489,13 @@ class LocalDockerProvider:
             )  # fmt: skip
         # `timeout` reports 124 (or 137 after -k); only the clock tells that from a command that
         # exits with those codes itself, or is killed by the OOM killer.
+        killed_at_cap = res.truncated and res.exit_code is None  # else: finished, text re-capped
         hit_timeout = (
-            not res.truncated
+            not killed_at_cap
             and res.exit_code in (_EXIT_TIMEOUT, _EXIT_KILLED)
             and elapsed >= timeout_s
         )
-        if res.truncated or hit_timeout:
+        if killed_at_cap or hit_timeout:
             destroyed = not self._sweep(session_id)
             return ExecResult(
                 None, res.stdout, res.stderr, timed_out=hit_timeout, truncated=res.truncated,
@@ -431,10 +509,30 @@ class LocalDockerProvider:
         return res
 
     def _sweep(self, session_id: str) -> bool:
-        """Kill everything the command left behind. True if verified; else the session is gone."""
+        """Kill everything the command left behind, then verify from the host.
+
+        True only if the sweep says clean AND the host sees just PID 1 and the keeper, several
+        times in a row. Anything else destroys the session and returns False.
+        """
         name = self.container_name(session_id)
         res = self._call("exec", name, "sh", "-c", SWEEP_SCRIPT, timeout_s=_SWEEP_TIMEOUT_S)
-        if res.exit_code == 0 and not res.timed_out and res.stdout.strip() == "clean":
+        said_clean = res.exit_code == 0 and not res.timed_out and res.stdout.strip() == "clean"
+        if said_clean and self._host_sees_quiet(name):
             return True
         self.stop(session_id)
+        return False
+
+    def _tasks(self, name: str) -> int | None:
+        """Tasks in the container cgroup (threads and zombies included), counted by the host."""
+        res = self._call("stats", "--no-stream", "--format", "{{.PIDs}}", name)
+        text = res.stdout.strip()
+        return int(text) if res.exit_code == 0 and text.isdigit() else None
+
+    def _host_sees_quiet(self, name: str) -> bool:
+        streak = 0
+        for _ in range(_MAX_SAMPLES):
+            streak = streak + 1 if self._tasks(name) == _BASELINE_TASKS else 0
+            if streak >= _QUIET_SAMPLES:
+                return True
+            self._sleep(_SAMPLE_PAUSE_S)
         return False

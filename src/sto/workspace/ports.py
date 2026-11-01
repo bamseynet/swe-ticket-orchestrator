@@ -13,13 +13,21 @@ Result semantics every provider must keep (the conformance suite runs them again
 against Docker):
 
 * ``exit_code`` is the command's own exit status, or ``None`` when the command did not exit by
-  itself: it timed out, or it was killed at the output cap. Never a signal number.
+  itself: it timed out, or it was killed at the output cap. Never a signal number. A command that
+  fails to start (126, 127) with the daemon up is an ordinary exit code, not an error.
 * **Timeout:** ``timed_out`` is True. Output produced so far is kept (capped).
 * **Output cap:** each stream is capped at ``max_output_bytes`` of what the caller receives. When a
   stream goes over, the command is killed, ``truncated`` is True and ``exit_code`` is ``None``.
+  A command that exits by itself with text that merely decodes past the cap (invalid UTF-8)
+  keeps its real ``exit_code``; ``truncated`` is still True and nothing is killed.
 * **After a timeout or cap, nothing the command started is still running** (children that ignore
-  SIGTERM or call ``setsid`` included), and the provider has verified it. If it cannot verify that,
-  it destroys the session and sets ``session_destroyed`` so the caller recovers from the branch.
+  SIGTERM or call ``setsid`` included), and the provider has verified it **from outside the
+  sandbox**, not by asking code in it. If it cannot verify that, it destroys the session and sets
+  ``session_destroyed`` so the caller recovers from the branch. A command that exits by itself is
+  never swept: a caller that needs a quiet workspace (patch capture) must check for itself.
+* **One command at a time per session.** ``exec`` calls on one session are serialized by the
+  provider: a second call waits until the first has finished and been cleaned up, so one command's
+  cleanup can never kill another command.
 * ``timed_out`` is set only when the time really elapsed. A command that exits with 124 or 137 on
   its own reports that exit code.
 * Infrastructure failures are never command results: a daemon that does not answer raises
@@ -27,7 +35,8 @@ against Docker):
 
 Snapshot format: a tar archive, plain or gzip, of regular files, directories and symbolic links
 (real repositories have them). Hard links, devices, absolute or ``..`` paths and members that sit
-behind a symbolic link are refused. Providers never follow a link out of the workspace.
+behind a symbolic link are refused. The fake never follows a link out of its snapshot; in a real
+container a link is the container's own filesystem, and the sandbox is the boundary.
 
 ``FakeWorkspaceProvider`` gives local tests the same port with no Docker.
 """
@@ -39,6 +48,7 @@ import io
 import posixpath
 import re
 import tarfile
+import threading
 import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -202,7 +212,10 @@ def _plain_tar(data: bytes) -> bytes:
 
 def read_snapshot(data: bytes) -> ParsedSnapshot:
     """Validate a snapshot (plain or gzip tar) and read it into memory. Nothing is extracted."""
-    plain = _plain_tar(data)
+    return _parse(_plain_tar(data))
+
+
+def _parse(plain: bytes) -> ParsedSnapshot:
     files: dict[str, bytes] = {}
     links: dict[str, str] = {}
     dirs: set[str] = set()
@@ -242,8 +255,9 @@ def read_snapshot(data: bytes) -> ParsedSnapshot:
 
 def normalize_snapshot(data: bytes) -> bytes:
     """Validate a snapshot and return it as a plain tar, ready to stream into a sandbox."""
-    read_snapshot(data)
-    return _plain_tar(data)
+    plain = _plain_tar(data)  # decompressed once
+    _parse(plain)
+    return plain
 
 
 def unpack_snapshot(data: bytes) -> dict[str, bytes]:
@@ -289,7 +303,7 @@ def _raw(value: str | bytes) -> bytes:
 @dataclass(frozen=True)
 class FakeOutcome:
     """A scripted command result. ``duration_s`` past the timeout makes the command time out;
-    ``unkillable`` makes the cleanup after that fail, so the session is destroyed."""
+    ``unkillable`` makes the cleanup after a timeout or a cap fail, so the session is destroyed."""
 
     stdout: str | bytes = ""
     stderr: str | bytes = ""
@@ -308,6 +322,8 @@ class FakeWorkspaceProvider:
 
     def __init__(self) -> None:
         self._fs: dict[str, ParsedSnapshot] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
         self._scripts: dict[str, FakeOutcome] = {}
         self.history: list[tuple[str, str]] = []  # (session_id, command)
 
@@ -341,29 +357,39 @@ class FakeWorkspaceProvider:
     ) -> ExecResult:
         check_session_id(session_id)
         check_exec_args(command, timeout_s, max_output_bytes)
+        with self._guard:
+            lock = self._locks.setdefault(session_id, threading.Lock())
+        with lock:  # one command at a time per session
+            return self._exec_locked(session_id, command, timeout_s, max_output_bytes)
+
+    def _exec_locked(
+        self, session_id: str, command: str, timeout_s: float, max_output_bytes: int
+    ) -> ExecResult:
         snap = self._fs.get(session_id)
         if snap is None:
             raise SessionLostError("no such session")
         self.history.append((session_id, command))
         outcome = self._outcome(command, snap)
         snap.files.update(outcome.writes)
-        out, out_cut = cap_text(_raw(outcome.stdout), max_output_bytes)
-        err, err_cut = cap_text(_raw(outcome.stderr), max_output_bytes)
-        if outcome.duration_s > timeout_s:
-            destroyed = outcome.unkillable
-            if destroyed:
-                self._fs.pop(session_id, None)
-            return ExecResult(
-                None,
-                out,
-                err,
-                timed_out=True,
-                truncated=out_cut or err_cut,
-                session_destroyed=destroyed,
-            )
-        if out_cut or err_cut:
-            return ExecResult(None, out, err, timed_out=False, truncated=True)
-        return ExecResult(outcome.exit_code, out, err, timed_out=False, truncated=False)
+        raw_out, raw_err = _raw(outcome.stdout), _raw(outcome.stderr)
+        out, out_cut = cap_text(raw_out, max_output_bytes)
+        err, err_cut = cap_text(raw_err, max_output_bytes)
+        timed_out = outcome.duration_s > timeout_s
+        killed_at_cap = not timed_out and (
+            len(raw_out) > max_output_bytes or len(raw_err) > max_output_bytes
+        )
+        destroyed = outcome.unkillable and (timed_out or killed_at_cap)
+        if destroyed:
+            self._fs.pop(session_id, None)
+        exit_code = None if (timed_out or killed_at_cap) else outcome.exit_code
+        return ExecResult(
+            exit_code,
+            out,
+            err,
+            timed_out=timed_out,
+            truncated=out_cut or err_cut,
+            session_destroyed=destroyed,
+        )
 
     def _outcome(self, command: str, snap: ParsedSnapshot) -> FakeOutcome:
         if command in self._scripts:
