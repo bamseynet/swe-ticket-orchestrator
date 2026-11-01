@@ -38,6 +38,7 @@ from sto.domain import (
     PermanentError,
     RunId,
     Surface,
+    TransientError,
     from_wire,
     to_wire,
 )
@@ -129,6 +130,13 @@ class StaleRoundError(GateError):
     code = "stale_round"
 
 
+class GateContentionError(TransientError):
+    """The gate kept changing under this call (or the store kept conflicting) until the retries
+    ran out. Nothing was written. Retry the call."""
+
+    code = "gate_contention"
+
+
 class GateRoundLimitError(GateError):
     """Too many rounds, or a transaction that would pass the store's operation cap."""
 
@@ -181,6 +189,10 @@ class GateService:
                     )
                 return gate
             siblings = self._rounds(scope, cmd.run_id, cmd.name)
+            if any(other.round > cmd.round for _, other in siblings):
+                raise GateConflictError(
+                    f"cannot open round {cmd.round} of gate {cmd.name!r}: a newer round exists"
+                )
             if len(siblings) >= MAX_ROUNDS_PER_GATE:
                 raise GateRoundLimitError(
                     f"gate {cmd.name!r} already has {len(siblings)} rounds; "
@@ -222,8 +234,9 @@ class GateService:
                 _backoff(attempt)
             else:
                 return gate
-        assert last is not None
-        raise last
+        if last is not None:
+            raise last
+        raise GateContentionError(f"gate {cmd.name!r} round {cmd.round} kept changing; try again")
 
     # --- decide -----------------------------------------------------------------------------
 
@@ -292,8 +305,9 @@ class GateService:
                 _backoff(attempt)
             else:
                 return Decided(closed, decision)
-        assert last is not None
-        raise last
+        if last is not None:
+            raise last
+        raise GateContentionError(f"gate {gate!r} round {round} kept changing; try again")
 
     # --- internals --------------------------------------------------------------------------
 
