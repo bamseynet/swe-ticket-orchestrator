@@ -19,11 +19,13 @@ from sto.agents.step_token import (
     ISSUER,
     MAX_JTI,
     MAX_LEEWAY,
+    MAX_SECRET_BYTES,
     MAX_TOKEN_BYTES,
     MAX_TOOL_NAME,
     MAX_TOOLS,
     MAX_TTL,
     AttemptDirectory,
+    AttemptLookup,
     AttemptRecord,
     InProcessReissuer,
     JwksVerifier,
@@ -668,8 +670,6 @@ class Env:
         *,
         issuer: str = ISSUER,
         audience: str = AUDIENCE,
-        reissue_issuer: str | None = None,
-        reissue_audience: str | None = None,
     ) -> None:
         self.signer = signer
         self.issuer, self.audience = issuer, audience
@@ -677,15 +677,7 @@ class Env:
         self.directory = InMemoryAttemptDirectory()
         self.flags = Flags()
         self.verifier = hs_verifier(signer, issuer=issuer, audience=audience)
-        self.reissuer = InProcessReissuer(
-            signer,
-            hs_verifier(
-                signer, issuer=reissue_issuer or issuer, audience=reissue_audience or audience
-            ),
-            self.directory,
-            issuer=reissue_issuer or issuer,
-            audience=reissue_audience or audience,
-        )
+        self.reissuer = InProcessReissuer(signer, self.verifier, self.directory)
         self.broker = StepBroker(
             verifier=self.verifier,
             reissuer=self.reissuer,
@@ -874,11 +866,40 @@ def test_refresh_keeps_a_non_default_issuer_and_audience(hs: LocalSigner) -> Non
     assert reason(hs_verifier(hs).verify, new, now=NOW + 100) == "wrong issuer"
 
 
-def test_refresh_refuses_a_reissuer_that_changes_audience_or_issuer(hs: LocalSigner) -> None:
-    _, token, secret = (e := Env(hs, audience="gateway", reissue_audience="other")).start()
-    assert reason(e.broker.refresh, token, secret, now=NOW + 1) == "wrong audience"
-    _, token, secret = (e := Env(hs, issuer="a", reissue_issuer="b")).start()
-    assert reason(e.broker.refresh, token, secret, now=NOW + 1) == "wrong issuer"
+class Mismatched:
+    """A reissuer with a correct input verifier that mints with another issuer or audience."""
+
+    ttl = 300
+
+    def __init__(self, env: Env, **mint_over: Any) -> None:
+        self.env = env
+        self.mint_over = mint_over
+
+    def reissue(self, token: str, secret: bytes, *, now: int) -> str:
+        verified = self.env.verifier.verify(token, now=now)
+        return mint_step_token(self.env.signer, verified.context, now=now, **self.mint_over)
+
+
+def test_broker_refuses_a_returned_token_with_another_audience_or_issuer(hs: LocalSigner) -> None:
+    for over, expected in (
+        ({"audience": "other"}, "wrong audience"),
+        ({"issuer": "b"}, "wrong issuer"),
+    ):
+        e = Env(hs, issuer="a" if "issuer" in over else ISSUER)
+        e.broker._reissuer = Mismatched(e, **over)  # noqa: SLF001
+        _, token, secret = e.start()
+        assert reason(e.broker.refresh, token, secret, now=NOW + 1) == expected
+
+
+def test_reissuer_mints_with_its_verifiers_issuer_and_audience(hs: LocalSigner) -> None:
+    e = Env(hs, issuer="sto-prod", audience="gateway")
+    _, token, secret = e.start()
+    new = e.reissuer.reissue(token, secret, now=NOW + 1)
+    claims = json.loads(base64.urlsafe_b64decode(new.split(".")[1] + "=="))
+    assert (claims["iss"], claims["aud"]) == ("sto-prod", "gateway")
+    params = inspect.signature(InProcessReissuer.__init__).parameters
+    assert "issuer" not in params
+    assert "audience" not in params
 
 
 def test_refresh_refuses_a_reissuer_that_changes_the_context(env: Env) -> None:
@@ -894,7 +915,10 @@ def test_refresh_refuses_a_reissuer_that_changes_the_context(env: Env) -> None:
         store=env.store, flags=env.flags,
     )  # fmt: skip
     _, token, secret = env.start()
-    assert reason(broker.refresh, token, secret, now=NOW) == "reissued token changed the context"
+    assert (
+        reason(broker.refresh, token, secret, now=NOW)
+        == "context differs from the registered attempt"
+    )
 
 
 def test_refresh_refuses_a_reissuer_that_outlives_the_deadline(env: Env) -> None:
@@ -1195,17 +1219,18 @@ def test_attempts_of_different_steps_do_not_supersede_each_other(
 
 
 class HookedLatest(dict[Any, int]):
-    """A ``_latest`` map that runs a callback the first time it is read."""
+    """A ``_latest`` map that reads, then runs a callback once, then returns the stale value."""
 
     def __init__(self) -> None:
         super().__init__()
         self.hook: Any = None
 
     def get(self, key: Any, default: Any = None) -> Any:
+        value = super().get(key, default)  # read first, then let the other thread in
         hook, self.hook = self.hook, None
         if hook is not None:
             hook()
-        return super().get(key, default)
+        return value
 
 
 def test_concurrent_register_never_moves_the_latest_attempt_backwards(env: Env) -> None:
@@ -1395,6 +1420,98 @@ def test_broker_calls_refuse_expired_and_wrong_alg_tokens(env: Env) -> None:
     _, token, _ = env.start()
     assert reason(env.broker.read_ledger, token, "TICKET#1", now=NOW + 300) == "expired"
     assert reason(env.broker.raise_flag, token, "n", "d", now=NOW + 300) == "expired"
+
+
+def test_read_and_flag_refuse_a_token_whose_context_differs_from_the_registered_one(
+    env: Env,
+) -> None:
+    env.start()
+    other = mint_step_token(env.signer, ctx(tools=("repo.read", "repo.write")), now=NOW)
+    msg = "context differs from the registered attempt"
+    assert reason(env.broker.read_ledger, other, "TICKET#1", now=NOW) == msg
+    assert reason(env.broker.raise_flag, other, "n", "d", now=NOW) == msg
+    for over in ({"repo": "evil/x"}, {"sha": "b" * 40}):
+        forged = mint_step_token(env.signer, ctx(**over), now=NOW)
+        assert reason(env.broker.read_ledger, forged, "TICKET#1", now=NOW) == msg
+    assert env.flags.raised == []
+
+
+def test_concurrent_end_never_moves_the_latest_attempt_backwards(env: Env) -> None:
+    """Force register(6) to run between end(5)'s read of the latest attempt and its write."""
+    latest = HookedLatest()
+    env.directory._latest = latest  # noqa: SLF001
+    done = threading.Event()
+
+    def register_six() -> None:
+        env.directory.register(ctx(attempt=6), new_attempt_secret(), deadline=NOW + 1000)
+        done.set()
+
+    def hook() -> None:
+        threading.Thread(target=register_six, daemon=True).start()
+        done.wait(timeout=0.3)  # without a lock this finishes here; with one it waits its turn
+
+    latest.hook = hook
+    env.directory.end(ctx(attempt=5))
+    assert done.wait(timeout=5)
+    six = env.directory.attempt(ctx(attempt=6))
+    assert six is not None
+    assert six.live is True
+
+
+def test_secret_length_is_capped_before_hashing(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, token, secret = env.start()
+    spy = SpyReissuer(env.reissuer)
+    env.broker._reissuer = spy  # noqa: SLF001
+    hashed: list[int] = []
+    real = hashlib.sha256
+
+    def counting(data: bytes = b"") -> Any:
+        hashed.append(len(data))
+        return real(data)
+
+    monkeypatch.setattr(hashlib, "sha256", counting)
+    huge = b"s" * (MAX_SECRET_BYTES + 1)
+    assert reason(env.reissuer.reissue, token, huge, now=NOW) == "bad attempt secret"
+    assert reason(env.broker.refresh, token, huge, now=NOW) == "bad attempt secret"
+    assert reason(env.broker.refresh, token, b"s" * 10_000_000, now=NOW) == "bad attempt secret"
+    assert [n for n in hashed if n] == []  # empty-data calls come from hmac internals
+    assert spy.calls == []
+    # the longest allowed secret is hashed and compared normally
+    assert (
+        reason(env.reissuer.reissue, token, b"s" * MAX_SECRET_BYTES, now=NOW)
+        == "bad attempt secret"
+    )
+    assert [n for n in hashed if n] == [MAX_SECRET_BYTES]
+    assert env.reissuer.reissue(token, secret, now=NOW)
+
+
+def test_register_caps_the_secret_length(env: Env) -> None:
+    c = ctx()
+    with pytest.raises(StepTokenError):
+        env.directory.register(c, b"s" * (MAX_SECRET_BYTES + 1), deadline=NOW + 10)
+    env.directory.register(c, b"s" * MAX_SECRET_BYTES, deadline=NOW + 10)
+
+
+def test_directory_protocol_declares_register_and_end_but_the_broker_needs_only_lookup(
+    env: Env,
+) -> None:
+    assert isinstance(env.directory, AttemptDirectory)
+    assert isinstance(env.directory, AttemptLookup)
+
+    class LookupOnly:
+        def attempt(self, context: StepContext) -> AttemptRecord | None:
+            return None
+
+    assert isinstance(LookupOnly(), AttemptLookup)
+    assert not isinstance(LookupOnly(), AttemptDirectory)
+    broker = StepBroker(
+        verifier=env.verifier,
+        reissuer=env.reissuer,
+        directory=LookupOnly(),
+        store=env.store,
+        flags=env.flags,
+    )
+    assert not hasattr(broker._directory, "register")  # noqa: SLF001
 
 
 # -- failing dependencies fail closed -----------------------------------------------------------

@@ -7,7 +7,10 @@ dispatcher delivered at invoke (``(step, attempt)`` is guessable, the secret is 
 
 The broker has **no signing power**: it holds a ``StepReissuer``, a narrow callback to the
 dispatcher that takes the presented token and the attempt secret and returns a token. The
-dispatcher re-checks both, so a compromised broker cannot mint for any other team, stage or scope.
+dispatcher re-checks both, so a compromised broker cannot mint for another team, stage or scope.
+It does not stop a caller who holds the token and secret and controls ``now`` from pre-minting
+future tokens or reviving an expired one, so a remote reissuer must use the dispatcher's clock and
+ignore the caller's ``now`` (D11-04).
 
 Rules, all fail-closed:
 
@@ -33,7 +36,8 @@ import threading
 from typing import Final, Protocol
 
 from sto.agents.step_token import (
-    AttemptDirectory,
+    MAX_SECRET_BYTES,
+    AttemptLookup,
     AttemptRecord,
     StepContext,
     StepReissuer,
@@ -75,7 +79,7 @@ class InMemoryAttemptDirectory:
         return (*cls._step(c), c.attempt)
 
     def register(self, context: StepContext, secret: bytes, *, deadline: int) -> None:
-        if not isinstance(secret, bytes) or len(secret) < SECRET_BYTES:
+        if not isinstance(secret, bytes) or not SECRET_BYTES <= len(secret) <= MAX_SECRET_BYTES:
             raise StepTokenError("invalid attempt secret")
         record = AttemptRecord(
             context=context, secret_digest=hashlib.sha256(secret).digest(), deadline=deadline
@@ -120,7 +124,7 @@ class StepBroker:
         *,
         verifier: StepTokenVerifier,
         reissuer: StepReissuer,
-        directory: AttemptDirectory,
+        directory: AttemptLookup,
         store: Store,
         flags: FlagSink,
     ) -> None:
@@ -139,6 +143,8 @@ class StepBroker:
             raise StepTokenError("step not live")
         if now >= record.deadline:
             raise StepTokenError("step deadline passed")
+        if verified.context != record.context:
+            raise StepTokenError("context differs from the registered attempt")
         return verified, record
 
     def read_ledger(self, token: str, sk: str, *, now: int) -> Item | None:
@@ -169,16 +175,17 @@ class StepBroker:
 
     def refresh(self, token: str, secret: bytes, *, now: int) -> str:
         """Ask the dispatcher for a new token with the same context, if the step is live."""
-        verified, record = self._live(token, now)
-        if not isinstance(secret, bytes) or not hmac.compare_digest(
-            hashlib.sha256(secret).digest(), record.secret_digest
+        _, record = self._live(token, now)
+        if (
+            not isinstance(secret, bytes)
+            or len(secret) > MAX_SECRET_BYTES
+            or not hmac.compare_digest(hashlib.sha256(secret).digest(), record.secret_digest)
         ):
             raise StepTokenError("bad attempt secret")
         new = self._reissuer.reissue(token, secret, now=now)
         # The reissuer is outside this process in a deployment: trust nothing it returns.
+        # ``_live`` also requires the new token's context to equal the registered one.
         again, again_record = self._live(new, now)
-        if again.context != verified.context:
-            raise StepTokenError("reissued token changed the context")
         if again.exp > again_record.deadline:
             raise StepTokenError("reissued token outlives the step")
         return new

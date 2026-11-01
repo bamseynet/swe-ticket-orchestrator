@@ -54,6 +54,7 @@ MAX_TOKEN_BYTES: Final = 8 * 1024
 MAX_TOOLS: Final = 64
 MAX_TOOL_NAME: Final = 128
 MAX_JTI: Final = 64
+MAX_SECRET_BYTES: Final = 128  # per-attempt secrets are 32 bytes; refuse bigger before hashing
 MIN_RSA_BITS: Final = 2048
 MAX_RSA_BITS: Final = 8192
 MIN_RSA_EXPONENT: Final = 65537
@@ -245,6 +246,14 @@ class StepTokenVerifier:
     @property
     def max_ttl(self) -> int:
         return self._max_ttl
+
+    @property
+    def issuer(self) -> str:
+        return self._issuer
+
+    @property
+    def audience(self) -> str:
+        return self._audience
 
     def __init__(
         self,
@@ -467,9 +476,19 @@ class AttemptRecord:
 
 
 @runtime_checkable
-class AttemptDirectory(Protocol):
+class AttemptLookup(Protocol):
+    """The read side of the directory: all that the broker and the reissuer need."""
+
+    def attempt(self, context: StepContext) -> AttemptRecord | None:
+        """The record, with ``live`` False once ended or superseded, or ``None`` if unknown."""
+        ...
+
+
+@runtime_checkable
+class AttemptDirectory(AttemptLookup, Protocol):
     """Which step attempts are live, with the stored context and digest of each attempt's secret.
 
+    The dispatcher holds this whole interface; the broker holds only ``AttemptLookup``.
     A *step* is ``(team, run, stage, visit)``; an *attempt* adds ``attempt``. Rules every
     implementation must keep:
 
@@ -483,12 +502,13 @@ class AttemptDirectory(Protocol):
       register: a full cancel needs a step-level stop, which is the engine's job.
     * ``register``, ``end`` and ``attempt`` are **atomic** with respect to each other: concurrent
       calls behave as if run one at a time, and the latest attempt of a step never goes backwards.
-    * ``deadline`` is an ``int`` (epoch seconds); anything else is refused.
+    * ``deadline`` is an ``int`` (epoch seconds), and ``secret`` is 32 to ``MAX_SECRET_BYTES``
+      bytes; anything else is refused.
     """
 
-    def attempt(self, context: StepContext) -> AttemptRecord | None:
-        """The record, with ``live`` False once ended or superseded, or ``None`` if unknown."""
-        ...
+    def register(self, context: StepContext, secret: bytes, *, deadline: int) -> None: ...
+
+    def end(self, context: StepContext) -> None: ...
 
 
 class StepReissuer(Protocol):
@@ -496,8 +516,13 @@ class StepReissuer(Protocol):
 
     ``reissue`` takes the token the caller presented and the per-attempt secret. The dispatcher
     checks both itself, and the broker's own checks are only defence in depth. A compromised
-    broker can therefore refresh only a live token it holds together with that attempt's secret.
-    ``ttl`` is the lifetime asked for before the expiry is clamped to the attempt's deadline.
+    broker therefore cannot change scope, or refresh another team's or an unknown attempt.
+
+    It is not proof that a refresh happens only when it should: a caller who holds the token and
+    the secret **and controls** ``now`` can pre-mint tokens for the future, or revive a token that
+    has expired. A remote reissuer must therefore use the dispatcher's own clock and ignore the
+    caller's ``now`` (D11-04). The deadline still bounds every token. ``ttl`` is the lifetime asked
+    for before the expiry is clamped to the attempt's deadline.
     """
 
     @property
@@ -509,23 +534,22 @@ class StepReissuer(Protocol):
 class InProcessReissuer:
     """``StepReissuer`` for one host and for tests. A deployed broker calls the dispatcher instead.
 
-    Before signing it: verifies the token with its own pinned verifier (issuer, audience,
-    algorithm, expiry); looks the attempt up in the directory and requires it to be live and
-    before its deadline; compares the secret in constant time with the stored digest; requires the
-    token's context to equal the context stored at registration; and clamps the expiry to the
+    It mints with its verifier's own issuer and audience, so the token it hands out is one that
+    verifier accepts. Before signing it: verifies the token with that pinned verifier (issuer,
+    audience, algorithm, expiry); looks the attempt up in the directory and requires it to be live
+    and before its deadline; compares the secret in constant time with the stored digest; requires
+    the token's context to equal the context stored at registration; and clamps the expiry to the
     deadline. After signing it checks the attempt is still live and refuses if it ended meanwhile.
     """
 
-    __slots__ = ("_audience", "_directory", "_issuer", "_signer", "_ttl", "_verifier")
+    __slots__ = ("_directory", "_signer", "_ttl", "_verifier")
 
     def __init__(
         self,
         signer: Signer,
         verifier: StepTokenVerifier,
-        directory: AttemptDirectory,
+        directory: AttemptLookup,
         *,
-        issuer: str = ISSUER,
-        audience: str = AUDIENCE,
         ttl: int = DEFAULT_TTL,
     ) -> None:
         if type(ttl) is not int or not 0 < ttl <= MAX_TTL:
@@ -533,8 +557,6 @@ class InProcessReissuer:
         self._signer = signer
         self._verifier = verifier
         self._directory = directory
-        self._issuer = issuer
-        self._audience = audience
         self._ttl = ttl
 
     @property
@@ -552,7 +574,7 @@ class InProcessReissuer:
     def reissue(self, token: str, secret: bytes, *, now: int) -> str:
         if type(now) is not int:
             raise _bad("invalid now")
-        if not isinstance(secret, bytes):
+        if not isinstance(secret, bytes) or len(secret) > MAX_SECRET_BYTES:
             raise _bad("bad attempt secret")
         verified = self._verifier.verify(token, now=now)
         record = self._live_record(verified.context, now)
@@ -565,8 +587,8 @@ class InProcessReissuer:
             record.context,
             now=now,
             ttl=min(self._ttl, record.deadline - now),
-            issuer=self._issuer,
-            audience=self._audience,
+            issuer=self._verifier.issuer,
+            audience=self._verifier.audience,
         )
         self._live_record(record.context, now)  # ended while signing: do not hand the token out
         return new
