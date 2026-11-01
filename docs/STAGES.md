@@ -219,7 +219,7 @@ Close three gaps left after D0-08's review: a backtick or `$(docker ...)` inside
 #### D0-09a: e2e tier
 Add an `e2e` marker and a `tests/e2e/` directory tier to the tier guard (CI only, deselected locally), and switch the e2e job from a path selection to `-m e2e`.
 **AC:** an unmarked test under `tests/e2e/` is in the e2e tier; e2e tests are deselected locally; the CI e2e job selects by marker and still runs its smoke test.
-**Deps:** D0-09, D0-08a. **Size:** S. **Run:** serial. **Files:** `tests/tier_guard.py`, `tests/test_tiers.py`, `.github/workflows/ci.yml`, `tests/e2e/test_stack_smoke.py`.
+**Deps:** D0-09, D0-08a. **Size:** S. **Run:** serial. **Files:** `tests/tier_guard.py`, `tests/test_tiers.py`, `.github/workflows/ci.yml`.
 
 ---
 

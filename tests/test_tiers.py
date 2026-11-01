@@ -626,5 +626,26 @@ def test_ci_e2e_job_selects_by_marker_and_runs_the_smoke_test() -> None:
     assert "-m integration" not in pytest_runs[0]
     assert "-rA" in pytest_runs[0]  # the log names each test that passed
     assert "e2e" in workflow["jobs"]["ci-required"]["needs"]
-    smoke = (TESTS_DIR / "e2e" / "test_stack_smoke.py").read_text()
-    assert "pytest.mark.integration" not in smoke  # else the job would not select it by tier
+    selected = collected_in("e2e", "tests/e2e")
+    assert "test_stack_smoke.py::test_stack_is_up_and_dynamodb_answers" in selected
+
+
+def collected_in(tier: str, path: str) -> str:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", tier, path],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    return result.stdout
+
+
+def test_e2e_directory_wins_over_another_tier_marker(tmp_path: Path) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_both.py").write_text(
+        "import pytest\n@pytest.mark.integration\ndef test_both(): pass\n"
+    )
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "--collect-only", "-m", "e2e")
+    assert "test_both" in result.stdout

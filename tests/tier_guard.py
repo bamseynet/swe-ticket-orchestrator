@@ -8,8 +8,9 @@
   ``ui_browser``. The program of every simple command is inspected (``sh -c``, ``env docker`` and
   ``shell=True`` strings, ``xargs``, backtick and ``$(...)`` substitutions and
   ``Popen(executable=...)`` included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
-  ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/``, ``contract(s)/``
-  or ``e2e/`` directory is in that tier even without the marker.
+  ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/``,
+  ``contract(s)/`` or ``e2e/`` directory is in that tier even without the marker; under ``e2e/``
+  it is e2e even with another tier marker.
 
 This is a best-effort guard against accidents, not a security boundary. Known limits, left open
 on purpose: shell keywords as the first word (``if docker ps; then``), ``command -v docker``
@@ -88,8 +89,13 @@ def _tier_from_directory(item: pytest.Item, root: Path) -> str:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     root = Path(str(config.rootpath)).resolve()
     for item in items:
-        if not any(item.get_closest_marker(t) for t in TIERS):
-            item.add_marker(getattr(pytest.mark, _tier_from_directory(item, root)))
+        tier = _tier_from_directory(item, root)
+        if tier == "e2e":
+            # Under tests/e2e/ a test is always e2e, whatever else it is marked (e.g. integration).
+            if not item.get_closest_marker("e2e"):
+                item.add_marker(pytest.mark.e2e)
+        elif not any(item.get_closest_marker(t) for t in TIERS):
+            item.add_marker(getattr(pytest.mark, tier))
     if config.getoption("markexpr", default=""):
         return  # an explicit -m selects the tier itself
     kept: list[pytest.Item] = []
