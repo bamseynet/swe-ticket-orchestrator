@@ -1,9 +1,10 @@
 """Local driver (D1-03): durable apply-and-feed-back loop, recovery from stored state only.
 
 The kill tests run the driver in a child process on a real SQLite file and SIGKILL it at each
-commit (just before it applies, and just after), then restart a fresh process on the same file.
-A ledger file records every piece of *work* actually performed, so duplicated work shows up as a
-repeated key, and the finished state must equal an uninterrupted run's.
+commit (just before it applies, and just after), then restart a fresh process that knows no run
+ID and calls ``resume_all``. A ledger records every piece of *work* actually performed and a
+separate call log records every ``execute`` call, so duplicated work and repeated calls both
+show up. The finished state and timeline must equal an uninterrupted run's.
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ import signal
 import subprocess
 import sys
 import textwrap
-from collections.abc import Sequence
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +36,19 @@ from sto.domain import (
     Subject,
     from_wire,
 )
-from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep
-from sto.engine.drivers.local import LocalDriver
-from sto.engine.drivers.ports import command_key
+from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep, StopRun
+from sto.engine.drivers.local import (
+    LeaseHeldError,
+    LeaseLostError,
+    LocalDriver,
+    RunWedgedError,
+    decode,
+    encode,
+)
+from sto.engine.drivers.ports import Done, Outcome, StillRunning, command_key
 from sto.engine.handlers.core import (
+    CancelCompleted,
+    CancelRequested,
     EffectConfirmed,
     GateClosed,
     StepFailed,
@@ -59,6 +71,7 @@ from sto.store.ports import (
 from sto.store.sqlite import SqliteStore
 
 RID = RunId.from_parts(1, bytes(10))
+RID2 = RunId.from_parts(2, bytes(10))
 SCOPE = TeamScope("t1")
 SUBJECT = Subject(
     patch_id="p1",
@@ -68,13 +81,18 @@ SUBJECT = Subject(
     attention_digest="a1",
 )
 THIS = Path(__file__).resolve()
+Override = Callable[[str, object], Outcome | None]
 
 
-def new_run() -> Run:
-    return Run(id=RID, team="t1")
+def new_run(rid: RunId = RID) -> Run:
+    return Run(id=rid, team="t1")
 
 
-def approve(cmd: OpenGate) -> GateClosed:
+def fixed_clock() -> float:
+    return 1000.0
+
+
+def approve(cmd: OpenGate, subject: Subject | None = None) -> GateClosed:
     return GateClosed(
         cmd.run_id,
         cmd.name,
@@ -82,50 +100,75 @@ def approve(cmd: OpenGate) -> GateClosed:
         DecisionKind.APPROVE,
         "alice",
         DecisionId.from_parts(cmd.round, bytes(10)),
-        cmd.subject,
+        subject if subject is not None else cmd.subject,
     )
 
 
 class Worker:
-    """Executor with a durable ledger. It is idempotent on the key, as the port requires:
-    a key already in the ledger is not performed again, and the answer is a pure function of
-    the command, so a re-run after a crash answers the same."""
+    """Executor with a durable ledger (work performed, once per key, as the port requires) and a
+    separate call log (every ``execute`` call), so a driver that calls twice is visible even
+    though the worker deduplicates. ``override`` may answer a call instead."""
 
-    def __init__(self, ledger: Path, *, auto_approve: bool = True) -> None:
+    def __init__(
+        self, ledger: Path, *, auto_approve: bool = True, override: Override | None = None
+    ) -> None:
         self.ledger = ledger
-        self.auto_approve = auto_approve
+        self.calls_file = ledger.with_name(ledger.name + ".calls")
+        self.auto_approve, self.override = auto_approve, override
+
+    @staticmethod
+    def _lines(path: Path) -> list[str]:
+        return path.read_text().split() if path.exists() else []
 
     def done(self) -> list[str]:
-        return self.ledger.read_text().split() if self.ledger.exists() else []
+        return self._lines(self.ledger)
 
-    async def execute(self, key: str, command: object) -> Sequence[object]:
+    def calls(self) -> list[str]:
+        return self._lines(self.calls_file)
+
+    @staticmethod
+    def _append(path: Path, key: str) -> None:
+        with path.open("a") as f:
+            f.write(key + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    async def execute(self, key: str, command: object) -> Outcome:
+        self._append(self.calls_file, key)
+        if self.override is not None and (answer := self.override(key, command)) is not None:
+            return answer
         if key not in self.done():
-            with self.ledger.open("a") as f:
-                f.write(key + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            self._append(self.ledger, key)
         if isinstance(command, RunStep):
-            return [StepSucceeded(StepKey(command.run_id, command.stage, command.visit), SUBJECT)]
+            step = StepSucceeded(StepKey(command.run_id, command.stage, command.visit), SUBJECT)
+            return Done([step])
         if isinstance(command, OpenGate):
-            return [approve(command)] if self.auto_approve else []
+            return Done([approve(command)] if self.auto_approve else [])
         if isinstance(command, RunEffect):
-            return [EffectConfirmed(command.run_id, command.type, command.visit, "merge1")]
-        return []
+            return Done([EffectConfirmed(command.run_id, command.type, command.visit, "merge1")])
+        if isinstance(command, StopRun):
+            return Done([CancelCompleted(command.run_id)])
+        return Done()
 
 
 class CountingStore:
-    """Delegates to a store; ``hook(n, phase)`` runs around the n-th transaction (0-based)."""
+    """Delegates to a store; ``hook(n, phase)`` runs around the n-th transaction (0-based).
+    Records the threads that touch the store."""
 
-    def __init__(self, inner: Store, hook: Any = None) -> None:
+    def __init__(self, inner: Store, hook: Callable[[int, str], None] | None = None) -> None:
         self.inner, self.hook, self.commits = inner, hook, 0
+        self.threads: set[int] = set()
 
     def get(self, scope: Any, key: Key) -> Any:
+        self.threads.add(threading.get_ident())
         return self.inner.get(scope, key)
 
     def query(self, scope: Any, pk: str, **kw: Any) -> Any:
+        self.threads.add(threading.get_ident())
         return self.inner.query(scope, pk, **kw)
 
     def transact(self, scope: Any, ops: Any) -> None:
+        self.threads.add(threading.get_ident())
         n, self.commits = self.commits, self.commits + 1
         if self.hook:
             self.hook(n, "before")
@@ -140,8 +183,15 @@ class CountingStore:
         raise AssertionError("the driver must commit through transact")
 
 
+def make(store: Store, worker: object, **kw: Any) -> LocalDriver:
+    kw.setdefault("owner", "me")
+    kw.setdefault("clock", fixed_clock)
+    kw.setdefault("lease_seconds", 60.0)
+    return LocalDriver(store, SCOPE, LINEAR_V0, worker, **kw)  # type: ignore[arg-type]
+
+
 def drive(store: Store, worker: Worker, *, start: bool = True, **kw: Any) -> RunState:
-    d = LocalDriver(store, SCOPE, LINEAR_V0, worker, **kw)
+    d = make(store, worker, **kw)
 
     async def go() -> RunState:
         if start:
@@ -159,6 +209,7 @@ def test_runs_linear_workflow_to_done(tmp_path: Path) -> None:
     rs = drive(MemoryStore(), w)
     assert rs.run.status is RunStatus.DONE
     assert len(w.done()) == len(set(w.done())) == 6  # 2 steps, 2 gates, 1 effect, finish
+    assert w.calls() == w.done()  # each command executed exactly once when nothing crashes
 
 
 def test_state_is_persisted_in_the_store(tmp_path: Path) -> None:
@@ -167,8 +218,7 @@ def test_state_is_persisted_in_the_store(tmp_path: Path) -> None:
     item = store.get(SCOPE, Key(f"RUN#{RID}", "META"))
     assert item is not None
     assert from_wire(Run, item.data) == rs.run
-    fresh = LocalDriver(store, SCOPE, LINEAR_V0, Worker(tmp_path / "ledger"))
-    assert fresh.state(RID) == rs
+    assert make(store, Worker(tmp_path / "ledger")).state(RID) == rs
 
 
 def test_start_is_idempotent(tmp_path: Path) -> None:
@@ -176,8 +226,26 @@ def test_start_is_idempotent(tmp_path: Path) -> None:
     w = Worker(tmp_path / "ledger")
     drive(store, w)
     before = w.done()
-    assert drive(store, w).run.status is RunStatus.DONE  # start again, then idle
+    assert drive(store, w, owner="other").run.status is RunStatus.DONE  # start again, then idle
     assert w.done() == before
+
+
+def test_timeline_records_every_event_in_order(tmp_path: Path) -> None:
+    store = MemoryStore()
+    drive(store, Worker(tmp_path / "ledger"))
+    tl = make(store, object()).timeline(RID)
+    assert [e["seq"] for e in tl] == list(range(len(tl)))
+    assert [e["type"] for e in tl] == [
+        "run.started",
+        "step.succeeded",
+        "gate.closed",
+        "step.succeeded",
+        "gate.closed",
+        "effect.confirmed",
+    ]
+    assert {e["outcome"] for e in tl} == {"applied"}
+    assert tl[-1]["status"] == RunStatus.DONE.value
+    assert decode({"type": tl[1]["type"], "data": tl[1]["data"]}, "event").key.stage == "implement"
 
 
 # --- a waiting gate stays waiting -------------------------------------------------------------
@@ -189,25 +257,24 @@ def test_waiting_gate_stays_waiting_and_is_not_reopened(tmp_path: Path) -> None:
     first = drive(store, w)
     assert first.run.status is RunStatus.WAITING_HUMAN
     assert first.run.stage == "review_gate"
-    for _ in range(3):  # restarts and idle polls change nothing
-        again = drive(store, w, start=False)
-        assert again == first
+    for i in range(3):  # restarts and idle polls change nothing
+        assert drive(store, w, start=False, owner=f"p{i}") == first
     assert [k for k in w.done() if k.startswith("gate:")] == [f"gate:{RID}:review_gate:1"]
+    assert w.calls() == w.done()
 
 
-def _gt(rs: RunState) -> Any:
-    return LINEAR_V0.node(rs.run.stage).gate_type
+def _gate_cmd(name: str = "review_gate", rnd: int = 1) -> OpenGate:
+    return OpenGate(RID, name, LINEAR_V0.node(name).gate_type, rnd, SUBJECT)  # type: ignore[arg-type]
 
 
 def test_gate_decision_resumes_a_waiting_run(tmp_path: Path) -> None:
     store = MemoryStore()
     w = Worker(tmp_path / "ledger", auto_approve=False)
-    waiting = drive(store, w)
-    d = LocalDriver(store, SCOPE, LINEAR_V0, w)
-    cmd = OpenGate(RID, "review_gate", _gt(waiting), 1, SUBJECT)
+    drive(store, w)
+    d = make(store, w, owner="p2")
 
     async def go() -> RunState:
-        await d.submit(RID, approve(cmd))
+        await d.submit(RID, approve(_gate_cmd()))
         return await d.run_until_idle(RID)
 
     rs = asyncio.run(go())
@@ -216,21 +283,19 @@ def test_gate_decision_resumes_a_waiting_run(tmp_path: Path) -> None:
 
 
 def test_open_gate_key_is_run_name_round() -> None:
-    gt = LINEAR_V0.node("review_gate").gate_type
-    a = command_key(OpenGate(RID, "review_gate", gt, 1, SUBJECT), 7)  # type: ignore[arg-type]
-    b = command_key(OpenGate(RID, "review_gate", gt, 1, SUBJECT), 99)  # type: ignore[arg-type]
-    c = command_key(OpenGate(RID, "review_gate", gt, 2, SUBJECT), 7)  # type: ignore[arg-type]
-    assert a == b != c
+    a = command_key(_gate_cmd(), 7)
+    assert a == command_key(_gate_cmd(), 99)
+    assert a != command_key(_gate_cmd(rnd=2), 7)
 
 
-# --- stale events, unknown events -------------------------------------------------------------
+# --- refused, malformed and unknown events ----------------------------------------------------
 
 
 def test_late_event_is_discarded_and_recorded(tmp_path: Path) -> None:
     store = MemoryStore()
     w = Worker(tmp_path / "ledger", auto_approve=False)
     waiting = drive(store, w)
-    d = LocalDriver(store, SCOPE, LINEAR_V0, w)
+    d = make(store, w, owner="p2")
     late = StepSucceeded(StepKey(RID, "implement", 1, 1), SUBJECT)
 
     async def go() -> RunState:
@@ -239,15 +304,36 @@ def test_late_event_is_discarded_and_recorded(tmp_path: Path) -> None:
 
     assert asyncio.run(go()) == waiting
     assert [r["reason"] for r in d.rejected(RID)] == ["out_of_order"]
+    assert d.timeline(RID)[-1]["outcome"] == "out_of_order"
+
+
+def test_malformed_event_is_quarantined_and_does_not_block_the_queue(tmp_path: Path) -> None:
+    store = MemoryStore()
+    w = Worker(tmp_path / "ledger", auto_approve=False)
+    drive(store, w)
+    d = make(store, w, owner="p2")
+    cmd = _gate_cmd()
+    no_subject = dataclasses.replace(approve(cmd), subject=None)  # approve needs the subject
+
+    async def go() -> RunState:
+        await d.submit(RID, no_subject)
+        await d.submit(RID, approve(cmd))
+        return await d.run_until_idle(RID)
+
+    rs = asyncio.run(go())
+    assert rs.run.stage == "qa_gate"  # the good decision behind the bad one was applied
+    assert [r["reason"] for r in d.rejected(RID)] == ["malformed"]
+    outcomes = [e["outcome"] for e in d.timeline(RID)]
+    assert outcomes.count("malformed") == 1
+    assert outcomes[outcomes.index("malformed") + 1] == "applied"
 
 
 def test_no_handler_is_not_discarded_as_late(tmp_path: Path) -> None:
     store = MemoryStore()
     w = Worker(tmp_path / "ledger", auto_approve=False)
     drive(store, w)
-
     # an empty registry has no handler for anything: the event must stay queued, not vanish
-    d = LocalDriver(store, SCOPE, LINEAR_V0, w, registry=HandlerRegistry())
+    d = make(store, w, owner="p2", registry=HandlerRegistry())
 
     async def go() -> None:
         await d.submit(RID, StepFailed(StepKey(RID, "x", 1), FailureClass.PERMANENT))
@@ -259,12 +345,109 @@ def test_no_handler_is_not_discarded_as_late(tmp_path: Path) -> None:
     assert d.pending_events(RID) == 1
 
 
-def test_out_of_order_is_the_only_discarded_error() -> None:
-    assert issubclass(OutOfOrderEventError, Exception)
+def test_out_of_order_is_not_a_no_handler() -> None:
     assert not issubclass(NoHandlerError, OutOfOrderEventError)
 
 
-# --- store conflicts --------------------------------------------------------------------------
+# --- a run that is idle but not waiting is stuck ----------------------------------------------
+
+
+def _wrong_sha_on_qa(key: str, command: object) -> Outcome | None:
+    if isinstance(command, RunStep) and command.stage == "qa":
+        other = dataclasses.replace(SUBJECT, head_sha="different")
+        return Done([StepSucceeded(StepKey(command.run_id, "qa", command.visit), other)])
+    return None
+
+
+def _no_subject(key: str, command: object) -> Outcome | None:
+    if isinstance(command, RunStep) and command.stage == "implement":
+        return Done([StepSucceeded(StepKey(command.run_id, "implement", command.visit), None)])
+    return None
+
+
+def _empty_replay(key: str, command: object) -> Outcome | None:
+    return Done() if isinstance(command, RunStep) and command.stage == "implement" else None
+
+
+@pytest.mark.parametrize(
+    ("override", "why"),
+    [(_wrong_sha_on_qa, "out_of_order"), (_no_subject, "malformed"), (_empty_replay, "")],
+    ids=["qa-reports-different-sha", "implement-reports-no-subject", "empty-replay"],
+)
+def test_idle_run_that_still_needs_work_is_reported_not_returned(
+    tmp_path: Path, override: Override, why: str
+) -> None:
+    w = Worker(tmp_path / "ledger", override=override)
+    with pytest.raises(RunWedgedError) as e:
+        drive(MemoryStore(), w)
+    assert "RUNNING" in str(e.value)
+    assert why in str(e.value)
+
+
+# --- a command that is not finished -----------------------------------------------------------
+
+
+def test_still_running_keeps_the_head_and_is_called_again_with_the_same_key(
+    tmp_path: Path,
+) -> None:
+    seen = {"n": 0}
+
+    def twice_busy(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunStep) and command.stage == "implement" and seen["n"] < 2:
+            seen["n"] += 1
+            return StillRunning(2.5, "in_flight")
+        return None
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleeps.append(s)
+
+    w = Worker(tmp_path / "ledger", override=twice_busy)
+    rs = drive(MemoryStore(), w, sleep=fake_sleep)
+    assert rs.run.status is RunStatus.DONE
+    assert sleeps == [2.5, 2.5]
+    first = w.calls()[0]
+    assert w.calls().count(first) == 3
+    assert w.done().count(first) == 1
+
+
+def test_stop_is_applied_between_polls_not_after_the_command(tmp_path: Path) -> None:
+    store = MemoryStore()
+    box: dict[str, Any] = {"status_at_call": []}
+
+    def busy_until_cancelled(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunStep):
+            status = box["driver"].state(RID).run.status
+            box["status_at_call"].append(status)
+            return StillRunning(1.0) if status is RunStatus.RUNNING else Done()
+        return None
+
+    async def stop_during_first_wait(_: float) -> None:
+        if not box.get("sent"):
+            box["sent"] = True
+            await box["driver"].submit(RID, CancelRequested(RID))
+
+    w = Worker(tmp_path / "ledger", override=busy_until_cancelled)
+    d = box["driver"] = make(store, w, sleep=stop_during_first_wait)
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = asyncio.run(go())
+    # the second call to the busy command happened only after the queued Stop was applied
+    assert box["status_at_call"] == [RunStatus.RUNNING, RunStatus.CANCELLING]
+    assert rs.run.status is RunStatus.CANCELLED
+
+
+def test_still_running_rejects_bad_delays() -> None:
+    for bad in (-1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="retry_after"):
+            StillRunning(bad)
+
+
+# --- store conflicts and lost races -----------------------------------------------------------
 
 
 def test_transaction_conflicts_are_retried_with_backoff(tmp_path: Path) -> None:
@@ -279,14 +462,13 @@ def test_transaction_conflicts_are_retried_with_backoff(tmp_path: Path) -> None:
     async def fake_sleep(s: float) -> None:
         sleeps.append(s)
 
-    store = CountingStore(MemoryStore(), flaky)
     w = Worker(tmp_path / "ledger")
-    rs = drive(store, w, sleep=fake_sleep)
+    rs = drive(CountingStore(MemoryStore(), flaky), w, sleep=fake_sleep)
     assert rs.run.status is RunStatus.DONE
     assert len(sleeps) == 3
     assert sleeps == sorted(sleeps)
     assert sleeps[0] < sleeps[-1]
-    assert len(w.done()) == len(set(w.done()))
+    assert w.calls() == w.done()
 
 
 def test_persistent_conflict_gives_up(tmp_path: Path) -> None:
@@ -301,27 +483,274 @@ def test_persistent_conflict_gives_up(tmp_path: Path) -> None:
         drive(CountingStore(MemoryStore(), always), Worker(tmp_path / "l"), sleep=no_sleep)
 
 
+def test_lost_version_race_reloads_retries_and_backs_off(tmp_path: Path) -> None:
+    """Another writer queues a Stop between our read and our write. We must not overwrite it,
+    must reload and retry, and must back off before retrying."""
+    inner = MemoryStore()
+    other = make(inner, object(), owner="api")
+    sleeps: list[float] = []
+
+    def api_writes_first(n: int, phase: str) -> None:
+        if n == 2 and phase == "before":  # our first event commit
+            asyncio.run(other.submit(RID, CancelRequested(RID)))
+
+    async def fake_sleep(s: float) -> None:
+        sleeps.append(s)
+
+    w = Worker(tmp_path / "ledger")
+    try:
+        rs = drive(CountingStore(inner, api_writes_first), w, sleep=fake_sleep)
+    except Exception as e:  # a lost race must be retried, not surfaced
+        pytest.fail(f"lost race was not retried: {e!r}")
+    assert rs.run.status is RunStatus.CANCELLED  # the Stop was not lost
+    assert len(sleeps) == 1
+
+
+def test_done_is_recorded_once_even_if_someone_else_recorded_it(tmp_path: Path) -> None:
+    """A former owner popped the head and queued its events before our commit: we must not
+    append them again."""
+    inner = MemoryStore()
+    helper = make(inner, object(), owner="ghost")
+    w = Worker(tmp_path / "ledger")
+
+    def ghost_records_the_command(n: int, phase: str) -> None:
+        if n == 3 and phase == "before":  # our commit of the first command
+            rec = helper._load(RID)
+            step = StepSucceeded(StepKey(RID, "implement", 1), SUBJECT)
+            theirs = dataclasses.replace(rec, pending=(), inbox=(encode(step, "event"),))
+            asyncio.run(helper._write(theirs))
+
+    store = CountingStore(inner, ghost_records_the_command)
+    rs = drive(store, w)
+    assert rs.run.status is RunStatus.DONE
+    assert make(inner, w).rejected(RID) == []  # no duplicate StepSucceeded was refused later
+
+
+def test_apply_with_an_empty_inbox_is_a_no_op() -> None:
+    d = make(MemoryStore(), object())
+    asyncio.run(d.start(new_run()))
+    rec = d._load(RID)
+    emptied = dataclasses.replace(rec, inbox=())
+    assert d._apply(emptied) == (emptied, ())
+
+
+def test_store_calls_do_not_run_on_the_event_loop_thread(tmp_path: Path) -> None:
+    store = CountingStore(MemoryStore())
+    loop_thread: list[int] = []
+
+    async def go() -> None:
+        loop_thread.append(threading.get_ident())
+        d = make(store, Worker(tmp_path / "ledger"))
+        await d.start(new_run())
+        await d.run_until_idle(RID)
+
+    asyncio.run(go())
+    assert store.threads
+    assert loop_thread[0] not in store.threads
+
+
+def test_a_non_suspending_executor_does_not_starve_other_tasks(tmp_path: Path) -> None:
+    ticks: list[int] = []
+
+    async def ticker(stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            ticks.append(1)
+            await asyncio.sleep(0)
+
+    async def go() -> None:
+        stop = asyncio.Event()
+        t = asyncio.create_task(ticker(stop))
+        d = make(MemoryStore(), Worker(tmp_path / "ledger"))
+        await d.start(new_run())
+        await d.run_until_idle(RID)
+        stop.set()
+        await t
+
+    asyncio.run(go())
+    assert len(ticks) > 12  # at least one tick per durable step
+
+
+# --- one driver per run -----------------------------------------------------------------------
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_second_driver_cannot_run_a_leased_run_and_never_calls_execute(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    wa, wb = Worker(tmp_path / "a"), Worker(tmp_path / "b")
+    a = make(store, wa, owner="a", clock=clock, lease_seconds=10)
+    b = make(store, wb, owner="b", clock=clock, lease_seconds=10)
+
+    async def go() -> None:
+        await a.start(new_run())
+        assert await a.step(RID) == "worked"  # a now holds the lease
+        with pytest.raises(LeaseHeldError):
+            await b.run_until_idle(RID)
+
+    asyncio.run(go())
+    assert wb.calls() == []
+
+
+def test_resume_all_reports_a_leased_run_without_stopping(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    b = make(store, Worker(tmp_path / "b"), owner="b", clock=clock, lease_seconds=10)
+
+    async def go() -> dict[RunId, Any]:
+        await a.start(new_run())
+        await a.start(new_run(RID2))
+        await a.step(RID)  # a holds only the first run
+        return await b.resume_all()
+
+    out = asyncio.run(go())
+    assert isinstance(out[RID], LeaseHeldError)
+    assert isinstance(out[RID2], RunState)
+    assert out[RID2].run.status is RunStatus.DONE
+
+
+def test_expired_lease_is_taken_over_and_the_old_owner_stops_writing(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    wb = Worker(tmp_path / "b")
+    b = make(store, wb, owner="b", clock=clock, lease_seconds=10)
+
+    class SlowWorker(Worker):
+        """Its lease runs out while it works, and b takes the run over before it commits."""
+
+        async def execute(self, key: str, command: object) -> Outcome:
+            outcome = await super().execute(key, command)
+            clock.now += 11
+            await b._claim(RID)
+            return outcome
+
+    wa = SlowWorker(tmp_path / "a")
+    a = make(store, wa, owner="a", clock=clock, lease_seconds=10)
+
+    async def go() -> RunState:
+        await a.start(new_run())
+        await a.step(RID)  # applies RunStarted
+        with pytest.raises(LeaseLostError):
+            await a.step(RID)  # executes RunStep; the lease is b's when it tries to commit
+        return await b.run_until_idle(RID)
+
+    assert asyncio.run(go()).run.status is RunStatus.DONE
+    assert len(wa.calls()) == 1
+    assert wb.calls()[0] == wa.calls()[0]  # the new owner replays a's unfinished command
+
+
+def test_lease_wait_sleeps_until_expiry_then_takes_over(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    naps: list[float] = []
+
+    async def advancing_sleep(s: float) -> None:
+        naps.append(s)
+        clock.now += s
+
+    a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    b = make(
+        store,
+        Worker(tmp_path / "b"),
+        owner="b",
+        clock=clock,
+        lease_seconds=10,
+        lease_wait=20,
+        sleep=advancing_sleep,
+    )
+
+    async def go() -> RunState:
+        await a.start(new_run())
+        await a.step(RID)
+        return await b.run_until_idle(RID)
+
+    assert asyncio.run(go()).run.status is RunStatus.DONE
+    assert naps
+    assert sum(naps) == pytest.approx(10)
+
+
+# --- finding unfinished runs without knowing their IDs ----------------------------------------
+
+
+def test_active_runs_lists_unfinished_runs_and_resume_all_drives_them(tmp_path: Path) -> None:
+    store = MemoryStore()
+    w = Worker(tmp_path / "ledger", auto_approve=False)
+    d = make(store, w)
+
+    async def go() -> tuple[list[RunId], dict[RunId, Any]]:
+        await d.start(new_run())
+        await d.start(new_run(RID2))
+        before = await d.active_runs()
+        await d.run_until_idle(RID)
+        await d.run_until_idle(RID2)
+        return before, await make(store, w, owner="p2").resume_all()
+
+    before, resumed = asyncio.run(go())
+    assert before == [RID, RID2]
+    assert set(resumed) == {RID, RID2}
+    assert all(s.run.status is RunStatus.WAITING_HUMAN for s in resumed.values())
+
+
+def test_finished_run_leaves_the_index(tmp_path: Path) -> None:
+    store = MemoryStore()
+    d = make(store, Worker(tmp_path / "ledger"))
+
+    async def go() -> list[RunId]:
+        await d.start(new_run())
+        assert await d.active_runs() == [RID]
+        await d.run_until_idle(RID)
+        return await d.active_runs()
+
+    assert asyncio.run(go()) == []
+
+
 # --- real process kill on SQLite --------------------------------------------------------------
 
 
-def _child(db: str, ledger: str, kill_at: int, phase: str, auto: bool) -> None:
-    """Runs in a child process: drive the run on the SQLite file, killing itself at a commit."""
+def _child_driver(db: str, ledger: str, auto: bool, hook: Any = None) -> LocalDriver:
+    return LocalDriver(
+        CountingStore(SqliteStore(db), hook),
+        SCOPE,
+        LINEAR_V0,
+        Worker(Path(ledger), auto_approve=auto),
+        owner=f"pid{os.getpid()}",
+        clock=time.time,
+        lease_seconds=0.4,
+        lease_wait=10,
+    )
+
+
+def _child_run(db: str, ledger: str, kill_at: int, phase: str, auto: bool) -> None:
+    """A fresh process: register the run and drive it, killing itself at the given commit."""
 
     def hook(n: int, ph: str) -> None:
         if n == kill_at and ph == phase:
             os.kill(os.getpid(), signal.SIGKILL)
 
-    store = CountingStore(SqliteStore(db), hook)
-    worker = Worker(Path(ledger), auto_approve=auto)
-    rs = drive(store, worker)
+    d = _child_driver(db, ledger, auto, hook)
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = asyncio.run(go())
     print(json.dumps({"status": rs.run.status.value, "stage": rs.run.stage}), flush=True)
     if not auto:
         os.kill(os.getpid(), signal.SIGKILL)  # die while the gate waits
 
 
-def _spawn(db: Path, ledger: Path, kill_at: int, phase: str, auto: bool = True) -> Any:
+def _child_resume(db: str, ledger: str, auto: bool) -> None:
+    """A fresh process that knows no run ID: it finds unfinished runs in the store."""
+    out = asyncio.run(_child_driver(db, ledger, auto).resume_all())
+    print(json.dumps({str(k): [v.run.status.value, v.run.stage] for k, v in out.items()}))  # type: ignore[union-attr]
+
+
+def _spawn(*args: object) -> Any:
     return subprocess.run(
-        [sys.executable, str(THIS), "child", str(db), str(ledger), str(kill_at), phase, str(auto)],
+        [sys.executable, str(THIS), "child", *map(str, args)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -329,60 +758,79 @@ def _spawn(db: Path, ledger: Path, kill_at: int, phase: str, auto: bool = True) 
     )
 
 
-# start, 6 events applied, 6 commands done. test_reference_run_commit_count pins it.
-COMMITS = 13
-
-
-def _dry_run(tmp_path: Path) -> tuple[int, list[str], RunState]:
-    store = CountingStore(MemoryStore())
-    w = Worker(tmp_path / "dry-ledger")
-    rs = drive(store, w)
-    return store.commits, w.done(), rs
+# start, claim of the lease, 6 events applied, 6 commands done, release of the lease.
+# test_reference_run pins the count.
+COMMITS = 15
+Reference = tuple[int, list[str], RunState, list[dict[str, Any]]]
 
 
 @pytest.fixture(scope="module")
-def reference(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, list[str], RunState]:
-    return _dry_run(tmp_path_factory.mktemp("ref"))
+def reference(tmp_path_factory: pytest.TempPathFactory) -> Reference:
+    store = CountingStore(MemoryStore())
+    w = Worker(tmp_path_factory.mktemp("ref") / "ledger")
+    rs = drive(store, w)
+    return store.commits, w.done(), rs, make(store.inner, w).timeline(RID)
 
 
-def test_reference_run_commit_count(reference: tuple[int, list[str], RunState]) -> None:
-    commits, work, rs = reference
+def test_reference_run(reference: Reference) -> None:
+    commits, work, rs, timeline = reference
     assert rs.run.status is RunStatus.DONE
-    assert commits == COMMITS
+    assert commits == COMMITS  # a new commit must be added to the kill sweep, not slip past it
     assert len(work) == 6
+    assert len(timeline) == 6
 
 
 @pytest.mark.parametrize("phase", ["before", "after"])
 @pytest.mark.parametrize("kill_at", range(COMMITS))
 def test_kill_at_every_commit_finishes_with_no_duplicated_work(
-    tmp_path: Path, kill_at: int, phase: str, reference: tuple[int, list[str], RunState]
+    tmp_path: Path, kill_at: int, phase: str, reference: Reference
 ) -> None:
-    _, work, final = reference
+    _, work, final, timeline = reference
     db, ledger = tmp_path / "s.db", tmp_path / "ledger"
-    killed = _spawn(db, ledger, kill_at, phase)
+    killed = _spawn("run", db, ledger, kill_at, phase, True)
     assert killed.returncode == -signal.SIGKILL, killed.stderr  # the kill really happened
-    resumed = _spawn(db, ledger, -1, phase)
+    resumed = _spawn("resume", db, ledger, True)  # knows no run ID
     assert resumed.returncode == 0, resumed.stderr
-    assert json.loads(resumed.stdout)["status"] == RunStatus.DONE.value
+    if json.loads(resumed.stdout) == {}:  # nothing unfinished in the store
+        if (kill_at, phase) == (0, "before"):  # the run was never stored: start it again
+            again = _spawn("run", db, ledger, -1, phase, True)
+            assert again.returncode == 0, again.stderr
+        else:  # the run had finished (Finish done); at most the lease release was lost
+            assert (kill_at, phase) in {
+                (COMMITS - 2, "after"),
+                (COMMITS - 1, "before"),
+                (COMMITS - 1, "after"),
+            }
+    else:
+        assert json.loads(resumed.stdout) == {str(RID): [RunStatus.DONE.value, final.run.stage]}
     done = ledger.read_text().split()
-    assert done == sorted(set(done), key=done.index), "a piece of work ran twice"
+    assert sorted(done) == sorted(set(done)), "a piece of work ran twice"
     assert sorted(done) == sorted(work)
-    store = SqliteStore(db)
-    rs = LocalDriver(store, SCOPE, LINEAR_V0, Worker(ledger)).state(RID)
-    assert rs == final
+    calls = Worker(ledger).calls()
+    assert len(calls) - len(set(calls)) <= 1, "more than the one replay a kill can cause"
+    d = make(SqliteStore(db), Worker(ledger))
+    assert d.state(RID) == final
+    assert d.timeline(RID) == timeline  # every event once, in order, none lost
+    assert asyncio.run(d.active_runs()) == []
+
+
+def test_restart_with_no_run_id_known_finishes_the_run(tmp_path: Path) -> None:
+    db, ledger = tmp_path / "s.db", tmp_path / "ledger"
+    assert _spawn("run", db, ledger, 7, "after", True).returncode == -signal.SIGKILL
+    resumed = _spawn("resume", db, ledger, True)  # no RID, no start: stored state only
+    assert resumed.returncode == 0, resumed.stderr
+    assert list(json.loads(resumed.stdout).values()) == [[RunStatus.DONE.value, "merge"]]
 
 
 def test_kill_while_gate_waits_then_restart_still_waits(tmp_path: Path) -> None:
     db, ledger = tmp_path / "s.db", tmp_path / "ledger"
-    died = _spawn(db, ledger, -1, "before", auto=False)
+    died = _spawn("run", db, ledger, -1, "before", False)
     assert died.returncode == -signal.SIGKILL
     assert json.loads(died.stdout)["stage"] == "review_gate"
-    again = _spawn(db, ledger, -1, "before", auto=False)  # fresh process, stored state only
-    assert again.returncode == -signal.SIGKILL
-    assert json.loads(again.stdout) == {
-        "status": RunStatus.WAITING_HUMAN.value,
-        "stage": "review_gate",
-    }
+    again = _spawn("resume", db, ledger, False)  # fresh process, stored state only
+    assert again.returncode == 0, again.stderr
+    waiting = [RunStatus.WAITING_HUMAN.value, "review_gate"]
+    assert json.loads(again.stdout) == {str(RID): waiting}
     opened = [k for k in ledger.read_text().split() if k.startswith("gate:")]
     assert opened == [f"gate:{RID}:review_gate:1"]
 
@@ -401,14 +849,18 @@ def test_driver_loads_handlers_itself() -> None:
 
         class Idle:
             async def execute(self, key, command):
-                return []
+                from sto.engine.drivers.ports import Done
+                return Done()
 
         rid = RunId.from_parts(1, bytes(10))
-        d = LocalDriver(MemoryStore(), TeamScope("t"), LINEAR_V0, Idle())
+        d = LocalDriver(MemoryStore(), TeamScope("t"), LINEAR_V0, Idle(), owner="x",
+                        clock=lambda: 1.0)
 
         async def go():
             await d.start(Run(id=rid, team="t"))
-            return await d.run_until_idle(rid)
+            await d.step(rid)  # claims the lease
+            await d.step(rid)  # applies RunStarted: next() needs the handlers loaded
+            return d.state(rid)
 
         print(asyncio.run(go()).run.stage)
         """
@@ -420,20 +872,16 @@ def test_driver_loads_handlers_itself() -> None:
     assert out.stdout.strip() == "implement"
 
 
-def test_wire_roundtrip_of_all_commands() -> None:
-    from sto.engine.drivers.local import decode, encode
-
-    gt = LINEAR_V0.node("review_gate").gate_type
-    cmds = [
-        RunStep(RID, "implement", 1, 1),
-        OpenGate(RID, "review_gate", gt, 1, SUBJECT),  # type: ignore[arg-type]
-        Finish(RID, RunStatus.DONE),
-    ]
+def test_wire_roundtrip_of_commands() -> None:
+    cmds = [RunStep(RID, "implement", 1, 1), _gate_cmd(), Finish(RID, RunStatus.DONE)]
     for c in cmds:
         assert decode(json.loads(json.dumps(encode(c, "command"))), "command") == c
-    assert dataclasses.is_dataclass(cmds[0])
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["child"]:
-    db_, ledger_, kill_, phase_, auto_ = sys.argv[2:7]
-    _child(db_, ledger_, int(kill_), phase_, auto_ == "True")
+    if sys.argv[2] == "run":
+        db_, ledger_, kill_, phase_, auto_ = sys.argv[3:8]
+        _child_run(db_, ledger_, int(kill_), phase_, auto_ == "True")
+    else:
+        db_, ledger_, auto_ = sys.argv[3:6]
+        _child_resume(db_, ledger_, auto_ == "True")
