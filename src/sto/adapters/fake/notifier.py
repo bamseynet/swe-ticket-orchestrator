@@ -18,6 +18,8 @@ from sto.domain.models import DecisionKind, Receipt
 
 
 class FakeNotifier(FakeBase):
+    _WRITES = frozenset({"send", "update"})
+
     def __init__(self, spy: SpyWriter | None = None) -> None:
         super().__init__("notifier", spy)
         self.capabilities = NotifierCapabilities()

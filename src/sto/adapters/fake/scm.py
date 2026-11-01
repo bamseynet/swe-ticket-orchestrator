@@ -82,6 +82,13 @@ class FakeScm(FakeBase):
         self._merge_conflicts: set[PrRef] = set()
         self._ghosts: dict[str, _Merge] = {}  # accepted but not applied: polls as not merged
 
+    _WRITES = frozenset(
+        {
+            "create_commit", "move_ref", "promote", "ensure_draft_pr", "mark_ready", "close_pr",
+            "merge_base_into", "open_revert_pr", "request_merge", "dequeue", "trigger_workflow",
+            "publish_check",
+        }
+    )  # fmt: skip
     _KEEP = (*FakeBase._KEEP, "_ghosts")
 
     # --- test controls and reads (not writes, so the spy ignores them) ---
@@ -420,9 +427,7 @@ class FakeScm(FakeBase):
 
     def trigger_workflow(self, repo: RepoRef, spec: DispatchSpec, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:
-            current = self.head(repo, spec.ref)
-            if spec.expected_head is not None and current != spec.expected_head:
-                raise StaleHeadError(f"{spec.ref} is at {current}, not {spec.expected_head}")
+            self.head(repo, spec.ref)
             return self._receipt("run", f"fake://{repo.name}/{spec.workflow}")
 
         return self._write("trigger_workflow", {"repo": repo, "spec": spec}, key, apply)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import socket
 
@@ -941,14 +942,47 @@ def test_a_lost_response_applies_the_write_and_a_retry_replays_it() -> None:
     assert len(scm._prs) == 1  # noqa: SLF001
 
 
-def test_a_release_dispatch_goes_stale_when_the_ref_moved() -> None:
+def test_a_release_dispatch_is_not_stale_just_because_the_ref_moved() -> None:
+    # PLAN releases the tested SHA through sha_input; its stale edge is a rejected commit in the
+    # range (line 1155), not a moved ref, so an unrelated merge must not raise it.
     scm, spy = _scm()
-    tested = scm.head(REPO, "main")
-    scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main", expected_head=tested), "w1")
-    _advance(scm, "main", "moved")
-    with pytest.raises(StaleHeadError):
-        scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main", expected_head=tested), "w2")
+    assert "expected_head" not in {f.name for f in dataclasses.fields(DispatchSpec)}
+    _advance(scm, "main", "unrelated-merge")
+    scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main"), "w1")
     assert len(spy.applied("trigger_workflow")) == 1
+
+
+def test_stale_next_makes_a_dispatch_raise_stale_once_and_apply_nothing() -> None:
+    scm, spy = _scm()
+    scm.stale_next("trigger_workflow")
+    with pytest.raises(StaleHeadError):
+        scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main"), "w1")
+    assert spy.calls_for("trigger_workflow")[0].error == "StaleHeadError"
+    assert spy.applied("trigger_workflow") == ()
+    scm.trigger_workflow(REPO, DispatchSpec("release.yml", "main"), "w1")  # only once
+    assert len(spy.applied("trigger_workflow")) == 1
+
+
+def test_a_lost_response_counts_as_applied_once_and_its_replay_does_not() -> None:
+    scm, spy = _scm()
+    scm.lose_response_next("ensure_draft_pr")
+    with pytest.raises(TransientError):
+        scm.ensure_draft_pr(SPEC, "K")
+    assert len(spy.applied("ensure_draft_pr")) == 1  # the write happened
+    scm.ensure_draft_pr(SPEC, "K")  # the same-key retry replays the original receipt
+    assert len(spy.applied("ensure_draft_pr")) == 1  # exactly once overall
+    t, tspy = _tickets()
+    t.fail_next("comment")
+    with pytest.raises(TransientError):
+        t.comment(TREF, "x", "K")
+    assert tspy.applied("comment") == ()  # a failure before applying is not a write
+
+
+@pytest.mark.parametrize("control", ["fail_next", "lose_response_next", "stale_next"])
+def test_failure_controls_refuse_an_unknown_method_name(control: str) -> None:
+    for fake in (_tickets()[0], _scm()[0], FakeNotifier()):
+        with pytest.raises(ValueError, match="no write method"):
+            getattr(fake, control)("comnent")  # a typo must not silently do nothing
 
 
 def test_a_squash_or_rebase_merge_does_not_make_the_head_an_ancestor() -> None:

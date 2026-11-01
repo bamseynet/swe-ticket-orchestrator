@@ -14,6 +14,7 @@ class SpyCall:
     key: str | None = None
     replayed: bool = False  # key already seen: the first result was returned
     error: str | None = None  # class name of the error raised; None if it applied
+    lost: bool = False  # the write happened but the caller saw an error (lost response)
     noop: bool = False  # accepted, but changed nothing (found, already there, conflict, unapplied)
 
 
@@ -29,11 +30,12 @@ class SpyWriter:
         return tuple(c for c in self._calls if c.method == method)
 
     def applied(self, method: str | None = None) -> tuple[SpyCall, ...]:
-        """Calls that changed state: not refused, not a replay and not a no-op."""
+        """Calls that changed state: not refused, not a replay, not a no-op. A write whose response
+        was lost still counts, because it happened."""
         return tuple(
             c
             for c in self._calls
-            if c.error is None
+            if (c.error is None or c.lost)
             and not c.replayed
             and not c.noop
             and (method is None or c.method == method)

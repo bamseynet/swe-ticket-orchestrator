@@ -297,9 +297,6 @@ class DispatchSpec:
     workflow: str
     ref: str
     inputs: Mapping[str, str] = field(default_factory=dict)
-    expected_head: str | None = (
-        None  # the tested SHA: a moved ``ref`` is stale (``release.trigger``)
-    )
 
 
 @dataclass(frozen=True)

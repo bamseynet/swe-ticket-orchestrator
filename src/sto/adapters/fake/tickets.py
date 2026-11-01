@@ -27,6 +27,8 @@ from sto.domain.models import Receipt
 
 
 class FakeTicketSource(FakeBase):
+    _WRITES = frozenset({"comment", "transition"})
+
     def __init__(self, spy: SpyWriter | None = None, *, page_size: int = 50) -> None:
         super().__init__("ticket_source", spy)
         self.capabilities = TicketCapabilities()
