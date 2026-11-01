@@ -11,7 +11,9 @@ dev = [
     "hypothesis>=6.100",
     "mypy>=1.13",
     "pytest>=8.3",
+    "pyyaml>=6.0.3",
     "ruff>=0.8",
+    "types-pyyaml>=6.0.12.20261030",
 ]
 
 [build-system]

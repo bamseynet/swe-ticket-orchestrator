@@ -1,0 +1,151 @@
+# CI for swe-ticket-orchestrator (D0-05). One workflow, one required check.
+#
+# Shape (ADR-0019): a `filter` job decides what changed, work jobs run (or are
+# skipped) from that, and the always-running `ci-required` aggregator is the ONLY
+# check the `main` ruleset requires (deploy/ruleset-main.json). A required check
+# that is skipped by a path filter stays "pending" forever, so we never require
+# the work jobs themselves.
+#
+# HOW LATER ISSUES ADD A JOB (D0-03 UI, D0-04 synth, D0-08 tiers, D0-09 e2e, ...)
+# without touching the aggregator's logic:
+#   1. Add a job that has `needs: filter` and `if: needs.filter.outputs.code == 'true'`
+#      (or its own new filter output, e.g. `web`, added in the `filter` job; keep
+#      shared code, CI and lockfiles in every output so they run everything).
+#   2. Add the job's id to the `needs:` list of `ci-required`. That list is the
+#      ONLY edit to the aggregator. Its script reads `toJSON(needs)` and fails on
+#      any `failure` or `cancelled` result, treats `skipped` (by filter) as a pass,
+#      and so needs no per-job logic.
+#   Never add a work job to the ruleset; never remove one from `needs`.
+#
+# Security: triggers are `push` to main and `pull_request` (never
+# `pull_request_target`), so fork PRs get a read-only token and NO secrets. No job
+# here uses any secret. Actions are pinned to full commit SHAs. See ADR-0021.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege by default; jobs that need more say so.
+permissions:
+  contents: read
+
+# A newer push to the same PR cancels the superseded run. Runs on main are never
+# cancelled: GitHub keeps only one pending run per group, so main runs get a
+# per-commit group and every main commit gets a full result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.13.6"
+
+jobs:
+  filter:
+    name: filter
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter lists PR files through the API
+    outputs:
+      # 'true' = something other than docs changed (or this is a push to main):
+      # run everything. Changes to shared code, CI or lockfiles are not docs, so
+      # they always land here.
+      code: ${{ github.event_name == 'push' || steps.changes.outputs.code == 'true' || steps.changes.outputs.spec == 'true' }}
+    steps:
+      # No checkout: on pull_request, paths-filter lists files through the API, and on
+      # push the paths-filter step is skipped.
+      - id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          predicate-quantifier: every # within a filter every pattern must match: "anything except docs"
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+              - '!LICENSE'
+            # Docs that tests read count as code (tools/backlog parses STAGES.md).
+            spec:
+              - 'docs/STAGES.md'
+
+  lint:
+    name: lint
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make lint
+
+  typecheck:
+    name: typecheck
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make typecheck
+
+  unit:
+    name: unit
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: make test-fast
+
+  # The only required check. Runs always, even when every work job was skipped
+  # or failed. Add new work jobs to `needs` below; do not change the script.
+  ci-required:
+    name: ci-required
+    if: ${{ always() }}
+    needs: [filter, lint, typecheck, unit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail if any needed job failed or was cancelled
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # Anything but success or skipped (failure, cancelled) fails the check.
+          # A skipped work job is "skipped by filter". The filter itself must succeed.
+          echo "$NEEDS" | jq -e '
+            ([to_entries[] | select(.value.result != "success" and .value.result != "skipped")] | length) == 0
+            and .filter.result == "success"' >/dev/null \
+            || { echo "ci-required FAILED"; exit 1; }
+          echo "ci-required passed"
