@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from sto.adapters.fake.scm import FakeScm
-from sto.adapters.ports import MergeMethod, MergeState, PrRef, PrSpec, RepoRef
+from sto.adapters.ports import MergeMethod, MergeState, PrRef, PrSpec, RepoRef, UnknownRefError
 from sto.domain import (
     DecisionId,
     DecisionKind,
@@ -1332,15 +1332,21 @@ def test_other_adapter_hiccups_are_retried_not_faults(tmp_path: Path, error: str
         def poll(*a: Any, **kw: Any) -> Any:
             if raised["n"] == 0:
                 raised["n"] += 1
+                # Another driver's poll wins: the record really moves to CONFIRMED, then ours
+                # finds it is no longer ACCEPTED.
+                if w.scm.poll_merge(w.scm.merges()[-1]).state is MergeState.PENDING:
+                    w.scm.complete_merge(w.scm.merges()[-1], "m1")
+                real_poll(*a, **kw)
                 raise ValueError("only an ACCEPTED effect can be polled")
             return real_poll(*a, **kw)
 
         w.fx.poll = poll  # type: ignore[method-assign]
 
     async def land() -> None:
-        if w.scm.merges():  # nothing to land until the merge has been requested
+        merges = w.scm.merges()
+        if merges and w.scm.poll_merge(merges[-1]).state is MergeState.PENDING:
             w.on_sleep = None
-            w.scm.complete_merge(w.scm.merges()[-1], "m1")
+            w.scm.complete_merge(merges[-1], "m1")
 
     w.on_sleep = land
     assert run(w.start()).run.status is RunStatus.DONE
@@ -1645,6 +1651,345 @@ def test_crash_at_every_commit_around_the_merge(
         assert MergeState.PENDING not in states, "the merge is still queued after the run ended"
     assert second.pending_events(RID) == 0
     assert run(second.active_runs()) == []
+
+
+# --- pass 4 -----------------------------------------------------------------------------------
+
+
+def test_a_joiner_does_not_trust_a_drive_that_had_already_read(tmp_path: Path) -> None:
+    """A decision is submitted after the first drive's final (empty) read; a second call joins it.
+    Nobody must be left holding the queued decision."""
+    inner = MemoryStore()
+    read, go_on = threading.Event(), threading.Event()
+    box = {"armed": False}
+
+    class Late(CountingStore):
+        def transact(self, scope: Any, ops: Any) -> None:
+            super().transact(scope, ops)
+            item = inner.get(SCOPE, Key(f"RUN#{RID}", "DRIVER"))
+            if (
+                item
+                and item.data["lease"] is None
+                and item.data["state"]["run"]["status"] == ("WAITING_HUMAN")
+            ):
+                box["armed"] = True  # the release just committed
+
+        def get(self, scope: Any, key: Key) -> Any:
+            out = super().get(scope, key)
+            if box["armed"] and key.sk == "DRIVER":
+                box["armed"] = False
+                read.set()  # the first drive has its final (empty) read in hand...
+                go_on.wait(10)  # ...and is scheduled late
+            return out
+
+    d = make(Late(inner), Worker(tmp_path / "l", auto_approve=False))
+
+    async def go() -> None:
+        await d.start(new_run())
+        first = asyncio.ensure_future(d.run_until_idle(RID))
+        await asyncio.to_thread(read.wait, 10)
+        await d.submit(RID, approve(_gate_cmd()))
+        second = asyncio.ensure_future(d.run_until_idle(RID))  # joins the first
+        await asyncio.sleep(0.01)
+        go_on.set()
+        await asyncio.gather(first, second)
+
+    run(go())
+    assert d.pending_events(RID) == 0, "the decision is queued and nobody is driving"
+    assert d.state(RID).run.stage == "qa_gate"
+
+
+def test_a_stop_submitted_while_a_held_call_returns_is_not_stranded(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    set_switch(w.store, SCOPE, "effects", True)
+    set_switch(w.store, SCOPE, "merge", False)
+    inner = w.driver._executor
+    box: dict[str, Any] = {}
+
+    class Wrap:
+        async def execute(self, key: str, cmd: object) -> Outcome:
+            out = await inner.execute(key, cmd)
+            if isinstance(cmd, RunEffect) and isinstance(out, Held) and "joined" not in box:
+                await w.driver.submit(RID, CancelRequested(RID))
+                box["joined"] = asyncio.ensure_future(w.driver.run_until_idle(RID))
+                await asyncio.sleep(0)
+            return out
+
+    w.driver._executor = Wrap()
+
+    async def go() -> RunState:
+        await w.start()
+        rs: RunState = await box["joined"]
+        return rs
+
+    assert run(go()).run.status is RunStatus.CANCELLED
+    assert w.driver.pending_events(RID) == 0
+
+
+def test_a_joiner_receives_the_first_drives_exception(tmp_path: Path) -> None:
+    class Faulty(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("fault")
+
+    d = make(MemoryStore(), Faulty(tmp_path / "l"))
+
+    async def go() -> list[Any]:
+        await d.start(new_run())
+        return list(
+            await asyncio.gather(
+                d.run_until_idle(RID), d.run_until_idle(RID), return_exceptions=True
+            )
+        )
+
+    out = run(go())
+    assert all(isinstance(o, RuntimeError) for o in out), out
+    assert not d._driving
+
+
+def test_cancelling_a_joiner_leaves_the_drive_running(tmp_path: Path) -> None:
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            await asyncio.sleep(0.02)
+            return await super().execute(key, command)
+
+    d = make(MemoryStore(), Slow(tmp_path / "l"))
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        first = asyncio.ensure_future(d.run_until_idle(RID))
+        await asyncio.sleep(0.01)
+        joiner = asyncio.ensure_future(d.run_until_idle(RID))
+        await asyncio.sleep(0.01)
+        joiner.cancel()
+        return await first
+
+    assert run(go()).run.status is RunStatus.DONE
+
+
+def test_cancelling_the_first_caller_does_not_cancel_resume_all(tmp_path: Path) -> None:
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.run_id == RID:
+                await asyncio.sleep(0.05)
+            return await super().execute(key, command)
+
+    d = make(MemoryStore(), Slow(tmp_path / "l"))
+
+    async def go() -> Any:
+        await d.start(new_run())
+        await d.start(new_run(RID2))
+        first = asyncio.ensure_future(d.run_until_idle(RID))
+        await asyncio.sleep(0.01)
+        resumed = asyncio.ensure_future(d.resume_all())
+        await asyncio.sleep(0.01)
+        first.cancel()  # e.g. a request timeout around the first caller
+        return (await asyncio.gather(resumed, return_exceptions=True))[0]
+
+    out = run(go())
+    assert isinstance(out, dict), f"resume_all lost every result: {out!r}"
+    assert out[RID2].run.status is RunStatus.DONE
+
+
+@pytest.mark.parametrize("what", ["raises", "returns_garbage"])
+def test_a_permanent_value_error_is_not_polled_forever(tmp_path: Path, what: str) -> None:
+    w = RealWorld(tmp_path)
+    real = w.handler
+
+    class Buggy:
+        def execute(self, e: Effect) -> Any:
+            return real.execute(e)
+
+        def poll(self, e: Effect) -> Any:
+            if what == "raises":
+                raise ValueError("a bug: bad JSON from the SCM")
+            return "not an outcome"
+
+        stop = reconcile = poll
+
+    w.handler = Buggy()
+    with pytest.raises(ValueError, match=".+"):  # not "spinning": the fault surfaces
+        run(w.start())
+
+
+class _StopFails:
+    """A handler that can no longer stop or reconcile its effect (the PR is gone)."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def execute(self, e: Effect) -> Any:
+        return self.inner.execute(e)
+
+    def poll(self, e: Effect) -> Any:
+        return self.inner.poll(e)
+
+    def stop(self, e: Effect) -> Any:
+        raise UnknownRefError("PR is gone")
+
+    reconcile = stop
+
+
+def _count_stop_runs(w: RealWorld) -> dict[str, int]:
+    seen = {"n": 0}
+    others = w.driver._executor._others  # type: ignore[attr-defined]
+
+    class Count:
+        async def execute(self, k: str, c: object) -> Outcome:
+            if isinstance(c, StopRun):
+                seen["n"] += 1
+            out: Outcome = await others.execute(k, c)
+            return out
+
+    w.driver._executor._others = Count()  # type: ignore[attr-defined]
+    return seen
+
+
+def test_a_permanent_stop_error_does_not_hold_the_stoprun_back(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    w.handler = _StopFails(w.handler)
+    stops = _count_stop_runs(w)
+    _stop_on_first_sleep(w)
+    with pytest.raises(UnknownRefError):  # the fault still surfaces, from the effect itself
+        run(w.start())
+    assert stops["n"] == 1
+    assert w.driver.state(RID).run.status is RunStatus.CANCELLED
+    with pytest.raises(UnknownRefError):  # and on every later call, not hidden
+        run(w.driver.run_until_idle(RID))
+    assert stops["n"] == 1
+
+
+def test_a_permanent_reconcile_error_does_not_hold_the_stoprun_back(tmp_path: Path) -> None:
+    clock = Clock()
+    w = RealWorld(tmp_path, clock=clock, lease_seconds=60.0)
+    real = w.handler
+
+    class CrashAfterRequest:
+        def execute(self, effect: Effect) -> Any:
+            real.execute(effect)
+            raise Crash()
+
+    w.handler = CrashAfterRequest()  # type: ignore[assignment]
+    with pytest.raises(Crash):
+        run(w.start())
+    w.handler = _StopFails(real)
+    stops = _count_stop_runs(w)
+
+    async def lease_lapses() -> None:
+        clock.now += 30
+
+    w.on_sleep = lease_lapses
+
+    async def go() -> None:
+        await w.driver.submit(RID, CancelRequested(RID))
+        await w.driver.run_until_idle(RID)
+
+    with pytest.raises(UnknownRefError):
+        run(go())
+    assert stops["n"] == 1
+    assert w.driver.state(RID).run.status is RunStatus.CANCELLED
+
+
+def test_a_persistent_transient_stop_error_cannot_hold_the_stoprun_back(tmp_path: Path) -> None:
+    """Known limit: the retries themselves are unbounded (D2-10). The Stop still runs."""
+    w = RealWorld(tmp_path)
+    real = w.handler
+
+    class Down:
+        def execute(self, e: Effect) -> Any:
+            return real.execute(e)
+
+        def poll(self, e: Effect) -> Any:
+            return real.poll(e)
+
+        def stop(self, e: Effect) -> Any:
+            raise TransientError("scm down")
+
+        reconcile = stop
+
+    w.handler = Down()
+    _stop_on_first_sleep(w)
+    with pytest.raises(AssertionError, match="spinning"):
+        run(w.start())
+    assert w.driver.state(RID).run.status is RunStatus.CANCELLED
+
+
+def test_the_heartbeat_gives_up_when_the_lease_has_run_out(tmp_path: Path) -> None:
+    """Retries are bounded by the lease's own expiry, not by a clock that starts at the first
+    failure: with a 2 s lease the command is aborted about when the lease runs out."""
+    inner = MemoryStore()
+    box: dict[str, Any] = {"fail": False}
+
+    class Busy(CountingStore):
+        def transact(self, scope: Any, ops: Any) -> None:
+            if box["fail"]:
+                raise TransactionConflictError("busy")
+            super().transact(scope, ops)
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                box["t_exec"] = time.time()
+                box["fail"] = True
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    box["t_abort"] = time.time()
+                    raise
+            return await super().execute(key, command)
+
+    a = make(Busy(inner), Slow(tmp_path / "a"), owner="a", clock=time.time, lease_seconds=2.0)
+
+    async def go() -> float:
+        await a.start(new_run())
+        await a.step(RID)  # claim and apply: the lease is stamped now
+        await asyncio.sleep(0.9)  # older than nothing, younger than ttl/2: no renewal yet
+        expires = float(a._load(RID).lease["expires"])  # type: ignore[index]
+        with pytest.raises(TransactionConflictError):
+            await a.step(RID)
+        return expires
+
+    expires = run(go(), timeout=30)
+    assert box["t_abort"] <= expires + 0.5, f"aborted {box['t_abort'] - expires:.2f}s late"
+
+
+def test_the_heartbeat_gives_up_after_its_attempts_even_if_the_lease_has_time(
+    tmp_path: Path,
+) -> None:
+    box: dict[str, Any] = {"fail": False, "n": 0}
+
+    class Down(CountingStore):
+        def transact(self, scope: Any, ops: Any) -> None:
+            if box["fail"]:
+                box["n"] += 1
+                assert box["n"] < 20, "the heartbeat keeps retrying past its attempt limit"
+                raise TransientError("store down")
+            super().transact(scope, ops)
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                box["fail"] = True
+                await asyncio.sleep(10)
+            return await super().execute(key, command)
+
+    # a frozen clock: the lease never runs out, so only the attempt limit can end the retries
+    d = make(Down(MemoryStore()), Slow(tmp_path / "a"), lease_seconds=0.3)
+
+    async def go() -> None:
+        await d.start(new_run())
+        with pytest.raises(TransientError):
+            await d.run_until_idle(RID)
+
+    run(go())
+    assert box["n"] == 8
+
+
+def test_dead_statuses_match_the_effects_core() -> None:
+    from sto.effects.core import _DEAD as CORE_DEAD
+    from sto.engine.drivers.local import _DEAD
+
+    assert _DEAD == CORE_DEAD
 
 
 # --- real process kill on SQLite --------------------------------------------------------------

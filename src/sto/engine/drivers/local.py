@@ -234,11 +234,13 @@ class LocalDriver:
         await self._sleep(delay)
         return delay * 2
 
-    async def _commit(self, run_id: RunId, change: _Change, *, owner: bool = True) -> None:
+    async def _commit(
+        self, run_id: RunId, change: _Change, *, owner: bool = True, attempts: int = _RETRIES
+    ) -> None:
         """Load, apply ``change`` (pure), write. Reload and retry, with backoff, on a lost
         race or a conflict. ``owner`` commits require our lease and renew it."""
         delay = self._backoff
-        for attempt in range(_RETRIES):
+        for attempt in range(attempts):
             try:
                 rec = await self._aload(run_id)
                 if owner and (rec.lease is None or rec.lease["owner"] != self._owner):
@@ -251,7 +253,7 @@ class LocalDriver:
                 await self._write(new, extra)
                 return
             except (ConditionFailedError, TransactionConflictError):
-                if attempt == _RETRIES - 1:
+                if attempt == attempts - 1:
                     raise
                 delay = await self._backoff_sleep(delay)
 
@@ -385,18 +387,22 @@ class LocalDriver:
         """Renew the lease while a command executes, so a long one does not lose the run. A
         store error that is not a lost lease is retried until the lease would run out; losing the
         lease for real ends the heartbeat (and so the command)."""
-        last_ok = self._clock()
+        lease = (await self._aload(run_id)).lease
+        expires = lease["expires"] if lease else self._clock()
         while True:
             await asyncio.sleep(self._ttl / 3)
             for attempt in range(_RETRIES):
+                started = self._clock()
                 try:
-                    await self._commit(run_id, lambda r: (dataclasses.replace(r), ()))
-                    last_ok = self._clock()
+                    await self._commit(
+                        run_id, lambda r: (dataclasses.replace(r), ()), attempts=1
+                    )  # one try: the retries below are bounded by the lease, not by backoff
+                    expires = started + self._ttl  # the stamp is at least this late
                     break
                 except LeaseLostError:
                     raise
                 except Exception:
-                    if attempt == _RETRIES - 1 or self._clock() >= last_ok + self._ttl:
+                    if attempt == _RETRIES - 1 or self._clock() >= expires:
                         raise
                     await asyncio.sleep(self._ttl / 10)
 
@@ -430,7 +436,18 @@ class LocalDriver:
         if not rec.pending:  # another writer finished the work while we claimed
             return "idle"
         head, probe = self._choose(rec)
-        outcome = await self._execute(run_id, head)
+        if probe:
+            try:
+                outcome = await self._execute(run_id, head)
+            except LeaseLostError:
+                raise
+            except Exception:
+                # The probe's one call failed for good (the handler cannot stop this effect).
+                # That must not hold the StopRun back; the effect, still at the head, raises the
+                # same fault again on its next call, so it is not hidden.
+                return "worked"
+        else:
+            outcome = await self._execute(run_id, head)
         if isinstance(outcome, StillRunning | Held):
             if probe:
                 return "worked"  # the probe has had its one call; go on to the StopRun
@@ -444,16 +461,26 @@ class LocalDriver:
         BLOCKED, finished or held (see ``held``); raises ``RunWedgedError`` if it is idle in
         any other status.
 
-        One drive per run per driver instance: a second call (or ``resume_all``) for a run this
-        instance is already driving executes nothing; it waits for the first drive and returns
-        its result. The lease cannot tell two tasks of one instance apart, so this guard does."""
-        running = self._driving.get(run_id)
-        if running is not None:
-            return await asyncio.shield(running)
+        One drive per run per driver instance: while this instance is already driving the run, a
+        second call (or ``resume_all``) executes nothing in the meantime. It waits for the first
+        drive to end without inheriting its cancellation, re-raises that drive's exception if it
+        had one, and otherwise runs its own drive (an idle drive costs nothing), so an event
+        queued after the first drive's last read is not left with nobody driving it. The lease
+        cannot tell two tasks of one instance apart, so this guard does."""
+        while (running := self._driving.get(run_id)) is not None:
+            await asyncio.wait({running})
+            if self._driving.get(run_id) is running:
+                del self._driving[run_id]  # do not wait for the done callback to clear it
+            if not running.cancelled() and (error := running.exception()) is not None:
+                raise error
         task = asyncio.ensure_future(self._drive(run_id))
         self._driving[run_id] = task
-        task.add_done_callback(lambda _: self._driving.pop(run_id, None))
+        task.add_done_callback(lambda t: self._forget(run_id, t))
         return await task
+
+    def _forget(self, run_id: RunId, task: asyncio.Future[RunState]) -> None:
+        if self._driving.get(run_id) is task:
+            del self._driving[run_id]
 
     async def _drive(self, run_id: RunId) -> RunState:
         self._held.pop(run_id, None)
@@ -627,7 +654,7 @@ class EffectsExecutor:
                 raise TypeError(f"no executor for {type(command).__name__}")
             return await self._others.execute(key, command)
         try:
-            outcome = await asyncio.to_thread(self._run_effect, command)
+            outcome = await asyncio.to_thread(self._run_effect, command, key)
         except TransientError as e:
             # An SCM blip, or the effect kept changing under the claim: try again later.
             return self._again(key, f"transient:{type(e).__name__}", retrying=True)
@@ -642,7 +669,7 @@ class EffectsExecutor:
         self._streak[key] = n + 1 if retrying else 0
         return StillRunning(min(self._poll * 2 ** min(n, 6), 60 * self._poll), reason)
 
-    def _run_effect(self, cmd: RunEffect) -> Outcome:
+    def _run_effect(self, cmd: RunEffect, key: str) -> Outcome:
         fx, run_id = self._fx, cmd.run_id
         planned = fx.plan(
             run_id,
@@ -672,12 +699,15 @@ class EffectsExecutor:
                     run_id, ikey, handler, live=self._live(cmd) if needs_live else None
                 )
         except ValueError:
-            # The record moved between get and poll/stop/reconcile (ACCEPTED -> CONFIRMED, ...):
-            # look again on the next call.
-            return self._again(ikey, "moved", retrying=False)
-        return self._map(cmd, result, ikey)
+            # A ValueError is a fault (a handler bug, a non-outcome return) unless the record
+            # really moved between get and poll/stop/reconcile (ACCEPTED -> CONFIRMED, ...):
+            # then look again on the next call.
+            if fx.get(run_id, ikey).status is status:
+                raise
+            return self._again(key, "moved", retrying=False)
+        return self._map(cmd, result, key)
 
-    def _map(self, cmd: RunEffect, result: ExecResult, ikey: str) -> Outcome:
+    def _map(self, cmd: RunEffect, result: ExecResult, key: str) -> Outcome:
         effect = result.effect
         failed = EffectFailed(cmd.run_id, cmd.type, cmd.visit)
         # Blocked means the outcome is unknown and a person must decide. It is reported even on a
@@ -694,4 +724,4 @@ class EffectsExecutor:
         if result.reason == "held":
             return Held("held")
         retrying = effect.status is EffectStatus.RETRYING
-        return self._again(ikey, result.reason or effect.status.value.lower(), retrying=retrying)
+        return self._again(key, result.reason or effect.status.value.lower(), retrying=retrying)

@@ -87,10 +87,12 @@ class CommandExecutor(Protocol):
     The driver runs a queued ``StopRun`` ahead of a command that is not finished, and applies
     queued events before every call, so none of these can hold a Stop behind a pending merge.
 
-    The driver never calls ``execute`` concurrently for one run: a second ``run_until_idle`` or
-    ``resume_all`` for a run the same driver instance is already driving joins the first drive.
-    Across driver instances the run's lease keeps it to one, so the same key may reach
-    ``execute`` twice only after a crash or a lapsed lease, which is why it must be idempotent.
+    The driver never calls ``execute`` concurrently for one run: while a driver instance is
+    driving a run, another ``run_until_idle`` or ``resume_all`` for it waits for that drive to end
+    (re-raising its exception, not inheriting its cancellation) and then runs its own, which
+    executes nothing if nothing is left. Across driver instances the run's lease keeps it to one,
+    so the same key may reach ``execute`` twice only after a crash or a lapsed lease, which is why
+    it must be idempotent.
 
     Do not poll or sleep inside ``execute``: return ``StillRunning`` instead, so queued events
     (Stop) can be applied between calls. Raising ends the driver loop; it is for faults.
