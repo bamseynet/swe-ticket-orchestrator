@@ -38,6 +38,10 @@ class FakeTicketSource(FakeBase):
     def add_ticket(self, ticket: Ticket) -> None:
         self._tickets[ticket.ref] = ticket
 
+    def edit(self, ref: TicketRef, editor: str, **changes: str) -> None:
+        """Test control: someone edits the ticket (title, body, ...); it records who."""
+        self._tickets[ref] = replace(self._ticket(ref), editor=editor, **changes)  # type: ignore[arg-type]
+
     def comments(self, ref: TicketRef) -> list[str]:
         return list(self._comments.get(ref, []))
 

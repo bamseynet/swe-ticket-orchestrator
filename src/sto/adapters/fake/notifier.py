@@ -11,6 +11,7 @@ from sto.adapters.ports import (
     MalformedWebhookError,
     NotifierCapabilities,
     RawWebhook,
+    RefusedError,
     UnknownRefError,
 )
 from sto.domain.models import DecisionKind, Receipt
@@ -22,8 +23,8 @@ class FakeNotifier(FakeBase):
         self.capabilities = NotifierCapabilities()
         self._messages: dict[str, GateMessage] = {}
 
-    def messages(self) -> list[GateMessage]:
-        return list(self._messages.values())
+    def messages(self, channel: str | None = None) -> list[GateMessage]:
+        return [m for m in self._messages.values() if channel is None or m.channel == channel]
 
     def send(self, message: GateMessage, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:
@@ -39,6 +40,8 @@ class FakeNotifier(FakeBase):
         def apply() -> Receipt:
             if receipt.external_id not in self._messages:
                 raise UnknownRefError(f"no message {receipt.external_id!r}")
+            if self._messages[receipt.external_id].channel != message.channel:
+                raise RefusedError("a sent message cannot move to another channel")
             self._messages[receipt.external_id] = message
             return self._receipt("msg", f"fake://msg/{message.gate_id}", receipt.external_id)
 

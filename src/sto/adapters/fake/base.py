@@ -18,6 +18,7 @@ from sto.adapters.ports import (
     RepoRef,
     TicketRef,
 )
+from sto.domain.errors import TransientError
 from sto.domain.models import Receipt
 
 
@@ -29,6 +30,8 @@ class FakeBase:
         self.read_back_verified = True  # False models "accepted but not applied" (ADR-0011)
         self._port, self._seq = port, 0
         self._noop = False
+        self._unapplied = False
+        self._failures: dict[str, list[str]] = {}
         self._ledger: dict[tuple[str, str], tuple[dict[str, Any], Any]] = {}
 
     def _next_id(self, prefix: str) -> str:
@@ -43,15 +46,27 @@ class FakeBase:
             simulated=True,
         )
 
+    # State a rollback must not undo: the spy, the ledger, flags, injected failures and ID counter.
+    _KEEP: tuple[str, ...] = ("spy", "_ledger", "_noop", "_unapplied", "_failures", "_seq")
+
+    def fail_next(self, method: str, times: int = 1) -> None:
+        """Make the next ``times`` calls to ``method`` raise a transient error and apply nothing
+        (the RETRYING path)."""
+        self._failures.setdefault(method, []).extend(["fail"] * times)
+
+    def lose_response_next(self, method: str, times: int = 1) -> None:
+        """Make the next ``times`` calls to ``method`` apply, then raise a transient error: the
+        write happened and the caller never saw the answer."""
+        self._failures.setdefault(method, []).extend(["lose"] * times)
+
     def _apply[T](self, apply: Callable[[], T]) -> T:
         """Run ``apply``; with ``read_back_verified`` off its effects are rolled back."""
         if self.read_back_verified:
             return apply()
-        keep = ("spy", "_ledger", "_noop")
-        saved = {k: copy.deepcopy(v) for k, v in self.__dict__.items() if k not in keep}
+        saved = {k: copy.deepcopy(v) for k, v in self.__dict__.items() if k not in self._KEEP}
         result = apply()
         self.__dict__.update(saved)
-        self._noop = True
+        self._noop = self._unapplied = True
         return result
 
     def _write[T](
@@ -60,9 +75,12 @@ class FakeBase:
         """Apply once per ``(method, key)``; a replay returns the first result, other arguments
         are refused. Every attempt, refused or not, reaches the spy. ``apply`` sets ``_noop`` when
         it accepted the call but changed nothing."""
-        replayed, self._noop = False, False
+        replayed, self._noop, self._unapplied = False, False, False
         ledger_key = (method, key or "")
+        injected = (self._failures.get(method) or [""]).pop(0)
         try:
+            if injected == "fail":
+                raise TransientError(f"injected failure in {method}")
             if key is not None and ledger_key in self._ledger:
                 first_args, result = self._ledger[ledger_key]
                 if first_args != args:
@@ -72,8 +90,10 @@ class FakeBase:
                 replayed = True
             else:
                 result = self._apply(apply)
-                if key is not None:
+                if key is not None and not self._unapplied:  # a retry must really write
                     self._ledger[ledger_key] = (args, result)
+            if injected == "lose":
+                raise TransientError(f"response of {method} lost")
         except Exception as exc:
             self.spy.record(SpyCall(self._port, method, args, key, error=type(exc).__name__))
             raise

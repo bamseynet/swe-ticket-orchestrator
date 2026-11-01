@@ -68,7 +68,7 @@ def _sha(*parts: str) -> str:
 class FakeScm(FakeBase):
     def __init__(self, spy: SpyWriter | None = None) -> None:
         super().__init__("scm", spy)
-        self.capabilities = ScmCapabilities()
+        self.capabilities = ScmCapabilities(merge_queue=False)  # merge groups are not modelled
         self.trusted = True
         self.require_up_to_date = True  # PLAN 6.4 guard 6; OrgPolicy may waive it
         self._heads: dict[tuple[RepoRef, str], str] = {}
@@ -80,13 +80,26 @@ class FakeScm(FakeBase):
         self._reverts: dict[tuple[RepoRef, str], Receipt] = {}
         self._update_conflicts: set[PrRef] = set()
         self._merge_conflicts: set[PrRef] = set()
+        self._ghosts: dict[str, _Merge] = {}  # accepted but not applied: polls as not merged
+
+    _KEEP = (*FakeBase._KEEP, "_ghosts")
 
     # --- test controls and reads (not writes, so the spy ignores them) ---
     def seed_branch(self, repo: RepoRef, branch: str, sha: str, parent: str | None = None) -> None:
-        """Make ``branch`` point at ``sha``, a root commit or a child of ``parent``."""
+        """Make ``branch`` point at ``sha``: a known commit, a child of ``parent``, or the first
+        commit of a repo. Another unrelated root would later read as "the base moved"."""
+        if (repo, sha) not in self._commits:
+            if parent is not None:
+                self._known_commit(repo, parent)
+            elif any(r == repo for r, _ in self._commits):
+                raise RefusedError(f"seeding {sha} needs a parent: it would be an unrelated root")
+            self._commits[(repo, sha)] = None
+            self._parents[(repo, sha)] = (parent,) if parent else ()
         self._heads[(repo, branch)] = sha
-        self._commits.setdefault((repo, sha), None)
-        self._parents.setdefault((repo, sha), (parent,) if parent else ())
+
+    def parents(self, repo: RepoRef, sha: str) -> tuple[str, ...]:
+        self._known_commit(repo, sha)
+        return self._parents[(repo, sha)]
 
     def set_update_conflict(self, pr: PrRef, conflict: bool) -> None:
         (self._update_conflicts.add if conflict else self._update_conflicts.discard)(pr)
@@ -127,7 +140,9 @@ class FakeScm(FakeBase):
             raise RefusedError(f"{merge_sha} already exists")
         base = self.head(spec.repo, spec.base)
         self._commits[(spec.repo, merge_sha)] = CommitIntent(merge_sha, base, PatchRef("merge"))
-        self._parents[(spec.repo, merge_sha)] = (base, merge.head)
+        # a squash or rebase writes new commits: the branch's own head is not an ancestor
+        merged_in = (merge.head,) if merge.method is MergeMethod.MERGE else ()
+        self._parents[(spec.repo, merge_sha)] = (base, *merged_in)
         self._heads[(spec.repo, spec.base)] = merge_sha
         self._finish(merge, MergeState.MERGED)
         merge.merge_sha = merge_sha
@@ -200,6 +215,8 @@ class FakeScm(FakeBase):
         return SnapshotLocation(f"fake://{repo.owner}/{repo.name}/{sha}")
 
     def poll_merge(self, handle: MergeHandle) -> MergeResult:
+        if handle.id in self._ghosts:  # accepted but never applied: simply not merged
+            return MergeResult(MergeState.PENDING)
         merge = self._resolve(self._merge(handle))
         return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason)
 
@@ -245,6 +262,11 @@ class FakeScm(FakeBase):
         def apply() -> Receipt:
             self._known_commit(repo, sha)
             current = self._heads.get((repo, branch))
+            if any(
+                p.spec.repo == repo and p.spec.base == branch and p.state in _OPEN
+                for p in self._prs.values()
+            ):
+                raise RefusedError(f"{branch} is the base of an open PR")
             if current is not None and not self._contains(repo, sha, current):
                 raise RefusedError(f"{sha} does not fast-forward {branch}")
             self._noop = current == sha
@@ -327,15 +349,25 @@ class FakeScm(FakeBase):
 
     def open_revert_pr(self, repo: RepoRef, merge_sha: str, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:
-            if all(p.merge_sha != merge_sha or p.spec.repo != repo for p in self._prs.values()):
+            merged = [
+                p for p in self._prs.values() if p.merge_sha == merge_sha and p.spec.repo == repo
+            ]
+            if not merged:
                 raise UnknownRefError(f"no merge {merge_sha} in {repo}")
             # keyed by (run, merge_sha): a declared and an implicit revert open one PR
             if (repo, merge_sha) in self._reverts:
                 self._noop = True
-            else:
-                self._reverts[(repo, merge_sha)] = self._receipt(
-                    "revert", f"fake://revert/{merge_sha}"
-                )
+                return self._reverts[(repo, merge_sha)]
+            base = merged[0].spec.base
+            tip = self.head(repo, base)
+            branch = f"sto-revert/{merge_sha}"
+            commit = CommitIntent(_sha("revert", merge_sha, tip), tip, PatchRef("revert"))
+            self._commits[(repo, commit.sha)] = commit
+            self._parents[(repo, commit.sha)] = (tip,)
+            self._heads[(repo, branch)] = commit.sha
+            ref = PrRef(repo, len(self._prs) + 1)
+            self._prs[ref] = _Pr(PrSpec(repo, branch, base, f"Revert {merge_sha}", ""), "ready")
+            self._reverts[(repo, merge_sha)] = self._pr_receipt(ref)
             return self._reverts[(repo, merge_sha)]
 
         args = {"repo": repo, "merge_sha": merge_sha}
@@ -366,6 +398,8 @@ class FakeScm(FakeBase):
                 return MergeHandle(pending.id, pr)
             merge = _Merge(self._next_id("merge"), pr, current, method)
             self._merges[merge.id] = merge
+            if not self.read_back_verified:  # the rollback drops it, the handle must still poll
+                self._ghosts[merge.id] = merge
             return MergeHandle(merge.id, pr)
 
         args = {"pr": pr, "expected_sha": expected_sha, "method": method}
@@ -385,12 +419,13 @@ class FakeScm(FakeBase):
         return self._write("dequeue", {"pr": pr, "expected_head": expected_head}, None, apply)
 
     def trigger_workflow(self, repo: RepoRef, spec: DispatchSpec, key: IdempotencyKey) -> Receipt:
-        return self._write(
-            "trigger_workflow",
-            {"repo": repo, "spec": spec},
-            key,
-            lambda: self._receipt("run", f"fake://{repo.name}/{spec.workflow}"),
-        )
+        def apply() -> Receipt:
+            current = self.head(repo, spec.ref)
+            if spec.expected_head is not None and current != spec.expected_head:
+                raise StaleHeadError(f"{spec.ref} is at {current}, not {spec.expected_head}")
+            return self._receipt("run", f"fake://{repo.name}/{spec.workflow}")
+
+        return self._write("trigger_workflow", {"repo": repo, "spec": spec}, key, apply)
 
     def publish_check(self, spec: CheckSpec, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:

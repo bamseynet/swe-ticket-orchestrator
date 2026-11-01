@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -24,8 +25,9 @@ class StaleHeadError(PermanentError):
 
     Permanent, so it fails closed: nothing retries the same head. Only ``pr.merge`` and
     ``release.trigger`` have a ``stale`` edge (PLAN 859), so D1-07 catches it for those two and
-    routes it there. ``move_ref``, ``merge_base_into`` and ``dequeue`` have no such edge, so for
-    them it BLOCKS.
+    routes it there. ``move_ref`` and ``merge_base_into`` have none, so it BLOCKS there. On Stop
+    (PLAN 14.3: dequeue if possible) the caller catches it from ``dequeue``, and ``RefusedError``
+    when the base moved, then polls the merge and reconciles: that merge is already dead.
     """
 
 
@@ -99,10 +101,18 @@ class DecisionRequest:
             value = getattr(self, name)
             if not isinstance(value, str) or (name != "comment" and not value):
                 raise ValueError(f"decision {name} must be a string")
-        if self.subject_digest is None and not self.kind.is_negative:
+        digest = self.subject_digest
+        if digest is None and not self.kind.is_negative:
             raise ValueError(f"a {self.kind} decision needs a subject_digest")
-        if self.subject_digest is not None and not isinstance(self.subject_digest, str):
-            raise ValueError("decision subject_digest must be a string")
+        if digest is not None and (
+            not isinstance(digest, str) or not (digest.strip() or self.kind.is_negative)
+        ):
+            raise ValueError("decision subject_digest must be a non-blank string")
+        if (
+            self.kind in (DecisionKind.REJECT, DecisionKind.REQUEST_CHANGES)
+            and not self.comment.strip()
+        ):
+            raise ValueError(f"a {self.kind} decision needs its comment (PLAN T16)")
 
 
 # --- tickets ------------------------------------------------------------------------------
@@ -225,12 +235,11 @@ class PrRef:
 
     @classmethod
     def of(cls, repo: RepoRef, receipt: Receipt) -> PrRef:
-        """The route from ``ensure_draft_pr`` / ``mark_ready`` to a ``PrRef``: a PR receipt's
-        ``external_id`` is the PR number."""
-        try:
-            return cls(repo, int(receipt.external_id))
-        except ValueError:
-            raise RefusedError(f"{receipt.external_id!r} is not a PR receipt") from None
+        """The route from a PR receipt to a ``PrRef``. A PR receipt's ``external_id`` is the PR
+        number (ASCII digits, above zero), never GitHub's global ID."""
+        if not re.fullmatch(r"[1-9][0-9]*", receipt.external_id, re.ASCII):
+            raise RefusedError(f"{receipt.external_id!r} is not a PR receipt")
+        return cls(repo, int(receipt.external_id))
 
 
 class MergeMethod(StrEnum):
@@ -288,6 +297,9 @@ class DispatchSpec:
     workflow: str
     ref: str
     inputs: Mapping[str, str] = field(default_factory=dict)
+    expected_head: str | None = (
+        None  # the tested SHA: a moved ``ref`` is stale (``release.trigger``)
+    )
 
 
 @dataclass(frozen=True)
