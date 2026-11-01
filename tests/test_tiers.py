@@ -251,9 +251,9 @@ def test_unmarked_tests_count_as_unit(tmp_path: Path) -> None:
     assert "1 deselected" in result.stdout
 
 
-def test_all_six_tier_markers_are_registered(tmp_path: Path) -> None:
+def test_all_seven_tier_markers_are_registered(tmp_path: Path) -> None:
     result = run_pytest(tmp_path, "def test_x(): pass\n", "--markers")
-    for tier in ("unit", "contract", "gate", "integration", "ui_browser", "live"):
+    for tier in ("unit", "contract", "gate", "integration", "ui_browser", "e2e", "live"):
         assert re.search(rf"@pytest\.mark\.{tier}:", result.stdout), tier
 
 
@@ -579,3 +579,93 @@ def test_package_is_importable_for_coverage() -> None:
     import sto
 
     assert sto.__name__ == "sto"
+
+
+# ---- D0-09a: the e2e tier ----
+
+
+def test_unmarked_test_under_e2e_directory_is_in_the_e2e_tier(tmp_path: Path) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_journey.py").write_text("def test_journey(): pass\n")
+    (tmp_path / "test_plain.py").write_text("def test_plain(): pass\n")
+    selected = run_pytest(tmp_path, "def test_x(): pass\n", "--collect-only", "-m", "e2e")
+    assert "e2e/test_journey.py::test_journey" in selected.stdout
+    assert "test_plain" not in selected.stdout
+    unit = run_pytest(tmp_path, "def test_x(): pass\n", "--collect-only", "-m", "unit")
+    assert "test_journey" not in unit.stdout
+
+
+def test_e2e_tests_are_deselected_locally(tmp_path: Path) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_dir.py").write_text(
+        'def test_by_dir(): raise AssertionError("must not run locally")\n'
+    )
+    source = """
+        import pytest
+        @pytest.mark.e2e
+        def test_by_marker(): raise AssertionError("must not run locally")
+        def test_plain(): pass
+    """
+    result = run_pytest(tmp_path, source)
+    assert result.returncode == 0, result.stdout
+    assert "1 passed" in result.stdout
+    assert "2 deselected" in result.stdout
+
+
+def test_e2e_marker_is_registered(tmp_path: Path) -> None:
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "--markers")
+    assert re.search(r"@pytest\.mark\.e2e:", result.stdout)
+
+
+def test_ci_e2e_job_selects_by_marker_and_runs_the_smoke_test() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    runs = [s["run"] for s in workflow["jobs"]["e2e"]["steps"] if "run" in s]
+    pytest_runs = [r for r in runs if "pytest" in r]
+    assert len(pytest_runs) == 1
+    assert "-m e2e" in pytest_runs[0]
+    assert "-m integration" not in pytest_runs[0]
+    assert "-rA" in pytest_runs[0]  # the log names each test that passed
+    assert "e2e" in workflow["jobs"]["ci-required"]["needs"]
+    selected = collected_in("e2e", "tests/e2e")
+    assert "test_stack_smoke.py::test_stack_is_up_and_dynamodb_answers" in selected
+
+
+def collected_in(tier: str, path: str) -> str:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", tier, path],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    return result.stdout
+
+
+def test_e2e_directory_wins_over_another_tier_marker(tmp_path: Path) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_both.py").write_text(
+        "import pytest\n@pytest.mark.integration\ndef test_both(): pass\n"
+    )
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "--collect-only", "-m", "e2e")
+    assert "test_both" in result.stdout
+
+
+@pytest.mark.parametrize("tier", ["unit", "contract", "gate"])
+def test_hermetic_tier_marker_under_e2e_directory_is_rejected(tmp_path: Path, tier: str) -> None:
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_bad.py").write_text(
+        f"import pytest\n@pytest.mark.{tier}\ndef test_bad(): pass\n"
+    )
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "-m", tier)
+    assert result.returncode != 0
+    assert "tests/e2e" in result.stdout + result.stderr
+    assert tier in result.stdout + result.stderr
+
+
+def test_e2e_test_may_use_docker(tmp_path: Path) -> None:
+    # PLAN section 18 tier table: the E2E tier runs with Docker.
+    (tmp_path / "e2e").mkdir()
+    (tmp_path / "e2e" / "test_dock.py").write_text(textwrap.dedent(DOCKER_TEST).format(marker=""))
+    result = run_pytest(tmp_path, "def test_x(): pass\n", "-m", "e2e")
+    assert result.returncode == 0, result.stdout

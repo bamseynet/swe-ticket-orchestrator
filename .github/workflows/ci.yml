@@ -307,8 +307,10 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv sync --locked
       - run: docker compose up -d --wait dynamodb-local
-      # Whole local stack up, then the e2e tests (selected by path; no e2e marker until D0-09a). D1-10 adds the real journey under tests/e2e/.
-      - run: uv run pytest -q -m integration tests/e2e
+      # Whole local stack up, then the e2e tests, selected by the `e2e` marker (anything under tests/e2e/ has it).
+      # `-rA` lists every test with its outcome, so the log shows the smoke test was selected and passed.
+      # D1-10 adds the real journey under tests/e2e/.
+      - run: uv run pytest -rA -q -m e2e
       - if: failure()
         run: docker compose logs
 
