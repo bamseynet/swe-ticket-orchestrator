@@ -271,7 +271,7 @@ def test_closing_an_older_round_never_invalidates_a_newer_one(
 
 
 class _FlipBetweenReads(MemoryStore):
-    """On the second ``GATE#`` query, approve round 1 behind the service's back: the state
+    """On the third ``GATE#`` query (the confirming re-read), approve round 1 behind the service's back: the state
     changed between its first look and the moment it reads the audit chain head."""
 
     def __init__(self) -> None:
@@ -282,7 +282,7 @@ class _FlipBetweenReads(MemoryStore):
     def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
         if self.armed and kw.get("sk_prefix", "").startswith("GATE#"):
             self.queries += 1
-            if self.queries == 2:
+            if self.queries == 3:
                 item = gate_item(self, round=1)
                 MemoryStore.put(self, TEAM, item.key, {**item.data, "status": "APPROVED"})
         return super().query(scope, pk, **kw)
