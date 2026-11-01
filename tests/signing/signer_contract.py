@@ -13,7 +13,8 @@ Import with ``from signing.signer_contract import SignerContract, VerifierContra
 
 * ``failing_signer``: a ``Signer`` whose backend fails transiently on ``sign`` and ``verify``.
 
-Set ``asymmetric = True`` on a subclass whose ``signer`` publishes public keys.
+Whether public keys are expected follows from ``signer.algorithm``: anything but ``HS256`` is
+asymmetric and must publish its key.
 """
 
 from __future__ import annotations
@@ -28,8 +29,6 @@ from sto.signing.port import Signature, Signer, SigningError, Verifier
 
 
 class VerifierContract:
-    asymmetric = False
-
     @pytest.fixture
     def verifier(self) -> Verifier:
         raise NotImplementedError
@@ -100,7 +99,10 @@ class VerifierContract:
         self, verifier: Verifier, signer: Signer
     ) -> None:
         keys = verifier.public_keys()
-        if not self.asymmetric:
+        private_members = {"d", "p", "q", "dp", "dq", "qi", "k"}
+        for key in keys:
+            assert not private_members & set(key)
+        if signer.algorithm == "HS256":
             assert list(keys) == []
             return
         match = [k for k in keys if k["kid"] == signer.key_id]

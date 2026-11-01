@@ -21,8 +21,8 @@ MIN_SECRET_BYTES = 32
 
 
 def _check(key_id: object, secret: object) -> None:
-    if not isinstance(key_id, str) or not key_id:
-        raise SigningError("key_id must be a non-empty string")
+    if not isinstance(key_id, str) or not key_id or not key_id.isprintable():
+        raise SigningError("key_id must be a non-empty printable string")
     if not isinstance(secret, bytes):
         raise SigningError("secret must be bytes")
     if len(secret) < MIN_SECRET_BYTES:

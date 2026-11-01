@@ -137,6 +137,8 @@ def test_usable_as_verifier() -> None:
         {"key_id": "k", "secret": SECRET, "retired": {"r": b"short"}},
         {"key_id": "k", "secret": SECRET, "retired": {"r": OLD.decode()}},
         {"key_id": "k", "secret": SECRET, "retired": {"": OLD}},
+        {"key_id": "k\n", "secret": SECRET},
+        {"key_id": "k", "secret": SECRET, "retired": {"old\n": OLD}},
         {"key_id": "k", "secret": SECRET, "retired": [SECRET]},
         {"key_id": "k", "secret": SECRET, "retired": 5},
     ],
@@ -187,6 +189,7 @@ def test_no_private_key_in_logs_repr_or_errors(caplog: pytest.LogCaptureFixture)
             # swapped arguments and inverted retired map: the secret ends up as the key ID
             lambda: LocalSigner(key_id=SECRET.decode(), secret=SHORT),
             lambda: LocalSigner(key_id=SECRET.decode(), secret=b"k"),
+            lambda: LocalSigner(key_id=SECRET.decode(), secret="k"),  # type: ignore[arg-type]
             lambda: LocalSigner(key_id=SECRET, secret=SECRET),  # type: ignore[arg-type]
             lambda: LocalSigner(key_id="k", secret=SECRET, retired={OLD.decode(): SHORT}),
             lambda: LocalSigner(
