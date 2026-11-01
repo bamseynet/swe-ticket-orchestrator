@@ -1,15 +1,15 @@
-"""Test-tier plugin (``-p tier_guard``), D0-08.
+"""Test-tier plugin (``-p tier_guard``), D0-08 and D0-09a.
 
-* Registers the six tier markers: ``unit``, ``contract``, ``gate``, ``integration``,
-  ``ui_browser`` and ``live``. A test with no tier marker counts as ``unit``.
-* ``integration``, ``ui_browser`` and ``live`` tests are deselected unless ``-m`` is given, so
-  local runs stay hermetic. CI jobs select them with ``-m``.
+* Registers the seven tier markers: ``unit``, ``contract``, ``gate``, ``integration``,
+  ``ui_browser``, ``e2e`` and ``live``. A test with no tier marker counts as ``unit``.
+* ``integration``, ``ui_browser``, ``e2e`` and ``live`` tests are deselected unless ``-m`` is
+  given, so local runs stay hermetic. CI jobs select them with ``-m``.
 * Docker use without the ``integration`` marker fails, and so does launching a browser without
   ``ui_browser``. The program of every simple command is inspected (``sh -c``, ``env docker`` and
   ``shell=True`` strings, ``xargs``, backtick and ``$(...)`` substitutions and
   ``Popen(executable=...)`` included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
-  ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/`` or ``contract(s)/``
-  directory is in that tier even without the marker.
+  ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/``, ``contract(s)/``
+  or ``e2e/`` directory is in that tier even without the marker.
 
 This is a best-effort guard against accidents, not a security boundary. Known limits, left open
 on purpose: shell keywords as the first word (``if docker ps; then``), ``command -v docker``
@@ -42,9 +42,10 @@ TIERS = {
     "gate": "gate-integrity scenarios on the in-memory store; hermetic",
     "integration": "needs Docker (DynamoDB Local, containers); CI only",
     "ui_browser": "needs a browser (Playwright); CI only",
+    "e2e": "whole local stack up (Docker); CI only",
     "live": "needs real GitHub or AWS; tagged, on demand",
 }
-HEAVY = ("integration", "ui_browser", "live")
+HEAVY = ("integration", "ui_browser", "e2e", "live")
 DOCKER_PROGRAMS = {"docker", "docker-compose", "podman"}
 BROWSER_HINTS = (
     "chrome",
@@ -55,7 +56,13 @@ BROWSER_HINTS = (
     "msedge",
     "headless_shell",
 )
-TIER_DIRS = {"gate": "gate", "gates": "gate", "contract": "contract", "contracts": "contract"}
+TIER_DIRS = {
+    "gate": "gate",
+    "gates": "gate",
+    "contract": "contract",
+    "contracts": "contract",
+    "e2e": "e2e",
+}
 
 
 class TierViolationError(RuntimeError):
