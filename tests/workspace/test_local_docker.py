@@ -1096,6 +1096,34 @@ def test_a_command_that_finished_with_text_over_the_cap_keeps_its_exit_status_an
     assert docker.sweeps() == []
 
 
+def test_a_sigkill_exit_is_rechecked_because_a_killed_keeper_stops_the_container_late(
+    docker: FakeDocker,
+) -> None:
+    # Docker still says "running" for a moment after the keeper dies; the next look says exited.
+    def flip(_seconds: float) -> None:
+        docker.containers[NAME].state = "exited"
+
+    provider = LocalDockerProvider(
+        image=IMAGE,
+        runner=docker,
+        docker="docker",
+        clock=docker.clock,
+        wall=docker.wall,
+        sleep=flip,
+    )
+    provider.start(SID, pack_snapshot({}))
+    docker.exec_script["kill-keeper"] = (failed(137), 0.0)
+    with pytest.raises(SessionLostError):
+        provider.exec(SID, "kill-keeper", timeout_s=30)
+
+
+def test_a_sigkill_exit_in_a_session_that_stays_up_is_just_an_exit_status(
+    live_provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    docker.exec_script["kill -9 $$"] = (failed(137), 0.0)
+    assert live_provider.exec(SID, "kill -9 $$", timeout_s=30).exit_code == 137
+
+
 # ---- the sweep's own report is never enough
 
 
@@ -1572,7 +1600,13 @@ ctypes.CDLL(None).pthread_exit(None)
 """,
     # A comm that imitates a stat line, so anything parsing /proc/PID/stat is fooled.
     "comm.py": b"""import sys, time
-open("/proc/self/comm", "wb").write(b"a) Z \nb")
+import os
+try:  # /proc/self is blocked by Docker's AppArmor profile; /proc/<pid> is not
+    open(f"/proc/{os.getpid()}/comm", "wb").write(b"a) Z \\nb")
+    status = "ok"
+except OSError as exc:
+    status = repr(exc)
+open("/workspace/comm_status", "w").write(status)
 end = time.time() + float(sys.argv[2])
 while time.time() < end:
     open(sys.argv[1], "w").write(str(time.time())); time.sleep(0.05)
@@ -1609,7 +1643,13 @@ def hostile(docker_provider: LocalDockerProvider) -> LocalDockerProvider:
     return docker_provider
 
 
-def contained(p: LocalDockerProvider, command: str, marker: str) -> str:
+def contained(
+    p: LocalDockerProvider,
+    command: str,
+    marker: str,
+    *,
+    precondition: tuple[str, str] | None = None,
+) -> str:
     """Run hostile code to a timeout. Either its marker stops changing, or the session is gone."""
     try:
         res = p.exec("itest-main", command, timeout_s=2)
@@ -1623,6 +1663,9 @@ def contained(p: LocalDockerProvider, command: str, marker: str) -> str:
     before, after = stable(p, f"/workspace/{marker}")
     assert before != "", f"{marker}: the hostile code never ran, so this proves nothing"
     assert before == after, f"{marker} is still changing after a sweep that reported clean"
+    if precondition:  # the trick under test really was applied
+        path, expected = precondition
+        assert p.exec("itest-main", f"cat {path}").stdout == expected
     return "swept"
 
 
@@ -1637,7 +1680,12 @@ def test_docker_a_zombie_leader_with_live_threads_does_not_survive(
 def test_docker_a_comm_that_imitates_a_stat_line_does_not_fool_the_sweep(
     hostile: LocalDockerProvider,
 ) -> None:
-    contained(hostile, "python comm.py /workspace/m_comm 600 & sleep 100", "m_comm")
+    contained(
+        hostile,
+        "python comm.py /workspace/m_comm 600 & sleep 100",
+        "m_comm",
+        precondition=("/workspace/comm_status", "ok"),
+    )
 
 
 @pytest.mark.integration

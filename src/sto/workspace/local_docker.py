@@ -86,6 +86,8 @@ _BASELINE_TASKS = 2  # PID 1 (init) and the keeper
 _QUIET_SAMPLES = 3  # consecutive host-side counts that must equal the baseline
 _MAX_SAMPLES = 15
 _SAMPLE_PAUSE_S = 0.2
+_SETTLE_CHECKS = 3
+_SETTLE_PAUSE_S = 0.5
 _STALE_START_S = 300.0  # an unfinished start older than this is a crashed one and is taken over
 _EXIT_TIMEOUT = 124  # `timeout` when the command timed out
 _EXIT_KILLED = 137  # 128 + SIGKILL, when `-k` had to escalate
@@ -506,7 +508,18 @@ class LocalDockerProvider:
             state = self._state(session_id)
             if state != "running":
                 raise SessionLostError(f"session is {state}")
+            if res.exit_code == _EXIT_KILLED:
+                self._confirm_still_running(session_id)
         return res
+
+    def _confirm_still_running(self, session_id: str) -> None:
+        """A SIGKILL exit may be the keeper being killed, and Docker takes a moment to notice the
+        container stopping. Look again over a short settle before calling the session alive."""
+        for _ in range(_SETTLE_CHECKS):
+            self._sleep(_SETTLE_PAUSE_S)
+            state = self._state(session_id)
+            if state != "running":
+                raise SessionLostError(f"session is {state}")
 
     def _sweep(self, session_id: str) -> bool:
         """Kill everything the command left behind, then verify from the host.
