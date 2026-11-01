@@ -81,6 +81,7 @@ export default function GatePage({ params }: { params: Record<string, string> })
   const generation = useRef(0); // bumped by every decision, so older reads are dropped
   const busy = useRef(false);
   const stuckPolls = useRef(0);
+  const lostKind = useRef<DecisionKind | null>(null); // the decision whose answer was lost
   const pendingNow = useRef<Pending | null>(null);
   pendingNow.current = pending;
   const statusLine = useRef<HTMLParagraphElement>(null);
@@ -96,14 +97,20 @@ export default function GatePage({ params }: { params: Record<string, string> })
       setPollError(null);
       if (found && found.status !== "OPEN") {
         // the answer to a decision may have been lost; a closed gate shows it did not fail
-        setActionError((e) => (e?.code === "network" ? null : e));
+        const lost = lostKind.current;
+        const notRecorded = lost ? refusal(lost, found.status, found.closed_by) : null;
+        setActionError((e) =>
+          e?.code === "network" ? (notRecorded ? { text: notRecorded, code: "refused" } : null) : e,
+        );
         const p = pendingNow.current;
         const refused = p ? refusal(p.kind, found.status, found.closed_by) : null;
         if (refused !== null) setPending((now) => (now ? { ...now, refused } : now)); // not back from null
       }
       const decided = found !== undefined && KIND_OF[found.status] !== undefined && found.closed_by !== null;
       const waiting = r?.status === "WAITING_HUMAN" && r.stage === name;
-      stuckPolls.current = decided && waiting ? stuckPolls.current + 1 : 0;
+      // A later round means the decision did reach the run (it asked for another round).
+      const newest = !g.gates.some((x) => x.name === name && x.round > round);
+      stuckPolls.current = decided && waiting && newest ? stuckPolls.current + 1 : 0;
       setStuck(stuckPolls.current >= STUCK_POLLS);
     } catch (e) {
       if (started === generation.current) setPollError(message(e));
@@ -173,6 +180,7 @@ export default function GatePage({ params }: { params: Record<string, string> })
       return;
     }
     busy.current = true;
+    lostKind.current = null;
     generation.current += 1;
     setSending(true);
     setActionError(null);
@@ -202,6 +210,7 @@ export default function GatePage({ params }: { params: Record<string, string> })
         setOfferStop(e.stop);
         void refresh();
       } else {
+        if (e instanceof ApiError && e.code === "network") lostKind.current = kind;
         setActionError({ text: message(e), code: e instanceof ApiError ? e.code : "error" });
         setOfferStop(e instanceof ApiError ? e.stop : null);
       }
@@ -213,6 +222,11 @@ export default function GatePage({ params }: { params: Record<string, string> })
 
   /** The gate is decided but its run still waits at it (a page left during delivery): any
    * request on a closed gate redelivers, so repeat the decision the gate shows. */
+  const retried = () => {
+    setNote("Delivery retried.");
+    stuckPolls.current = 0;
+    setStuck(false);
+  };
   const retryStuck = async () => {
     if (gate == null || busy.current) return;
     const kind = KIND_OF[gate.status];
@@ -222,13 +236,11 @@ export default function GatePage({ params }: { params: Record<string, string> })
     setNote(null);
     try {
       await decide(run, name, round, kind, gate.subject_digest, "retrying delivery");
-      setNote("Delivery retried.");
+      retried();
     } catch (e) {
-      if (e instanceof ApiError && e.code === "gate_closed") setNote("Delivery retried.");
-      else setActionError({ text: message(e), code: "error" });
+      if (e instanceof ApiError && e.code === "gate_closed") retried();
+      else setActionError({ text: message(e), code: "error" }); // the button stays
     } finally {
-      stuckPolls.current = 0;
-      setStuck(false);
       busy.current = false;
     }
   };

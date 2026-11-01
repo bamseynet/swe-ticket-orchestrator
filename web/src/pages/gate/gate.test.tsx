@@ -669,4 +669,47 @@ it("a failed Retry delivery says so and the button stays", async () => {
   await tick(4300);
   fireEvent.click(await screen.findByRole("button", { name: "Retry delivery" }));
   await waitFor(() => { expect(screen.getAllByRole("alert").some((a) => /not delivered/.test(a.textContent))).toBe(true); });
+  expect(screen.getByRole("button", { name: "Retry delivery" })).toBeTruthy();
+});
+
+it("a later round means the decision reached the run: no Retry delivery on an earlier round", async () => {
+  // Request changes on round 1 leaves the run waiting at the same stage on round 2.
+  serve((c) => (c.method === "POST" ? conflict("CHANGES_REQUESTED") : c.url.endsWith("/gates") ? json(200, { gates: GATES }) : json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate" })));
+  render(<Gate params={{ ...params, round: "1" }} />);
+  await screen.findByTestId("closed-by");
+  await tick(8000);
+  expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("shows one Retry delivery during delivery, not two", async () => {
+  serve((c) => {
+    if (c.method === "POST") return failed();
+    return c.url.endsWith("/gates") ? json(200, { gates: [GATES[1]] }) : json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate" });
+  });
+  render(<Gate params={params} />);
+  fireEvent.click(await open());
+  await screen.findByText(/delivering/);
+  // the gate is read as closed and the run waits at it for several polls while the repeats fail
+  serve((c) => {
+    if (c.method === "POST") return failed();
+    return c.url.endsWith("/gates") ? json(200, { gates: [closedAs("APPROVED")] }) : json(200, { id: "R1", status: "WAITING_HUMAN", stage: "review_gate" });
+  });
+  for (const ms of DELIVERY_BACKOFF_MS) await tick(ms);
+  await screen.findAllByRole("button", { name: "Retry delivery" });
+  expect(screen.getAllByRole("button", { name: "Retry delivery" })).toHaveLength(1);
+});
+
+it("a lost Reject that meets an APPROVED gate says it was not recorded", async () => {
+  let lost = false;
+  serve((c) => {
+    if (c.method === "POST") { lost = true; return new Error("lost"); }
+    return lost && c.url.endsWith("/gates") ? json(200, { gates: [closedAs("APPROVED")] }) : api()(c);
+  });
+  render(<Gate params={params} />);
+  await decideWith("Reject");
+  await screen.findByText(/could not reach/);
+  await tick(2100);
+  await screen.findByText("Your reject was not recorded; this gate is APPROVED, closed by dev.");
+  expect(screen.queryByText(/could not reach/)).toBeNull();
 });
