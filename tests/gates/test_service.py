@@ -912,6 +912,17 @@ def test_audit_is_a_hash_chain_in_the_audit_table(store: Store, svc: GateService
         verify_audit_chain(broken, TEAM, RUN)
 
 
+def test_the_default_writer_redacts_secrets_in_the_chain(store: Store, svc: GateService) -> None:
+    """Redaction is inside ``ChainedAuditWriter``, so a service built with no arguments has it."""
+    token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    gate = svc.open_gate(TEAM, open_cmd())
+    decide(svc, DecisionKind.REQUEST_CHANGES, gate=gate, comment=f"use {token} please")
+    stored = str([dict(e.data) for e in audit(store)])
+    assert token not in stored
+    assert "[REDACTED]" in stored
+    assert verify_audit_chain(store, TEAM, RUN) == 2
+
+
 def test_audit_table_refuses_overwrite_and_delete(store: Store, svc: GateService) -> None:
     svc.open_gate(TEAM, open_cmd())
     (entry,) = audit(store)
