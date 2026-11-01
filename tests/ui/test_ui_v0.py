@@ -29,7 +29,9 @@ LONG = 45_000  # ms: the run has to move (poll interval 2s in the UI)
 
 
 def free_port() -> int:
-    with socket.socket() as s:
+    with socket.socket(
+        socket.AF_INET, socket.SOCK_STREAM
+    ) as s:  # family explicit: the guard needs it
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
 
