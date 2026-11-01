@@ -10,6 +10,7 @@ show up. The finished state and timeline must equal an uninterrupted run's.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -27,7 +28,7 @@ from typing import Any
 import pytest
 
 from sto.adapters.fake.scm import FakeScm
-from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RepoRef
+from sto.adapters.ports import MergeMethod, MergeState, PrRef, PrSpec, RepoRef
 from sto.domain import (
     DecisionId,
     DecisionKind,
@@ -44,7 +45,7 @@ from sto.domain import (
 )
 from sto.domain.errors import TransientError
 from sto.effects.core import EffectExecutor, set_switch
-from sto.effects.ports import EffectHandler, Failed, MergeHandler
+from sto.effects.ports import EffectHandler, Failed, MergeHandler, Pending
 from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep, StopRun
 from sto.engine.drivers.local import (
     EffectsExecutor,
@@ -916,12 +917,13 @@ def test_timeline_and_active_runs_follow_the_cursor(tmp_path: Path) -> None:
     d = make(store, Worker(tmp_path / "ledger"))
 
     async def go() -> list[RunId]:
-        for n in (21, 22, 23):
+        for n in (21, 22, 23, 24, 25):
             await d.start(new_run(_rid(n)))
         await d.run_until_idle(_rid(21))  # finishes: six events, three pages of two
         return await d.active_runs()
 
-    assert run(go()) == [_rid(22), _rid(23)]  # the finished run left the index; two pages
+    # the finished run left the index; four runs span two pages of two
+    assert run(go()) == [_rid(22), _rid(23), _rid(24), _rid(25)]
     assert len(d.timeline(_rid(21))) == 6
 
 
@@ -1115,6 +1117,535 @@ def test_a_held_merge_returns_held_and_resumes_when_released(tmp_path: Path) -> 
     assert w.driver.held(RID) is None
 
 
+# --- Stop and the merge queue, transient errors, one drive per run ----------------------------
+
+
+class Crash(BaseException):
+    """A process death in the middle of a handler call."""
+
+
+class Flaky:
+    """Forwards to a real handler; the named method raises ``TransientError`` the first time."""
+
+    def __init__(self, inner: Any, method: str) -> None:
+        self.inner, self.method, self.left = inner, method, 1
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(self.inner, name)
+        if name != self.method:
+            return fn
+
+        def wrapped(effect: Effect) -> Any:
+            if self.left:
+                self.left -= 1
+                raise TransientError(f"scm blip in {name}")
+            return fn(effect)
+
+        return wrapped
+
+
+class Spy:
+    """Forwards to a real handler and records which methods were called."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(self.inner, name)
+
+        def call(effect: Effect) -> Any:
+            self.calls.append(name)
+            return fn(effect)
+
+        return call
+
+
+def _stop_on_first_sleep(w: RealWorld) -> None:
+    async def stop() -> None:
+        w.on_sleep = None
+        await w.driver.submit(RID, CancelRequested(RID))
+
+    w.on_sleep = stop
+
+
+def test_a_transient_poll_is_retried_not_a_fault(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    w.handler = Flaky(w.handler, "poll")
+
+    async def land() -> None:
+        w.on_sleep = None
+        w.scm.complete_merge(w.scm.merges()[-1], "m1")
+
+    w.on_sleep = land
+    try:
+        rs = run(w.start())
+    except TransientError as e:
+        pytest.fail(f"a transient error ended the drive: {e!r}")
+    assert rs.run.status is RunStatus.DONE
+
+
+def test_a_transient_stop_still_dequeues_the_merge(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    w.handler = Flaky(w.handler, "stop")
+    _stop_on_first_sleep(w)
+    try:
+        rs = run(w.start())
+    except TransientError as e:
+        pytest.fail(f"a transient error ended the drive: {e!r}")
+    assert rs.run.status is RunStatus.CANCELLED
+    assert w.scm.poll_merge(w.scm.merges()[-1]).state is MergeState.DEQUEUED
+    assert w.driver._probed == set()  # nothing is remembered once the drive ends
+
+
+def test_a_stop_after_a_crash_in_flight_reconciles_the_queued_merge(tmp_path: Path) -> None:
+    """Crash after request_merge, before settling; restart; Stop. The effect is still ATTEMPTING
+    inside its lease, then the lease lapses: the handler must be asked to reconcile (dequeue)."""
+    clock = Clock()
+    w = RealWorld(tmp_path, clock=clock, lease_seconds=60.0)
+    real = w.handler
+
+    class CrashAfterRequest:
+        def execute(self, effect: Effect) -> Any:
+            real.execute(effect)
+            raise Crash()
+
+    w.handler = CrashAfterRequest()  # type: ignore[assignment]
+    with pytest.raises(Crash):
+        run(w.start())
+    assert w.effect().status is EffectStatus.ATTEMPTING
+    spy = w.handler = Spy(real)
+
+    async def lease_lapses() -> None:
+        clock.now += 30
+
+    w.on_sleep = lease_lapses
+
+    async def go() -> RunState:
+        await w.driver.submit(RID, CancelRequested(RID))
+        return await w.driver.run_until_idle(RID)
+
+    rs = run(go())
+    assert rs.run.status is RunStatus.CANCELLED
+    assert "reconcile" in spy.calls
+    assert w.scm.poll_merge(w.scm.merges()[-1]).state is MergeState.DEQUEUED
+
+
+def test_the_stop_probe_is_made_once_and_does_not_starve_the_stop(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+
+    class SlowToStop:
+        calls = 0
+
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def execute(self, effect: Effect) -> Any:
+            return self.inner.execute(effect)
+
+        def poll(self, effect: Effect) -> Any:
+            return self.inner.poll(effect)
+
+        def reconcile(self, effect: Effect) -> Any:
+            return self.inner.reconcile(effect)
+
+        def stop(self, effect: Effect) -> Any:
+            SlowToStop.calls += 1
+            assert SlowToStop.calls < 8, "the probe is repeated, so the StopRun never runs"
+            return (
+                Pending(effect.intent or "h") if SlowToStop.calls < 3 else self.inner.stop(effect)
+            )
+
+    w.handler = SlowToStop(w.handler)
+    _stop_on_first_sleep(w)
+    rs = run(w.start())
+    assert rs.run.status is RunStatus.CANCELLED
+    assert SlowToStop.calls == 3  # the probe, then two more once the run was CANCELLED
+    assert w.scm.poll_merge(w.scm.merges()[-1]).state is MergeState.DEQUEUED
+
+
+def test_a_replay_of_a_finished_effect_does_not_need_the_live_subject(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    adapter = w.driver._executor
+    seen: dict[str, Any] = {}
+
+    class Record:
+        async def execute(self, key: str, cmd: object) -> Outcome:
+            out = await adapter.execute(key, cmd)
+            if isinstance(cmd, RunEffect):
+                seen.update(key=key, cmd=cmd, out=out)
+            return out
+
+    w.driver._executor = Record()
+
+    async def land() -> None:
+        w.on_sleep = None
+        w.scm.complete_merge(w.scm.merges()[-1], "m1")
+
+    w.on_sleep = land
+    assert run(w.start()).run.status is RunStatus.DONE
+
+    def gone(cmd: RunEffect) -> Subject:
+        raise TransientError("the SCM is down")
+
+    adapter._live = gone  # type: ignore[attr-defined]
+    assert run(adapter.execute(seen["key"], seen["cmd"])) == seen["out"]
+
+
+def test_a_stop_against_a_held_effect_does_not_need_the_live_subject(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    set_switch(w.store, SCOPE, "effects", True)
+    set_switch(w.store, SCOPE, "merge", False)
+    run(w.start())
+    assert w.driver.held(RID) == "held"
+
+    def gone(cmd: RunEffect) -> Subject:
+        raise TransientError("the SCM is down")
+
+    w.driver._executor._live = gone  # type: ignore[attr-defined]
+
+    async def go() -> RunState:
+        await w.driver.submit(RID, CancelRequested(RID))
+        return await w.driver.run_until_idle(RID)
+
+    assert run(go()).run.status is RunStatus.CANCELLED
+
+
+@pytest.mark.parametrize("error", ["plan_conflict", "moved"])
+def test_other_adapter_hiccups_are_retried_not_faults(tmp_path: Path, error: str) -> None:
+    w = RealWorld(tmp_path)
+    raised = {"n": 0}
+    if error == "plan_conflict":
+        real_plan = w.fx.plan
+
+        def plan(*a: Any, **kw: Any) -> Effect:
+            if raised["n"] == 0:
+                raised["n"] += 1
+                raise TransactionConflictError("busy")
+            return real_plan(*a, **kw)
+
+        w.fx.plan = plan  # type: ignore[method-assign]
+    else:
+        real_poll = w.fx.poll
+
+        def poll(*a: Any, **kw: Any) -> Any:
+            if raised["n"] == 0:
+                raised["n"] += 1
+                raise ValueError("only an ACCEPTED effect can be polled")
+            return real_poll(*a, **kw)
+
+        w.fx.poll = poll  # type: ignore[method-assign]
+
+    async def land() -> None:
+        if w.scm.merges():  # nothing to land until the merge has been requested
+            w.on_sleep = None
+            w.scm.complete_merge(w.scm.merges()[-1], "m1")
+
+    w.on_sleep = land
+    assert run(w.start()).run.status is RunStatus.DONE
+    assert raised["n"] == 1
+
+
+def test_retries_back_off(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path, max_attempts=3)
+
+    class Down:
+        def execute(self, effect: Effect) -> Any:
+            raise TransientError("scm is down")
+
+    w.handler = Down()  # type: ignore[assignment]
+    assert run(w.start()).run.status is RunStatus.BLOCKED
+    assert w.sleeps == [0.5, 1.0]  # doubling, not a fixed interval
+
+
+def test_two_drives_of_one_run_on_one_driver_execute_once(tmp_path: Path) -> None:
+    store = MemoryStore()
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                await asyncio.sleep(0.2)
+            return await super().execute(key, command)
+
+    w = Slow(tmp_path / "l")
+    d = make(store, w)
+
+    async def go() -> tuple[Any, Any]:
+        await d.start(new_run())
+        a, b = await asyncio.gather(
+            d.run_until_idle(RID), d.run_until_idle(RID), return_exceptions=True
+        )
+        return a, b
+
+    first, second = run(go())
+    assert not isinstance(first, Exception), first
+    assert not isinstance(second, Exception), second
+    assert first == second  # the second joined the first
+    assert w.calls() == w.done()
+    assert len(w.calls()) == len(set(w.calls()))
+
+
+def test_resume_all_joins_a_drive_already_running_on_this_driver(tmp_path: Path) -> None:
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                await asyncio.sleep(0.2)
+            return await super().execute(key, command)
+
+    w = Slow(tmp_path / "l")
+    d = make(MemoryStore(), w)
+
+    async def go() -> tuple[dict[RunId, Any], Any]:
+        await d.start(new_run())
+        live = asyncio.ensure_future(d.run_until_idle(RID))
+        await asyncio.sleep(0.05)
+        resumed = await d.resume_all()
+        return resumed, await live
+
+    resumed, rs = run(go())
+    assert resumed[RID] == rs
+    assert w.calls() == w.done()
+
+
+def test_wedge_check_decides_from_a_read_after_the_release(tmp_path: Path) -> None:
+    """A submit that lands just ahead of the release commit must not be reported as a wedge."""
+    inner = MemoryStore()
+    api = make(inner, object(), owner="api")
+    box = {"fired": False, "ready": False}
+
+    def hook(n: int, phase: str) -> None:
+        if phase != "before" or box["fired"] or not box["ready"]:
+            return
+        rec = api._load(RID)
+        if not rec.inbox and not rec.pending and rec.state.run.status is RunStatus.RUNNING:
+            box["fired"] = True  # this is the release commit: a submit gets in just ahead of it
+            run(api.submit(RID, StepSucceeded(StepKey(RID, "implement", 1), SUBJECT)))
+
+    d = make(CountingStore(inner, hook), Worker(tmp_path / "l", override=_empty_replay))
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        box["ready"] = True
+        return await d.run_until_idle(RID)
+
+    try:
+        rs = run(go())
+    except RunWedgedError as e:
+        pytest.fail(f"a false wedge with an event queued: {e}")
+    assert box["fired"]
+    assert rs.run.status is RunStatus.DONE
+
+
+def test_the_wedge_report_reads_the_store_off_the_loop(tmp_path: Path) -> None:
+    store = CountingStore(MemoryStore())
+    loop_thread: list[int] = []
+
+    async def go() -> None:
+        loop_thread.append(threading.get_ident())
+        d = make(store, Worker(tmp_path / "l", override=_empty_replay))
+        await d.start(new_run())
+        with pytest.raises(RunWedgedError):
+            await d.run_until_idle(RID)
+
+    run(go())
+    assert loop_thread[0] not in store.threads
+
+
+def test_lease_lost_during_a_command_cancels_the_work_and_surfaces(tmp_path: Path) -> None:
+    store = MemoryStore()
+    box: dict[str, Any] = {}
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                box["started"] = True
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    box["cancelled"] = True
+                    raise
+            return await super().execute(key, command)
+
+    a = make(store, Slow(tmp_path / "a"), owner="a", clock=time.time, lease_seconds=0.3)
+    thief = make(store, Worker(tmp_path / "b"), owner="b", clock=time.time, lease_seconds=0.3)
+
+    def steal(rec: Any) -> Any:
+        return dataclasses.replace(rec, lease={"owner": "thief", "expires": time.time() + 5}), ()
+
+    async def go() -> None:
+        await a.start(new_run())
+        drive_task = asyncio.ensure_future(a.run_until_idle(RID))
+        while "started" not in box:
+            await asyncio.sleep(0.01)
+        await thief._commit(RID, steal, owner=False)
+        with pytest.raises(LeaseLostError):
+            await drive_task
+
+    run(go())
+    assert box.get("cancelled")  # the work stopped; it did not run on without the lease
+
+
+def test_a_store_hiccup_during_a_heartbeat_does_not_abort_the_command(tmp_path: Path) -> None:
+    inner = MemoryStore()
+    box = {"arm": False}
+
+    class Hiccup(CountingStore):
+        def transact(self, scope: Any, ops: Any) -> None:
+            if box["arm"]:
+                box["arm"] = False
+                raise TransientError("store hiccup")
+            super().transact(scope, ops)
+
+    class Slow(Worker):
+        async def execute(self, key: str, command: object) -> Outcome:
+            if isinstance(command, RunStep) and command.stage == "implement":
+                box["arm"] = True
+                await asyncio.sleep(1.0)
+            return await super().execute(key, command)
+
+    d = make(Hiccup(inner), Slow(tmp_path / "a"), clock=time.time, lease_seconds=0.6)
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    try:
+        rs = run(go())
+    except TransientError as e:
+        pytest.fail(f"one store hiccup aborted a live command: {e!r}")
+    assert rs.run.status is RunStatus.DONE
+
+
+def test_lease_seconds_must_be_positive() -> None:
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            make(MemoryStore(), object(), lease_seconds=bad)
+
+
+def test_held_is_forgotten_once_the_run_is_finished(tmp_path: Path) -> None:
+    w = RealWorld(tmp_path)
+    set_switch(w.store, SCOPE, "effects", True)
+    set_switch(w.store, SCOPE, "merge", False)
+    run(w.start())
+    assert w.driver.held(RID) == "held"
+    _stop_on_first_sleep(w)
+
+    async def go() -> RunState:
+        await w.driver.submit(RID, CancelRequested(RID))
+        return await w.driver.run_until_idle(RID)
+
+    assert run(go()).run.status is RunStatus.CANCELLED
+    assert w.driver.held(RID) is None
+
+
+def _crashing_adapter(w: RealWorld, store: Store, clock: Clock, holder: dict[str, Any]) -> Any:
+    fx = EffectExecutor(store, SCOPE, clock=clock)
+    return EffectsExecutor(
+        fx,
+        {"pr.merge": Delegate(w)},
+        lambda c: w.live_subject,
+        lambda rid: holder["d"].state(rid).run.status,
+        others=w.driver._executor._others,  # type: ignore[attr-defined]
+        poll_interval=0.5,
+    )
+
+
+@pytest.mark.parametrize("variant", ["finish", "stop"])
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("kill", range(14))
+def test_crash_at_every_commit_around_the_merge(
+    tmp_path: Path, kill: int, phase: str, variant: str
+) -> None:
+    """The merge is requested, the process dies at each commit, a fresh driver and adapter resume
+    (and, for ``stop``, a Stop arrives): the run ends DONE with one landed merge, or CANCELLED
+    with no merge left queued, and no second merge request is ever made."""
+    clock = Clock()
+    w = RealWorld(tmp_path, clock=clock)
+    first = make(w.store, w.driver._executor, clock=clock, lease_seconds=10, owner="p1")
+    w.driver = first
+    set_switch(w.store, SCOPE, "effects", True)
+    set_switch(w.store, SCOPE, "merge", False)
+
+    async def stand_at_the_merge() -> RunState:
+        await first.start(new_run())
+        return await first.run_until_idle(RID)
+
+    assert run(stand_at_the_merge()).run.stage == "merge"
+    set_switch(w.store, SCOPE, "merge", True)
+
+    def hook(n: int, ph: str) -> None:
+        if n == kill and ph == phase:
+            raise Crash()
+
+    crashing = CountingStore(w.store, hook)
+    holder: dict[str, Any] = {}
+    polls = {"n": 0}
+
+    def land_if_pending() -> None:
+        merges = w.scm.merges()
+        if (
+            merges
+            and variant == "finish"
+            and w.scm.poll_merge(merges[-1]).state is MergeState.PENDING
+        ):
+            w.scm.complete_merge(merges[-1], "m1")
+
+    async def die_after_a_while(_: float) -> None:
+        polls["n"] += 1
+        if polls["n"] > 20:
+            raise Crash()  # the first process must not poll forever
+        land_if_pending()
+
+    holder["d"] = make(
+        crashing,
+        _crashing_adapter(w, crashing, clock, holder),
+        clock=clock,
+        lease_seconds=10,
+        owner="p1",
+        sleep=die_after_a_while,
+    )
+    with contextlib.suppress(Crash):
+        run(holder["d"].run_until_idle(RID))
+
+    resumed: dict[str, Any] = {}
+    sleeps = {"n": 0}
+
+    async def advance(seconds: float) -> None:
+        sleeps["n"] += 1
+        assert sleeps["n"] < 2000, "the resumed driver is spinning"
+        clock.now += max(seconds, 0.5)
+        land_if_pending()
+
+    second = resumed["d"] = make(
+        w.store,
+        _crashing_adapter(w, w.store, clock, resumed),
+        clock=clock,
+        lease_seconds=10,
+        owner="p2",
+        sleep=advance,
+    )
+
+    async def restart() -> dict[RunId, Any]:
+        if variant == "stop":
+            await second.submit(RID, CancelRequested(RID))
+        return await second.resume_all()
+
+    out = run(restart(), timeout=25)
+    rs = out[RID] if out else second.state(RID)
+    assert not isinstance(rs, Exception), repr(rs)
+    states = [w.scm.poll_merge(m).state for m in w.scm.merges()]
+    assert len(states) <= 1, "a second merge was requested"
+    if variant == "finish":
+        assert rs.run.status is RunStatus.DONE
+        assert w.effect().status is EffectStatus.CONFIRMED
+        assert states == [MergeState.MERGED]
+    else:
+        assert rs.run.status in (RunStatus.CANCELLED, RunStatus.DONE)
+        assert MergeState.PENDING not in states, "the merge is still queued after the run ended"
+    assert second.pending_events(RID) == 0
+    assert run(second.active_runs()) == []
+
+
 # --- real process kill on SQLite --------------------------------------------------------------
 
 
@@ -1275,7 +1806,11 @@ def test_driver_loads_handlers_itself() -> None:
         """
     )
     out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ)
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+        timeout=60,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "implement"

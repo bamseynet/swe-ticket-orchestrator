@@ -2,11 +2,13 @@
 
 Everything the driver knows lives in one store item per run (``RUN#r`` / ``DRIVER``): the
 ``RunState`` that goes to ``next()``, an inbox of events not yet applied, a log of commands not
-yet done, events refused as late, and the lease that says which driver owns the run. Every
+yet done, and the lease that says which driver owns the run. Every
 step is one conditional transaction on that item. The same transaction writes the run's
 ``META``, the active-runs index entry, and, when an event is applied, its timeline entry
-``EVT#<seq>``. A kill at any point leaves a state that a fresh process resumes from, using the
-store alone (``resume_all`` finds the unfinished runs; no run ID has to be known):
+``EVT#<seq>`` (events refused as late or malformed are those entries whose outcome is not
+``applied``; there is no second copy). A kill at any point leaves a state that a fresh process
+resumes from, using the store alone (``resume_all`` finds the unfinished runs; no run ID has
+to be known):
 
 * applying an event: pop it from the inbox, store the new state, append its commands;
 * executing a command: call the executor with the command's key, then pop it and append the
@@ -178,6 +180,8 @@ class LocalDriver:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backoff: float = 0.01,
     ) -> None:
+        if not lease_seconds > 0:
+            raise ValueError("lease_seconds must be positive")
         load_handlers()  # before any stored event is decoded (decoding needs the registries)
         self._store, self._scope, self._wf = store, scope, workflow
         self._executor, self._registry = executor, registry
@@ -187,6 +191,7 @@ class LocalDriver:
         self._ttl, self._lease_wait = lease_seconds, lease_wait
         self._sleep, self._backoff = sleep, backoff
         self._held: dict[RunId, str] = {}
+        self._driving: dict[RunId, asyncio.Future[RunState]] = {}
 
     # --- storage ------------------------------------------------------------------------------
 
@@ -377,10 +382,23 @@ class LocalDriver:
         return (stops[0] if stops else rec.pending[0]), False
 
     async def _heartbeat(self, run_id: RunId) -> None:
-        """Renew the lease while a command executes, so a long one does not lose the run."""
+        """Renew the lease while a command executes, so a long one does not lose the run. A
+        store error that is not a lost lease is retried until the lease would run out; losing the
+        lease for real ends the heartbeat (and so the command)."""
+        last_ok = self._clock()
         while True:
             await asyncio.sleep(self._ttl / 3)
-            await self._commit(run_id, lambda r: (dataclasses.replace(r), ()))
+            for attempt in range(_RETRIES):
+                try:
+                    await self._commit(run_id, lambda r: (dataclasses.replace(r), ()))
+                    last_ok = self._clock()
+                    break
+                except LeaseLostError:
+                    raise
+                except Exception:
+                    if attempt == _RETRIES - 1 or self._clock() >= last_ok + self._ttl:
+                        raise
+                    await asyncio.sleep(self._ttl / 10)
 
     async def _execute(self, run_id: RunId, head: dict[str, Any]) -> Outcome:
         work = asyncio.ensure_future(
@@ -424,34 +442,52 @@ class LocalDriver:
     async def run_until_idle(self, run_id: RunId) -> RunState:
         """Drive until there is nothing to do. Returns with the run waiting for a person,
         BLOCKED, finished or held (see ``held``); raises ``RunWedgedError`` if it is idle in
-        any other status."""
+        any other status.
+
+        One drive per run per driver instance: a second call (or ``resume_all``) for a run this
+        instance is already driving executes nothing; it waits for the first drive and returns
+        its result. The lease cannot tell two tasks of one instance apart, so this guard does."""
+        running = self._driving.get(run_id)
+        if running is not None:
+            return await asyncio.shield(running)
+        task = asyncio.ensure_future(self._drive(run_id))
+        self._driving[run_id] = task
+        task.add_done_callback(lambda _: self._driving.pop(run_id, None))
+        return await task
+
+    async def _drive(self, run_id: RunId) -> RunState:
         self._held.pop(run_id, None)
-        while True:
+        try:
             while True:
-                result = await self.step(run_id)
-                if isinstance(result, Held):
-                    self._held[run_id] = result.reason
-                    break
-                if result == "worked":
-                    await asyncio.sleep(0)  # a non-suspending executor must not starve the loop
-                elif isinstance(result, Waiting):
-                    await self._sleep(result.retry_after)
-                else:
-                    break
-            rec = await self._aload(run_id)
-            if (rec.inbox or rec.pending) and run_id not in self._held:
-                continue  # another writer queued work since we looked: not idle after all
-            break
-        await self._release(run_id)
-        rs = rec.state
-        status = rs.run.status
-        if run_id not in self._held and status not in _IDLE_OK and not status.is_terminal:
-            refused = [r["reason"] for r in self.rejected(run_id)]
-            raise RunWedgedError(
-                f"run {run_id} is idle in {status.value} at {rs.run.stage!r} with nothing queued"
-                f" (refused events: {refused})"
-            )
-        return rs
+                while True:
+                    result = await self.step(run_id)
+                    if isinstance(result, Held):
+                        self._held[run_id] = result.reason
+                        break
+                    if result == "worked":
+                        await asyncio.sleep(0)  # a non-suspending executor must not starve others
+                    elif isinstance(result, Waiting):
+                        await self._sleep(result.retry_after)
+                    else:
+                        break
+                await self._release(run_id)
+                rec = await self._aload(run_id)  # read at or after the release: it decides
+                if (rec.inbox or rec.pending) and run_id not in self._held:
+                    continue  # another writer queued work meanwhile: not idle after all
+                break
+            rs = rec.state
+            status = rs.run.status
+            if run_id not in self._held and status not in _IDLE_OK and not status.is_terminal:
+                refused = [r["reason"] for r in await asyncio.to_thread(self.rejected, run_id)]
+                raise RunWedgedError(
+                    f"run {run_id} is idle in {status.value} at {rs.run.stage!r} with nothing"
+                    f" queued (refused events: {refused})"
+                )
+            if status.is_terminal:
+                self._held.pop(run_id, None)
+            return rs
+        finally:
+            self._probed = {p for p in self._probed if p[0] != run_id}
 
     def held(self, run_id: RunId) -> str | None:
         """Why the last ``run_until_idle`` of this run stopped on a held command, if it did."""
@@ -583,13 +619,28 @@ class EffectsExecutor:
     ) -> None:
         self._fx, self._handlers, self._live = effects, handlers, live
         self._status_of, self._others, self._poll = status_of, others, poll_interval
+        self._streak: dict[str, int] = {}
 
     async def execute(self, key: str, command: object) -> Outcome:
         if not isinstance(command, RunEffect):
             if self._others is None:
                 raise TypeError(f"no executor for {type(command).__name__}")
             return await self._others.execute(key, command)
-        return await asyncio.to_thread(self._run_effect, command)
+        try:
+            outcome = await asyncio.to_thread(self._run_effect, command)
+        except TransientError as e:
+            # An SCM blip, or the effect kept changing under the claim: try again later.
+            return self._again(key, f"transient:{type(e).__name__}", retrying=True)
+        if isinstance(outcome, Done):
+            self._streak.pop(key, None)
+        return outcome
+
+    def _again(self, key: str, reason: str, *, retrying: bool) -> StillRunning:
+        """``StillRunning``. Retries back off (doubling, capped), so attempts do not all go
+        within seconds of one blip; plain polls of an accepted effect keep the fixed interval."""
+        n = self._streak.get(key, 0) if retrying else 0
+        self._streak[key] = n + 1 if retrying else 0
+        return StillRunning(min(self._poll * 2 ** min(n, 6), 60 * self._poll), reason)
 
     def _run_effect(self, cmd: RunEffect) -> Outcome:
         fx, run_id = self._fx, cmd.run_id
@@ -604,19 +655,34 @@ class EffectsExecutor:
             subject=cmd.subject,
         )
         handler, ikey = self._handlers[cmd.type], planned.idempotency_key
-        dying = self._status_of(run_id) is RunStatus.CANCELLING
+        # Once the run is dead (CANCELLING included) an effect that was tried is stopped or
+        # reconciled, not polled or written: a merge must not land after the Stop.
+        dying = self._status_of(run_id) in _DEAD
         status = fx.get(run_id, ikey).status
-        if status is EffectStatus.ACCEPTED:
-            result = fx.stop(run_id, ikey, handler) if dying else fx.poll(run_id, ikey, handler)
-        elif dying and status in (EffectStatus.ATTEMPTING, EffectStatus.RETRYING):
-            result = fx.reconcile(run_id, ikey, handler)
-        else:
-            result = fx.execute(run_id, ikey, handler, live=self._live(cmd))
-        return self._map(cmd, result)
+        try:
+            if status is EffectStatus.ACCEPTED:
+                result = fx.stop(run_id, ikey, handler) if dying else fx.poll(run_id, ikey, handler)
+            elif dying and status in (EffectStatus.ATTEMPTING, EffectStatus.RETRYING):
+                result = fx.reconcile(run_id, ikey, handler)
+            else:
+                # The live subject is only needed to claim a write; a dead run or a finished
+                # effect is refused or replayed before it is looked at.
+                needs_live = not dying and not status.is_terminal
+                result = fx.execute(
+                    run_id, ikey, handler, live=self._live(cmd) if needs_live else None
+                )
+        except ValueError:
+            # The record moved between get and poll/stop/reconcile (ACCEPTED -> CONFIRMED, ...):
+            # look again on the next call.
+            return self._again(ikey, "moved", retrying=False)
+        return self._map(cmd, result, ikey)
 
-    def _map(self, cmd: RunEffect, result: ExecResult) -> Outcome:
+    def _map(self, cmd: RunEffect, result: ExecResult, ikey: str) -> Outcome:
         effect = result.effect
         failed = EffectFailed(cmd.run_id, cmd.type, cmd.visit)
+        # Blocked means the outcome is unknown and a person must decide. It is reported even on a
+        # dead run: the run refuses it, which leaves the only trace of it in the timeline (D2-11
+        # decides what a blocked effect on a stopped run shows).
         if result.blocked:
             return Done([failed])
         if effect.status is EffectStatus.CONFIRMED:
@@ -627,4 +693,5 @@ class EffectsExecutor:
             return Done() if dead else Done([failed])
         if result.reason == "held":
             return Held("held")
-        return StillRunning(self._poll, result.reason or effect.status.value.lower())
+        retrying = effect.status is EffectStatus.RETRYING
+        return self._again(ikey, result.reason or effect.status.value.lower(), retrying=retrying)
