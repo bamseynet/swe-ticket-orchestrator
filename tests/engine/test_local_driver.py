@@ -835,6 +835,8 @@ def test_resume_all_runs_runs_concurrently_and_isolates_faults(tmp_path: Path) -
         return await make(store, w, owner="restart").resume_all()
 
     out = run(go())
+    assert not isinstance(out[r1], Exception), out[r1]
+    assert not isinstance(out[r2], Exception), out[r2]
     assert out[r1].run.status is RunStatus.DONE
     assert out[r2].run.status is RunStatus.DONE
     assert isinstance(out[r3], RuntimeError)  # reported, and the others still finished
@@ -997,6 +999,7 @@ class RealWorld:
 
         async def sleep(s: float) -> None:
             self.sleeps.append(s)
+            assert len(self.sleeps) < 8, "the driver is spinning on a command that cannot finish"
             if self.on_sleep is not None:
                 await self.on_sleep()
 
@@ -1052,6 +1055,7 @@ def test_a_stop_between_polls_reaches_the_handler_and_dequeues_the_merge(tmp_pat
     assert rs.run.status is RunStatus.CANCELLED
     assert w.effect().status is EffectStatus.VOIDED  # handler.stop dequeued it before the Stop ran
     assert "effect.confirmed" not in [e["type"] for e in w.driver.timeline(RID)]
+    assert w.driver.rejected(RID) == []  # a voided effect on a dead run reports nothing
     assert w.scm.merges()  # a merge was requested, and then dequeued by the handler's stop
 
 
