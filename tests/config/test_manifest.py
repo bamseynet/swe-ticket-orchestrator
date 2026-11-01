@@ -133,7 +133,7 @@ EFFECTS: dict[
         {"done"},
         FULL,
         600,
-        {"to_status_category": ("enum", True, ("todo", "in_progress", "done"))},
+        {"to_status_category": ("enum", True, ("todo", "in_progress", "in_review", "done"))},
     ),
     "env.deploy_preview": ("gated", {"done"}, FULL, 0, {}),
     "release.trigger": (
@@ -174,6 +174,25 @@ def test_catalog_lists_every_effect_in_the_schema(mf: Manifest) -> None:
 
 def test_tiers_are_valid_model_tiers(mf: Manifest) -> None:
     assert {p.default_tier for p in mf.profiles.values()} <= set(get_args(ModelTier))
+
+
+def test_a_transition_to_in_review_is_not_a_done_transition(mf: Manifest) -> None:
+    """The QA floor (V17) counts only a move to ``done``; in_review needs no QA gate."""
+    from sto.config import org_policy
+    from sto.config.schema import EffectStage
+
+    allowed = mf.effects["ticket.transition"].with_keys["to_status_category"].values
+    assert "in_review" in allowed
+    for category in allowed:
+        stage = EffectStage.model_validate(
+            {
+                "kind": "effect",
+                "effect": "ticket.transition",
+                "with": {"to_status_category": category},
+                "next": {"done": "closed"},
+            }
+        )
+        assert org_policy._is_ticket_done(stage) == (category == "done"), category
 
 
 def test_nothing_in_with_can_change_a_gate_or_a_hold(mf: Manifest) -> None:
@@ -228,12 +247,35 @@ def _orchestrator(cell: str) -> str:
     return name.replace(" ", "_")
 
 
+def _workers(cell: str) -> set[str]:
+    """Worker names in a Workers cell; fail on any item that is not `name` or `name` (tier)."""
+    if cell == "None":
+        return set()
+    names = set()
+    for item in cell.split(", "):
+        m = re.fullmatch(r"`([a-z][a-z0-9_]*)`(?: \((?:fast|standard|deep)\))?", item)
+        assert m, f"cannot read worker {item!r} in {cell!r}"
+        names.add(m[1])
+    return names
+
+
+@pytest.mark.parametrize(
+    "cell", ["`Coder`", "coder", "`my-coder`", "`a`, b", "`a` (huge)", "`a`;`b`"]
+)
+def test_the_workers_parser_fails_on_what_it_cannot_read(cell: str) -> None:
+    with pytest.raises(AssertionError, match="cannot read worker"):
+        _workers(cell)
+
+
+def test_the_workers_parser_reads_plan_syntax() -> None:
+    assert _workers("`a`, `b_2` (deep)") == {"a", "b_2"}
+    assert _workers("None") == set()
+
+
 def test_stage_to_worker_sets_match_plan_exactly(mf: Manifest) -> None:
     plan: dict[str, set[str]] = {}
     for row in _roster():
-        plan[_orchestrator(row["Orchestrator"])] = set(
-            re.findall(r"`([a-z0-9_]+)`", row["Workers"])
-        )
+        plan[_orchestrator(row["Orchestrator"])] = _workers(row["Workers"])
     assert set(plan) == {
         "triage",
         "refiner",
@@ -349,7 +391,8 @@ def test_catalog_files_ship_inside_the_package() -> None:
     for name in ("profiles.yaml", "effects.yaml"):
         assert root.joinpath(name).is_file(), name
     src = ROOT / "src" / "sto" / "catalog"
-    assert {p.name for p in src.glob("*.yaml")} == {"profiles.yaml", "effects.yaml"}
+    # Later stages add models.yaml and prices.yaml here, so this is a lower bound.
+    assert {p.name for p in src.glob("*.yaml")} >= {"profiles.yaml", "effects.yaml"}
     assert (src / "__init__.py").is_file()
     assert not (ROOT / "catalog").exists()
 
@@ -363,7 +406,9 @@ def test_the_build_does_not_exclude_catalog_files() -> None:
 
 # --- refusals, through parse_manifest ------------------------------------------------------
 
-GOOD_EFFECT = "  e.x: {class: scoped, outcomes: [done], key_scope: [run], hold: 0s, with: {}}\n"
+GOOD_EFFECT = (
+    "  e.x: {class: scoped, outcomes: [done], key_scope: [run, branch], hold: 0s, with: {}}\n"
+)
 GOOD_EFFECTS = "effects:\n" + GOOD_EFFECT
 
 
@@ -501,8 +546,59 @@ def test_duplicate_tools_outcomes_and_values_are_refused() -> None:
 
 def test_wildcards_are_only_for_browser() -> None:
     assert parse_manifest("profiles:\n" + _orch().replace("x.y", "browser.*"), GOOD_EFFECTS)
-    for bad in ("github.*", "workspace.*", "*"):
+    for bad in ("github.*", "workspace.*", "*", "github.*.merge", "a.*.b", "browser.*.x", "a*"):
         assert _refused("profiles:\n" + _orch().replace("x.y", bad)), bad
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("tools: [x.y]", "tools: [[a]]"),
+        ("tools: [x.y]", "tools: [{a: 1}]"),
+        ("outcomes: [a]", "outcomes: [[a]]"),
+    ],
+)
+def test_unhashable_list_items_are_refused_not_crashes(old: str, new: str) -> None:
+    problems = _refused("profiles:\n" + _orch().replace(old, new))
+    assert any("plain words" in p for p in problems)
+
+
+def test_unhashable_key_scope_and_enum_values_are_refused() -> None:
+    for old, new in (
+        ("key_scope: [run, branch]", "key_scope: [[run]]"),
+        ("with: {}", "with: {k: {type: enum, values: [[a]]}}"),
+    ):
+        problems = _refused("profiles:\n" + _orch(), GOOD_EFFECTS.replace(old, new))
+        assert any("plain words" in p for p in problems), old
+
+
+def test_non_ascii_digits_are_not_a_duration() -> None:
+    effects = GOOD_EFFECTS.replace("scoped", "gated").replace("hold: 0s", 'hold: "\u0661\u0660m"')
+    assert "hold must be a duration" in _refused("profiles:\n" + _orch(), effects)[0]
+
+
+def test_problems_name_the_files_that_were_passed() -> None:
+    bad = "profiles:\n" + _worker(boss="ghost") + _orch("review_panel")
+    with pytest.raises(ManifestError) as err:
+        parse_manifest(bad, GOOD_EFFECTS, profiles_file="p.yaml", effects_file="e.yaml")
+    assert err.value.problems
+    assert all(p.startswith("p.yaml: ") for p in err.value.problems)
+
+
+def test_several_problems_in_one_file_are_all_reported() -> None:
+    bad = "profiles:\n" + _orch("a").replace("fast", "huge") + _orch("b").replace("[a]", "[]")
+    bad += _worker("c", boss="ghost")
+    problems = _refused(bad)
+    assert len(problems) == 2  # the cross-check waits until each profile is valid
+    assert {p.split(":")[1].strip().split(".")[0] for p in problems} == {"a", "b"}
+
+
+def test_a_yaml_error_in_one_file_does_not_hide_problems_in_the_other() -> None:
+    with pytest.raises(ManifestError) as err:
+        parse_manifest("profiles: [\n", GOOD_EFFECTS.replace("scoped", "weird"))
+    files = [p.split(":")[0] for p in err.value.problems]
+    assert files == ["profiles.yaml", "effects.yaml"]
+    assert "not valid YAML" in err.value.problems[0]
 
 
 def test_tool_names_are_checked() -> None:
@@ -516,9 +612,17 @@ def test_effect_rules() -> None:
 
     assert "done outcome" in one("[done]", "[conflict]")[0]
     assert "only a gated effect has a hold" in one("hold: 0s", "hold: 10m")[0]
-    assert "key_scope" in one("[run]", "[]")[0]
-    assert "not a key part" in one("[run]", "[run, nonsense]")[0]
-    assert "listed twice" in one("[run]", "[run, run]")[0]
+    assert "listed twice" in one("[run, branch]", "[run, run]")[0]
+    for bad in (
+        "[]",
+        "[run]",
+        "[stage]",
+        "[branch]",
+        "[subject, run]",
+        "[run, nonsense]",
+        "[run, stage]",
+    ):
+        assert "is not one of" in one("[run, branch]", bad)[0], bad
     for bad in ("10m\n", "10", "m", "1.5h", "-1s", "10 m", "0"):
         assert "hold must be a duration" in one("hold: 0s", f'hold: "{bad}"')[0], repr(bad)
     assert "hold must be a duration" in one("hold: 0s", "hold: 0")[0]
@@ -546,8 +650,15 @@ def test_with_key_rules() -> None:
 
 
 def test_names_are_checked() -> None:
-    assert _refused("profiles:\n" + _orch("Boss"))
-    assert _refused("profiles:\n" + _orch(), GOOD_EFFECTS.replace("e.x", "E.x"))
+    with pytest.raises(ManifestError) as err:
+        parse_manifest(
+            "profiles:\n" + _orch("Boss"),
+            GOOD_EFFECTS.replace("e.x", "E.x"),
+            profiles_file="p.yaml",
+            effects_file="e.yaml",
+        )
+    assert any(p.startswith("p.yaml/e.yaml: ") and "Boss" in p for p in err.value.problems)
+    assert any("E.x" in p for p in err.value.problems)
 
 
 def test_a_catalog_effect_has_no_stringly_typed_bools() -> None:

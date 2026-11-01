@@ -63,7 +63,7 @@ effects:
     key_scope: [run, stage, visit, subject]
     hold: 10m
     with:
-      to_status_category: { type: enum, values: [todo, in_progress, done], required: true }
+      to_status_category: { type: enum, values: [todo, in_progress, in_review, done], required: true }
   env.deploy_preview:
     class: gated
     outcomes: [done]

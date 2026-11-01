@@ -12,7 +12,7 @@ import re
 from collections.abc import Mapping
 from importlib import resources
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import (
@@ -37,20 +37,25 @@ _IDENT = r"[a-z][a-z0-9_]*"
 Ident = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}$")]
 Tool = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}(\.({_IDENT}|\*))*$")]
 Dotted = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}(\.{_IDENT})*$")]
-_DURATION = re.compile(r"(\d+)([smhd])")
+_DURATION = re.compile(r"([0-9]+)([smhd])")
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
-# Wildcards are for a tool family the platform means to open whole. Nothing else may end in ``.*``.
+# Wildcards are for a tool family the platform means to open whole. A ``*`` elsewhere is refused.
 WILDCARD_TOOLS = frozenset({"browser.*"})
-# PLAN 8.3, llm_review row: every review_panel worker holds these and no others.
+# PLAN 8.3, llm_review row: a review_panel worker holds a subset of these (a team may narrow it)
+# and no other tool.
 PANEL_TOOLS = frozenset(
     {"repo.read_file", "repo.search", "pr.diff", "checks.read", "record_finding"}
 )
 PANEL = "review_panel"  # a stage kind, not a profile: the orchestrator a panel worker names
-KEY_SCOPE_PARTS = ("run", "stage", "visit", "subject", "branch", "merge_sha")
-
-K = TypeVar("K")
-V = TypeVar("V")
+# PLAN 6.3 gives exactly three shapes. ``effect_key()`` adds the effect type to each.
+KEY_SCOPES = frozenset(
+    {
+        ("run", "stage", "visit", "subject"),
+        ("run", "branch"),  # pr.ensure_draft: finds or creates, one PR per branch
+        ("run", "merge_sha"),  # pr.open_revert: a declared and an implicit revert open one PR
+    }
+)
 
 
 class ManifestError(ValueError):
@@ -65,7 +70,11 @@ def _no_repeats(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         seen: set[Any] = set()
         for item in value:
-            if item in seen:
+            try:
+                duplicate = item in seen
+            except TypeError:
+                raise ValueError("items must be plain words, not lists or maps") from None
+            if duplicate:
                 raise ValueError(f"{item!r} is listed twice")
             seen.add(item)
     return value
@@ -73,7 +82,7 @@ def _no_repeats(value: Any) -> Any:
 
 def _check_tools(tools: frozenset[str]) -> frozenset[str]:
     for tool in tools:
-        if tool.endswith(".*") and tool not in WILDCARD_TOOLS:
+        if "*" in tool and tool not in WILDCARD_TOOLS:
             raise ValueError(
                 f"wildcard {tool!r} is not allowed; wildcards: {sorted(WILDCARD_TOOLS)}"
             )
@@ -81,9 +90,9 @@ def _check_tools(tools: frozenset[str]) -> frozenset[str]:
 
 
 def _check_scope(parts: tuple[str, ...]) -> tuple[str, ...]:
-    bad = [p for p in parts if p not in KEY_SCOPE_PARTS]
-    if bad:
-        raise ValueError(f"{bad[0]!r} is not a key part; use: {', '.join(KEY_SCOPE_PARTS)}")
+    if parts not in KEY_SCOPES:
+        shapes = "; ".join("[" + ", ".join(k) + "]" for k in sorted(KEY_SCOPES))
+        raise ValueError(f"key_scope {list(parts)} is not one of: {shapes}")
     return parts
 
 
@@ -121,9 +130,10 @@ KeyScope = Annotated[
     BeforeValidator(_no_repeats),
     BeforeValidator(lambda v: tuple(v) if isinstance(v, list) else v),
     AfterValidator(_check_scope),
-    Field(min_length=1),
 ]
-ReadOnlyMap = Annotated[Mapping[K, V], AfterValidator(_freeze_map), PlainSerializer(_dump_map)]
+type ReadOnlyMap[K, V] = Annotated[
+    Mapping[K, V], AfterValidator(_freeze_map), PlainSerializer(_dump_map)
+]
 
 
 def _seconds(value: Any) -> Any:
@@ -256,28 +266,26 @@ def _problems(file: str, exc: ValidationError) -> list[str]:
     return [f"{file}: {'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
 
 
-def _cross_checks(profiles: Mapping[str, Profile]) -> list[str]:
+def _cross_checks(profiles: Mapping[str, Profile], file: str) -> list[str]:
     out: list[str] = []
     if PANEL in profiles:
-        out.append(f"{PROFILES_FILE}: {PANEL} is a stage kind and cannot be a profile name")
+        out.append(f"{file}: {PANEL} is a stage kind and cannot be a profile name")
     for name, p in profiles.items():
         if p.role != "worker":
             continue
         if p.orchestrator == PANEL:
             extra = sorted(p.tools - PANEL_TOOLS)
             if extra:
-                out.append(f"{PROFILES_FILE}: {name}: a panel worker may not hold {extra}")
+                out.append(f"{file}: {name}: a panel worker may not hold {extra}")
             if "record_finding" not in p.tools:
-                out.append(f"{PROFILES_FILE}: {name}: a panel worker must hold record_finding")
+                out.append(f"{file}: {name}: a panel worker must hold record_finding")
             continue
         parent = profiles.get(p.orchestrator or "")
         if parent is None or parent.role != "orchestrator":
-            out.append(
-                f"{PROFILES_FILE}: {name}: orchestrator {p.orchestrator!r} is not an orchestrator"
-            )
+            out.append(f"{file}: {name}: orchestrator {p.orchestrator!r} is not an orchestrator")
         elif not p.tools <= parent.tools:
             out.append(
-                f"{PROFILES_FILE}: {name}: tools {sorted(p.tools - parent.tools)} "
+                f"{file}: {name}: tools {sorted(p.tools - parent.tools)} "
                 f"are not in {p.orchestrator}'s allowlist"
             )
     return out
@@ -311,8 +319,8 @@ def parse_manifest(
         try:
             manifest = Manifest(profiles=parsed["profiles"], effects=parsed["effects"])
         except ValidationError as exc:  # key names are checked here
-            raise ManifestError(_problems(PROFILES_FILE + "/" + EFFECTS_FILE, exc)) from exc
-        problems = _cross_checks(manifest.profiles)
+            raise ManifestError(_problems(f"{profiles_file}/{effects_file}", exc)) from exc
+        problems = _cross_checks(manifest.profiles, profiles_file)
         if not problems:
             return manifest
     raise ManifestError(problems)
