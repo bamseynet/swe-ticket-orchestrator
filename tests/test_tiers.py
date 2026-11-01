@@ -320,6 +320,80 @@ BYPASSES = {
 }
 
 
+# ---- D0-08a: remaining Docker launch gaps ----
+
+GAPS = {
+    "backtick_in_shell_string": 'import subprocess\nsubprocess.run("echo `docker ps`", shell=True)',
+    "dollar_paren_in_shell_string": (
+        'import subprocess\nsubprocess.run("echo $(docker ps)", shell=True)'
+    ),
+    "substitution_inside_double_quotes": (
+        "import subprocess\nsubprocess.run('echo \"$(docker ps)\"', shell=True)"
+    ),
+    "popen_executable": 'import subprocess\nsubprocess.Popen(["x", "ps"], executable="docker")',
+    "xargs_wrapper": 'import subprocess\nsubprocess.run(["xargs", "docker", "rm"], input=b"")',
+    "xargs_with_options": (
+        'import subprocess\nsubprocess.run(["xargs", "-n", "1", "-I", "{}", "docker", "rm", "{}"])'
+    ),
+    "xargs_in_shell_string": (
+        'import subprocess\nsubprocess.run("echo a | xargs -r docker rm", shell=True)'
+    ),
+    # review pass 1
+    "apostrophe_in_double_quotes": (
+        "import subprocess\nsubprocess.run('echo \"it\\'s $(docker ps)\"', shell=True)"
+    ),
+    "apostrophe_then_backtick": (
+        "import subprocess\nsubprocess.run('echo \"it\\'s `docker ps`\"', shell=True)"
+    ),
+    "xargs_gnu_i": 'import subprocess\nsubprocess.run(["xargs", "-i", "docker", "rm", "{}"])',
+    "xargs_long_option": (
+        'import subprocess\nsubprocess.run(["xargs", "--max-args", "1", "docker", "rm"])'
+    ),
+    "xargs_option_cluster": (
+        'import subprocess\nsubprocess.run(["xargs", "-rn", "1", "docker", "rm"])'
+    ),
+    "shell_true_with_executable": (
+        'import subprocess\nsubprocess.Popen("ps", shell=True, executable="docker")'
+    ),
+    "nested_escaped_backticks": (
+        'import subprocess\nsubprocess.run(r"echo `echo \\`docker ps\\``", shell=True)'
+    ),
+    "newline_separated": 'import subprocess\nsubprocess.run("echo hi\\ndocker ps", shell=True)',
+    "absurd_nesting_fails_closed": (
+        'import subprocess\nsubprocess.run("$(" * 3000 + "docker ps" + ")" * 3000, shell=True)'
+    ),
+}
+
+
+CONTINUATIONS = [
+    "echo hi && \\\n docker ps",
+    "xargs \\\n docker rm",
+    "FOO=1 \\\n docker ps",
+    "sudo \\\n docker ps",
+    'echo hi && "\\\n"docker ps',
+]
+
+
+@pytest.mark.parametrize("command", CONTINUATIONS)
+def test_line_continuation_does_not_hide_docker(tmp_path: Path, command: str) -> None:
+    source = f"""
+        import subprocess
+        def test_gap():
+            subprocess.run({command!r}, shell=True)
+    """
+    result = run_pytest(tmp_path, source)
+    assert result.returncode == 1, result.stdout
+    assert "TierViolationError" in result.stdout
+
+
+@pytest.mark.parametrize("name", sorted(GAPS))
+def test_docker_launch_gap_is_blocked(tmp_path: Path, name: str) -> None:
+    body = textwrap.indent(GAPS[name], "    ")
+    result = run_pytest(tmp_path, f"def test_gap():\n{body}\n")
+    assert result.returncode == 1, result.stdout
+    assert "TierViolationError" in result.stdout
+
+
 @pytest.mark.parametrize("name", sorted(BYPASSES))
 def test_guard_bypass_is_blocked(tmp_path: Path, name: str) -> None:
     body = textwrap.indent(BYPASSES[name], "    ")
@@ -337,6 +411,18 @@ INNOCENT = [
     'subprocess.run(["cat", "node_modules/playwright/package.json"], check=True)',
     'subprocess.run(["sh", "-c", "echo docker"], check=True)',
     'assert os.system("echo chromium") == 0',
+    "subprocess.run(\"echo 'literal `docker ps` and $(docker ps)'\", shell=True, check=True)",
+    'subprocess.run("echo `echo hi`", shell=True, check=True)',
+    'subprocess.run("echo $(echo hi)", shell=True, check=True)',
+    'subprocess.run(["echo", "$(docker ps)"], check=True)',
+    'subprocess.run(["echo", "x"], executable="/bin/echo", check=True)',
+    'subprocess.run(["xargs", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run(["xargs", "-n", "1", "echo"], input=b"docker", check=True)',
+    'subprocess.run(["xargs", "-i", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run(["xargs", "--max-args", "1", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run("echo \\"it\'s\\" \'$(docker ps)\'", shell=True, check=True)',
+    "subprocess.run(\"grep ';' firefox.txt\", shell=True, check=False)",
+    'subprocess.run("echo hi # $(docker ps)", shell=True, check=True)',
 ]
 
 

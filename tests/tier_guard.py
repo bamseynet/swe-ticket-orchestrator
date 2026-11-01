@@ -5,10 +5,20 @@
 * ``integration``, ``ui_browser`` and ``live`` tests are deselected unless ``-m`` is given, so
   local runs stay hermetic. CI jobs select them with ``-m``.
 * Docker use without the ``integration`` marker fails, and so does launching a browser without
-  ``ui_browser``. Every word of a command is inspected (``sh -c``, ``env docker`` and
-  ``shell=True`` strings included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
+  ``ui_browser``. The program of every simple command is inspected (``sh -c``, ``env docker`` and
+  ``shell=True`` strings, ``xargs``, backtick and ``$(...)`` substitutions and
+  ``Popen(executable=...)`` included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
   ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/`` or ``contract(s)/``
   directory is in that tier even without the marker.
+
+This is a best-effort guard against accidents, not a security boundary. Known limits, left open
+on purpose: shell keywords as the first word (``if docker ps; then``), ``command -v docker``
+(flagged although it only looks), ``&>file`` redirections glued to a word, and
+``Popen(["docker"], executable="/bin/echo")`` (flagged although it runs echo),
+``echo $(x)#b; docker ps`` and ``echo a\\ #b; docker ps`` (``#`` wrongly read as a comment), heredoc
+bodies (read as commands), and an unquoted ``|`` or ``(`` in ``case`` patterns, array
+assignments and ``[[ =~ ]]`` (read as a command separator). Odd input fails
+closed: nesting deeper than ``MAX_DEPTH`` raises ``TierViolationError``.
 
 This sits beside ``hermetic_guard`` and does not change its network and AWS guards.
 """
@@ -86,6 +96,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "ash"}
 WRAPPERS = {"env", "sudo", "nice", "nohup", "command", "exec", "time", "timeout", "stdbuf"}
+XARGS_SHORT_VALUE = set("InPLsdEaRS")  # the value is the rest of the word, or the next word
+XARGS_SHORT_ATTACHED = set("ile")  # GNU: the value, if any, must be attached
+XARGS_LONG_VALUE = {
+    "--max-args",
+    "--max-procs",
+    "--max-chars",
+    "--delimiter",
+    "--arg-file",
+    "--process-slot-var",
+}
+MAX_DEPTH = 16
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -98,43 +119,144 @@ def _as_argv(command: Any) -> list[str]:
         return []
 
 
+def _is_comment_start(text: str, i: int) -> bool:
+    return text[i] == "#" and (i == 0 or text[i - 1] in " \t\n;&|()")
+
+
 def _shell_segments(text: str) -> list[list[str]]:
-    """Split a shell string into simple commands at ; & | and newlines (quotes respected)."""
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
-    lexer.whitespace_split = True
-    segments: list[list[str]] = [[]]
-    try:
-        for token in lexer:
-            if token and set(token) <= set(";&|()\n"):
-                segments.append([])
-            else:
-                segments[-1].append(token)
-    except ValueError:  # unbalanced quotes: fall back to plain words
-        return [text.split()]
-    return [seg for seg in segments if seg]
+    """Split a shell string into simple commands at unquoted ; & | ( ) and newlines.
+
+    Quotes and backslashes are respected, and ``#`` comments are dropped.
+    """
+    parts: list[str] = [""]
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'" and text.startswith("\n", i + 1):
+            i += 2  # a line continuation joins lines and leaves no trace
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"' and i + 1 < len(text):
+                parts[-1] += ch
+                i += 1
+                ch = text[i]
+            parts[-1] += ch
+        elif ch == "\\" and i + 1 < len(text):
+            parts[-1] += text[i : i + 2]
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+            parts[-1] += ch
+        elif _is_comment_start(text, i):
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            parts.append("")
+        elif ch in ";&|()\n":
+            parts.append("")
+        else:
+            parts[-1] += ch
+        i += 1
+    segments: list[list[str]] = []
+    for part in parts:
+        try:
+            words = shlex.split(part)
+        except ValueError:  # unbalanced quotes: fall back to plain words
+            words = part.split()
+        if words:
+            segments.append(words)
+    return segments
 
 
-def _programs(argv: list[str], *, shell_string: bool = False) -> list[str]:
+def _substitutions(text: str) -> list[str]:
+    """Bodies of backtick and ``$(...)`` command substitutions (not inside single quotes)."""
+    found: list[str] = []
+    i, n = 0, len(text)
+    single = double = False
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and not single:
+            i += 2
+            continue
+        if not single and not double and _is_comment_start(text, i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "'" and not double:
+            single = not single
+        elif ch == '"' and not single:
+            double = not double
+        elif not single and ch == "`":
+            j = i + 1
+            while j < n and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            found.append(re.sub(r"\\([`$\\])", r"\1", text[i + 1 : j]))
+            i = j
+        elif not single and text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += (text[j] == "(") - (text[j] == ")")
+                j += 1
+            found.append(text[i + 2 : j - 1 if depth == 0 else j])
+            i = j - 1
+        i += 1
+    return found
+
+
+def _xargs_command(rest: list[str]) -> list[str]:
+    """The command ``xargs`` runs: ``rest`` without xargs's own options."""
+    i = 0
+    while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
+        word = rest[i]
+        i += 1
+        if word.startswith("--"):
+            if word in XARGS_LONG_VALUE:
+                i += 1
+            continue
+        for pos, flag in enumerate(word[1:], start=2):
+            if flag in XARGS_SHORT_ATTACHED:
+                break
+            if flag in XARGS_SHORT_VALUE:
+                if pos == len(word):  # nothing attached: the value is the next word
+                    i += 1
+                break
+    if i < len(rest) and rest[i] == "--":
+        i += 1
+    return rest[i:]
+
+
+def _programs(argv: list[str], *, shell_string: bool = False, depth: int = 0) -> list[str]:
     """The programs a command actually runs: argv[0], through env-like wrappers and ``sh -c``."""
+    if depth > MAX_DEPTH:  # fail closed rather than recurse without limit
+        raise TierViolationError("command nests too deeply for the tier guard to inspect")
     if shell_string:
-        return [p for seg in _shell_segments(" ".join(argv)) for p in _programs(seg)]
+        text = " ".join(argv)
+        found = [p for seg in _shell_segments(text) for p in _programs(seg, depth=depth + 1)]
+        for body in _substitutions(text):
+            found.extend(_programs([body], shell_string=True, depth=depth + 1))
+        return found
     while argv and _ASSIGNMENT.match(argv[0]):
         argv = argv[1:]
     if not argv:
         return []
     base = os.path.basename(argv[0]).lower()
     rest = argv[1:]
+    if base == "xargs":
+        return [argv[0], *_programs(_xargs_command(rest), depth=depth + 1)]
     if base in WRAPPERS:
         # Skip options and VAR=value words; the next word is the wrapped program.
         i = 0
         while i < len(rest) and (rest[i].startswith("-") or _ASSIGNMENT.match(rest[i])):
             i += 1
-        return [argv[0], *_programs(rest[i:])]
+        return [argv[0], *_programs(rest[i:], depth=depth + 1)]
     if base in SHELLS:
         for i, word in enumerate(rest):
             if word.startswith("-") and not word.startswith("--") and "c" in word:
                 if i + 1 < len(rest):
-                    return [argv[0], *_programs([rest[i + 1]], shell_string=True)]
+                    inner = _programs([rest[i + 1]], shell_string=True, depth=depth + 1)
+                    return [argv[0], *inner]
                 break
         return [argv[0]]
     return [argv[0]]
@@ -196,7 +318,12 @@ def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     original_connect_ex = socket.socket.connect_ex
 
     def guarded_init(self: Any, args: Any, *a: Any, **kw: Any) -> None:
-        check(args, shell_string=bool(kw.get("shell")) or (len(a) > 7 and bool(a[7])))
+        shell = bool(kw.get("shell")) or (len(a) > 7 and bool(a[7]))
+        executable = kw.get("executable", a[1] if len(a) > 1 else None)
+        if executable is not None:
+            # executable replaces argv[0] (or /bin/sh when shell=True) as the program run
+            check([executable] if shell else [executable, *_as_argv(args)[1:]])
+        check(args, shell_string=shell)
         original_init(self, args, *a, **kw)
 
     def guarded_system(command: Any) -> int:
