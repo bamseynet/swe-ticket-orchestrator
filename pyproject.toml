@@ -8,6 +8,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.100",
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
@@ -29,13 +30,13 @@ extend-exclude = ["docs", "*.md"]
 select = ["E", "F", "I", "B", "UP", "SIM", "PT"]
 
 [tool.mypy]
+python_version = "3.12"
 strict = true
 files = ["src", "tests"]
 mypy_path = "src"
-sqlite_cache = false  # some pyenv builds lack _sqlite3
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tools"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
 pythonpath = ["src"]

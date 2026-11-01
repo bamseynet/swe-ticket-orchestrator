@@ -6,8 +6,10 @@ guards are exercised exactly as every other test sees them, including the failin
 
 from __future__ import annotations
 
-import os
+import _socket
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -96,5 +98,85 @@ def test_aws_environment_is_hidden(
     guarded.runpytest_subprocess().assert_outcomes(passed=1)
 
 
-def test_aws_profile_is_unset_in_tests() -> None:
-    assert "AWS_PROFILE" not in os.environ
+def test_session_fixture_and_import_time_are_guarded(
+    guarded: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_PROFILE", "prod")
+    guarded.makepyfile(
+        """
+        import os
+        import socket
+
+        import pytest
+
+        @pytest.fixture(scope="session")
+        def session_probe():
+            assert "AWS_PROFILE" not in os.environ
+            return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        def test_uses_session_fixture(session_probe):
+            pass
+        """
+    )
+    result = guarded.runpytest_subprocess()
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*SocketBlockedError*"])
+
+
+def test_import_time_socket_and_aws_are_guarded(
+    guarded: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_PROFILE", "prod")
+    guarded.makepyfile(
+        """
+        import os
+        import socket
+
+        assert "AWS_PROFILE" not in os.environ
+        socket.create_connection(("127.0.0.1", 9))
+
+        def test_never_collected():
+            pass
+        """
+    )
+    result = guarded.runpytest_subprocess()
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*SocketBlockedError*"])
+
+
+def test_home_and_boto_config_are_unreachable(
+    guarded: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", "/host/home")
+    monkeypatch.setenv("BOTO_CONFIG", "/host/home/.boto")
+    guarded.makepyfile(
+        """
+        import os
+        from pathlib import Path
+
+        def test_hidden():
+            assert "/host" not in os.environ["HOME"]
+            assert "/host" not in str(Path.home())
+            assert "/host" not in os.environ["BOTO_CONFIG"]
+            assert not Path(os.environ["BOTO_CONFIG"]).exists()
+            assert not (Path.home() / ".aws").exists()
+        """
+    )
+    guarded.runpytest_subprocess().assert_outcomes(passed=1)
+
+
+def test_getnameinfo_is_blocked() -> None:
+    with pytest.raises(Exception, match="network sockets are blocked"):
+        socket.getnameinfo(("127.0.0.1", 80), 0)
+
+
+def test_low_level_socket_is_blocked() -> None:
+    with pytest.raises(Exception, match="network sockets are blocked"):
+        _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+
+
+def test_subprocesses_are_guarded() -> None:
+    code = "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM)"
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "network sockets are blocked" in proc.stderr
