@@ -284,14 +284,21 @@ class HmacVerifier:
     """Raw-body HMAC (over ``timestamp.body`` when the vendor signs it), an optional replay
     window, and a required delivery ID."""
 
+    sig_header = "X-Signature"
+    id_header = "X-Delivery"
+
     def __init__(
         self,
         secret: bytes,
         clock: Callable[[], float],
         window: float | None,
         ts_signed: bool = True,
+        sig_header: str | None = None,
+        id_header: str | None = None,
     ) -> None:
         self.secret, self.clock, self.window, self.ts_signed = secret, clock, window, ts_signed
+        self.sig_header = sig_header or type(self).sig_header
+        self.id_header = id_header or type(self).id_header
 
     def _signed_over(self, headers: Mapping[str, str], raw_body: bytes) -> bytes:
         if not self.ts_signed:
@@ -299,7 +306,7 @@ class HmacVerifier:
         return f"{headers.get('X-Timestamp', '')}.".encode() + raw_body
 
     def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
-        sent = headers.get("X-Signature")
+        sent = headers.get(self.sig_header)
         if sent is None:
             raise PermanentError("401 unsigned")
         expected = (
@@ -326,7 +333,7 @@ class HmacVerifier:
         return delivery_id
 
     def _id(self, headers: Mapping[str, str], raw_body: bytes) -> str:
-        return headers.get("X-Delivery", "")
+        return headers.get(self.id_header, "")
 
 
 class FormVerifier(HmacVerifier):
@@ -361,8 +368,19 @@ class Adapter:
     def queue(self) -> list[Any]:
         return self.store.queue
 
+    secret = SECRET
+    sig_header: str | None = None  # the vendor's own header names, if they are not the stub's
+    id_header: str | None = None
+
     def _verifier(self) -> HmacVerifier:
-        return HmacVerifier(SECRET, lambda: self.server.now, self.window, self.ts_signed)
+        return HmacVerifier(
+            self.secret,
+            lambda: self.server.now,
+            self.window,
+            self.ts_signed,
+            self.sig_header,
+            self.id_header,
+        )
 
     # --- writes: look up first (PLAN 6.3), then post, then read back ---
     @staticmethod
@@ -493,6 +511,15 @@ class GitHubAdapter(Adapter):
     ts_signed = False
 
 
+class GitHubHeadersAdapter(GitHubAdapter):
+    """The same honest GitHub-shaped logic, reading GitHub's own header names, over the fake
+    GitHub server of D4-16. It adds no logic of its own: only the names and the secret."""
+
+    secret = b"synthetic-webhook-secret"
+    sig_header = "X-Hub-Signature-256"
+    id_header = "X-GitHub-Delivery"
+
+
 class JiraAdapter(Adapter):
     """Honest Jira-shaped: no signed timestamp, and a 401 gets exactly one refresh and one retry
     (3LO, D6-02)."""
@@ -561,6 +588,9 @@ class StubTarget(Target):
             if c.author == PRINCIPAL and f"<!-- sto:{key}:" in c.body:
                 return c.id
         return None
+
+    def listed(self) -> int:
+        return len(self.server.comments)
 
     def calls(self, op: str) -> int:
         return self.server.counts[op]
@@ -1571,6 +1601,8 @@ def _capped(pages: int) -> type[Adapter]:
 
 BadPageCap8 = _capped(8)
 BadPageCap10 = _capped(10)
+BadPageCap34 = _capped(34)
+BadPageCap50 = _capped(50)
 
 
 class BadHeadOnly300(Adapter):
@@ -1683,6 +1715,9 @@ def _bad(
 
 
 TS = Port.TICKET_SOURCE
+LOOKUP_DEPTH_TEST = (
+    "test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk"
+)
 # PINNED-BEGIN
 _bad(
     BadNoSignatureCheck,
@@ -1912,6 +1947,8 @@ _bad(
     TS,
     {"test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk": A},
 )
+_bad(BadPageCap34, None, TS, {LOOKUP_DEPTH_TEST: A})
+_bad(BadPageCap50, None, TS, {LOOKUP_DEPTH_TEST: A})
 _bad(
     BadHeadOnly300,
     None,
@@ -2270,6 +2307,8 @@ def test_every_suite_test_is_pinned_by_a_bad_adapter_or_is_a_harness_check() -> 
         "test_crash_when_the_lookup_fails_then_a_restart_writes_once",
         "test_a_write_accepted_but_not_applied_is_never_reported_verified",
         "test_an_applied_write_is_reported_read_back_verified",
+        "test_the_harness_restart_gives_a_fresh_adapter_over_the_same_durable_stores",
+        "test_the_harness_seeds_and_plants_objects_the_server_lists",
     }
     unpinned = set(applicable(Port.TICKET_SOURCE)) - pinned - harness_checks
     assert unpinned == set(), sorted(unpinned)
@@ -2345,8 +2384,9 @@ def test_the_auth_webhook_port_needs_no_write_surface() -> None:
         assert "key" not in name
 
 
-def test_the_port_is_verified_not_claimed() -> None:
+def test_the_port_is_verified_not_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """An adapter implementing a wider port cannot claim a narrower one."""
+    monkeypatch.setattr("contract.suite._vendor_matches", lambda cls, vendor: True)
     ticket_adapter = types.SimpleNamespace(
         vendor=Vendor.GITHUB, adapter=FakeTicketSource(SpyWriter())
     )
@@ -2361,11 +2401,11 @@ def test_the_port_is_verified_not_claimed() -> None:
     validate_target(notifier_adapter, Port.TICKET_SOURCE)  # type: ignore[arg-type]
 
 
-def test_an_adapter_that_implements_no_port_cannot_claim_one() -> None:
-    class Plain:
-        pass
-
-    target = types.SimpleNamespace(vendor=Vendor.SLACK, adapter=Plain())
+def test_an_adapter_that_implements_no_port_cannot_claim_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = _sto_class(monkeypatch, "sto.adapters.slack.ingest")
+    target = types.SimpleNamespace(vendor=Vendor.SLACK, adapter=plain)
     for port in (Port.TICKET_SOURCE, Port.SCM, Port.NOTIFIER):
         with pytest.raises(PortClaimError, match="implements no"):
             validate_target(target, port)  # type: ignore[arg-type]
@@ -3143,3 +3183,236 @@ class TestMergedFakesIdempotency:
         assert fake_writer.effects() == 0
         fake_writer.write("k1")
         assert fake_writer.effects() == 1
+
+
+# --- D4-16: harness self-checks, page depth, real adapter classes, vendor and module ------------
+
+LOOKUP_DEPTH = "test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk"
+FORGE_CHECK = "test_a_forged_delivery_differs_from_a_genuine_one_only_in_its_signature"
+RESTART_CHECK = "test_the_harness_restart_gives_a_fresh_adapter_over_the_same_durable_stores"
+SEED_CHECK = "test_the_harness_seeds_and_plants_objects_the_server_lists"
+
+
+@pytest.mark.parametrize("bad", [BadPageCap34, BadPageCap50])
+def test_a_silent_page_cap_of_34_or_more_fails(bad: type[Adapter]) -> None:
+    error = run_suite(_with(bad), Port.TICKET_SOURCE)[LOOKUP_DEPTH]
+    assert type(error) is AssertionError, f"{bad.__name__} slipped past"
+
+
+def test_the_page_cap_the_suite_catches_is_documented_by_the_depth_it_seeds() -> None:
+    from contract.suite import DEEP
+
+    assert DEEP // PAGE_SIZE >= 51  # the marker is past page 50 from each end
+
+
+class _ForgeVariant(StubTarget):
+    """A harness whose ``forge()`` is wrong in one way."""
+
+    def __init__(self, fault: str) -> None:
+        super().__init__()
+        self.fault = fault
+
+    def forge(
+        self, revision: int, delivery_id: str, how: ForgeKind = ForgeKind.WRONG_SECRET
+    ) -> RawWebhook:
+        good = super().forge(revision, delivery_id, how)
+        sig = self.signature_header
+        genuine = self.emit(revision, delivery_id).headers[sig]
+        value = good.headers[sig]
+        if self.fault == "all_wrong_secret":
+            return super().forge(revision, delivery_id, ForgeKind.WRONG_SECRET)
+        if self.fault == "truncated_not_prefix" and how is ForgeKind.TRUNCATED_MAC:
+            value = "sha256=" + "0" * 8
+        if self.fault == "truncated_is_genuine" and how is ForgeKind.TRUNCATED_MAC:
+            value = genuine
+        if self.fault == "blank_not_empty" and how is ForgeKind.BLANK_HEADER:
+            value = " "
+        if self.fault == "blank_missing" and how is ForgeKind.BLANK_HEADER:
+            return RawWebhook({k: v for k, v in good.headers.items() if k != sig}, good.body)
+        if self.fault == "empty_key_is_genuine" and how is ForgeKind.EMPTY_KEY:
+            value = genuine
+        if self.fault == "empty_mac_is_blank" and how is ForgeKind.EMPTY_MAC:
+            value = ""
+        if self.fault == "body_changed" and how is ForgeKind.EMPTY_KEY:
+            return RawWebhook(good.headers, good.body + b" ")
+        if self.fault == "header_changed" and how is ForgeKind.BLANK_HEADER:
+            return RawWebhook({**good.headers, "X-Delivery": "other"}, good.body)
+        return RawWebhook({**good.headers, sig: value}, good.body)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "all_wrong_secret",
+        "truncated_not_prefix",
+        "truncated_is_genuine",
+        "blank_not_empty",
+        "blank_missing",
+        "empty_key_is_genuine",
+        "empty_mac_is_blank",
+        "body_changed",
+        "header_changed",
+    ],
+)
+def test_an_inconsistent_forge_for_any_kind_is_a_harness_error(fault: str) -> None:
+    error = run_suite(lambda: _ForgeVariant(fault))[FORGE_CHECK]
+    assert type(error) is HarnessError, (fault, error)
+
+
+def test_a_consistent_forge_passes_the_forge_check_for_every_kind() -> None:
+    assert run_suite(reference)[FORGE_CHECK] is None
+    assert run_suite(github_shaped, Port.SCM)[FORGE_CHECK] is None
+
+
+class _NoOpRestart(StubTarget):
+    def restart(self) -> None:
+        pass
+
+
+class _RestartDropsQueue(StubTarget):
+    def restart(self) -> None:
+        super().restart()
+        self.store.queue.clear()
+
+
+class _NoOpPlant(StubTarget):
+    def plant_foreign_marker(self, key: str, variant: str = "a", author: str = "mallory") -> None:
+        pass
+
+
+class _NoOpSeed(StubTarget):
+    def seed_others(self, n: int, newer: bool = True) -> None:
+        pass
+
+
+class _PlantsAsUs(StubTarget):
+    def plant_foreign_marker(self, key: str, variant: str = "a", author: str = "mallory") -> None:
+        super().plant_foreign_marker(key, variant, PRINCIPAL)
+
+
+@pytest.mark.parametrize("factory", [_NoOpRestart, _RestartDropsQueue])
+def test_a_restart_that_changes_nothing_or_loses_the_stores_is_a_harness_error(
+    factory: Callable[[], Target],
+) -> None:
+    for port in (Port.TICKET_SOURCE, Port.WEBHOOK):
+        error = run_suite(factory, port)[RESTART_CHECK]
+        assert type(error) is HarnessError, (factory.__name__, port, error)
+
+
+@pytest.mark.parametrize("factory", [_NoOpPlant, _NoOpSeed, _PlantsAsUs])
+def test_a_plant_or_seed_that_does_nothing_is_a_harness_error(
+    factory: Callable[[], Target],
+) -> None:
+    error = run_suite(factory)[SEED_CHECK]
+    assert type(error) is HarnessError, (factory.__name__, error)
+
+
+def test_honest_restart_plant_and_seed_pass_their_checks() -> None:
+    for port in (Port.TICKET_SOURCE, Port.WEBHOOK):
+        assert run_suite(reference, port)[RESTART_CHECK] is None
+    assert run_suite(reference)[SEED_CHECK] is None
+
+
+# the adapter under test: a class really defined under sto., exposing only what its port has
+
+
+def _sto_class(monkeypatch: pytest.MonkeyPatch, module: str, **ns: Any) -> object:
+    """An instance of a class that looks really defined in module ``module`` (a name under
+    ``sto.``): loaded under that name, holding the class, with a file in a sto directory."""
+    import contract.suite as suite
+
+    mod = types.ModuleType(module)
+    mod.__file__ = str(SRC_DIR / "sto" / "adapters" / "probe.py")
+    cls = type("Thing", (), {"__module__": module, **ns})
+    mod.Thing = cls  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module, mod)
+    monkeypatch.setattr(suite, "_sto_directories", lambda: [SRC_DIR / "sto"])
+    return cls()
+
+
+def test_the_adapter_under_test_must_be_a_class_really_defined_under_sto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Local:
+        pass
+
+    outside = types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=Local())
+    with pytest.raises(PortClaimError, match="defined under sto"):
+        validate_target(outside, Port.WEBHOOK)  # type: ignore[arg-type]
+    named = type("Named", (), {"__module__": "sto.adapters.github.ingest"})()
+    forged = types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=named)
+    with pytest.raises(PortClaimError, match="defined under sto"):
+        validate_target(forged, Port.WEBHOOK)  # type: ignore[arg-type]
+    prefixed = _sto_class(monkeypatch, "stolen.github.ingest")
+    with pytest.raises(PortClaimError, match="defined under sto"):
+        validate_target(
+            types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=prefixed),  # type: ignore[arg-type]
+            Port.WEBHOOK,
+        )
+    real = _sto_class(monkeypatch, "sto.adapters.github.ingest")
+    validate_target(types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=real), Port.WEBHOOK)  # type: ignore[arg-type]
+
+
+def test_a_reference_adapter_is_exempt_from_the_sto_check() -> None:
+    validate_target(reference(), Port.TICKET_SOURCE)
+    validate_target(auth_webhook(), Port.AUTH_WEBHOOK)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "comment",
+        "transition",
+        "create_commit",
+        "move_ref",
+        "promote",
+        "ensure_draft_pr",
+        "mark_ready",
+        "close_pr",
+        "merge_base_into",
+        "open_revert_pr",
+        "request_merge",
+        "dequeue",
+        "trigger_workflow",
+        "publish_check",
+        "send",
+        "update",
+    ],
+)
+def test_an_adapter_with_no_port_exposes_none_of_the_ports_write_methods(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    adapter = _sto_class(monkeypatch, "sto.adapters.github.ingest", **{method: lambda self: None})
+    target = types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=adapter)
+    for port in (Port.WEBHOOK, Port.AUTH_WEBHOOK):
+        with pytest.raises(PortClaimError, match=method):
+            validate_target(target, port)  # type: ignore[arg-type]
+
+
+def test_the_write_methods_checked_are_every_non_read_method_of_the_three_ports() -> None:
+    from contract.suite import PORT_READ_METHODS, PORT_WRITE_METHODS
+    from sto.adapters.ports import Notifier, ScmProvider, TicketSource
+
+    every = {
+        n
+        for protocol in (TicketSource, ScmProvider, Notifier)
+        for n, v in vars(protocol).items()
+        if callable(v) and not n.startswith("_")
+    }
+    assert every - PORT_READ_METHODS == PORT_WRITE_METHODS
+    assert {"comment", "send", "publish_check", "move_ref"} <= PORT_WRITE_METHODS
+    assert not PORT_READ_METHODS & PORT_WRITE_METHODS
+
+
+def test_a_declared_vendor_must_match_the_adapters_module_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _sto_class(monkeypatch, "sto.adapters.github.ingest")
+    validate_target(types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=adapter), Port.WEBHOOK)  # type: ignore[arg-type]
+    for wrong in (Vendor.SLACK, Vendor.JIRA):
+        with pytest.raises(PortClaimError, match="module path"):
+            validate_target(types.SimpleNamespace(vendor=wrong, adapter=adapter), Port.WEBHOOK)  # type: ignore[arg-type]
+    # a segment, not a substring
+    sub = _sto_class(monkeypatch, "sto.adapters.githubish.ingest")
+    with pytest.raises(PortClaimError, match="module path"):
+        validate_target(types.SimpleNamespace(vendor=Vendor.GITHUB, adapter=sub), Port.WEBHOOK)  # type: ignore[arg-type]

@@ -33,15 +33,14 @@ Known limits, deliberate routes the suite does not stop:
 
 * Forging the private waiver token, and setting ``__module__`` plus ``setattr`` into
   ``contract.test_suite`` to pass as a reference adapter.
-* The port and waiver checks trust ``target.adapter``: a target can name a different real class
-  (D4-16).
-* ``forge()`` is only checked against ``emit`` for ``WRONG_SECRET``; a ``forge()`` that returns
-  that for every ``ForgeKind`` lets a prefix-compare or empty-key verifier pass (D4-16).
+* The port, vendor and waiver checks trust ``target.adapter``: a target can name a different real
+  class under ``sto.`` (the class must be really defined there, and match the declared vendor's
+  module path, but the suite cannot tell it from the class the test means to exercise).
 * Header names are matched case-sensitively (fails closed).
 * Nothing requires a real adapter to HAVE a conformance subclass.
-* A silent page cap of 34 or more is not seen: the absent-key walk is about 45 pages and includes
-  the read-back walk, and the marker is 1,100 objects (11 pages) from each end. A cap below that
-  fails; "up to ten pages" understates how much is missed above it.
+* A silent page cap above 50 pages is not seen: the marker is 5,100 objects (51 pages) from each
+  end, and the absent-key walk is about 200 pages including the read-back walk. A cap of 34 pages
+  or more, up to 50, fails.
 * A ``::`` argument narrows the completeness check to the classes it names.
 
 What a fake server must provide for the suite to be meaningful: it must page at 100 items (the
@@ -127,9 +126,10 @@ DEFAULT_TARGET = "fake"  # the only name whose receipts may be simulated
 MAX_REPLAY_WINDOW = 300.0  # seconds; set here, a target cannot raise it
 FAR_FUTURE = 10.0**10  # seconds; longer than any finite window an adapter could sensibly use
 PAGE_SIZE = 100  # GitHub's maximum; the server pages at this size
-DEEP = 1100  # objects on each side of a marker: past any page cap up to ten pages
+DEEP = 5100  # objects on each side of a marker: past any page cap up to 50 pages
 RETRIES = 5
 FAKE_MODULE = "sto.adapters.fake"
+STO_MODULE = "sto"
 REFERENCE_MODULE = "contract.test_suite"
 PORT_ERRORS = (
     IdempotencyKeyReuseError,
@@ -175,6 +175,21 @@ _REAL_PORTS: tuple[tuple[Port, type], ...] = (
     (Port.TICKET_SOURCE, TicketSource),
     (Port.SCM, ScmProvider),
     (Port.NOTIFIER, Notifier),
+)
+# The methods of the three ports that only read or parse. Every other public method writes, so an
+# adapter that implements no port must not expose one: it would be a write the suite never sees.
+PORT_READ_METHODS = frozenset(
+    {"get", "search", "parse_event", "current_sprint", "snapshot", "poll_merge", "ci_trust"}
+    | {"checks", "parse_action"}
+)
+PORT_WRITE_METHODS = (
+    frozenset(
+        name
+        for _, protocol in _REAL_PORTS
+        for name, value in vars(protocol).items()
+        if callable(value) and not name.startswith("_")
+    )
+    - PORT_READ_METHODS
 )
 
 
@@ -357,6 +372,10 @@ class Target:
     def stored_id_for(self, key: str) -> str | None:
         raise _unset("stored_id_for")
 
+    def listed(self) -> int:
+        """How many objects the server lists in all, whoever stored them."""
+        raise _unset("listed")
+
     def calls(self, op: str) -> int:
         """Requests the server received: ``lookup``, ``write``, ``read``, ``refresh``,
         ``unauthorized``, ``limited``."""
@@ -487,6 +506,16 @@ def _fake_directories() -> list[Path]:
     return [Path(p).resolve() for p in (spec.submodule_search_locations or [])] if spec else []
 
 
+def _sto_directories() -> list[Path]:
+    spec = importlib.util.find_spec(STO_MODULE)
+    return [Path(p).resolve() for p in (spec.submodule_search_locations or [])] if spec else []
+
+
+def is_sto_class(cls: type) -> bool:
+    """``cls`` is REALLY defined under ``sto.``: not merely named so."""
+    return _defined_under(cls, STO_MODULE, _sto_directories())
+
+
 def is_fake(cls: type) -> bool:
     return _defined_under(cls, FAKE_MODULE, _fake_directories())
 
@@ -502,6 +531,11 @@ def implemented_ports(adapter: object) -> list[Port]:
 def _caps(target: Target) -> Capabilities:
     """The vendor's capabilities, as the suite owns them: never the target's own claim."""
     return CAPABILITIES[target.vendor]
+
+
+def _vendor_matches(cls: type, vendor: Vendor) -> bool:
+    """The vendor is a whole segment of the adapter's module path (``sto.adapters.github.x``)."""
+    return vendor.value in cls.__module__.split(".")
 
 
 def validate_target(target: Target, port: Port) -> None:
@@ -530,10 +564,21 @@ def validate_target(target: Target, port: Port) -> None:
         )
     if reference:
         return
+    if not is_sto_class(type(adapter)):
+        raise PortClaimError(
+            f"{type(adapter).__qualname__} must be a class really defined under sto."
+        )
+    if not _vendor_matches(type(adapter), vendor):
+        raise PortClaimError(
+            f"vendor {vendor} does not match the adapter's module path {type(adapter).__module__}"
+        )
     implemented = implemented_ports(adapter)
     if not implemented:
         if port not in (Port.WEBHOOK, Port.AUTH_WEBHOOK):
             raise PortClaimError(f"the adapter implements no {port} port")
+        exposed = sorted(n for n in PORT_WRITE_METHODS if callable(getattr(adapter, n, None)))
+        if exposed:
+            raise PortClaimError(f"an adapter with no port exposes write methods: {exposed}")
         return
     needed: set[Section] = set().union(*(PORT_SECTIONS[p] for p in implemented))
     if not needed <= PORT_SECTIONS[port]:
@@ -880,16 +925,50 @@ class AdapterConformance:
     def test_a_forged_delivery_differs_from_a_genuine_one_only_in_its_signature(
         self, target: Target
     ) -> None:
-        """The harness check: else a rejection could be for some other reason."""
+        """The harness check, for EVERY kind of forgery: else a rejection could be for some other
+        reason, or one kind could quietly stand in for another (a ``forge()`` returning the wrong
+        secret for all of them would let a prefix-compare or empty-key verifier pass)."""
         target.require(Control.SIGNATURE)
-        genuine, forged = target.emit(1, "d-1"), target.forge(1, "d-1")
-        sig = target.signature_header.lower()
-        same = {k: v for k, v in genuine.headers.items() if k.lower() != sig}
-        if genuine.body != forged.body or same != {
-            k: v for k, v in forged.headers.items() if k.lower() != sig
-        }:
-            raise HarnessError("forge() changed something besides the signature")
-        assert genuine.headers[target.signature_header] != forged.headers[target.signature_header]
+        header = target.signature_header
+        genuine = target.emit(1, "d-1")
+        same = {k: v for k, v in genuine.headers.items() if k.lower() != header.lower()}
+        real = genuine.headers[header]
+        seen: dict[ForgeKind, str] = {}
+        for how in ForgeKind:
+            forged = target.forge(1, "d-1", how)
+            others = {k: v for k, v in forged.headers.items() if k.lower() != header.lower()}
+            if genuine.body != forged.body or same != others:
+                raise HarnessError(f"forge({how}) changed something besides the signature")
+            if header not in forged.headers:
+                raise HarnessError(f"forge({how}) removed the {header} header")
+            seen[how] = forged.headers[header]
+        for how, value in seen.items():
+            if value == real:
+                raise HarnessError(f"forge({how}) produced the genuine signature")
+        if len(set(seen.values())) != len(seen):
+            raise HarnessError("forge() gave two kinds of forgery the same signature")
+        if seen[ForgeKind.BLANK_HEADER] != "":
+            raise HarnessError("forge(BLANK_HEADER) must leave the header present and empty")
+        truncated = seen[ForgeKind.TRUNCATED_MAC]
+        if not (real.startswith(truncated) and len(truncated) < len(real)):
+            raise HarnessError("forge(TRUNCATED_MAC) must be a proper prefix of the genuine one")
+        if len(seen[ForgeKind.EMPTY_MAC]) > len(truncated):
+            raise HarnessError("forge(EMPTY_MAC) must carry less than the truncated MAC")
+
+    @covers(Section.WEBHOOK, Control.RESTART)
+    def test_the_harness_restart_gives_a_fresh_adapter_over_the_same_durable_stores(
+        self, target: Target
+    ) -> None:
+        """The harness check: a ``restart()`` that does nothing makes every restart test vacuous,
+        and one that loses the durable tables makes them pass for the wrong reason."""
+        target.require(Control.RESTART)
+        target.deliver(target.emit(1, "d-1"))
+        adapter, verifier, queued = target.adapter, target.verifier, target.queued()
+        target.restart()
+        if target.adapter is adapter or target.verifier is verifier:
+            raise HarnessError("restart() left the same adapter in place")
+        if target.queued() != queued:
+            raise HarnessError("restart() lost the durable queue")
 
     @covers(Section.WEBHOOK, Control.SIGNATURE)
     def test_t6_genuine_delivery_is_accepted(self, target: Target) -> None:
@@ -1238,6 +1317,24 @@ class AdapterConformance:
         assert len(target.stored_ids()) == 1
 
     # ==== LOOKUP: look-up-first (PLAN 6.3) ==================================================
+
+    @covers(Section.LOOKUP, Control.LOOKUP)
+    def test_the_harness_seeds_and_plants_objects_the_server_lists(self, target: Target) -> None:
+        """The harness check: a ``seed_others`` or ``plant_foreign_marker`` that does nothing
+        makes the look-up and read-back tests pass vacuously, and a plant under our own name is
+        not a foreign one."""
+        target.require(Control.LOOKUP)
+        for newer in (True, False):
+            before = target.listed()
+            target.seed_others(3, newer=newer)
+            if target.listed() != before + 3:
+                raise HarnessError("seed_others() did not add the objects it was asked to")
+        before, ours = target.listed(), target.stored_ids()
+        target.plant_foreign_marker("k-plant")
+        if target.listed() != before + 1:
+            raise HarnessError("plant_foreign_marker() added no object to the server")
+        if target.stored_ids() != ours or target.stored_id_for("k-plant") is not None:
+            raise HarnessError("plant_foreign_marker() planted an object by our own principal")
 
     @covers(Section.LOOKUP, Control.CRASH, Control.RESTART, Control.LOOKUP)
     def test_lookup_walks_every_page_in_either_order_and_an_absent_key_costs_a_full_walk(
