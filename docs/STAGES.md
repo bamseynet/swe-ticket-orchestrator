@@ -361,13 +361,13 @@ D5 and D8 implement these profiles, and a test fails if code and manifest differ
 #### D2-02: Overlays and flattening
 Apply a `WorkflowOverlay` to its pinned template with JSON Merge Patch on the stage map, and flatten at publish, with provenance for each value.
 Maps merge, lists replace and `null` removes. A value below a floor gets an error naming the floor.
-**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value.
+**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal.
 **Deps:** D2-01, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/overlays.py`, `tests/config/test_overlays.py`.
 
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound.
 **Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `tests/config/test_validate_structure.py`.
 
 #### D2-04: Gate dominance proof
@@ -391,13 +391,13 @@ It replaces the hard-coded path, with no behaviour change to the gate suite. `wa
 #### D2-07: Publishing and pinning
 Publishing stores a flattened, immutable version with a manifest digest over workflow, profiles, effects and prompts, and a run pins that digest at start.
 Old manifests stay addressable by hash, so a changed profile cannot strand a run.
-**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live.
+**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too.
 **Deps:** D2-02, D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/publish.py`, `tests/config/test_publish.py`.
 
 #### D2-08: Subject and rounds
 Compute subject digests, verbatim `patch_id`, attention digests, normalised `ticket_revision` and round numbers, and store the data for interdiffs.
 A re-entered gate is a new instance linked to the last, and it cannot open if evidence is not valid for the subject.
-**AC:** same diff on a new base gives the same `patch_id`; a whitespace-only change gives a different one; our own ticket comments do not change `ticket_revision`; interdiff data exists for round 2 onward.
+**AC:** same diff on a new base gives the same `patch_id`; a whitespace-only change gives a different one; our own ticket comments do not change `ticket_revision`; interdiff data exists for round 2 onward. A gate that expects no evidence has a stated rule; completeness follows V14; hashes use `canonical_data`; also-contains notes are captured in `evidence_digest` or with the gate; a malformed containment answer (`TypeError`) propagates and is never a verdict; a `Verdict` that gets persisted is validated, since `from_wire` accepts `valid: "false"`; stored artifact refs (PLAN.md's evidence item) extend `Evidence` deliberately, because `from_wire` rejects extra fields.
 **Deps:** D1-06, D2-06, D2-22. **Size:** M. **Run:** parallel. **Files:** `src/sto/gates/subject.py`, `tests/gates/test_subject.py`.
 
 #### D2-09: Carry-over and invalidation
@@ -410,7 +410,7 @@ This is the most dangerous logic in the product, and it implements invariant G13
 Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, and add an audited human retry that stops the earlier attempt. This issue owns a person's Retry of a blocked effect: it writes the audit record and calls `EffectExecutor.retry_blocked` (D1-07 has no caller for it).
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
 Carried from D1-03: the local driver retries a persistent `TransientError` with capped backoff but no limit on total time, so cap it, and classify permanent errors that arrive as transient.
-**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited.
+**AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited. A head that moves during the QA step blocks the run; today it wedges with `RunWedgedError` and no merge.
 **Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
 
 #### D2-11: Cancel v1
@@ -418,7 +418,7 @@ Add the `CANCELLING` state from any active state, with a timeout and alarm, void
 Carried from D1-03: add the stuck-stop alarm for a dead run whose `stop` or `reconcile` keeps failing; a blocked effect on a stopped run shows only as a refused event, so show it plainly. The lease heartbeat shares the default thread pool with handler calls, and a saturated pool can delay a renewal: give it its own. A heartbeat's first load is unguarded, so a store error there aborts the command. `WAITING_EXTERNAL` needs to be idle-allowed when a handler first uses it.
 Carried from D1-07: a stalled worker past its lease can still send a request after reconcile voided the effect, and a lookup handler that returns `Written` for `pr.merge` must supply the frozen subject.
 Stopping model calls mid-step and session stopping arrive in D10-06.
-**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`.
+**AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`. `void_planned` after CONFIRMED reports the landed merge rather than staying silent (`effects/core.py:684-689`); the test uses a real Stop through the driver.
 **Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `tests/engine/test_cancel.py`, `tests/adapters/test_fake.py`.
 
 #### D2-12: Timers and business calendar
@@ -472,7 +472,7 @@ In-flight runs must survive deployments, and this comes before D3 so nothing nee
 #### D2-21: Same-patch result reuse
 A `review_panel` and an `agent` QA stage reuse results when `patch_id` is unchanged, with `same_patch` validity, and `checks` stages never do.
 This keeps a base update cheap, and the reuse decision is recorded.
-**AC:** a base update re-runs CI and QA suites, and reuses reviews; a changed patch reuses nothing; a new required reviewer is not reused away.
+**AC:** a base update re-runs CI and QA suites, and reuses reviews; a changed patch reuses nothing; a new required reviewer is not reused away. Reuse is refused for `checks` stages, using the stage in `EV#stage#ulid`.
 **Deps:** D2-22, D2-06. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/reuse.py`, `tests/engine/test_reuse.py`.
 
 #### D2-22: Evidence records
@@ -552,7 +552,7 @@ An admin who changed a mapping, attributed a commit or cleared an exclusion is i
 #### D3-06: Quorum and veto
 Quorum per role, one vote per person, and veto by any negative decision, replacing the v0 decision path. All surfaces use it.
 Negative decisions are exempt from the digest match, and a moved subject drops earlier votes.
-**AC:** G3 by every commit order; a per-role quorum needs each role; votes drop on a ticket edit; required comments are enforced.
+**AC:** G3 by every commit order; a per-role quorum needs each role; votes drop on a ticket edit; required comments are enforced. Contention in `service.py:308-309` and `open_gate` raises `GateContentionError`, not `ConditionFailedError`.
 **Deps:** D3-05, D2-08. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_decisions.py`.
 
 #### D3-07: Eligibility display and escalation
@@ -682,13 +682,13 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 #### D4-01: Conformance suite
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
 It is written once, and every adapter in every later stage runs it.
-**AC:** suite covers signature rejection, duplicates, out-of-order delivery, crash-after-write, rate limits and auth failure; it runs in process with no Docker; a trivial fake adapter passes it; T6 covered.
-**Deps:** D1-04. **Size:** M. **Run:** serial. **Files:** `tests/contract/suite.py`, `tests/contract/test_suite.py`.
+**AC:** suite covers signature rejection, duplicates, out-of-order delivery, crash-after-write, rate limits and auth failure; it runs in process with no Docker; a trivial fake adapter passes it; T6 covered. A target declares typed capabilities that select a different mandatory test and never remove a control; required sections come from the port it implements; a subclass cannot skip or override a suite test; `pending_controls` works only for adapters under `sto.adapters.fake`.
+**Deps:** D1-04. **Size:** M. **Run:** serial. **Files:** `tests/contract/__init__.py`, `tests/contract/conftest.py`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-16: Fake GitHub: auth and webhooks
 First part of an in-process fake: App auth, tokens, signatures, deliveries, pagination, rate limits and errors.
 Each behaviour is documented with its source URL, and the live suite later proves it.
-**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic.
+**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every fake then passes its port's sections.
 **Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`.
 
 #### D4-02: Credential broker and GitHub auth port
@@ -700,13 +700,13 @@ Tokens are narrowed per call, cached under an hour, never logged, and refused fo
 #### D4-03: Webhook ingest core
 Generic ingest: verify on the raw body, dedupe, enqueue, respond inside the vendor's deadline.
 Consumers treat the delivery as a nudge and re-read state.
-**AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries.
+**AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries. This issue owns the `WebhookVerifier` port and the queue failure path, and the port says a delivery ID outside the signature does not stop an attacker, so a decision-shaped delivery must re-read.
 **Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
 
 #### D4-04: GitHub webhooks
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
 Installation and permission events update connection state.
-**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture.
+**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading.
 **Deps:** D4-03, D4-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
 
 #### D4-05: GitHub issues as tickets
@@ -773,7 +773,7 @@ The revert goes through normal review, and the run ends `done_with_incident`.
 #### D4-15: Live GitHub conformance
 Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** before a human approves it.
 It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow. The worker identity is not on that reviewer list.
-**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself.
+**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself. The network guard has a live exemption that a typo in the target variable cannot enable by accident; a transport shim provokes `crash`, `swallow` and rate limits on demand; live keys are unique per run.
 **Deps:** D4-24, D4-05, D4-08, D4-26, D4-27. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
 
 #### D4-17: CI trust report
@@ -785,7 +785,7 @@ Anything it cannot prove stays `unknown`, because attestation fails closed. Fork
 #### D4-19: Fake GitHub: PRs and merges
 Fake pull requests, draft state, async merge with polling and `sha`, base updates through `POST /merges`, commit and ref APIs, and merge queue responses.
 It models the async API as the main path, with the behaviours marked unverified until D4-23.
-**AC:** async merge, a moved head, `enqueued` and conflict are all simulated; the conformance suite's SCM section can target it.
+**AC:** async merge, a moved head, `enqueued` and conflict are all simulated; the conformance suite's SCM section can target it. It runs the suite's SCM section.
 **Deps:** D4-16. **Size:** L. **Run:** parallel. **Files:** `tests/fakes/github/pulls/`.
 
 #### D4-20: Fake GitHub: checks, rulesets and dispatch
@@ -884,13 +884,13 @@ No framework substitution is ever used.
 #### D5-04: Secret scanning and redaction
 Scan all tool output and everything rendered into a prompt before the model sees it, scan patches before push, and redact errors at one boundary.
 Scanning covers known formats and entropy, including inside source files.
-**AC:** T4: canaries with unusual names and inside source are caught, including in ticket text; T5: errors lose URLs, paths and tokens; a finding in a patch blocks the step.
+**AC:** T4: canaries with unusual names and inside source are caught, including in ticket text; T5: errors lose URLs, paths and tokens; a finding in a patch blocks the step. Scanning runs before neutralising; the prompt hash is taken after redaction; raw `Untrusted.text` and `asdict` output never reach logs.
 **Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/safety/`, `tests/agents/test_safety.py`.
 
 #### D5-05: Tool broker and read tools
 Registry that enforces a stage's allowlist, plus `ticket.*`, `repo.*`, `pr.diff`, `checks.read` and record tools. **Repo and SHA come from the signed step context, never from model arguments.** `ticket.read` serves a confirmed snapshot and member comments, with others withheld.
 All output passes through the scanner, and is framed as untrusted.
-**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; G11: a non-member's comment or a later edit never reaches an agent, through `ticket.read` or `ticket.search_similar`; every result is scanned; SHA-pinned reads.
+**AC:** A1: a tool outside the allowlist cannot be built or called; no write tool exists; a model-supplied repo argument is ignored or refused; G11: a non-member's comment or a later edit never reaches an agent, through `ticket.read` or `ticket.search_similar`; every result is scanned; SHA-pinned reads. Tool output is capped, and lone surrogates from `surrogateescape` or `os.fsdecode` are sanitised before wrapping, so a hostile filename cannot fail the step.
 **Deps:** D5-01, D5-04, D4-06, D5-19, D3-14. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/tools/registry.py`, `src/sto/agents/tools/read.py`, `tests/agents/test_tools.py`.
 
 #### D5-06: Workspace port and local Docker
@@ -908,7 +908,7 @@ The sandbox never sees an SCM token.
 #### D5-08: Triage, refine and plan profiles
 Profiles and prompts for the three early stages, with workers, each with declared outcomes.
 The plan is a tool call, because text between tool calls may be hidden on Opus.
-**AC:** each outcome is reachable with scripted models; a plan arrives through `record_plan`; missing acceptance criteria route correctly.
+**AC:** each outcome is reachable with scripted models; a plan arrives through `record_plan`; missing acceptance criteria route correctly. The system prompt includes `FRAME_GUIDANCE`, and `record()` is written into run records; the D5-09 profiles follow the same rule.
 **Deps:** D5-02, D5-03, D5-05. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/profiles/triage.py`, `src/sto/agents/profiles/refiner.py`, `src/sto/agents/profiles/planner.py`, `src/sto/agents/prompts/early/`, `tests/agents/test_early_profiles.py`.
 
 #### D5-09: Implementer profile
@@ -956,7 +956,7 @@ The task token never enters the session. Commands travel in a versioned envelope
 #### D5-16: Hostile corpus
 A set of hostile tickets, code comments, CI logs and web pages, run through scripted models and real tool layers.
 It proves the controls hold when the model obeys the attacker.
-**AC:** G14 and T1: a scripted obedient model still cannot approve, merge or skip; T3 and T12 covered; corpus is easy to extend.
+**AC:** G14 and T1: a scripted obedient model still cannot approve, merge or skip; T3 and T12 covered; corpus is easy to extend. The corpus includes `<!--` and `-->` across two values, an unclosed `<![CDATA[`, identical values, and lookalike closers with a real HEX.
 **Deps:** D5-09, D5-10, D5-14. **Size:** M. **Run:** parallel. **Files:** `tests/security/`.
 
 #### D5-17: Memory port
@@ -980,7 +980,7 @@ Cedar and the tool layer both read it. The AWS issuer comes in D11-23.
 #### D5-20: Custom profiles
 A team declares its own reviewer or agent in `TeamConfig`: a built-in base, a prompt addendum, and a subset of tools. Outcomes come from the base. A run pins them in its manifest at start, so edits affect only new runs.
 This delivers "config, not forks" for team-specific review.
-**AC:** a custom reviewer runs in a panel with no platform PR; a tool outside the base's set is refused; the addendum is rendered as trusted team config but is size-limited; editing a profile does not change a run in flight.
+**AC:** a custom reviewer runs in a panel with no platform PR; a tool outside the base's set is refused; the addendum is rendered as trusted team config but is size-limited; editing a profile does not change a run in flight. Team-supplied text reaches a prompt only as `Untrusted` or by the explicit `Trusted` path, and never as template text, whose validator is quadratic on `{{`.
 **Deps:** D5-10, D2-24. **Size:** S. **Run:** parallel. **Files:** `src/sto/agents/profiles/custom.py`, `tests/agents/test_custom_profiles.py`.
 
 ---
@@ -1013,7 +1013,7 @@ Every Jira test uses it.
 #### D6-02: Jira auth
 Service account with API token as the default, through the credential broker, with OAuth 2.0 3LO as the alternative, including token refresh.
 Auth failures are `permanent` with a clear reason.
-**AC:** expired 3LO tokens refresh once; a revoked app or lapsed refresh token blocks with a useful message; no token is logged; our bot identity for marker trust is defined for both modes.
+**AC:** expired 3LO tokens refresh once; a revoked app or lapsed refresh token blocks with a useful message; no token is logged; our bot identity for marker trust is defined for both modes. Refresh once is the conformance suite's `auth_refresh=once`.
 **Deps:** D6-01, D4-02. **Size:** S. **Run:** parallel. **Files:** `src/sto/adapters/jira/auth.py`, `tests/adapters/jira/test_auth.py`.
 
 #### D6-03: Jira reads
@@ -1031,7 +1031,7 @@ A required screen field gives a clear `BLOCKED` reason.
 #### D6-05: Jira webhooks
 Verify HMAC and bearer forms, dedupe on the webhook identifier, register and refresh well inside 30 days, with one shared registration per Jira site, because of the limit per app and user.
 Webhook JQL supports only a few clauses, so filtering happens after the re-read. Expiry raises an alert, and the reconciler covers the gap.
-**AC:** refresh job is tested with a fake clock; many teams on one site stay within the limit, routed by project binding; an expired webhook alerts; out-of-order events change nothing.
+**AC:** refresh job is tested with a fake clock; many teams on one site stay within the limit, routed by project binding; an expired webhook alerts; out-of-order events change nothing. Before adopting the suite's tamper tests, confirm whether Jira's OAuth webhook token covers the body; a replay window must fit Jira retries 5 to 15 minutes apart.
 **Deps:** D4-03, D6-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/jira.py`, `src/sto/adapters/jira/webhooks.py`, `tests/ingest/test_jira.py`.
 
 #### D6-06: Jira sprints
@@ -1049,7 +1049,7 @@ Includes a stale ticket during a gate.
 #### D6-08: Jira live suite, ready to run
 Tag the same tests for a real site, with a setup guide and a cleanup step.
 It stays skipped until D12-11 supplies a site.
-**AC:** one setting points tests at a real site; skipped cleanly otherwise; guide lists required scopes.
+**AC:** one setting points tests at a real site; skipped cleanly otherwise; guide lists required scopes. Same live exemption, transport shim and unique keys as D4-15.
 **Deps:** D6-07. **Size:** S. **Run:** parallel. **Files:** `tests/live/jira/`, `docs/JIRA.md`.
 
 #### D6-09: Fake Jira: workflow features
@@ -1086,7 +1086,7 @@ Built from Slack's docs, and used by every Slack test.
 #### D7-02: Slack verification and ack path
 Verify `v0` signatures on the raw body with a 5 minute window, then ack fast and hand off.
 A separate small function handles interactivity.
-**AC:** old timestamps are refused; handler has no heavy imports and a measured budget under 1 second in tests; retries are deduped.
+**AC:** old timestamps are refused; handler has no heavy imports and a measured budget under 1 second in tests; retries are deduped. Slack has no delivery ID: define the dedupe key and verify it is unique per delivery; `trigger_id` is untested. The suite reads Slack's form-encoded body through the target.
 **Deps:** D7-01, D4-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/slack.py`, `tests/ingest/test_slack.py`.
 
 #### D7-03: Gate messages
@@ -1122,7 +1122,7 @@ Scopes are minimal, and documented with a reason each.
 #### D7-08: Slack end to end and live suite
 Conformance on the fake, an end-to-end decision on the local stack, and a live-tagged suite for later.
 It stays skipped until D12-12 supplies a workspace.
-**AC:** conformance passes; one setting targets a real workspace; a setup guide exists; a stale linked identity is refused end to end.
+**AC:** conformance passes; one setting targets a real workspace; a setup guide exists; a stale linked identity is refused end to end. Same live exemption, transport shim and unique keys as D4-15.
 **Deps:** D7-04, D7-05, D7-06, D7-07. **Size:** M. **Run:** parallel. **Files:** `tests/contract/test_slack.py`, `tests/e2e/test_slack_gate.py`, `tests/live/slack/`, `docs/SLACK.md`.
 
 ---
@@ -1156,7 +1156,7 @@ Flaky retries are detected and reported.
 #### D8-02: Environment port
 Find the test URL from config or GitHub Deployments, and wait for readiness at a deployment containing the required SHA, recording `tested_sha`.
 An environment that never becomes ready ends in a defined timeout.
-**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; a host outside the team's `test_domains` is refused.
+**AC:** a deployment missing the SHA is refused, and one containing it is accepted, for trunk-based staging; timeout follows its edge; a host outside the team's `test_domains` is refused. It owns the containment answer for `contains_sha`, adding the port method; defines the set's contents and range; and wires it from the provider in one place. Implementations return `set` or `frozenset`.
 **Deps:** D4-06, D2-13, D2-24. **Size:** S. **Run:** parallel. **Files:** `src/sto/qa/environment.py`, `tests/qa/test_environment.py`.
 
 #### D8-03: Browser port
@@ -1210,7 +1210,7 @@ Our own merge must not supersede the QA gate.
 #### D8-11: Release effect
 `release.trigger` dispatches the team's deploy workflow with the release SHA and the effect key as required inputs, shows the key in `run-name`, and reads back the run. The range check requires a QA approval for each run-merged commit since the last release, read from the deploy workflow's run history.
 A crash can lose the run ID, so retry looks up by key, and ambiguity means `BLOCKED`, never a second deploy. As with any real adapter behind D1-07, look up before creating, and keep the effect lease longer than every adapter timeout.
-**AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; a tested SHA that is an ancestor of the last release finishes as "already released"; a blocked good run takes `stale` back to QA; an alarm fires on hold age; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake.
+**AC:** G9: a crash after dispatch does not deploy twice; G22: a rejected, pending or cancelled run blocks, acknowledgement cannot override a rejection, and each commit is listed on the QA gate; a tested SHA that is an ancestor of the last release finishes as "already released"; a blocked good run takes `stale` back to QA; an alarm fires on hold age; human-merged commits need a named acknowledgement; an unknown last release blocks; requires a QA approval and honours the hold; supported in the fake. The release range comes from git, not from notes.
 **Deps:** D4-11, D4-20. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/release.py`, `tests/effects/test_release.py`.
 
 #### D8-12: Live GitHub re-run
@@ -1314,7 +1314,7 @@ Text is inert, and a blocked gate says why and who can clear it.
 #### D9-09: QA gate page and evidence viewer
 Layout from PLAN.md section 4.2: matrix with three states, results, screenshots, recordings and notes.
 `not verified` is unmissable and needs acknowledgement.
-**AC:** retest and waive appear only when permitted; recordings play; missing evidence is shown as missing; in merge-before-QA, every commit in the release range is listed with its run's QA status.
+**AC:** retest and waive appear only when permitted; recordings play; missing evidence is shown as missing; in merge-before-QA, every commit in the release range is listed with its run's QA status. Also-contains notes are shown with the evidence; the release range comes from git.
 **Deps:** D9-01, D8-07, D8-11. **Size:** L. **Run:** parallel. **Files:** `web/src/pages/qa-gate/`, `web/src/components/evidence/`.
 
 #### D9-10: Workflow editor
@@ -1836,7 +1836,7 @@ This has no dependency on D11, so the spike never runs unguarded.
 #### D13-01: Linear adapter
 `TicketSource` for Linear, with a fake server, passing conformance with no engine change.
 Uses signature, timestamp window and delivery dedupe per Linear's docs.
-**AC:** conformance passes; any needed engine change is reported as an SPI bug; live suite tagged.
+**AC:** conformance passes; any needed engine change is reported as an SPI bug; live suite tagged. Define its dedupe key the same way as D7-02 if Linear has no delivery ID.
 **Deps:** D4-01, D3-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/linear/`, `src/sto/ingest/linear.py`, `tests/fakes/linear/`, `tests/contract/test_linear.py`.
 
 #### D13-02: Azure DevOps tickets
