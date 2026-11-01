@@ -14,6 +14,7 @@ class SpyCall:
     key: str | None = None
     replayed: bool = False  # key already seen: the first result was returned
     error: str | None = None  # class name of the error raised; None if it applied
+    noop: bool = False  # accepted, but changed nothing (found, already there, conflict, unapplied)
 
 
 class SpyWriter:
@@ -28,11 +29,14 @@ class SpyWriter:
         return tuple(c for c in self._calls if c.method == method)
 
     def applied(self, method: str | None = None) -> tuple[SpyCall, ...]:
-        """Calls that changed state: not refused and not an idempotent replay."""
+        """Calls that changed state: not refused, not a replay and not a no-op."""
         return tuple(
             c
             for c in self._calls
-            if c.error is None and not c.replayed and (method is None or c.method == method)
+            if c.error is None
+            and not c.replayed
+            and not c.noop
+            and (method is None or c.method == method)
         )
 
     def clear(self) -> None:

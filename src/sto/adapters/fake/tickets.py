@@ -8,6 +8,7 @@ from sto.adapters.fake.base import FakeBase, parse_changes
 from sto.adapters.fake.spy import SpyWriter
 from sto.adapters.ports import (
     BoardRef,
+    ChangeKind,
     ExternalChange,
     IdempotencyKey,
     IntakeQuery,
@@ -55,6 +56,8 @@ class FakeTicketSource(FakeBase):
             for t in self._tickets.values()
             if (query.status is None or t.status == query.status)
             and all(label in t.labels for label in query.labels)
+            and (query.project is None or t.project == query.project)
+            and (not query.issue_types or t.issue_type in query.issue_types)
         ]
         try:
             start = int(cursor) if cursor else 0
@@ -64,7 +67,7 @@ class FakeTicketSource(FakeBase):
         return Page(tuple(found[start:end]), str(end) if end < len(found) else None)
 
     def parse_event(self, raw: RawWebhook) -> list[ExternalChange]:
-        return parse_changes(raw)
+        return parse_changes(raw, frozenset({ChangeKind.TICKET}))
 
     def comment(self, ref: TicketRef, body: str, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:
@@ -76,7 +79,9 @@ class FakeTicketSource(FakeBase):
 
     def transition(self, ref: TicketRef, to: StatusIntent, key: IdempotencyKey) -> Receipt:
         def apply() -> Receipt:
-            self._tickets[ref] = replace(self._ticket(ref), status=to.value)
+            ticket = self._ticket(ref)
+            self._noop = ticket.status == to.value  # already there is success (PLAN 6.3)
+            self._tickets[ref] = replace(ticket, status=to.value)
             return self._receipt("transition", f"fake://{ref.key}")
 
         return self._write("transition", {"ref": ref, "to": to}, key, apply)

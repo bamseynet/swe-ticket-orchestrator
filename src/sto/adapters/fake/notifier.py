@@ -49,12 +49,13 @@ class FakeNotifier(FakeBase):
             return None
         body = load_json(raw)
         try:
+            digest = body.get("subject_digest")  # vetoes may omit it (PLAN 4)
             return DecisionRequest(
-                gate_id=str(body["gate_id"]),
+                gate_id=body["gate_id"],
                 kind=DecisionKind(body["kind"]),
-                actor=str(body["actor"]),
-                subject_digest=str(body["subject_digest"]),
-                comment=str(body.get("comment", "")),
+                actor=body["actor"],
+                subject_digest=digest,
+                comment=body.get("comment", ""),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise MalformedWebhookError("unreadable decision action") from exc

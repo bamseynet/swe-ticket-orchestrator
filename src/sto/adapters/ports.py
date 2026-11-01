@@ -7,30 +7,26 @@ Adapters implement these narrow ports; the engine never imports a vendor. Writes
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from sto.domain.errors import FailureClass, PermanentError, StoError
+from sto.domain.errors import PermanentError
 from sto.domain.models import DecisionKind, Receipt
 
 type IdempotencyKey = str
 
 
-class StaleHeadError(StoError):
+class StaleHeadError(PermanentError):
     """The head the caller expected is not the head now (``expected_head`` / ``expected_sha``).
 
-    Not a ``PermanentError``, which means BLOCKED at once; PLAN 6.4 sends a moved head down the
-    ``stale`` edge. The effects layer (D1-07) catches this and maps it to that edge. It is
-    ``TRANSIENT`` only so it never BLOCKS; ``retryable`` is off as the head can never match.
+    Permanent, so it fails closed: nothing retries the same head. Only ``pr.merge`` and
+    ``release.trigger`` have a ``stale`` edge (PLAN 859), so D1-07 catches it for those two and
+    routes it there. ``move_ref``, ``merge_base_into`` and ``dequeue`` have no such edge, so for
+    them it BLOCKS.
     """
-
-    failure_class = FailureClass.TRANSIENT
-
-    @property
-    def retryable(self) -> bool:
-        return False
 
 
 class UnknownRefError(PermanentError):
@@ -71,6 +67,7 @@ class ChangeKind(StrEnum):
     CHECK = "check"
     REVIEW = "review"
     MERGE_GROUP = "merge_group"
+    INSTALLATION = "installation"  # a GitHub App installation changed (PLAN 10.3)
 
 
 @dataclass(frozen=True)
@@ -94,8 +91,18 @@ class DecisionRequest:
     gate_id: str
     kind: DecisionKind
     actor: str
-    subject_digest: str
+    subject_digest: str | None  # vetoes are exempt from the digest match (PLAN 4), so may omit it
     comment: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("gate_id", "actor", "comment"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or (name != "comment" and not value):
+                raise ValueError(f"decision {name} must be a string")
+        if self.subject_digest is None and not self.kind.is_negative:
+            raise ValueError(f"a {self.kind} decision needs a subject_digest")
+        if self.subject_digest is not None and not isinstance(self.subject_digest, str):
+            raise ValueError("decision subject_digest must be a string")
 
 
 # --- tickets ------------------------------------------------------------------------------
@@ -116,6 +123,9 @@ class Ticket:
     labels: tuple[str, ...] = ()
     acceptance_criteria: str = ""
     route_fields: tuple[tuple[str, str], ...] = ()  # (field, value) pairs read for routing
+    project: str = ""
+    issue_type: str = ""
+    editor: str = ""  # who last edited it; a non-member editor pauses the run (T11)
 
     @property
     def revision(self) -> str:
@@ -125,9 +135,9 @@ class Ticket:
         def norm(text: str) -> str:
             return " ".join(text.split())
 
-        parts = [norm(self.title), norm(self.body), norm(self.acceptance_criteria)]
-        parts += [f"{norm(k)}={norm(v)}" for k, v in sorted(self.route_fields)]
-        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+        routes = sorted((norm(k), norm(v)) for k, v in self.route_fields)
+        canonical = [norm(self.title), norm(self.body), norm(self.acceptance_criteria), routes]
+        return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -141,6 +151,8 @@ class TicketSummary:
 class IntakeQuery:
     labels: tuple[str, ...] = ()
     status: str | None = None
+    project: str | None = None
+    issue_types: tuple[str, ...] = ()
 
 
 class StatusIntent(StrEnum):
@@ -211,6 +223,15 @@ class PrRef:
     repo: RepoRef
     number: int
 
+    @classmethod
+    def of(cls, repo: RepoRef, receipt: Receipt) -> PrRef:
+        """The route from ``ensure_draft_pr`` / ``mark_ready`` to a ``PrRef``: a PR receipt's
+        ``external_id`` is the PR number."""
+        try:
+            return cls(repo, int(receipt.external_id))
+        except ValueError:
+            raise RefusedError(f"{receipt.external_id!r} is not a PR receipt") from None
+
 
 class MergeMethod(StrEnum):
     MERGE = "merge"
@@ -246,11 +267,20 @@ class MergeState(StrEnum):
     DEQUEUED = "dequeued"
 
 
+class MergeReason(StrEnum):
+    """Why a merge FAILED, so ``pr.merge`` can choose its ``stale`` or ``conflict`` edge."""
+
+    STALE = "stale"  # the head moved, or the base moved under it
+    CONFLICT = "conflict"
+    REJECTED = "rejected"  # anything else: checks, protection, ...
+
+
 @dataclass(frozen=True)
 class MergeResult:
     state: MergeState
     merge_sha: str | None = None
     receipt: Receipt | None = None
+    reason: MergeReason | None = None  # set when ``state`` is FAILED
 
 
 @dataclass(frozen=True)
@@ -294,6 +324,7 @@ class GateMessage:
     gate_id: str
     summary: str
     subject_digest: str
+    channel: str = ""  # the channel bound to the team (PLAN 10.5)
     attention: tuple[str, ...] = ()  # the attention list shown on the gate (PLAN 10.5)
     deep_link: str = ""
 
@@ -334,7 +365,7 @@ class ScmProvider(Protocol):
     def merge_base_into(
         self, pr: PrRef, expected_head: str, key: IdempotencyKey
     ) -> UpdateResult: ...
-    def open_revert_pr(self, merge_sha: str, key: IdempotencyKey) -> Receipt: ...
+    def open_revert_pr(self, repo: RepoRef, merge_sha: str, key: IdempotencyKey) -> Receipt: ...
     def request_merge(
         self, pr: PrRef, expected_sha: str, method: MergeMethod, key: IdempotencyKey
     ) -> MergeHandle: ...
