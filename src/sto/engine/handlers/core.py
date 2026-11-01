@@ -34,6 +34,7 @@ from sto.engine.reducer import (
     RunState,
     Transition,
     Workflow,
+    WorkflowMismatchError,
     handles,
 )
 
@@ -45,6 +46,11 @@ class AttemptsExhausted:
 
 @BLOCKED_REASONS.register("permanent_failure")
 class PermanentFailure:
+    pass
+
+
+@BLOCKED_REASONS.register("effect_failed")
+class EffectFailedReason:
     pass
 
 
@@ -89,13 +95,13 @@ class StepFailed:
 @EVENTS.register("gate.closed")
 @dataclass(frozen=True)
 class GateClosed:
-    """What the decision was made on. ``subject`` is required for approve and waive (negative
+    """What the decision was made on; ``round`` is the key (a gate has no visit of its own).
+    ``subject`` is required for approve and waive (negative
     decisions are exempt from the digest match, PLAN 4 / ADR-0005) and must be the live one."""
 
     run_id: RunId
     gate: str
     round: int
-    visit: int
     kind: DecisionKind
     actor: str
     decision_id: DecisionId
@@ -108,10 +114,24 @@ class GateClosed:
 @EVENTS.register("effect.confirmed")
 @dataclass(frozen=True)
 class EffectConfirmed:
+    """``visit`` is the effect node's own visit (the ``RunEffect.visit``). ``pr.merge`` must
+    report ``merge_sha``. D2-11: this is refused while the run is CANCELLING, so a merge that
+    lands during Stop needs handling there (PLAN 6.2 done_with_incident)."""
+
     run_id: RunId
     effect: str
     visit: int
     merge_sha: str | None = None
+
+
+@EVENTS.register("effect.failed")
+@dataclass(frozen=True)
+class EffectFailed:
+    """A permanent effect failure: the run BLOCKS (PLAN 6.2). Re-entry on ``gate_invalid`` is D2."""
+
+    run_id: RunId
+    effect: str
+    visit: int
 
 
 @EVENTS.register("cancel.requested")
@@ -165,11 +185,13 @@ def _enter(rs: RunState, wf: Workflow, node: Node, subject: Subject | None) -> T
     if missing:
         raise _out(f"effect {node.name!r} lacks approval from {missing}")
     digest = rs.subject.digest()
+    # D1-07: ``subject_digest`` is QA's subject, so it differs from the review approval's
+    # digest (``Approval.subject_digest``); compare approvals by head SHA (PLAN 4.3.2).
     cmd = RunEffect(
         run.id,
         node.effect,
         node.name,
-        rs.visit,
+        count,
         rs.subject,
         digest,
         node.requires_gates,
@@ -215,9 +237,9 @@ def on_step_succeeded(rs: RunState, event: StepSucceeded, wf: Workflow) -> Trans
         not node.produces_code
         and subject is not None
         and rs.subject is not None
-        and subject.head_sha != rs.subject.head_sha
+        and (subject.head_sha, subject.patch_id) != (rs.subject.head_sha, rs.subject.patch_id)
     ):
-        raise _out(f"step {node.name!r} reported {subject.head_sha}, not the reviewed SHA")
+        raise _out(f"step {node.name!r} reported a different SHA or patch than the reviewed one")
     return _enter(rs, wf, following, subject)
 
 
@@ -245,11 +267,8 @@ def on_gate_closed(rs: RunState, event: GateClosed, wf: Workflow) -> Transition:
     node = wf.node(run.stage)
     if node.kind != "gate" or event.gate != node.name:
         raise _out(f"gate {event.gate!r} is not the open gate ({run.stage!r})")
-    if event.round != rs.round or event.visit != rs.visit:
-        raise _out(
-            f"stale gate event: round {event.round} visit {event.visit}, "
-            f"live is round {rs.round} visit {rs.visit}"
-        )
+    if event.round != rs.round:
+        raise _out(f"stale gate event: round {event.round}, live is round {rs.round}")
     if event.kind not in node.decisions:
         raise MalformedEventError(f"{event.kind.value} is not allowed at {node.name!r}")
     resumed = run.advance(RunStatus.RUNNING)
@@ -261,7 +280,8 @@ def on_gate_closed(rs: RunState, event: GateClosed, wf: Workflow) -> Transition:
         approval = Approval(node.name, event.round, event.decision_id, event.subject.digest())
         kept = tuple(a for a in rs.approvals if a.gate != node.name) + (approval,)
         following = wf.after(node.name)
-        assert following is not None
+        if following is None:
+            raise WorkflowMismatchError(f"nothing follows gate {node.name!r}")
         return _enter(dataclasses.replace(rs, run=resumed, approvals=kept), wf, following, None)
     if event.kind is DecisionKind.REJECT:
         rejected = resumed.advance(RunStatus.REJECTED)
@@ -282,9 +302,24 @@ def on_effect_confirmed(rs: RunState, event: EffectConfirmed, wf: Workflow) -> T
     node = wf.node(run.stage)
     if node.kind != "effect" or node.effect != event.effect:
         raise _out(f"effect {event.effect!r} is not the current one")
-    if event.visit != rs.visit:
+    if event.visit != rs.count(node.name):
         raise _out("stale effect event")
+    if node.effect == "pr.merge" and event.merge_sha is None:
+        raise MalformedEventError("a pr.merge confirmation must report merge_sha")
     return Transition(_with(rs, run.advance(RunStatus.DONE)), (Finish(run.id, RunStatus.DONE),))
+
+
+@handles(EffectFailed)
+def on_effect_failed(rs: RunState, event: EffectFailed, wf: Workflow) -> Transition:
+    run = rs.run
+    if run.status is not RunStatus.RUNNING:
+        raise _out(f"effect failed while run is {run.status.value}")
+    node = wf.node(run.stage)
+    if node.kind != "effect" or node.effect != event.effect:
+        raise _out(f"effect {event.effect!r} is not the current one")
+    if event.visit != rs.count(node.name):
+        raise _out("stale effect event")
+    return Transition(_with(rs, run.advance(RunStatus.BLOCKED, blocked_reason="effect_failed")))
 
 
 @handles(CancelRequested)

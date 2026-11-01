@@ -38,6 +38,7 @@ from sto.engine.handlers.core import (
     CancelCompleted,
     CancelRequested,
     EffectConfirmed,
+    EffectFailed,
     GateClosed,
     RunStarted,
     StepFailed,
@@ -47,8 +48,10 @@ from sto.engine.reducer import (
     HANDLERS,
     LINEAR_V0,
     HandlerRegistry,
+    HandlersNotLoadedError,
     MalformedEventError,
     Node,
+    NoHandlerError,
     OutOfOrderEventError,
     RunState,
     Transition,
@@ -58,6 +61,8 @@ from sto.engine.reducer import (
     load_handlers,
     next,
 )
+
+load_handlers()  # startup step; next() refuses the default registry until this has run
 
 RID = RunId.from_parts(1, bytes(10))
 OTHER = RunId.from_parts(2, bytes(10))
@@ -109,13 +114,12 @@ def close(
     kind: DecisionKind = K.APPROVE,
     *,
     round: int = 1,
-    visit: int = 1,
     subject: Subject | None = None,
     rid: RunId = RID,
 ) -> GateClosed:
     if subject is None and not kind.is_negative:
         subject = REV if gate == "review_gate" else QAS
-    return GateClosed(rid, gate, round, visit, kind, "alice", did(), subject)
+    return GateClosed(rid, gate, round, kind, "alice", did(), subject)
 
 
 START = RunStarted(RID)
@@ -226,12 +230,9 @@ def test_review_approve_goes_to_qa_and_records_the_approval() -> None:
     assert approval.subject_digest == REV.digest()
 
 
-def test_review_waive_approves_like_approve() -> None:
-    event = close("review_gate", K.WAIVE)
-    t = next(play(*AT_REVIEW), event, WF)
-    assert t.state.run.stage == "qa"
-    assert t.commands == (RunStep(RID, "qa", visit=1, attempt=1),)
-    assert [a.decision_id for a in t.state.approvals] == [event.decision_id]
+def test_review_gate_refuses_waive() -> None:
+    with pytest.raises(MalformedEventError, match="waive"):
+        next(play(*AT_REVIEW), close("review_gate", K.WAIVE), WF)
 
 
 def test_review_request_changes_reruns_implement_and_voids_approvals() -> None:
@@ -262,11 +263,11 @@ def test_qa_step_opens_qa_gate() -> None:
 
 
 def test_qa_step_cannot_report_a_different_sha() -> None:
-    with pytest.raises(OutOfOrderEventError, match="reviewed SHA"):
+    with pytest.raises(OutOfOrderEventError, match="different SHA or patch"):
         next(play(*AT_QA_STEP), StepSucceeded(key("qa"), NEW), WF)
 
 
-@pytest.mark.parametrize("kind", [K.APPROVE, K.WAIVE])
+@pytest.mark.parametrize("kind", [K.APPROVE, K.WAIVE])  # waive is QA-only
 def test_qa_approval_plans_the_gated_merge(kind: DecisionKind) -> None:
     event = close("qa_gate", kind)
     t = next(play(*AT_QA_GATE), event, WF)
@@ -312,7 +313,7 @@ def test_qa_retest_reruns_qa_on_the_same_sha_with_a_new_gate() -> None:
         next(t.state, StepSucceeded(key("qa", 2), NEW), WF)
     g2 = next(t.state, StepSucceeded(key("qa", 2), subj("abc", "qa-2")), WF)
     assert g2.commands[0].round == 2  # type: ignore[attr-defined]
-    done = next(g2.state, close("qa_gate", round=2, visit=2, subject=subj("abc", "qa-2")), WF)
+    done = next(g2.state, close("qa_gate", round=2, subject=subj("abc", "qa-2")), WF)
     assert done.state.run.stage == "merge"
 
 
@@ -404,14 +405,9 @@ OUT_OF_ORDER: list[tuple[str, RunState, Any]] = [
     (
         "round-1 approve on round-2 gate",
         GATE_R2,
-        close("review_gate", round=1, visit=2, subject=NEW),
+        close("review_gate", round=1, subject=NEW),
     ),
     ("round 99", GATE1, close("review_gate", round=99)),
-    (
-        "gate event from an earlier visit",
-        GATE_R2,
-        close("review_gate", round=2, visit=1, subject=NEW),
-    ),
     (
         "duplicate failure after retry",
         RETRIED,
@@ -425,9 +421,9 @@ OUT_OF_ORDER: list[tuple[str, RunState, Any]] = [
     ("attempt 99", RUNNING, StepFailed(key("implement", attempt=99), FailureClass.TRANSIENT)),
     ("stale approval subject", GATE1, close("review_gate", subject=NEW)),
     ("round-1 approve after the gate already moved", MERGING, close("review_gate")),
-    ("effect before its time", RUNNING, EffectConfirmed(RID, "pr.merge", 1)),
-    ("wrong effect", MERGING, EffectConfirmed(RID, "pr.other", 1)),
-    ("stale effect visit", MERGING, EffectConfirmed(RID, "pr.merge", 2)),
+    ("effect before its time", RUNNING, EffectConfirmed(RID, "pr.merge", 1, "m1")),
+    ("wrong effect", MERGING, EffectConfirmed(RID, "pr.other", 1, "m1")),
+    ("stale effect visit", MERGING, EffectConfirmed(RID, "pr.merge", 2, "m1")),
     ("cancel completed without cancelling", RUNNING, CancelCompleted(RID)),
     ("cancel twice", step(RUNNING, CancelRequested(RID)), CancelRequested(RID)),
     ("step on blocked run", BLOCKED, IMPL),
@@ -453,7 +449,7 @@ def test_malformed_events_are_not_out_of_order() -> None:
         assert issubclass(error, PermanentError)
     assert not issubclass(MalformedEventError, OutOfOrderEventError)
     with pytest.raises(MalformedEventError, match="subject"):
-        next(GATE1, GateClosed(RID, "review_gate", 1, 1, K.APPROVE, "a", did(), None), WF)
+        next(GATE1, GateClosed(RID, "review_gate", 1, K.APPROVE, "a", did(), None), WF)
 
 
 def test_workflow_version_must_match() -> None:
@@ -467,7 +463,7 @@ def test_unregistered_event_type_is_rejected() -> None:
     class Stray:
         run_id: RunId
 
-    with pytest.raises(OutOfOrderEventError, match="no handler"):
+    with pytest.raises(NoHandlerError, match="no handler"):
         next(RUNNING, Stray(RID), WF)
 
 
@@ -498,7 +494,7 @@ _EVENTS: list[Any] = [
     close("review_gate", K.REQUEST_CHANGES),
     close("qa_gate"),
     close("qa_gate", K.RETEST),
-    EffectConfirmed(RID, "pr.merge", 1),
+    EffectConfirmed(RID, "pr.merge", 1, "m1"),
     CancelRequested(RID),
     CancelCompleted(RID),
 ]
@@ -598,7 +594,7 @@ def test_new_event_handler_and_command_register_from_outside() -> None:
         return Transition(state, (Ping(event.run_id),))
 
     assert next(RUNNING, Pinged(RID), WF, registry=reg) == Transition(RUNNING, (Ping(RID),))
-    with pytest.raises(OutOfOrderEventError):  # the default registry never saw it
+    with pytest.raises(NoHandlerError):  # the default registry never saw it
         next(RUNNING, Pinged(RID), WF)
 
 
@@ -648,20 +644,119 @@ def test_load_handlers_loads_a_new_file_without_editing_anything(
     load_handlers("newhandlers")  # idempotent: a second call does not re-register
 
 
-def test_load_handlers_is_what_registers_the_core_handlers() -> None:
-    """In a fresh interpreter nothing is registered until load_handlers() runs."""
-    src = str(ENGINE.parents[1])
+def test_next_refuses_until_handlers_are_loaded_in_a_fresh_interpreter() -> None:
+    """Importing core by hand must not make next() work: loading is an explicit startup step."""
     code = textwrap.dedent(
         """
-        import sys
-        from sto.engine.reducer import HANDLERS, load_handlers
-        assert 'sto.engine.handlers.core' not in sys.modules
+        from sto.domain import Run, RunId
+        from sto.engine.handlers.core import RunStarted
+        from sto.engine.reducer import (
+            LINEAR_V0, HANDLERS, HandlersNotLoadedError, RunState, load_handlers, next,
+        )
+        rid = RunId.from_parts(1, bytes(10))
+        state = RunState(Run(id=rid, team="t"))
+        try:
+            next(state, RunStarted(rid), LINEAR_V0)
+        except HandlersNotLoadedError:
+            pass
+        else:
+            raise SystemExit("next() ran before load_handlers()")
         load_handlers()
-        from sto.engine.handlers.core import GateClosed
-        assert HANDLERS.get(GateClosed) is not None
+        assert next(state, RunStarted(rid), LINEAR_V0).state.run.stage == "implement"
         """
     )
-    subprocess.run([sys.executable, "-I", "-c", code], check=True, env={"PYTHONPATH": src})
+    env = {"PYTHONPATH": str(ENGINE.parents[1])}
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+def test_an_unhandled_event_is_not_an_out_of_order_one() -> None:
+    assert not issubclass(NoHandlerError, OutOfOrderEventError)
+    assert not issubclass(HandlersNotLoadedError, OutOfOrderEventError)
+    assert HANDLERS.get(RunStarted) is not None
+
+
+# --- review pass 2 ----------------------------------------------------------------------------
+
+
+def test_failed_merge_blocks_the_run() -> None:
+    t = next(MERGING, EffectFailed(RID, "pr.merge", 1), WF)
+    assert t.state.run.status is RunStatus.BLOCKED
+    assert t.state.run.blocked_reason == "effect_failed"
+    assert t.commands == ()
+
+
+@pytest.mark.parametrize(
+    "event",
+    [EffectFailed(RID, "pr.other", 1), EffectFailed(RID, "pr.merge", 2)],
+    ids=["wrong effect", "stale visit"],
+)
+def test_effect_failure_must_match_the_live_effect(event: EffectFailed) -> None:
+    with pytest.raises(OutOfOrderEventError):
+        next(MERGING, event, WF)
+    with pytest.raises(OutOfOrderEventError):
+        next(RUNNING, EffectFailed(RID, "pr.merge", 1), WF)
+
+
+def test_merge_confirmation_must_report_the_merge_sha() -> None:
+    with pytest.raises(MalformedEventError, match="merge_sha"):
+        next(MERGING, EffectConfirmed(RID, "pr.merge", 1), WF)
+
+
+def test_effect_visit_is_the_merge_nodes_own_not_qas() -> None:
+    """After a retest QA is on visit 2 but merge is on its first visit (PLAN 6.3 effect key)."""
+    rs = play(*AT_QA_GATE, close("qa_gate", K.RETEST))
+    qa2 = subj("abc", "qa-2")
+    rs = step(rs, StepSucceeded(key("qa", 2), qa2))
+    t = next(rs, close("qa_gate", round=2, subject=qa2), WF)
+    (cmd,) = t.commands
+    assert isinstance(cmd, RunEffect)
+    assert (cmd.stage, cmd.visit) == ("merge", 1)
+    assert t.state.visit == 2  # QA's visit is untouched
+    with pytest.raises(OutOfOrderEventError):
+        next(t.state, EffectConfirmed(RID, "pr.merge", 2, "m1"), WF)
+    done = next(t.state, EffectConfirmed(RID, "pr.merge", 1, "m1"), WF)
+    assert done.state.run.status is RunStatus.DONE
+
+
+def test_attempt_resets_on_reentry() -> None:
+    rs = play(START, StepFailed(key("implement"), FailureClass.TRANSIENT))
+    assert rs.attempt == 2
+    rs = step(rs, StepSucceeded(key("implement", attempt=2), REV))
+    t = next(rs, close("review_gate", K.REQUEST_CHANGES), WF)
+    assert t.state.attempt == 1
+    assert t.commands == (RunStep(RID, "implement", visit=2, attempt=1),)
+
+
+def test_qa_step_must_keep_the_reviewed_patch_id() -> None:
+    other_patch = dataclasses.replace(QAS, patch_id="p2")
+    with pytest.raises(OutOfOrderEventError, match="different SHA or patch"):
+        next(play(*AT_QA_STEP), StepSucceeded(key("qa"), other_patch), WF)
+
+
+def test_a_gate_with_nothing_after_it_is_a_workflow_error() -> None:
+    wf = _one(
+        Node("a", "step"),
+        Node("g", "gate", gate_type=GateType.QA, decisions=frozenset({K.APPROVE})),
+    )
+    rs = next(next(new(), START, wf).state, StepSucceeded(key("a"), REV), wf).state
+    with pytest.raises(WorkflowMismatchError, match="nothing follows"):
+        next(rs, close("g", subject=REV), wf)
+
+
+@given(st.lists(st.sampled_from(_EVENTS), max_size=16))
+def test_a_merge_command_always_has_both_approvals(events: list[Any]) -> None:
+    rs = new()
+    for e in events:
+        try:
+            t = next(rs, e, WF)
+        except (OutOfOrderEventError, MalformedEventError):
+            continue
+        rs = t.state
+        for cmd in t.commands:
+            if isinstance(cmd, RunEffect):
+                assert cmd.requires_gates == ("review_gate", "qa_gate")
+                assert len(set(cmd.decision_ids)) == 2
+                assert {a.gate for a in rs.approvals} >= set(cmd.requires_gates)
 
 
 # --- workflow shapes the default one never exercises --------------------------------------------
@@ -706,3 +801,16 @@ def test_a_gate_cannot_be_entered_without_a_subject() -> None:
 def test_unknown_node_is_out_of_order() -> None:
     with pytest.raises(OutOfOrderEventError, match="unknown node"):
         WF.node("ghost")
+
+
+def test_effect_failure_on_a_blocked_run_is_refused() -> None:
+    with pytest.raises(OutOfOrderEventError, match="BLOCKED"):
+        next(BLOCKED, EffectFailed(RID, "pr.merge", 1), WF)
+
+
+def test_next_refuses_the_default_registry_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sto.engine.reducer as reducer
+
+    monkeypatch.setattr(reducer, "_loaded", set())
+    with pytest.raises(HandlersNotLoadedError):
+        next(new(), START, WF)

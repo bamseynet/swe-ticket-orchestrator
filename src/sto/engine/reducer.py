@@ -35,6 +35,16 @@ class OutOfOrderEventError(PermanentError):
     """The event is not valid for the run's current state, so it is refused."""
 
 
+class HandlersNotLoadedError(PermanentError):
+    """Raised by ``next`` with the default registry before ``load_handlers()``. It is a
+    deployment fault, not a stale event, so a driver must never discard the event over it."""
+
+
+class NoHandlerError(PermanentError):
+    """No handler is registered for the event type. Distinct from ``OutOfOrderEventError`` so
+    a driver cannot mistake an unhandled event for a late one and discard it."""
+
+
 class MalformedEventError(PermanentError):
     """The event is not well formed for the node it targets, whatever the state."""
 
@@ -109,6 +119,9 @@ _REVIEW = frozenset(
     }
 )
 
+# PLAN 4.1 / templates: the review gate offers approve, request changes and reject only.
+_REVIEW_DECISIONS = _REVIEW - {DecisionKind.WAIVE}
+
 # PLAN 3 default order: implement, review gate, QA, QA gate, then the merge. Request changes
 # at either gate goes back to implement, so the review gate runs again (PLAN 4.2); retest
 # returns to the QA stage on the same SHA (PLAN 4.2). Only QA offers retest (PLAN 4.1, 4.7).
@@ -120,7 +133,7 @@ LINEAR_V0 = Workflow(
             "review_gate",
             "gate",
             gate_type=GateType.REVIEW,
-            decisions=_REVIEW,
+            decisions=_REVIEW_DECISIONS,
             on_changes="implement",
         ),
         Node("qa", "step"),
@@ -202,15 +215,18 @@ def handles(
     return deco
 
 
+DEFAULT_PACKAGE = "sto.engine.handlers"
 _loaded: set[str] = set()
 
 
-def load_handlers(package: str = "sto.engine.handlers") -> None:
+def load_handlers(package: str = DEFAULT_PACKAGE) -> None:
     """Import every module of ``package`` so its handlers, events and commands register.
 
     Call once at startup. D1-03 must call it before decoding stored events, because decoding
     looks names up in the ``sto.domain`` registries that these modules fill. ``next`` never
-    imports. Modules load in name order; calling again is a no-op.
+    imports; with the default registry it refuses until this has run, so a skipped call
+    fails loudly instead of silently dropping later handler files. Modules load in name
+    order; calling again is a no-op.
     """
     if package in _loaded:
         return
@@ -225,11 +241,15 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     event: Event,
     workflow: Workflow,
     *,
-    registry: HandlerRegistry = HANDLERS,
+    registry: HandlerRegistry | None = None,
 ) -> Transition:
+    if registry is None:
+        if DEFAULT_PACKAGE not in _loaded:
+            raise HandlersNotLoadedError("call load_handlers() at startup before next()")
+        registry = HANDLERS
     handler = registry.get(type(event))
     if handler is None:
-        raise OutOfOrderEventError(f"no handler for {type(event).__name__}")
+        raise NoHandlerError(f"no handler for {type(event).__name__}")
     if event.run_id != state.run.id:
         raise OutOfOrderEventError(f"{type(event).__name__} is for another run")
     if state.run.workflow_version not in (None, workflow.version):
