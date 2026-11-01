@@ -1,0 +1,23 @@
+name: Bug report
+description: Something behaves differently from the plan or the acceptance criteria
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Observed behaviour versus expected. Include exact error text if short.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest hermetic test or command that shows it. Do not paste real account IDs, tokens or customer data (this repo is public).
+    validations:
+      required: true
+  - type: input
+    id: issue
+    attributes:
+      label: Related issue ID
+      placeholder: D1-05
