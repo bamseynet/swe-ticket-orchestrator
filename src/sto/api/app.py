@@ -22,16 +22,18 @@ import os
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from sto.adapters.fake.scm import FakeScm
-from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RepoRef
+from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
 from sto.api.routers import gates, runs
-from sto.api.routers.runs import ApiError
+from sto.api.routers.runs import ApiError, ErrorResponse
 from sto.api.runtime import Runtime, scm_merge_factory
 from sto.domain import RunId, StepKey, Subject
 from sto.effects.core import EffectExecutor
@@ -47,6 +49,23 @@ log = logging.getLogger("sto.api")
 DEFAULT_TOKEN = "dev-token"  # noqa: S105 - the documented local default, loopback only
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 Service = Callable[[], Coroutine[None, None, None]]
+
+
+class Health(BaseModel):
+    ok: bool
+    failed_services: list[str]
+    runs_with_errors: int
+
+
+async def _supervised(name: str, service: Service, failed: dict[str, str]) -> None:
+    """Run a background service; if it dies, say so in the log and in ``/healthz``."""
+    try:
+        await service()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        failed[name] = f"{type(e).__name__}: {e}"
+        log.exception("background service %s died: %r", name, e)
 
 
 class DevAuthRefusedError(RuntimeError):
@@ -83,11 +102,16 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+    failed: dict[str, str] = {}
+
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await runtime.start()
         tasks: list[asyncio.Task[None]] = [
-            asyncio.get_running_loop().create_task(s(), name="service") for s in services
+            asyncio.get_running_loop().create_task(
+                _supervised(getattr(s, "__name__", "service"), s, failed), name="service"
+            )
+            for s in services
         ]
         try:
             yield
@@ -104,15 +128,34 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = runtime
+    app.state.failed_services = failed
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:
         body = {"code": exc.code, "message": exc.message, **exc.extra}
         return JSONResponse({"error": body}, status_code=exc.http_status, headers=exc.headers)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
+        fields = [{"loc": [str(x) for x in e["loc"]], "msg": str(e["msg"])} for e in exc.errors()]
+        body = {"code": "validation_error", "message": "the request is not valid", "fields": fields}
+        return JSONResponse({"error": body}, status_code=422)
+
+    @app.get("/healthz", tags=["health"], summary="Is the API healthy?", response_model=Health)
+    async def health(response: Response) -> dict[str, Any]:
+        """No token needed; says only whether the background parts are alive."""
+        broken = sorted(failed)
+        if broken:
+            response.status_code = 503
+        return {"ok": not broken, "failed_services": broken, "runs_with_errors": runtime.errors()}
+
     protected = [Depends(authorize)]
-    app.include_router(runs.router, dependencies=protected)
-    app.include_router(gates.router, dependencies=protected)
+    shared: dict[int | str, dict[str, Any]] = {
+        401: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    }
+    app.include_router(runs.router, dependencies=protected, responses=shared)
+    app.include_router(gates.router, dependencies=protected, responses=shared)
     return app
 
 
@@ -134,6 +177,19 @@ class SimulatedSteps:
         subject = self._subject_for(command.run_id)
         key_ = StepKey(command.run_id, command.stage, command.visit, command.attempt)
         return Done([StepSucceeded(key_, subject)])
+
+
+def land_pending(scm: FakeScm, landed: int) -> int:
+    """Land the merges requested since the last call; a merge a Stop already dequeued is
+    skipped, not an error. Returns how many have been handled."""
+    merges = scm.merges()
+    for handle in merges[landed:]:
+        try:
+            scm.complete_merge(handle, f"simulated-{landed}")
+        except RefusedError as e:
+            log.info("merge %s was not landed: %s", handle.id, e)
+        landed += 1
+    return landed
 
 
 def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
@@ -188,10 +244,7 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
         """The simulated merge queue: lands whatever was requested."""
         landed = 0
         while True:
-            merges = scm.merges()
-            for handle in merges[landed:]:
-                scm.complete_merge(handle, f"simulated-{landed}")
-                landed += 1
+            landed = land_pending(scm, landed)
             await asyncio.sleep(0.05)
 
     app = create_app(

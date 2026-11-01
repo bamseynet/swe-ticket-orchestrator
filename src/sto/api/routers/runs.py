@@ -38,9 +38,26 @@ class ApiError(Exception):
         super().__init__(message)
 
 
+class StopOption(BaseModel):
+    method: str
+    href: str
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
+    gate: str | None = None
+    round: int | None = None
+    status: str | None = Field(default=None, description="Of the gate, when it is closed.")
+    closed_by: str | None = Field(default=None, description="Who closed the gate.")
+    decision_recorded: bool | None = Field(
+        default=None, description="True when a decision is stored but not yet delivered."
+    )
+    stop: StopOption | None = Field(
+        default=None,
+        description="After a gate is closed the way to stop is Stop (PLAN 4.3 rule 5).",
+    )
+    fields: list[dict[str, Any]] | None = Field(default=None, description="Invalid fields.")
 
 
 class ErrorResponse(BaseModel):
@@ -77,6 +94,11 @@ class RunOut(BaseModel):
     driver_error: str | None = Field(description="The error that ended the last drive, if any.")
 
 
+class Accepted(BaseModel):
+    id: str
+    accepted: bool = True
+
+
 class RunPage(BaseModel):
     runs: list[RunOut]
     cursor: str | None
@@ -101,6 +123,7 @@ class EventPage(BaseModel):
     "/runs",
     status_code=202,
     response_model=RunOut,
+    responses={503: {"model": ErrorResponse}},
     summary="Start a run",
     description="Accepted: the run is queued and driven in the background.",
 )
@@ -109,7 +132,16 @@ async def create_run(body: NewRun, rt: RuntimeDep) -> dict[str, Any]:
         run = await rt.create_run(body.ticket)
     except StoreConflictError as e:
         raise _busy(e) from e
-    return await rt.get_run(run.id)
+    # The run is durable: answer from what was written, not from a read that could fail.
+    return {
+        "id": str(run.id),
+        "status": run.status.value,
+        "stage": run.stage,
+        "blocked_reason": None,
+        "ticket": body.ticket,
+        "held": None,
+        "driver_error": None,
+    }
 
 
 @router.get("/runs", response_model=RunPage, summary="List runs")
@@ -173,8 +205,12 @@ async def events(
 @router.post(
     "/runs/{run_id}/cancel",
     status_code=202,
-    response_model=RunOut,
-    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    response_model=Accepted,
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse, "description": "The run is finished or already stopping."},
+        503: {"model": ErrorResponse},
+    },
     summary="Stop a run",
     description="Accepted: the Stop is applied in the background, ahead of any waiting backoff.",
 )
@@ -182,11 +218,13 @@ async def cancel(run_id: str, rt: RuntimeDep) -> dict[str, Any]:
     rid = parse_run_id(run_id)
     try:
         await rt.cancel(rid)
-        return await rt.get_run(rid)
     except RunNotFoundError as e:
         raise ApiError(404, "run_not_found", str(e)) from e
     except RunFinishedError as e:
         raise ApiError(409, "run_finished", str(e)) from e
+    except StoreConflictError as e:
+        raise _busy(e) from e
+    return {"id": str(rid), "accepted": True}
 
 
 def _busy(e: Exception) -> ApiError:

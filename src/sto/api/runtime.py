@@ -34,7 +34,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from sto.adapters.ports import MergeMethod, PrRef, ScmProvider
 from sto.domain import Decision as DecisionRecord
@@ -66,6 +66,7 @@ log = logging.getLogger("sto.api")
 
 API_INDEX = "RUNS_API"  # the API's own list of runs: the driver's index drops finished ones
 _STORE_ATTEMPTS = 8
+_DRIVE_ATTEMPTS = 6
 _RUN: contextvars.ContextVar[RunId | None] = contextvars.ContextVar("sto_api_run", default=None)
 
 MergeFactory = Callable[[Effect], EffectHandler]
@@ -209,7 +210,7 @@ class _Commands:
         if isinstance(command, Finish):
             return Done()
         if isinstance(command, RunStep):
-            status = self._status_of(command.run_id)
+            status = await asyncio.to_thread(self._status_of, command.run_id)
             if status.is_terminal or status is RunStatus.CANCELLING:
                 return Done()  # the run was stopped while this step waited: do not start it
             return await self._steps.execute(key, command)
@@ -298,7 +299,12 @@ class Runtime:
         self._started = True
         load_handlers()
         for run_id in await self.driver.active_runs():
-            await self.redeliver(run_id)
+            try:
+                await self.redeliver(run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # one bad run must not stop the API from starting
+                self._report(run_id, e)
         self._resume_task = asyncio.get_running_loop().create_task(
             self._resume_all(), name="resume_all"
         )
@@ -314,6 +320,8 @@ class Runtime:
         for run_id, result in results.items():
             if isinstance(result, Exception):
                 self._report(run_id, result)
+            else:
+                self._errors.pop(run_id, None)
 
     async def close(self) -> None:
         tasks = [*self._tasks.values(), *([self._resume_task] if self._resume_task else [])]
@@ -322,6 +330,13 @@ class Runtime:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._resume_task = None
+        # Give the runs up, so the next process need not wait for the leases to run out. The
+        # driver has no public release yet (a D1-03 follow-up); it ignores a lease that is not ours.
+        for run_id in await self.driver.active_runs():
+            try:
+                await self.driver._release(run_id)
+            except Exception as e:
+                log.warning("could not release the lease of run %s: %r", run_id, e)
 
     def background_tasks(self) -> list[asyncio.Task[None]]:
         """Every task still running for the API (drives, and the startup resume)."""
@@ -346,7 +361,7 @@ class Runtime:
             while run_id in self._again:
                 self._again.discard(run_id)
                 try:
-                    await self.driver.run_until_idle(run_id)
+                    await self._drive_with_retries(run_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -357,9 +372,28 @@ class Runtime:
             # No await between the loop test and here, so a kick cannot slip in unseen.
             self._tasks.pop(run_id, None)
 
+    async def _drive_with_retries(self, run_id: RunId) -> None:
+        """A transient error (a store that kept conflicting) ends one drive, not the run: retry
+        with backoff before giving up. Anything else is a fault and surfaces at once."""
+        delay = self._backoff
+        for attempt in range(_DRIVE_ATTEMPTS):
+            try:
+                await self.driver.run_until_idle(run_id)
+                return
+            except TransientError as e:
+                if attempt == _DRIVE_ATTEMPTS - 1:
+                    raise
+                log.warning("driving run %s hit %r; retrying", run_id, e)
+                await self._api_sleep(delay)
+                delay = min(delay * 2, 1.0)
+
     def _report(self, run_id: RunId, error: BaseException) -> None:
         self._errors[run_id] = f"{type(error).__name__}: {error}"
         log.error("driving run %s failed: %r", run_id, error, exc_info=error)
+
+    def errors(self) -> int:
+        """How many runs have an unreported-to-clear driver error."""
+        return len(self._errors)
 
     def driver_error(self, run_id: RunId) -> str | None:
         """The exception that ended the last drive of this run, if it did not end cleanly."""
@@ -378,7 +412,10 @@ class Runtime:
 
     async def submit(self, run_id: RunId, event: object) -> None:
         """Queue an event (durable once this returns), wake the run's sleep and drive it."""
-        await self.driver.submit(run_id, event)
+        try:
+            await self.driver.submit(run_id, event)
+        except TransactionConflictError as e:
+            raise StoreConflictError("the store kept conflicting; try again") from e
         self._wake.setdefault(run_id, asyncio.Event()).set()
         self.kick(run_id)
 
@@ -405,7 +442,10 @@ class Runtime:
                 self.scope, Key(API_INDEX, str(run.id)), {"ticket": ticket}, when=Absent()
             )
         )
-        await self.driver.start(run)
+        try:
+            await self.driver.start(run)
+        except TransactionConflictError as e:
+            raise StoreConflictError("the store kept conflicting; try again") from e
         self.kick(run.id)
         return run
 
@@ -447,15 +487,21 @@ class Runtime:
 
         return await self._store(read)
 
+    async def _astate(self, run_id: RunId) -> RunState:
+        return await self._store(self.state, run_id)
+
     async def events(self, run_id: RunId, after: int, limit: int) -> list[dict[str, Any]]:
         """Timeline entries with ``seq`` above ``after``, oldest first."""
-        self.state(run_id)  # 404 for an unknown run
+        await self._astate(run_id)  # 404 for an unknown run
         everything = await self._store(self.driver.timeline, run_id)
         return [e for e in everything if e["seq"] > after][:limit]
 
     async def cancel(self, run_id: RunId) -> None:
-        status = self.state(run_id).run.status
+        status = (await self._astate(run_id)).run.status
         if status.is_terminal or status is RunStatus.CANCELLING:
+            # A Stop whose drive died leaves the run CANCELLING with the StopRun queued: the
+            # repeat is refused, but it still gets the run driven again.
+            self.kick(run_id)
             raise RunFinishedError(f"run {run_id} is already {status.value}")
         await self.submit(run_id, CancelRequested(run_id))
 
@@ -465,7 +511,7 @@ class Runtime:
         return self._locks.setdefault(run_id, asyncio.Lock())
 
     async def gates(self, run_id: RunId) -> list[Gate]:
-        self.state(run_id)
+        await self._astate(run_id)
 
         def read() -> list[Gate]:
             found: list[Gate] = []
@@ -514,7 +560,11 @@ class Runtime:
             except PermanentError as e:
                 if getattr(e, "code", None) == "gate_closed":
                     # Someone closed it. If their delivery never happened, do it now.
-                    await self._redeliver_locked(run_id)
+                    try:
+                        await self._redeliver_locked(run_id)
+                    except Exception as d:  # the delivery is what failed, not the decision
+                        log.error("redelivery for run %s failed: %r", run_id, d)
+                        raise DeliveryFailedError(d) from d
                 raise
             event = _closed_event(decided.gate, decided.decision)
             try:
@@ -530,7 +580,7 @@ class Runtime:
             return await self._redeliver_locked(run_id)
 
     async def _redeliver_locked(self, run_id: RunId) -> bool:
-        def missing() -> GateClosed | None:
+        def missing() -> GateClosed | Literal["queued"] | None:
             try:
                 rs = self.driver.state(run_id)
             except KeyError:
@@ -538,7 +588,7 @@ class Runtime:
             if rs.run.status is not RunStatus.WAITING_HUMAN or rs.run.stage is None:
                 return None
             if self.driver.pending_events(run_id):
-                return None  # something is already queued; it will be applied first
+                return "queued"  # it will be applied first
             item = self.store.get(
                 self.scope, Key(f"RUN#{run_id}", f"GATE#{rs.run.stage}#{rs.round}")
             )
@@ -555,6 +605,9 @@ class Runtime:
             return _closed_event(gate, from_wire(DecisionRecord, page.items[0].data))
 
         event = await self._store(missing)
+        if event == "queued":
+            self.kick(run_id)  # whatever is queued must not wait for a drive that already died
+            return False
         if event is None:
             return False
         await self.submit(run_id, event)

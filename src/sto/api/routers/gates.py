@@ -28,9 +28,11 @@ from sto.gates.service import (
     StaleRoundError,
     StaleSubjectError,
 )
+from sto.store.ports import ConditionFailedError
 
 router = APIRouter(tags=["gates"])
 
+_RETRY = {"Retry-After": "1"}
 ACTOR = "dev"  # the dev token has one identity
 
 
@@ -52,7 +54,11 @@ class GateList(BaseModel):
 class DecisionIn(BaseModel):
     kind: DecisionKind
     subject_digest: str = Field(min_length=1, max_length=200)
-    comment: str = Field(default="", max_length=10_000)
+    comment: str = Field(
+        default="",
+        max_length=10_000,
+        description="Required (not blank) for every kind except `approve`: a veto says why.",
+    )
 
 
 class DecisionOut(BaseModel):
@@ -111,7 +117,11 @@ _REFUSALS: list[tuple[type[GateError], int]] = [
             "description": "The gate is closed (`gate_closed`, with who closed it), or the "
             "subject or round is stale.",
         },
-        422: {"model": ErrorResponse, "description": "That decision is not available here."},
+        422: {
+            "model": ErrorResponse,
+            "description": "That decision is not available here, or a comment is required "
+            "(`comment_required`: every kind but `approve` needs a non-blank comment).",
+        },
         503: {
             "model": ErrorResponse,
             "description": "Busy, or the decision is recorded but not yet delivered to the run "
@@ -119,9 +129,15 @@ _REFUSALS: list[tuple[type[GateError], int]] = [
         },
     },
     summary="Decide a gate",
-    description="Accepted: the gate is closed now; the run moves on in the background.",
+    description=(
+        "Accepted: the gate is closed now; the run moves on in the background. A comment is "
+        "required for every kind except `approve`. Deciding a gate of a run that was already "
+        "stopped closes the gate but changes nothing else (closing gates on Stop is D2-11)."
+    ),
 )
 async def decide(run_id: str, name: str, round: int, body: DecisionIn, rt: RuntimeDep) -> Any:
+    if body.kind is not DecisionKind.APPROVE and not body.comment.strip():
+        raise ApiError(422, "comment_required", f"a {body.kind.value} decision needs a comment")
     try:
         decided = await rt.decide(
             parse_run_id(run_id),
@@ -153,6 +169,7 @@ async def decide(run_id: str, name: str, round: int, body: DecisionIn, rt: Runti
                 "round": e.round,
                 "status": e.status.value,
                 "closed_by": e.closed_by,
+                "stop": {"method": "POST", "href": f"/runs/{run_id}/cancel"},
             },
         ) from e
     except GateError as e:
@@ -160,6 +177,11 @@ async def decide(run_id: str, name: str, round: int, body: DecisionIn, rt: Runti
             if isinstance(e, kind):
                 raise ApiError(status, e.code, str(e)) from e
         raise ApiError(400, e.code, str(e)) from e
+    except ConditionFailedError as e:
+        # The gate service ran out of retries on a gate that is still open (D3-06 reworks this).
+        raise ApiError(
+            503, "gate_contention", "the gate kept changing; try again", headers=_RETRY
+        ) from e
     except TransientError as e:  # the gate kept changing under the call
-        raise ApiError(503, "busy", str(e), headers={"Retry-After": "1"}) from e
+        raise ApiError(503, "gate_contention", str(e), headers=_RETRY) from e
     return {"decision_id": str(decided.decision.id), "gate": gate_out(decided.gate)}

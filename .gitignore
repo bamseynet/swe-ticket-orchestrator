@@ -8,3 +8,4 @@ dist/
 node_modules/
 cdk.out/
 .coverage
+.sto/
