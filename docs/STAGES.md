@@ -885,7 +885,7 @@ No framework substitution is ever used.
 Scan all tool output and everything rendered into a prompt before the model sees it, scan patches before push, and redact errors at one boundary.
 Scanning covers known formats and entropy, including inside source files.
 **AC:** T4: canaries with unusual names and inside source are caught, including in ticket text; T5: errors lose URLs, paths and tokens; a finding in a patch blocks the step. Scanning runs before neutralising; the prompt hash is taken after redaction; raw `Untrusted.text` and `asdict` output never reach logs.
-**Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/safety/`, `tests/agents/test_safety.py`.
+**Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/safety/`, `tests/agents/test_safety.py`, `tests/agents/safety_fixtures/`.
 
 #### D5-05: Tool broker and read tools
 Registry that enforces a stage's allowlist, plus `ticket.*`, `repo.*`, `pr.diff`, `checks.read` and record tools. **Repo and SHA come from the signed step context, never from model arguments.** `ticket.read` serves a confirmed snapshot and member comments, with others withheld.
@@ -897,7 +897,7 @@ All output passes through the scanner, and is framed as untrusted.
 `WorkspaceProvider` port, and a local provider with no network and no credentials.
 It matches the AgentCore command model, so tests stay meaningful.
 **AC:** code in the container cannot reach the network or host credentials, in CI's integration job; a fake provider gives local tests the same port with no Docker; command timeout and output caps hold; a lost session recovers from the branch.
-**Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/ports.py`, `src/sto/workspace/local_docker.py`, `tests/workspace/test_local_docker.py`.
+**Deps:** D0-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/ports.py`, `src/sto/workspace/local_docker.py`, `tests/workspace/test_local_docker.py`, `tests/integration/test_workspace_docker.py`.
 
 #### D5-07: Patch flow
 Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then hand-off to `branch.push` by effect, held in S3 until allowed. The harness checkpoints a patch at each worker turn, and caps commands per step.
