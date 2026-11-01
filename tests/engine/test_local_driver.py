@@ -1728,9 +1728,14 @@ def test_a_stop_submitted_while_a_held_call_returns_is_not_stranded(tmp_path: Pa
 
 def test_a_joiner_receives_the_first_drives_exception(tmp_path: Path) -> None:
     class Faulty(Worker):
+        failed = False
+
         async def execute(self, key: str, command: object) -> Outcome:
             await asyncio.sleep(0.05)
-            raise RuntimeError("fault")
+            if not Faulty.failed:  # only the first call fails: a joiner that ran its own
+                Faulty.failed = True  # drive would succeed, so it must have been handed this
+                raise RuntimeError("fault")
+            return await super().execute(key, command)
 
     d = make(MemoryStore(), Faulty(tmp_path / "l"))
 
