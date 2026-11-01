@@ -588,7 +588,7 @@ Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLA
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
 Atomicity uses `TransactWriteItems` with conditions.
 **AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction. The port refuses numbers below 1E-130 and empty object keys for every store, so a run cannot work locally and fail in production. The read that decides the head moved is strongly consistent.
-**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`, `tests/store/store_contract.py`.
+**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`, `src/sto/store/ports.py`, `tests/store/store_contract.py`, `tests/audit/test_writer_conformance.py`.
 
 #### D3-10: Indexed queries
 "My approvals", run lists, ticket lookup and PR lookup, all through indexes with pagination.
@@ -1748,7 +1748,7 @@ Record quality problems as issues for D14.
 #### D12-07: Verify engine and enforcement
 Run `TestState` and real callbacks on the interpreter. Try forbidden actions for real with session keys, Gateway auth and Cedar, including reaching another session's prefix and another team's data.
 The cross-team tests also try a real Slack and Jira resource binding once those are connected.
-**AC:** L7 and L8 confirmed or fixed; G14 live; D11-03 gaps closed.
+**AC:** L7 and L8 confirmed or fixed; G14 live; D11-03 gaps closed. A real `TransactionConflict` from live DynamoDB proves the retry contract in PLAN section 11: DynamoDB Local produced none at 32 threads by 150 iterations.
 **Deps:** D12-04, D11-03, D11-10. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_enforcement.py`, `docs/findings/enforcement.md`.
 
 #### D12-08: Verify sandbox
