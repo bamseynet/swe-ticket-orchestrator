@@ -91,8 +91,14 @@ class DeliveryFailedError(TransientError):
     retry of the decision hits the closed gate and queues it then; so does a restart."""
 
     def __init__(self, cause: BaseException) -> None:
+        # The client gets a fixed message; what went wrong is logged where it happened.
         self.decision_recorded = True
-        super().__init__(f"the decision was recorded but not delivered to the run: {cause!r}")
+        self.__cause__ = cause
+        super().__init__("the decision was recorded but could not be delivered to the run yet")
+
+
+class BadCursorError(PermanentError):
+    pass
 
 
 class RunNotFoundError(PermanentError):
@@ -228,7 +234,7 @@ class _Commands:
 
 class _TaggedDriver(LocalDriver):
     """Tells the sleep which run it is sleeping for, however the drive was started (a kick, or
-    ``resume_all``, which calls ``run_until_idle`` per run)."""
+    a start-up kick, which calls ``run_until_idle`` per run)."""
 
     async def run_until_idle(self, run_id: RunId) -> RunState:
         token = _RUN.set(run_id)
@@ -323,7 +329,8 @@ class Runtime:
             await self._list_and_resume()
         except asyncio.CancelledError:
             raise
-        except Exception:  # not listing the runs is not fatal: keep trying in the background
+        except Exception as e:  # not listing the runs is not fatal: keep trying in the background
+            log.error("listing the unfinished runs failed: %r", e, exc_info=e)
             self._startup_task = asyncio.get_running_loop().create_task(
                 self._retry_until_done(self._list_and_resume, "listing the runs"), name="startup"
             )
@@ -333,9 +340,8 @@ class Runtime:
             run_ids = await self.driver.active_runs()
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            self._startup_failed = True
-            log.error("listing the unfinished runs failed: %r", e, exc_info=e)
+        except Exception:
+            self._startup_failed = True  # logged by the caller, once per failure
             raise
         self._startup_failed = False
         for run_id in run_ids:
@@ -372,7 +378,7 @@ class Runtime:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("%s failed again: %r", what, e)
+                log.warning("%s failed again: %r", what, e)  # no traceback: the first has one
                 delay = min(delay * 2, 5.0)
             else:
                 return
@@ -431,7 +437,7 @@ class Runtime:
                     if self.driver.held(run_id) is None:
                         self._cool.pop(run_id, None)
                     else:
-                        self._cool_down(run_id)  # a held command is not retried by a poll
+                        self._cool_down(run_id)  # a held command is retried after the cool-down
         finally:
             # No await between the loop test and here, so a kick cannot slip in unseen.
             self._tasks.pop(run_id, None)
@@ -607,7 +613,10 @@ class Runtime:
 
     async def list_runs(self, limit: int, cursor: str | None) -> tuple[list[dict[str, Any]], Any]:
         def read() -> tuple[list[dict[str, Any]], str | None]:
-            page = self.store.query(self.scope, API_INDEX, limit=limit, cursor=cursor)
+            try:
+                page = self.store.query(self.scope, API_INDEX, limit=limit, cursor=cursor)
+            except ValueError as e:  # only the query refuses a cursor; reading a run is not that
+                raise BadCursorError("that cursor is not valid") from e
             views = [self._view(RunId.parse(i.key.sk), i) for i in page.items]
             return [v for v in views if v is not None], page.cursor
 
@@ -678,6 +687,7 @@ class Runtime:
         """Close the gate (the one decision function), then queue the decision for the run. The
         gate is closed for good once ``decide`` returns; if queueing it fails, ``DeliveryFailed``
         says so and a retry or a restart finishes the delivery."""
+        await self._astate(run_id)  # no lock (and no memory) for a run that does not exist
         async with self._lock(run_id):
             try:
                 decided = await asyncio.to_thread(
@@ -698,6 +708,8 @@ class Runtime:
                     # Someone closed it. If their delivery never happened, do it now.
                     try:
                         await self._redeliver_locked(run_id)
+                    except (ValueError, TypeError):
+                        raise  # stored data the domain refuses: a server fault, not a retry
                     except Exception as d:  # the delivery is what failed, not the decision
                         log.error("redelivery for run %s failed: %r", run_id, d)
                         raise DeliveryFailedError(d) from d
@@ -707,6 +719,8 @@ class Runtime:
             event = _closed_event(decided.gate, decided.decision)
             try:
                 await self.submit(run_id, event)
+            except (ValueError, TypeError):
+                raise
             except Exception as e:
                 log.error("decision for run %s recorded but not delivered: %r", run_id, e)
                 raise DeliveryFailedError(e) from e

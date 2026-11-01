@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
 from sto.api.runtime import (
+    BadCursorError,
     RunFinishedError,
     RunNotFoundError,
     Runtime,
@@ -152,7 +153,7 @@ async def list_runs(
 ) -> dict[str, Any]:
     try:
         runs, nxt = await rt.list_runs(limit, cursor)
-    except ValueError:
+    except BadCursorError:
         raise ApiError(422, "bad_cursor", "that cursor is not valid") from None
     except StoreConflictError as e:
         raise _busy(e) from e

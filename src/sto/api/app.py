@@ -5,7 +5,7 @@
   must be set to ``local`` (unset is refused: fail closed). Real sign-in is D3.
 * ``build_local`` is the stack ``make dev`` serves: the SQLite store (so a waiting gate survives
   a restart), the fake SCM, simulated steps, and a simulated merge queue. ``Runtime.start``
-  brings unfinished runs back with ``resume_all`` when the app starts.
+  kicks every unfinished run back into motion when the app starts.
 * No request holds work open: handlers record and return, the runtime drives in the background.
 
 Run it: ``STO_MODE=local python -m sto.api.app`` (``make dev``). Environment: ``STO_DB`` (file,
@@ -138,6 +138,15 @@ def create_app(
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:
         body = {"code": exc.code, "message": exc.message, **exc.extra}
         return JSONResponse({"error": body}, status_code=exc.http_status, headers=exc.headers)
+
+    @app.exception_handler(Exception)
+    async def unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # Nothing about the fault goes to the client; it is logged here.
+        log.error(
+            "unhandled error on %s %s: %r", request.method, request.url.path, exc, exc_info=exc
+        )
+        body = {"code": "internal_error", "message": "the server could not process this request"}
+        return JSONResponse({"error": body}, status_code=500)
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request: Request, exc: RequestValidationError) -> JSONResponse:

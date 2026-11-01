@@ -165,6 +165,8 @@ async def decide(
             subject_digest=body.subject_digest,
             comment=body.comment,
         )
+    except RunNotFoundError as e:
+        raise ApiError(404, "run_not_found", str(e)) from e
     except DeliveryFailedError as e:
         raise ApiError(
             503,
@@ -184,8 +186,9 @@ async def decide(
         }
         try:
             stop_offered = await rt.can_stop(parse_run_id(run_id))
-        except StoreConflictError:
-            stop_offered = False  # the 409 is true whether or not we can say who can stop it
+        except Exception as stop_error:  # the 409 is true whether or not we can say who can stop
+            log.warning("could not tell whether run %s can be stopped: %r", run_id, stop_error)
+            stop_offered = False
         if stop_offered:
             extra["stop"] = {"method": "POST", "href": f"/runs/{run_id}/cancel"}
         raise ApiError(
