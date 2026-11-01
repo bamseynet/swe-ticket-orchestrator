@@ -35,13 +35,16 @@ class Ulid:
 
     @classmethod
     def new(cls) -> Self:
-        """Impure edge: reads the system clock and OS randomness. Never call from the reducer."""
+        """Impure edge: reads the system clock and OS randomness. Never call from the reducer.
+
+        Order within one millisecond is random; IDs sort by time only to millisecond precision.
+        """
         return cls.from_parts(time.time_ns() // 1_000_000, os.urandom(10))
 
     @classmethod
     def parse(cls, text: str) -> Self:
-        if len(text) != 26:
-            raise InvalidIdError(f"ULID must be 26 characters, got {len(text)}")
+        if not text.isascii() or len(text) != 26:
+            raise InvalidIdError("ULID must be 26 ASCII characters")
         value = 0
         for ch in text.upper():
             digit = _DECODE.get(ch)

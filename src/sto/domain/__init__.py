@@ -16,13 +16,25 @@ from .models import (
     Effect,
     EffectClass,
     Gate,
+    GateType,
+    Receipt,
     Run,
+    Step,
     StepKey,
     Subject,
+    Surface,
     effect_key,
 )
 from .registry import BLOCKED_REASONS, COMMANDS, EVENTS, Registry
-from .states import EffectStatus, GateStatus, RunStatus, can_transition, transition
+from .serialize import to_wire
+from .states import (
+    EffectStatus,
+    GateStatus,
+    RunStatus,
+    StepStatus,
+    can_transition,
+    transition,
+)
 
 __all__ = [
     "BLOCKED_REASONS",
@@ -41,20 +53,26 @@ __all__ = [
     "Gate",
     "GateId",
     "GateStatus",
+    "GateType",
     "InvalidIdError",
     "InvalidTransitionError",
     "OutboxId",
     "PermanentError",
+    "Receipt",
     "Registry",
     "Run",
     "RunId",
     "RunStatus",
+    "Step",
     "StepKey",
+    "StepStatus",
     "StoError",
     "Subject",
+    "Surface",
     "TransientError",
     "Ulid",
     "can_transition",
     "effect_key",
+    "to_wire",
     "transition",
 ]
