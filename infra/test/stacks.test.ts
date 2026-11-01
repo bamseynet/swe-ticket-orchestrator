@@ -60,7 +60,7 @@ describe("cdk-nag", () => {
     const app = new App();
     new Bucket(new Stack(app, "Bad", { env }), "Open"); // no SSL enforcement, no access logs
     applyNag(app);
-    expect(() => app.synth()).toThrow();
+    expect(() => app.synth()).toThrow(/AwsSolutions-S10/);
   });
 
   it("passes a compliant app", () => {

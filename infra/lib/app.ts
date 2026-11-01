@@ -27,6 +27,12 @@ export function discoverStackFiles(dir: string = LIB_DIR): StackFile[] {
     .map((f) => ({ name: basename(f, SUFFIX), path: join(dir, f) }));
 }
 
+// Stacks receive only `env` (and the name), by design: nothing here is shared between
+// them. When a D11 stack needs another stack's values, share them without editing this
+// file: write SSM parameters under `/${cfg.name}/<stack>/<key>` in the producer and read
+// them with ssm.StringParameter.valueForStringParameter in the consumer, or export a
+// typed registry module from the producer's own file. Not built yet.
+//
 // Each lib/<x>-stack.ts default-exports a Stack class; adding a file adds a
 // stack with no edit here, so parallel issues never touch a shared file.
 export async function buildApp(cfg: Deployment, env: Environment, dir?: string): Promise<App> {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDeployment } from "../lib/config.js";
+import { parseDeployment, resolveAccount } from "../lib/config.js";
 
 describe("deployment.yaml schema", () => {
   it("accepts a valid config", () => {
@@ -23,5 +23,17 @@ describe("deployment.yaml schema", () => {
 
   it("rejects a bad profile", () => {
     expect(() => parseDeployment("name: sto\nregion: eu-west-1\nprofile: qa\n")).toThrow(/profile/);
+  });
+});
+
+describe("STO_ACCOUNT", () => {
+  it("defaults to the dummy account", () => {
+    expect(resolveAccount(undefined)).toBe("000000000000");
+  });
+  it("accepts 12 digits", () => {
+    expect(resolveAccount("123456789012")).toBe("123456789012");
+  });
+  it.each(["", "1234", "12345678901a", "1234567890123"])("rejects %j loudly", (v) => {
+    expect(() => resolveAccount(v)).toThrow(/STO_ACCOUNT/);
   });
 });
