@@ -1638,7 +1638,7 @@ IDs only, never payloads, so the 256 KiB limit does not apply.
 | Outbox | `TEAM#t#RUN#r` | `OUT#ulid` | Signal to deliver |
 | Event | `TEAM#t#RUN#r` | `EVT#seq` | Typed run event for the timeline |
 | Task token | `TEAM#t#RUN#r` | `TOK#step` | Token. Readable only by result and relay roles. TTL |
-| Delivery | `HOOK#surface#id` | `SEEN` | Webhook dedupe, TTL |
+| Delivery | `HOOK#surface#id` | `SEEN` | Webhook dedupe. TTL only for vendors with a signed timestamp; otherwise it is the only replay bound and does not expire |
 | Budget ledger | `TEAM#t` or `ORG` | `BUD#period` | Reserved, spent. Atomic, conditional |
 | Concurrency | `TEAM#t` | `SLOT#ulid` | Lease with TTL |
 | Audit | `TEAM#t#RUN#r` (audit table) | `seq` | Hash chain |
@@ -1680,7 +1680,7 @@ retry contract, since the fast stores may not model it.
 | T11 | Cost or injection attack through tickets | Commands need linked roles. Intake records its actor and ticket revision, and an edit by a non-member or unknown editor pauses the run for a member to confirm. **Agents read a confirmed snapshot and member comments only.** Public repos need explicit opt-in. Budgets and concurrency caps | Intake tests, G11 |
 | T12 | Poisoned memory or session | Memory written only from approved content and read as untrusted. Sessions only from own prefix | Memory and session tests |
 | T13 | Malicious rendering in UI | Everything rendered as text. Strict CSP. Diff viewer escapes. Links allowlisted | XSS fixtures |
-| T14 | Tampered audit | Hash chain, Object Lock, signed checkpoints, IAM denies mutation. Tampering before the copy reaches S3 is not prevented, only detected against checkpoints | Chain verifier test, tail-removal test |
+| T14 | Tampered audit | Hash chain, Object Lock, signed checkpoints, IAM denies mutation. Tampering before the copy reaches S3 is not prevented, only detected against checkpoints, and a checkpoint covers nothing past its own counts | Chain verifier test, tail-removal test |
 | T15 | Over-privileged App or role | Least privilege, tested on the synthesized template, tokens narrowed per call. cdk-nag with no unjustified suppressions | Template tests |
 | T16 | Reviewer rubber-stamps | Attention list, required comments on negative decisions, acknowledgement of unverified rows, metrics on time to decide and approval rate | Metrics (section 14) |
 | T17 | Model invocation logs hold source code. `InvokeAgentRuntimeCommand` also logs the input command to CloudWatch [S61] | Invocation logging off by default, or to a KMS bucket restricted like source. Sandbox log groups are restricted the same way | Infra test |
