@@ -1,7 +1,10 @@
 # Effect catalog (PLAN.md sections 6.3 and 7.2). The class comes from here, never from config.
 # outcomes: the edges a workflow must provide (V2). key_scope: the idempotency key parts; the
-# default run/stage/visit/subject opens a new record on a deliberate retry. with: the typed
-# keys a stage may pass; any other key is refused. hold: the default hold after approval.
+# default run/stage/visit/subject opens a new record on a deliberate retry. effect_key() adds
+# the effect type to these parts itself. with: the typed keys a stage may pass; any other key is
+# refused. hold: the default hold after approval (PLAN 4.3 rule 5: a done transition waits too).
+# Engine-implicit effects (pr.close, check.publish, gate.notify) are not listed: no workflow
+# stage can name them. src/sto/effects/ports.py keeps its own list of them.
 # Keep outcomes in step with EFFECT_OUTCOMES in src/sto/config/schema.py (checked by a test).
 effects:
   branch.push:
@@ -58,7 +61,7 @@ effects:
     class: gated
     outcomes: [done]
     key_scope: [run, stage, visit, subject]
-    hold: 0s
+    hold: 10m
     with:
       to_status_category: { type: enum, values: [todo, in_progress, done], required: true }
   env.deploy_preview:

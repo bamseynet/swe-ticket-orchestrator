@@ -1,6 +1,7 @@
 # Agent profiles (PLAN.md section 8.3). Data, not code: the validator (V2, V9) reads this
 # before any agent exists, and D5 and D8 carry a test that fails if their code differs.
 # role: orchestrator runs a stage and declares its outcomes. worker is called by one.
+# The review_panel workers may hold only the llm_review tool set, and must hold record_finding.
 # Tools are the allowlist. No agent has a write tool to GitHub, Jira or Slack.
 profiles:
   triage:
@@ -98,7 +99,7 @@ profiles:
     role: worker
     orchestrator: qa_agent
     default_tier: standard
-    tools: [env.info, record_evidence, pr.diff]
+    tools: [env.info, pr.diff]
   explorer:
     role: worker
     orchestrator: qa_agent
