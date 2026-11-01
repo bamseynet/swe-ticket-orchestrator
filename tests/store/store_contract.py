@@ -10,8 +10,10 @@ The base class is not collected itself (its name does not start with ``Test``).
 
 from __future__ import annotations
 
+import base64
 import sys
 import threading
+import time
 from collections.abc import Callable
 from enum import StrEnum
 
@@ -23,6 +25,7 @@ from sto.domain.serialize import from_wire, to_wire
 from sto.store.ports import (
     AUDIT,
     PLATFORM,
+    TEAM_ROOT,
     Absent,
     Check,
     ConditionFailedError,
@@ -42,6 +45,9 @@ class Status(StrEnum):
     OPEN = "open"
 
 
+MAX_CONFLICT_RETRIES = 50
+
+
 def race_claims(store: Store, *, threads: int = 8, rounds: int = 40) -> list[int]:
     """Per round, how many of ``threads`` simultaneous claims on one version won. All threads
     start together (Barrier) with a tiny switch interval, to give a lockless store every chance
@@ -55,26 +61,38 @@ def race_claims(store: Store, *, threads: int = 8, rounds: int = 40) -> list[int
             store.put(A, key, {"owner": None})
             barrier = threading.Barrier(threads)
             wins: list[int] = []
+            exhausted: list[int] = []
 
             def claim(
-                n: int, key: Key = key, wins: list[int] = wins, b: threading.Barrier = barrier
+                n: int,
+                key: Key = key,
+                wins: list[int] = wins,
+                lost: list[int] = exhausted,
+                b: threading.Barrier = barrier,
             ) -> None:
                 b.wait()
-                while True:
+                for attempt in range(MAX_CONFLICT_RETRIES):
                     try:
                         store.transact(A, [Put(key, {"owner": n}, when=VersionIs(1))])
                         wins.append(n)
                     except TransactionConflictError:
-                        continue  # a DynamoDB store reports a conflict like this: retry
+                        time.sleep(0.001 * (attempt + 1))  # a DynamoDB store: retry with backoff
+                        continue
                     except ConditionFailedError:
                         pass
                     return
+                lost.append(n)
 
             pool = [threading.Thread(target=claim, args=(n,)) for n in range(threads)]
             for t in pool:
                 t.start()
             for t in pool:
                 t.join()
+            if exhausted:
+                raise AssertionError(
+                    f"{len(exhausted)} claim(s) still hit TransactionConflictError after "
+                    f"{MAX_CONFLICT_RETRIES} retries"
+                )
             counts.append(len(wins))
     finally:
         sys.setswitchinterval(old)
@@ -703,3 +721,44 @@ class StoreContract:
                 store.query(A, "P", cursor=bad)
         with pytest.raises(ValueError, match="cursor"):
             store.query(A, "P", cursor=123)  # type: ignore[arg-type]
+
+    # --- review pass 3 ------------------------------------------------------------------------
+
+    def test_the_team_root_partition_is_one_shared_item_per_team(self, store: Store) -> None:
+        switches, budget = Key(TEAM_ROOT, "META"), Key(TEAM_ROOT, "BUD#2026-11")
+        store.put(A, switches, {"merge": "on"}, when=Absent())
+        with pytest.raises(ConditionFailedError):  # a second caller cannot create a twin
+            store.put(A, Key(TEAM_ROOT, "META"), {"merge": "off"}, when=Absent())
+        store.put(A, budget, {"spent": 0})
+        got = store.get(A, switches)
+        assert got is not None
+        assert got.data == {"merge": "on"}
+        assert store.get(B, switches) is None  # per team
+        assert [i.key.sk for i in store.query(A, TEAM_ROOT).items] == ["BUD#2026-11", "META"]
+        assert store.query(A, TEAM_ROOT, sk_prefix="BUD#").items[0].data == {"spent": 0}
+        assert store.query(A, "RUN#1").items == ()  # not mixed into ordinary partitions
+        store.put(A, RUN, {"n": 1})  # a claim can check the switch and write a run together
+        store.transact(A, [Check(switches, FieldEquals("merge", "on")), Put(RUN, {"n": 2})])
+        with pytest.raises(ValueError, match="platform"):
+            store.get(PLATFORM, switches)
+
+    def test_a_deeply_nested_cursor_is_refused_like_any_bad_cursor(self, store: Store) -> None:
+        deep = base64.b64encode(b"[" * 200_000).decode()
+        with pytest.raises(ValueError, match="cursor"):
+            store.query(A, "P", cursor=deep)
+
+    def test_data_nesting_is_limited_like_dynamodb(self, store: Store) -> None:
+        def nest(levels: int) -> dict[str, object]:
+            data: dict[str, object] = {}
+            for _ in range(levels):
+                data = {"a": data}
+            return data
+
+        store.put(A, RUN, nest(30))
+        with pytest.raises(TypeError, match="deeply"):
+            store.put(A, RUN, nest(40))
+
+    def test_sk_prefix_is_limited_like_a_sort_key(self, store: Store) -> None:
+        store.query(A, "P", sk_prefix="s" * 1024)
+        with pytest.raises(ValueError, match="sk_prefix"):
+            store.query(A, "P", sk_prefix="s" * 1025)

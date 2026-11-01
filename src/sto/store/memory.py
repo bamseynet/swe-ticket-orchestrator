@@ -78,14 +78,15 @@ class MemoryStore:
     ) -> Page:
         require_scope(scope)
         check_query_args(pk, limit, table, sk_prefix)
-        partition = resolve(scope, Key(pk, "-", table)).partition
+        root = resolve(scope, Key(pk, "-", table))
+        partition = root.partition
         after = None if cursor is None else decode_cursor(cursor, partition, table, pk, sk_prefix)
         with self._lock:
             matching = sorted(
                 (
                     item
                     for addr, item in self._items.items()
-                    if (addr.partition, addr.table, addr.pk) == (partition, table, pk)
+                    if (addr.partition, addr.table, addr.pk) == (partition, table, root.pk)
                     and addr.sk.startswith(sk_prefix)
                     and (after is None or addr.sk > after)
                 ),

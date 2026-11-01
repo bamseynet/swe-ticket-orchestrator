@@ -43,7 +43,14 @@ MAX_TRANSACTION_BYTES = 4 * 1024 * 1024
 MAX_PK_BYTES = 2048
 MAX_SK_BYTES = 1024
 _MAX_NUMBER = 10**38
-_MAX_DEPTH = 64
+# DynamoDB allows 32 levels of nesting. Numbers beyond its range or precision (e.g. 1e-200) are
+# not rejected here yet; D3-09 decides how its store maps them.
+_MAX_DEPTH = 32
+
+# The team's own bare partition (PLAN 11: Team META and switches, CONFIG, WF#, BUD#, SLOT#, CONN#,
+# IMAGE# live under exactly ``TEAM#<t>``). ``Key(TEAM_ROOT, "META")`` addresses it, so every caller
+# reaches the same item. The pk string is reserved: it never names an ordinary partition.
+TEAM_ROOT = "TEAM"
 
 MAIN = "main"
 AUDIT = "audit"
@@ -159,7 +166,8 @@ class Page:
 @dataclass(frozen=True)
 class Addr:
     """A fully resolved item address: what a store actually keys on. ``partition`` is
-    ``TEAM#<team>`` or ``PLATFORM``; a DynamoDB store prefixes team pks with it."""
+    ``TEAM#<team>`` or ``PLATFORM``. A DynamoDB store writes a team's pk as ``TEAM#<team>#<pk>``,
+    or as exactly ``TEAM#<team>`` when ``pk`` is empty (the ``TEAM_ROOT`` partition)."""
 
     partition: str
     table: str
@@ -178,7 +186,7 @@ def resolve(scope: Scope, key: Key, override: PlatformScope | None = None) -> Ad
             raise ValueError(
                 f"key pk is longer than {MAX_PK_BYTES} bytes once prefixed with the team"
             )
-        return Addr(f"TEAM#{scope.team}", key.table, key.pk, key.sk)
+        return Addr(f"TEAM#{scope.team}", key.table, "" if key.pk == TEAM_ROOT else key.pk, key.sk)
     if not any(
         key.pk == p or key.pk.startswith(p if p.endswith("#") else p + "#")
         for p in PLATFORM_PREFIXES
@@ -210,7 +218,7 @@ def decode_cursor(cursor: object, partition: str, table: str, pk: str, sk_prefix
         raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
         parts = json.loads(raw.decode("utf-8"))
         ok = isinstance(parts, list) and len(parts) == 5 and all(isinstance(p, str) for p in parts)
-    except (TypeError, ValueError, binascii.Error):  # includes JSON and Unicode errors
+    except (TypeError, ValueError, binascii.Error, RecursionError):  # JSON, Unicode, deep nesting
         raise ValueError("invalid cursor") from None
     if not ok:
         raise ValueError("invalid cursor")
@@ -434,6 +442,8 @@ def check_query_args(pk: object, limit: int | None, table: str, sk_prefix: objec
     _check_part("pk", pk, MAX_PK_BYTES)
     if not isinstance(sk_prefix, str):
         raise TypeError(f"sk_prefix must be a str, not {type(sk_prefix).__name__}")
+    if len(sk_prefix.encode("utf-8", "surrogatepass")) > MAX_SK_BYTES:
+        raise ValueError(f"sk_prefix is longer than {MAX_SK_BYTES} bytes")
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("limit must be a positive int")
     if table not in TABLES:
