@@ -96,9 +96,9 @@ def test_orphan_issue_after_stage_flagged():
     assert any("D9-99" in w for w in d.warnings)
 
 
-def test_real_doc_has_244_issues_and_no_warnings():
+def test_real_doc_has_247_issues_and_no_warnings():
     d = s.parse(s.STAGES_PATH.read_text())
-    assert len(d.issues) == 244
+    assert len(d.issues) == 247
     assert d.warnings == []
 
 
@@ -134,3 +134,10 @@ def test_body_resolves_deps_and_keeps_ticks():
     assert "STAGES.md#d0-02-live-github-docs" in body
     # rendering is stable, so a second run edits nothing
     assert body == s.render_body(b, d, "o/r", {"D0-01": 7, "D1-01": 9}, body)
+
+
+def test_id_re_accepts_follow_up_suffix() -> None:
+    import re
+
+    assert re.findall(s.ID_RE, "D0-07, D0-08a and D1-08.") == ["D0-07", "D0-08a", "D1-08"]
+    assert re.fullmatch(s.ID_RE, "D0-08ab") is None
