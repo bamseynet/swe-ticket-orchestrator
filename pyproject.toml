@@ -16,6 +16,10 @@ dev = [
     "ruff>=0.8",
     "types-pyyaml>=6.0.12.20261030",
 ]
+# CI-only (ui-browser job): `uv sync --locked --group browser`. Not a default group.
+browser = [
+    "playwright==1.55.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.8,<0.14"]

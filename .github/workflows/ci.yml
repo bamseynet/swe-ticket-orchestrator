@@ -41,7 +41,6 @@ concurrency:
 
 env:
   UV_VERSION: "0.13.6"
-  PLAYWRIGHT_VERSION: "1.55.0"
   # Tests run with a sandboxed HOME, so the browsers live at an explicit path.
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
 
@@ -260,21 +259,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --locked
-      # Image cache: a warm run loads the tarball instead of pulling.
-      - id: image-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/docker-images
-          key: docker-images-${{ hashFiles('docker-compose.yml') }}
-      - if: steps.image-cache.outputs.cache-hit == 'true'
-        run: docker load -i ~/docker-images/dynamodb-local.tar
-      - if: steps.image-cache.outputs.cache-hit != 'true'
-        run: |
-          docker compose pull dynamodb-local
-          mkdir -p ~/docker-images
-          docker save -o ~/docker-images/dynamodb-local.tar "$(docker compose config --images | head -n1)"
       - run: docker compose up -d --wait dynamodb-local
-      - run: uv run pytest -q -m integration -k "not stack_smoke"
+      - run: uv run pytest -q -m integration tests/integration
       - if: failure()
         run: docker compose logs dynamodb-local
 
@@ -293,15 +279,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - run: uv sync --locked
+      - run: uv sync --locked --group browser
       - id: pw-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pw-browsers
-          key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}
-      # Playwright is CI-only and not a project dependency; the version is pinned in env.
-      - run: uv run --with playwright==$PLAYWRIGHT_VERSION playwright install --with-deps chromium
-      - run: uv run --with playwright==$PLAYWRIGHT_VERSION pytest -q -m ui_browser
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -q -m ui_browser
 
   e2e:
     name: e2e
@@ -319,22 +304,9 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --locked
-      # Image cache: a warm run loads the tarball instead of pulling.
-      - id: image-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/docker-images
-          key: docker-images-${{ hashFiles('docker-compose.yml') }}
-      - if: steps.image-cache.outputs.cache-hit == 'true'
-        run: docker load -i ~/docker-images/dynamodb-local.tar
-      - if: steps.image-cache.outputs.cache-hit != 'true'
-        run: |
-          docker compose pull dynamodb-local
-          mkdir -p ~/docker-images
-          docker save -o ~/docker-images/dynamodb-local.tar "$(docker compose config --images | head -n1)"
       - run: docker compose up -d --wait dynamodb-local
-      # Whole local stack up, then the stack smoke test. D1-10 adds the real journey under tests/e2e/.
-      - run: uv run pytest -q -m integration -k stack_smoke
+      # Whole local stack up, then the e2e tests (selected by path; no e2e marker until D0-09a). D1-10 adds the real journey under tests/e2e/.
+      - run: uv run pytest -q -m integration tests/e2e
       - if: failure()
         run: docker compose logs
 

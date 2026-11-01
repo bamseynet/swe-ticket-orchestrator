@@ -31,7 +31,7 @@ def loopback() -> Iterator[None]:
         yield
 
 
-def _list_tables() -> dict[str, object]:
+def list_tables() -> dict[str, object]:
     """POST ListTables over a raw loopback socket (name lookups stay blocked by the guard)."""
     payload = b"{}"
     head = (
@@ -54,17 +54,8 @@ def _list_tables() -> dict[str, object]:
 
 
 @pytest.mark.integration
-def test_dynamodb_local_answers_list_tables(loopback: None) -> None:
-    assert "TableNames" in _list_tables()
-
-
-@pytest.mark.integration
-def test_stack_smoke_dynamodb_local_is_the_only_service_so_far(loopback: None) -> None:
-    """The e2e job's placeholder: the whole local stack is up and answering.
-
-    D1-10 replaces this with the walking-skeleton journey under tests/e2e/.
-    """
-    assert _list_tables().get("TableNames") == []
+def test_dynamodb_local_answerslist_tables(loopback: None) -> None:
+    assert "TableNames" in list_tables()
 
 
 @pytest.mark.ui_browser
