@@ -360,19 +360,19 @@ There is deliberately no `auto_approve` key, and unknown keys are refused.
 #### D2-18: Agent profile manifest
 Declare each agent profile's outcomes, tool allowlist and default tier as data, so the validator can check them before any agent exists.
 D5 and D8 implement these profiles, and a test fails if code and manifest differ.
-**AC:** V2 and V9 can read it; all profiles in PLAN.md section 8.3 are listed; the effect catalog gives each effect's class, outcomes, key scope, typed `with` and hold default, including a push effect and `pr.ensure_draft`. A check keeps `EFFECT_OUTCOMES` in `src/sto/config/` in sync with this catalog.
-**Deps:** D2-01. **Size:** S. **Run:** parallel. **Files:** `catalog/profiles.yaml`, `catalog/effects.yaml`, `src/sto/config/manifest.py`, `tests/config/test_manifest.py`.
+**AC:** V2 and V9 can read it; all profiles in PLAN.md section 8.3 are listed; the effect catalog gives each effect's class, outcomes, key scope, typed `with` and hold default, including a push effect and `pr.ensure_draft`. A check keeps `EFFECT_OUTCOMES` in `src/sto/config/` in sync with this catalog. The catalog ships inside the package and loads with `importlib.resources`, so an installed wheel can read it. A done transition carries the hold, and `to_status_category` on `ticket.transition` is required with its values pinned.
+**Deps:** D2-01. **Size:** S. **Run:** parallel. **Files:** `src/sto/catalog/profiles.yaml`, `src/sto/catalog/effects.yaml`, `src/sto/catalog/__init__.py`, `src/sto/config/manifest.py`, `tests/config/test_manifest.py`.
 
 #### D2-02: Overlays and flattening
 Apply a `WorkflowOverlay` to its pinned template with JSON Merge Patch on the stage map, and flatten at publish, with provenance for each value.
 Maps merge, lists replace and `null` removes. A value below a floor gets an error naming the floor.
 **AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal. Flatten must not use `exclude_none`, which drops removals, and re-validates the result. Dump a template with `exclude_unset`: a plain `model_dump` of a `Workflow` is refused on re-validation. `fail_closed: null` is a floor error, not a fall back to `False`. Flatten and `load_document` agree on nulls nested in `with`. An `env.deploy_preview` `with` cannot name a production deployment.
-**Deps:** D2-01, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/overlays.py`, `tests/config/test_overlays.py`.
+**Deps:** D2-01, D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/overlays.py`, `tests/config/test_overlays.py`.
 
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides. A team cannot rank a value below the org's in a route's `order` to skip a `when` gate: `OrgPolicy` gains an org-owned ordering.
 **Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `tests/config/test_validate_structure.py`.
 
 #### D2-04: Gate dominance proof
@@ -581,7 +581,7 @@ Write an audit entry for each of those state changes in the same transaction. A 
 
 #### D3-08b: Decision comments and refused attempts
 Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLAN.md 4.9's redaction before anything is stored, comments have no size cap, and nothing calls the refused-attempt path.
-**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record. A surrogate in a comment does not raise `UnicodeEncodeError`. Refused records have a named reader. An invalid `at` on a refused record is refused or marked, not silently 0. Add token shapes `AIza`, `npm_`, `pypi-`, `hf_`, `ya29.` and `xapp-` to redaction.
+**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record. A surrogate in a comment does not raise `UnicodeEncodeError`. Refused records have a named reader. An invalid `at` on a refused record is refused or marked, not silently 0. Add token shapes `AIza`, `npm_`, `pypi-`, `hf_`, `ya29.`, `xapp-`, `SG.`, `shpat_`, `AGE-SECRET-KEY` and `dop_v1_`, and the names `session`, `sessionid`, `client_key`, `csrf`, `pass`, `passcode` and `creds`, to redaction.
 **Deps:** D3-08, D3-06. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_comment_redaction.py`.
 
 #### D3-09: DynamoDB store
@@ -938,7 +938,7 @@ It asserts on real SDK output, because the docs page could not be retrieved at r
 Model catalog from [RESEARCH.md](RESEARCH.md) section 3 per tier and geography, a `BedrockModel` wrapper, the abort fix from the Strands PoC, and a per-team client rate limiter.
 Tested on real botocore against a local stub.
 **AC:** a tier with no profile in the geography fails validation; request shape, signing Region and structured output retry are asserted through botocore's `before-send` hook, with sockets still blocked; C2: a stream closes at the next chunk after cancel; inner retries are off.
-**Deps:** D5-01. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/models/bedrock.py`, `src/sto/agents/models/catalog.py`, `catalog/models.yaml`, `tests/agents/test_bedrock_wire.py`.
+**Deps:** D5-01. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/models/bedrock.py`, `src/sto/agents/models/catalog.py`, `src/sto/catalog/models.yaml`, `tests/agents/test_bedrock_wire.py`.
 
 #### D5-13: AgentCore entrypoint
 Container with `/invocations` and `/ping`, async tasks, session IDs of the right length, and results through a queue port. Built for arm64. **Provisional until the AWS spike (D12-18).**
@@ -949,7 +949,7 @@ AWS clients are built inside the handler, because clients made at module scope l
 #### D5-14: In-stage interrupts
 `ask_human` and high-risk tool approval, through Strands hooks and a session manager on S3, trying `SnapshotSessionManager` first. The dispatcher copies the snapshot into the new session's prefix.
 The engine's `wait` stage holds the human wait, with no session alive.
-**AC:** the choice of manager is recorded with a reason; an answer resumes a new session correctly; sessions load only from our prefix, and a repo path is refused; only the orchestrator has a manager; a worker's interrupt with `preserve_context=False` resumes, pinned by test.
+**AC:** the choice of manager is recorded with a reason; an answer resumes a new session correctly; sessions load only from our prefix, and a repo path is refused; only the orchestrator has a manager; a worker's interrupt with `preserve_context=False` resumes, pinned by test. PLAN 8.5 has `ask_human` end a step `needs_info`, while the implementer's outcomes are `ready` and `blocked`: settle this and correct PLAN or the catalog.
 **Deps:** D5-01, D2-13. **Size:** M. **Run:** parallel. **Files:** `src/sto/agents/interrupts.py`, `tests/agents/test_interrupts.py`.
 
 #### D5-15: Dispatch and result handling
@@ -1418,7 +1418,7 @@ calls, as counted at the stub. A local trace shows a whole run.
 Prices with source and effective date, including long-context tiers, and a function from usage to estimated cost.
 Prices are data, and a stale date warns.
 **AC:** cached, thinking and long-context usage are calculated by a table of cases; unknown model fails closed.
-**Deps:** D5-12. **Size:** S. **Run:** parallel. **Files:** `src/sto/budget/prices.py`, `catalog/prices.yaml`, `tests/budget/test_prices.py`.
+**Deps:** D5-12. **Size:** S. **Run:** parallel. **Files:** `src/sto/budget/prices.py`, `src/sto/catalog/prices.yaml`, `tests/budget/test_prices.py`.
 
 #### D10-02: Budget ledger
 Atomic reservations and settlement at step, stage, run, team and org, on both stores.
@@ -1719,7 +1719,7 @@ Deploying waits for this, so a failed spike cannot be skipped.
 `sto doctor --aws` calls `GetInferenceProfile` for each catalog entry from the source Region, one small `Converse` per model, and reports Bedrock quotas.
 It corrects the catalog and IAM wherever the docs and reality differ.
 **AC:** L1 confirmed or fixed; the tool exits non-zero on any mismatch; quotas are compared with expected use; costs recorded.
-**Deps:** D12-01, D2-14, D5-12. **Size:** S. **Run:** serial. **Files:** `src/sto/cli/doctor_aws.py`, `catalog/models.yaml`, `tests/cli/test_doctor_aws.py`.
+**Deps:** D12-01, D2-14, D5-12. **Size:** S. **Run:** serial. **Files:** `src/sto/cli/doctor_aws.py`, `src/sto/catalog/models.yaml`, `tests/cli/test_doctor_aws.py`.
 
 #### D12-03: Deploy control plane on fake LLM
 Deploy Foundation, Identity, ControlPlane, and Web with the fake LLM, and run the demo with no Bedrock cost.
@@ -1959,7 +1959,7 @@ Includes bugs seeded for reviewers to find.
 Make the single change with the largest expected effect on evals, with before and after numbers. Further passes are new issues, one each.
 Security corpus must still pass.
 **AC:** eval scores improve, and the remaining gap to FF-24 is listed as issues; prompt versions are recorded; no injection regressions.
-**Deps:** D14-01, D5-12, D10-01. **Size:** M. **Run:** serial. **Files:** `src/sto/agents/prompts/`, `catalog/`.
+**Deps:** D14-01, D5-12, D10-01. **Size:** M. **Run:** serial. **Files:** `src/sto/agents/prompts/`, `src/sto/catalog/`.
 
 #### D14-03: Pilot team onboarding
 Onboard the first team using only the docs and UI, with nobody who built it helping, starting with low-risk tickets. Fix what blocks them.
