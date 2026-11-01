@@ -1508,6 +1508,7 @@ name = "sto"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "strands-agents" },
 ]
 
@@ -1526,7 +1527,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "strands-agents", specifier = "~=1.63" }]
+requires-dist = [
+    { name = "cryptography", specifier = ">=42" },
+    { name = "strands-agents", specifier = "~=1.63" },
+]
 
 [package.metadata.requires-dev]
 browser = [{ name = "playwright", specifier = "==1.55.0" }]
