@@ -583,7 +583,7 @@ Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLA
 Implement the store and table design from PLAN.md section 11, passing the shared contract suite on moto locally and DynamoDB Local in CI.
 Atomicity uses `TransactWriteItems` with conditions.
 **AC:** contract suite passes on memory, SQLite and moto with no Docker, and on DynamoDB Local in CI's integration job; a test bounds items per transaction.
-**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`.
+**Deps:** D1-01, D0-09. **Size:** L. **Run:** serial. **Files:** `src/sto/store/dynamodb.py`, `tests/store/test_dynamodb.py`, `tests/integration/test_dynamodb_local.py`.
 
 #### D3-10: Indexed queries
 "My approvals", run lists, ticket lookup and PR lookup, all through indexes with pagination.
