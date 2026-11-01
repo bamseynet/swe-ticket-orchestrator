@@ -308,7 +308,7 @@ It shows simulated writes as simulated, and renders all model and ticket text as
 `make dev` starts the whole local stack with demo tickets and no Docker, and CI's e2e job drives it through both gates.
 The README states the status plainly, including "never deployed".
 **AC:** works from a fresh clone with no credentials or Docker; the e2e covers approve-approve and reject at each gate; README is accurate. `make dev` starts only the API today, and the landing page has no route to `/runs`. CI's `ui-browser` job sets up Node in `ci.yml`, so the browser test stops building inside the test.
-**Deps:** D1-05, D1-08, D1-09, D0-09. **Size:** M. **Run:** serial. **Files:** `README.md`, `tests/e2e/test_skeleton.py`, `scripts/dev.py`.
+**Deps:** D1-05, D1-08, D1-09, D0-09. **Size:** M. **Run:** serial. **Files:** `README.md`, `tests/e2e/test_skeleton.py`, `scripts/dev.py`, `web/src/pages/home/index.tsx`.
 
 #### D1-11: Gate suite v1
 Create `tests/gates/` integrity suite with G1, G4, G10 and the single-approver cases of G3 and G5, in the gate-integrity job that feeds `ci-required`. Quorum cases come with D3-06.
@@ -366,25 +366,25 @@ D5 and D8 implement these profiles, and a test fails if code and manifest differ
 #### D2-02: Overlays and flattening
 Apply a `WorkflowOverlay` to its pinned template with JSON Merge Patch on the stage map, and flatten at publish, with provenance for each value.
 Maps merge, lists replace and `null` removes. A value below a floor gets an error naming the floor.
-**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal. Flatten must not use `exclude_none`, which drops removals, and re-validates the result. Dump a template with `exclude_unset`: a plain `model_dump` of a `Workflow` is refused on re-validation. `fail_closed: null` is a floor error, not a fall back to `False`. Flatten and `load_document` agree on nulls nested in `with`.
+**AC:** merge rules have a table of cases; all three PLAN.md overlays flatten; removing a mandatory gate fails; provenance shows which layer set a value. `separation_of_duties: null` in an overlay is a floor error, not a removal. Flatten must not use `exclude_none`, which drops removals, and re-validates the result. Dump a template with `exclude_unset`: a plain `model_dump` of a `Workflow` is refused on re-validation. `fail_closed: null` is a floor error, not a fall back to `False`. Flatten and `load_document` agree on nulls nested in `with`. An `env.deploy_preview` `with` cannot name a production deployment.
 **Deps:** D2-01, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/overlays.py`, `tests/config/test_overlays.py`.
 
 #### D2-03: Structural validator
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
-**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them.
+**AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides.
 **Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `tests/config/test_validate_structure.py`.
 
 #### D2-04: Gate dominance proof
 Implement V4, V5, V6, V11 and V14 by edge-removal reachability on the stage graph, deriving code-changing stages from the manifest, and V6's clause scoped to merges reachable with QA approvals removed.
 This is the static generalisation of the LangGraph PoC's topology test, and it applies Q2's default.
-**AC:** mutation tests: deleting or bypassing any gate edge in any template fails; a gated effect with empty `requires_gates` fails; `review_gate -> merge -> closed` fails; the standard and regulated orders pass; the failing path is printed; G2 is added to the gate suite.
+**AC:** mutation tests: deleting or bypassing any gate edge in any template fails; a gated effect with empty `requires_gates` fails; `review_gate -> merge -> closed` fails; the standard and regulated orders pass; the failing path is printed; G2 is added to the gate suite. V6 refuses a merge followed by a `rejected` terminal with no QA gate on that path, because PLAN 7.7 says a rejected run blocks the release; V17 accepts that shape and leaves it to V6.
 **Deps:** D2-18, D1-11. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_gates.py`, `tests/config/test_validate_gates.py`, `tests/gates/test_static_dominance.py`.
 
 #### D2-05: Bundled templates
 Ship `standard` as the template, and Kanban and regulated as overlays on it, each with a README.
 All later suites run against all of them.
-**AC:** all validate; each has a README on when to use it, and which checks to require; PLAN.md examples match, or a test explains why not. The bundled policy names the `pre_push` and custom surfaces.
+**AC:** all validate; each has a README on when to use it, and which checks to require; PLAN.md examples match, or a test explains why not. The bundled policy names the `pre_push` and custom surfaces. The Kanban README shows `quorum: [{role: qa, count: 1}]`, which an org requiring `qa_gate` with role `qa` needs.
 **Deps:** D2-02, D2-03, D2-04. **Size:** S. **Run:** parallel. **Files:** `templates/`, `tests/config/test_templates.py`.
 
 #### D2-06: Reducer v1
@@ -581,7 +581,7 @@ Write an audit entry for each of those state changes in the same transaction. A 
 
 #### D3-08b: Decision comments and refused attempts
 Split out of D3-08's review: `DEC#` items keep the raw comment, which breaks PLAN.md 4.9's redaction before anything is stored, comments have no size cap, and nothing calls the refused-attempt path.
-**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record. A surrogate in a comment does not raise `UnicodeEncodeError`. Refused records have a named reader. Add token shapes `AIza`, `npm_`, `pypi-`, `hf_`, `ya29.` and `xapp-` to redaction.
+**AC:** a secret in a comment reaches neither the `DEC#` item nor the chain; an oversized comment is refused before any regex runs; each refused decision reaches `RefusedAttempts`, and a failure there never changes the decision's outcome; padding an attempt cannot erase its record. A surrogate in a comment does not raise `UnicodeEncodeError`. Refused records have a named reader. An invalid `at` on a refused record is refused or marked, not silently 0. Add token shapes `AIza`, `npm_`, `pypi-`, `hf_`, `ya29.` and `xapp-` to redaction.
 **Deps:** D3-08, D3-06. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_comment_redaction.py`.
 
 #### D3-09: DynamoDB store
@@ -599,8 +599,8 @@ This removes the PoC's read-everything list.
 #### D3-11: Outbox relay
 Deliver committed signals to the driver, retrying until delivered, treating "already closed" as success after a reconcile.
 This is the seam that G6 tests hardest, including a decision committing before the task token is stored.
-**AC:** G6: a crash after each write recovers and applies once; a stuck entry raises an alarm metric; ordering per run holds.
-**Deps:** D3-06, D1-03. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/relay.py`, `tests/gates/test_outbox_crash.py`.
+**AC:** G6: a crash after each write recovers and applies once; a stuck entry raises an alarm metric; ordering per run holds. A delivery failure reports `decision_recorded: true` only when this request's decision committed: today a refused decision on a closed gate says it too (`runtime.py:707-715`, `routers/gates.py:170-177`), and `test_delivery_failed_is_reported_on_every_attempt` pins it.
+**Deps:** D3-06, D1-03. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/relay.py`, `src/sto/api/runtime.py`, `src/sto/api/routers/gates.py`, `tests/gates/test_outbox_crash.py`.
 
 #### D3-12: Cognito triggers
 An Inbound federation trigger that rewrites groups on every sign-in, a Pre authentication fallback, a pre token trigger that normalises immutable group IDs, and a configuration guide for Entra ID, Okta and a generic SAML IdP.
@@ -693,7 +693,7 @@ It is written once, and every adapter in every later stage runs it.
 #### D4-16: Fake GitHub: auth and webhooks
 First part of an in-process fake: App auth, tokens, signatures, deliveries, pagination, rate limits and errors.
 Each behaviour is documented with its source URL, and the live suite later proves it.
-**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every fake then passes its port's sections. Checks in `tests/contract/suite.py`, which this issue may change: the running adapter must be a class really defined under `sto.`, and an adapter with no port exposes none of the ports' write methods (naming a different real class stays a known limit); `forge()` is consistent across kinds, so signatures differ, the truncated MAC is a prefix of the genuine one and the blank one is empty; harness self-checks catch a no-op `restart()` or `plant_foreign_marker`; a silent page cap of 34 or more fails, seeding deeper as needed; a declared vendor must match the adapter's module path. Dedupe does not expire for this fake, as D4-03 rules.
+**AC:** the conformance suite's auth and webhook sections can target it; fixtures are synthetic. It has no adapter of its own and must not write its own verifier. It owns the merged fakes' missing signature, dedupe, rate-limit and auth behaviour, recorded in PR #283; every vendor fake server under `tests/fakes/` then passes its port's sections through a real or reference adapter, and `sto.adapters.fake.*` are port doubles, not conformance targets. Checks in `tests/contract/suite.py`, which this issue may change: the running adapter must be a class really defined under `sto.`, and an adapter with no port exposes none of the ports' write methods (naming a different real class stays a known limit); `forge()` is consistent across kinds, so signatures differ, the truncated MAC is a prefix of the genuine one and the blank one is empty; harness self-checks catch a no-op `restart()` or `plant_foreign_marker`; a silent page cap of 34 or more fails, seeding deeper as needed; a declared vendor must match the adapter's module path. Dedupe does not expire for this fake, as D4-03 rules.
 **Deps:** D4-01. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/github/auth/`, `tests/fakes/github/webhooks/`, `tests/fakes/__init__.py`, `tests/fakes/github/__init__.py`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-02: Credential broker and GitHub auth port
@@ -711,13 +711,13 @@ Consumers treat the delivery as a nudge and re-read state.
 #### D4-04: GitHub webhooks
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
 Installation and permission events update connection state.
-**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading. The dedupe record does not expire, as D4-03 rules. The constant-time static check covers every signature comparison under `src/sto/adapters/`, not only this one, so Jira and Slack are held to it.
+**AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading. The dedupe record does not expire, as D4-03 rules. The constant-time static check covers every signature comparison under `src/sto/adapters/`, not only this one, so Jira and Slack are held to it. The conformance target is a class defined in `sto.ingest.github`, since the vendor check refuses a generic class from `sto/ingest/core.py`.
 **Deps:** D4-03, D4-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
 
 #### D4-05: GitHub issues as tickets
 `TicketSource` on issues: intake by label, comments, labels and `/sto` commands from linked users only, recording the actor from the issue's events.
 A closed state maps to `to_status_category: done`.
-**AC:** a command from an unlinked user is refused with a reply; a planted marker from another user does not suppress our comment (G9); idempotent after a crash.
+**AC:** a command from an unlinked user is refused with a reply; a planted marker from another user does not suppress our comment (G9); idempotent after a crash. The conformance suite's ticket-source sections pass on fake GitHub.
 **Deps:** D4-02, D4-04, D3-04. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/tickets.py`, `tests/adapters/github/test_tickets.py`.
 
 #### D4-06: SCM reads
@@ -778,7 +778,7 @@ The revert goes through normal review, and the run ends `done_with_incident`.
 #### D4-15: Live GitHub conformance
 Run the conformance suite against the real App on a throwaway repo, including a **hostile test that must not read a canary secret** before a human approves it.
 It is tagged, and its secrets are in a GitHub Environment with Peter as required reviewer, because a same-repo branch could otherwise edit the workflow. The worker identity is not on that reviewer list.
-**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself. The network guard has a live exemption that a typo in the target variable cannot enable by accident; a transport shim provokes `crash`, `swallow` and rate limits on demand; live keys are unique per run. A live suite needs a module-level `pytestmark`: `-m live` deselects a shared `{fake, live}` class, and `@pytest.mark.live` on a class exits 4. Correct the example at `suite.py:16-18`.
+**AC:** conformance passes live; no branch exists before the pre-push approval; the canary stays unread; App permissions are confirmed; differences from the fake are fixed in the fake; test repo cleans up after itself. The network guard has a live exemption that a typo in the target variable cannot enable by accident; a transport shim provokes `crash`, `swallow` and rate limits on demand; live keys are unique per run. A live suite needs a module-level `pytestmark`: `-m live` deselects a shared `{fake, live}` class, and `@pytest.mark.live` on a class exits 4. Correct the example at `suite.py:16-18`. The deep look-up test seeds 20,400 objects, about 41 hours at GitHub's 500 content-generating requests an hour, so live uses a persistent pre-seeded repo that the run does not clean up.
 **Deps:** D4-24, D4-05, D4-08, D4-26, D4-27. **Size:** M. **Run:** serial. **Files:** `tests/live/github/test_conformance.py`, `.github/workflows/live-github.yml`.
 
 #### D4-17: CI trust report
@@ -790,7 +790,7 @@ Anything it cannot prove stays `unknown`, because attestation fails closed. Fork
 #### D4-19: Fake GitHub: PRs and merges
 Fake pull requests, draft state, async merge with polling and `sha`, base updates through `POST /merges`, commit and ref APIs, and merge queue responses.
 It models the async API as the main path, with the behaviours marked unverified until D4-23.
-**AC:** async merge, a moved head, `enqueued` and conflict are all simulated; the conformance suite's SCM section can target it. It runs the suite's SCM section.
+**AC:** async merge, a moved head, `enqueued` and conflict are all simulated; the conformance suite's SCM section can target it. It runs the suite's SCM section. Give `pending_controls` a user here, or retire it and correct D4-01's tests, since no merged fake can reach it now.
 **Deps:** D4-16. **Size:** L. **Run:** parallel. **Files:** `tests/fakes/github/pulls/`.
 
 #### D4-20: Fake GitHub: checks, rulesets and dispatch
@@ -907,7 +907,7 @@ It matches the AgentCore command model, so tests stay meaningful.
 #### D5-07: Patch flow
 Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then hand-off to `branch.push` by effect, held in S3 until allowed. The harness checkpoints a patch at each worker turn, and caps commands per step.
 The sandbox never sees an SCM token.
-**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint. `ExecResult` is decoded text and the sandbox has no network, so capture with `git diff --binary | base64` through `exec`, never a raw diff or a presigned PUT. Capture arguments do not trust `.gitattributes` from the sandbox. Decide with D11-12 whether `start` takes a snapshot reference, since bytes hold up to 256 MB in memory. A command that exits normally is never swept, so `setsid daemon &` can outlive it: confirm nothing else is running before capture, using the provider's host-side count.
+**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint. `ExecResult` is decoded text and the sandbox has no network, so capture with `git diff --binary | base64` through `exec`, never a raw diff or a presigned PUT. Capture arguments do not trust `.gitattributes` from the sandbox. Decide with D11-12 whether `start` takes a snapshot reference, since bytes hold up to 256 MB in memory. A command that exits normally is never swept, so `setsid daemon &` can outlive it: confirm nothing else is running before capture, using the provider's host-side count. A blocked patch hands kind, path and line back to the agent to correct, so a block does not need a person.
 **Deps:** D5-06, D5-05, D4-07, D4-27. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/patch.py`, `src/sto/agents/tools/workspace.py`, `tests/workspace/test_patch.py`.
 
 #### D5-08: Triage, refine and plan profiles
@@ -1227,7 +1227,7 @@ This closes the [GH] parts of FF-01, FF-03, FF-04, FF-05 and FF-09, which D4-23 
 #### D8-13: Preview environments
 `env.deploy_preview`, a gated effect that triggers the team's preview deployment after the review gate, on the team's `test_domains`, so agentic QA has somewhere to run on unmerged code.
 It uses the same keyed dispatch as release.
-**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; a preview URL outside the team's `test_domains` is refused.
+**AC:** it needs a review approval; it waits for readiness at the SHA; a crash does not deploy twice; a preview URL outside the team's `test_domains` is refused; its `with` cannot name a production deployment, as D2-02 rules.
 **Deps:** D8-02, D8-11, D4-17. **Size:** S. **Run:** parallel. **Files:** `src/sto/effects/preview.py`, `tests/effects/test_preview.py`.
 
 #### D8-14: Surface parity
@@ -1283,14 +1283,14 @@ Validation here returns the same errors as the CLI.
 #### D9-20: Audit, org and resource APIs
 Routers for audit search and export, org policy, resource bindings, sandbox images, model catalog and kill switch.
 Only auditors and org admins can reach them, by role.
-**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier; a complete export does not depend on a run list the caller chose. Every `OrgPolicy` write is audited. `OrgPolicy.teams` is keyed by team or tag (PLAN.md), so reads resolve a team's tags as well as its name, and a write naming a team or tag that is not in the D9-03 registry is refused: a typo there would otherwise enforce nothing, silently.
-**Deps:** D3-03, D3-08, D9-03, D10-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/audit.py`, `src/sto/api/routers/org.py`, `src/sto/config/org_policy.py`, `tests/api/test_audit_org.py`.
+**AC:** auditors can change nothing; kill switch calls are audited, and confirm the blast radius; export matches the verifier; a complete export does not depend on a run list the caller chose. Every `OrgPolicy` write is audited. `OrgPolicy.teams` is keyed by team or tag (PLAN.md), so reads resolve a team's tags as well as its name, and a write naming a team or tag that is not in the D9-03 registry is refused: a typo there would otherwise enforce nothing, silently. A period export carries entries to the next checkpoint past the range, which proves where the period ends: a truncated or emptied period passes today. A team export including a run newer than the last checkpoint has a way through other than a fresh checkpoint. `check_against_checkpoints` and `counts` stop scaling as runs times heads.
+**Deps:** D3-03, D3-08, D9-03, D10-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/api/routers/audit.py`, `src/sto/api/routers/org.py`, `src/sto/config/org_policy.py`, `src/sto/audit/export.py`, `tests/api/test_audit_org.py`.
 
 #### D9-04: Live updates hook
 Cursor-based event reading with backoff, and an optional nudge channel port.
 If the socket fails, polling continues with no user-visible error.
-**AC:** a drop resumes without gaps or duplicates; a page on a throttled connection keeps responding to input; two open tabs both show the same events, in order. The live hook backs off on errors and pauses on a hidden tab.
-**Deps:** D9-02. **Size:** S. **Run:** parallel. **Files:** `web/src/live/`.
+**AC:** a drop resumes without gaps or duplicates; a page on a throttled connection keeps responding to input; two open tabs both show the same events, in order. The live hook backs off on errors and pauses on a hidden tab. Loaded pages of a list refresh their status, and newer runs appear without a reload (`pages/runs/index.tsx:33`).
+**Deps:** D9-02. **Size:** S. **Run:** parallel. **Files:** `web/src/live/`, `web/src/pages/runs/`.
 
 #### D9-05: My work page
 Open gates I can decide, my runs and blocked items, with counts.
