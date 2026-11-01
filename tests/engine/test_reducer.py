@@ -733,30 +733,86 @@ def test_qa_step_must_keep_the_reviewed_patch_id() -> None:
         next(play(*AT_QA_STEP), StepSucceeded(key("qa"), other_patch), WF)
 
 
-def test_a_gate_with_nothing_after_it_is_a_workflow_error() -> None:
+def test_a_gate_with_nothing_after_it_is_refused_like_a_step() -> None:
     wf = _one(
         Node("a", "step"),
         Node("g", "gate", gate_type=GateType.QA, decisions=frozenset({K.APPROVE})),
     )
     rs = next(next(new(), START, wf).state, StepSucceeded(key("a"), REV), wf).state
-    with pytest.raises(WorkflowMismatchError, match="nothing follows"):
+    with pytest.raises(OutOfOrderEventError, match="nothing follows"):
         next(rs, close("g", subject=REV), wf)
 
 
-@given(st.lists(st.sampled_from(_EVENTS), max_size=16))
-def test_a_merge_command_always_has_both_approvals(events: list[Any]) -> None:
-    rs = new()
-    for e in events:
-        try:
-            t = next(rs, e, WF)
-        except (OutOfOrderEventError, MalformedEventError):
-            continue
-        rs = t.state
-        for cmd in t.commands:
-            if isinstance(cmd, RunEffect):
-                assert cmd.requires_gates == ("review_gate", "qa_gate")
-                assert len(set(cmd.decision_ids)) == 2
-                assert {a.gate for a in rs.approvals} >= set(cmd.requires_gates)
+def _plausible(rs: RunState) -> list[Any]:
+    """Every kind of event aimed at the live position, plus a stale one, built from state."""
+    run, out = rs.run, [START, CancelRequested(RID), CancelCompleted(RID)]
+    stage = run.stage or "implement"
+    sha = f"sha{rs.visits and dict(rs.visits).get('implement', 1)}"
+    live = rs.subject
+    subject = REV if live is None else live
+    for fc in FailureClass:
+        out.append(StepFailed(key(stage, max(rs.visit, 1), max(rs.attempt, 1)), fc))
+    step_subject = (
+        subj(sha, f"ev-{rs.visit}")
+        if stage == "implement"
+        else (dataclasses.replace(live, evidence_digest=f"qa-{rs.visit}") if live else subject)
+    )
+    out.append(StepSucceeded(key(stage, max(rs.visit, 1), max(rs.attempt, 1)), step_subject))
+    out.append(StepSucceeded(key(stage, 99), step_subject))  # stale
+    for kind in DecisionKind:
+        gid = DecisionId.from_parts(10 * rs.round + list(DecisionKind).index(kind), bytes(10))
+        out.append(
+            GateClosed(RID, stage, rs.round, kind, "a", gid, None if kind.is_negative else live)
+        )
+    count = max(rs.count("merge"), 1)
+    out += [EffectConfirmed(RID, "pr.merge", count, "m1"), EffectFailed(RID, "pr.merge", count)]
+    return out
+
+
+def test_every_reachable_merge_has_exactly_the_live_approvals() -> None:
+    """Walk the state space breadth-first (visits capped at 2), from events aimed at the live
+    position. Asserts the merge is actually reached, and that every merge command carries the
+    decisions of the latest review and QA approvals, with no request-changes after them."""
+    seen: set[RunState] = {new()}
+    frontier: list[tuple[RunState, tuple[Any, ...]]] = [(new(), ())]
+    merges = done = 0
+    while frontier:
+        nxt: list[tuple[RunState, tuple[Any, ...]]] = []
+        for rs, history in frontier:
+            for event in _plausible(rs):
+                try:
+                    t = next(rs, event, WF)
+                except (OutOfOrderEventError, MalformedEventError):
+                    continue
+                done += t.state.run.status is RunStatus.DONE
+                path = (*history, event)
+                for cmd in t.commands:
+                    if not isinstance(cmd, RunEffect):
+                        continue
+                    merges += 1
+                    approved = {}
+                    for e in path:
+                        if isinstance(e, GateClosed) and e.kind in (K.APPROVE, K.WAIVE):
+                            approved[e.gate] = e.decision_id
+                        elif isinstance(e, GateClosed) and e.kind is K.REQUEST_CHANGES:
+                            approved.clear()
+                    assert cmd.requires_gates == ("review_gate", "qa_gate")
+                    assert cmd.decision_ids == (approved["review_gate"], approved["qa_gate"])
+                    assert cmd.subject == t.state.subject
+                if any(c > 2 for _, c in t.state.visits) or t.state in seen:
+                    continue
+                seen.add(t.state)
+                nxt.append((t.state, path))
+        frontier = nxt
+    assert merges > 0
+    assert done > 0
+    assert len(seen) > 30
+
+
+def test_merge_confirmation_refuses_a_blank_merge_sha() -> None:
+    for blank in ("", "   "):
+        with pytest.raises(MalformedEventError, match="merge_sha"):
+            next(MERGING, EffectConfirmed(RID, "pr.merge", 1, blank), WF)
 
 
 # --- workflow shapes the default one never exercises --------------------------------------------

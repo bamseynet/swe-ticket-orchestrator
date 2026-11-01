@@ -110,17 +110,16 @@ class Workflow:
         return self.nodes[i] if i < len(self.nodes) else None
 
 
-_REVIEW = frozenset(
+# PLAN 4.1: the review gate offers approve, request changes and reject only; QA adds waive
+# and retest (PLAN 4.2).
+_BASE_DECISIONS = frozenset(
     {
         DecisionKind.APPROVE,
-        DecisionKind.WAIVE,
         DecisionKind.REQUEST_CHANGES,
         DecisionKind.REJECT,
     }
 )
 
-# PLAN 4.1 / templates: the review gate offers approve, request changes and reject only.
-_REVIEW_DECISIONS = _REVIEW - {DecisionKind.WAIVE}
 
 # PLAN 3 default order: implement, review gate, QA, QA gate, then the merge. Request changes
 # at either gate goes back to implement, so the review gate runs again (PLAN 4.2); retest
@@ -133,7 +132,7 @@ LINEAR_V0 = Workflow(
             "review_gate",
             "gate",
             gate_type=GateType.REVIEW,
-            decisions=_REVIEW_DECISIONS,
+            decisions=_BASE_DECISIONS,
             on_changes="implement",
         ),
         Node("qa", "step"),
@@ -141,7 +140,7 @@ LINEAR_V0 = Workflow(
             "qa_gate",
             "gate",
             gate_type=GateType.QA,
-            decisions=_REVIEW | {DecisionKind.RETEST},
+            decisions=_BASE_DECISIONS | {DecisionKind.WAIVE, DecisionKind.RETEST},
             on_changes="implement",
             on_retest="qa",
         ),

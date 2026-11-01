@@ -34,7 +34,6 @@ from sto.engine.reducer import (
     RunState,
     Transition,
     Workflow,
-    WorkflowMismatchError,
     handles,
 )
 
@@ -281,7 +280,7 @@ def on_gate_closed(rs: RunState, event: GateClosed, wf: Workflow) -> Transition:
         kept = tuple(a for a in rs.approvals if a.gate != node.name) + (approval,)
         following = wf.after(node.name)
         if following is None:
-            raise WorkflowMismatchError(f"nothing follows gate {node.name!r}")
+            raise _out(f"nothing follows {node.name!r}")
         return _enter(dataclasses.replace(rs, run=resumed, approvals=kept), wf, following, None)
     if event.kind is DecisionKind.REJECT:
         rejected = resumed.advance(RunStatus.REJECTED)
@@ -304,7 +303,7 @@ def on_effect_confirmed(rs: RunState, event: EffectConfirmed, wf: Workflow) -> T
         raise _out(f"effect {event.effect!r} is not the current one")
     if event.visit != rs.count(node.name):
         raise _out("stale effect event")
-    if node.effect == "pr.merge" and event.merge_sha is None:
+    if node.effect == "pr.merge" and not (event.merge_sha or "").strip():
         raise MalformedEventError("a pr.merge confirmation must report merge_sha")
     return Transition(_with(rs, run.advance(RunStatus.DONE)), (Finish(run.id, RunStatus.DONE),))
 
