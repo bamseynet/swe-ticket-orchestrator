@@ -308,6 +308,15 @@ BYPASSES = {
     ),
     "browser_via_shell": 'import subprocess\nsubprocess.run("chromium --headless", shell=True)',
     "browser_via_env": 'import subprocess\nsubprocess.run(["env", "google-chrome", "--version"])',
+    "exec": 'import os\nos.execvp("docker", ["docker", "version"])',
+    "execl": 'import os\nos.execl("/usr/bin/env", "env", "docker", "ps")',
+    "spawnv": 'import os\nos.spawnv(os.P_WAIT, "/usr/bin/env", ["env", "docker", "ps"])',
+    "spawnlp": 'import os\nos.spawnlp(os.P_WAIT, "docker", "docker", "ps")',
+    "pty_spawn": 'import pty\npty.spawn(["docker", "ps"])',
+    "chained_shell": 'import subprocess\nsubprocess.run("cd /tmp && docker ps", shell=True)',
+    "env_with_assignment": (
+        'import subprocess\nsubprocess.run(["env", "FOO=1", "-i", "docker", "ps"])'
+    ),
 }
 
 
@@ -319,13 +328,28 @@ def test_guard_bypass_is_blocked(tmp_path: Path, name: str) -> None:
     assert "TierViolationError" in result.stdout
 
 
-def test_innocent_commands_are_not_blocked(tmp_path: Path) -> None:
-    source = """
+INNOCENT = [
+    'subprocess.run(["grep", "-r", "docker", "."], check=False)',
+    'subprocess.run("grep -r docker .", shell=True, check=False)',
+    'subprocess.run(["echo", "fix firefox"], check=True)',
+    "subprocess.run(\"echo 'fix firefox; docker ps'\", shell=True, check=True)",
+    'subprocess.run(["ls", "chrome-test-dir"], check=True)',
+    'subprocess.run(["cat", "node_modules/playwright/package.json"], check=True)',
+    'subprocess.run(["sh", "-c", "echo docker"], check=True)',
+    'assert os.system("echo chromium") == 0',
+]
+
+
+@pytest.mark.parametrize("call", INNOCENT)
+def test_innocent_commands_are_not_blocked(tmp_path: Path, call: str) -> None:
+    source = f"""
         import os, subprocess
-        def test_ok():
-            subprocess.run(["echo", "hello"], check=True)
-            subprocess.run("echo plain text", shell=True, check=True)
-            assert os.system("true") == 0
+        def test_ok(tmp_path, monkeypatch):
+            monkeypatch.chdir(tmp_path)
+            (tmp_path / "chrome-test-dir").mkdir()
+            (tmp_path / "node_modules" / "playwright").mkdir(parents=True)
+            (tmp_path / "node_modules" / "playwright" / "package.json").write_text("{{}}")
+            {call}
     """
     result = run_pytest(tmp_path, source)
     assert result.returncode == 0, result.stdout
@@ -423,6 +447,21 @@ def test_unit_job_runs_unit_only_and_coverage_measures_real_code() -> None:
         "source"
     ]
     assert {"sto", "tools", "scripts"} <= set(source)
+
+
+def test_coverage_omits_tests_but_not_scripts_named_test_something() -> None:
+    import fnmatch
+
+    omit = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["coverage"]["run"]["omit"]
+
+    def omitted(path: str) -> bool:
+        return any(fnmatch.fnmatch(str(ROOT / path), pat) for pat in omit)
+
+    assert not omitted("scripts/test_changed.py")
+    assert omitted("tests/test_tiers.py")
+    assert omitted("tests/scripts/test_doctor.py")
+    assert omitted("tools/backlog/test_sync_issues.py")
+    assert not omitted("tools/backlog/sync_issues.py")
 
 
 # ---- CI wiring and make targets ----

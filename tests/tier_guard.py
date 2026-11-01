@@ -16,6 +16,7 @@ This sits beside ``hermetic_guard`` and does not change its network and AWS guar
 from __future__ import annotations
 
 import os
+import pty
 import re
 import shlex
 import socket
@@ -83,38 +84,82 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         items[:] = kept
 
 
-def _words(args: Any) -> list[str]:
-    """Every word in a command: all argv items, each also split like a shell would."""
-    if isinstance(args, (str, bytes, os.PathLike)):
-        args = [args]
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "ash"}
+WRAPPERS = {"env", "sudo", "nice", "nohup", "command", "exec", "time", "timeout", "stdbuf"}
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _as_argv(command: Any) -> list[str]:
+    if isinstance(command, (str, bytes, os.PathLike)):
+        command = [command]
     try:
-        items = [os.fsdecode(a) for a in args]
+        return [os.fsdecode(a) for a in command]
     except TypeError:
         return []
-    words: list[str] = []
-    for item in items:
-        words.append(item)
-        try:
-            words.extend(shlex.split(item, posix=True))
-        except ValueError:
-            words.extend(item.split())
-        words.extend(w for w in re.split(r"[\s;&|()<>`$]+", item) if w)
-    return words
 
 
-def _program_kind(args: Any) -> str | None:
-    """'docker' or 'browser' when any word of the command launches one, else None.
+def _shell_segments(text: str) -> list[list[str]]:
+    """Split a shell string into simple commands at ; & | and newlines (quotes respected)."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
+    lexer.whitespace_split = True
+    segments: list[list[str]] = [[]]
+    try:
+        for token in lexer:
+            if token and set(token) <= set(";&|()\n"):
+                segments.append([])
+            else:
+                segments[-1].append(token)
+    except ValueError:  # unbalanced quotes: fall back to plain words
+        return [text.split()]
+    return [seg for seg in segments if seg]
 
-    Looks at every word, not only argv[0], so ``sh -c "docker ..."``, ``env docker`` and
-    ``shell=True`` strings are caught. Playwright is matched anywhere in a path, because its
-    driver is a ``node`` binary living under a ``playwright`` directory.
+
+def _programs(argv: list[str], *, shell_string: bool = False) -> list[str]:
+    """The programs a command actually runs: argv[0], through env-like wrappers and ``sh -c``."""
+    if shell_string:
+        return [p for seg in _shell_segments(" ".join(argv)) for p in _programs(seg)]
+    while argv and _ASSIGNMENT.match(argv[0]):
+        argv = argv[1:]
+    if not argv:
+        return []
+    base = os.path.basename(argv[0]).lower()
+    rest = argv[1:]
+    if base in WRAPPERS:
+        # Skip options and VAR=value words; the next word is the wrapped program.
+        i = 0
+        while i < len(rest) and (rest[i].startswith("-") or _ASSIGNMENT.match(rest[i])):
+            i += 1
+        return [argv[0], *_programs(rest[i:])]
+    if base in SHELLS:
+        for i, word in enumerate(rest):
+            if word.startswith("-") and not word.startswith("--") and "c" in word:
+                if i + 1 < len(rest):
+                    return [argv[0], *_programs([rest[i + 1]], shell_string=True)]
+                break
+        return [argv[0]]
+    return [argv[0]]
+
+
+def _kind(program: str) -> str | None:
+    base = os.path.basename(program).lower()
+    if base in DOCKER_PROGRAMS:
+        return "docker"
+    # Playwright's driver is a ``node`` binary under a ``playwright`` directory.
+    if any(hint in base for hint in BROWSER_HINTS) or "/playwright/" in program.lower():
+        return "browser"
+    return None
+
+
+def _program_kind(command: Any, *, shell_string: bool = False) -> str | None:
+    """'docker' or 'browser' when the command launches one, else None.
+
+    Only the program that is actually run counts (argv[0], the word after ``env``, the first word
+    of an ``sh -c`` or ``shell=True`` string), so ``grep docker`` and ``echo firefox`` pass.
     """
-    for word in _words(args):
-        base = os.path.basename(word).lower()
-        if base in DOCKER_PROGRAMS:
-            return "docker"
-        if any(hint in base for hint in BROWSER_HINTS) or "/playwright/" in word.lower():
-            return "browser"
+    for program in _programs(_as_argv(command), shell_string=shell_string):
+        kind = _kind(program)
+        if kind:
+            return kind
     return None
 
 
@@ -130,8 +175,8 @@ def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     docker_ok = node.get_closest_marker("integration") is not None
     browser_ok = node.get_closest_marker("ui_browser") is not None
 
-    def check(command: Any) -> None:
-        kind = _program_kind(command)
+    def check(command: Any, *, shell_string: bool = False) -> None:
+        kind = _program_kind(command, shell_string=shell_string)
         if kind == "docker" and not docker_ok:
             raise TierViolationError(
                 "this test uses Docker without @pytest.mark.integration; "
@@ -151,11 +196,11 @@ def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     original_connect_ex = socket.socket.connect_ex
 
     def guarded_init(self: Any, args: Any, *a: Any, **kw: Any) -> None:
-        check(args)
+        check(args, shell_string=bool(kw.get("shell")) or (len(a) > 7 and bool(a[7])))
         original_init(self, args, *a, **kw)
 
     def guarded_system(command: Any) -> int:
-        check(command)
+        check(command, shell_string=True)
         return original_system(command)
 
     def guarded_spawn(path: Any, argv: Any, *a: Any, **kw: Any) -> int:
@@ -180,6 +225,28 @@ def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
         guard_socket(address)
         return original_connect_ex(self, address)
 
+    def wrap_exec(original: Any, *, has_mode: bool) -> Any:
+        def guarded(*a: Any, **kw: Any) -> Any:
+            args = list(a[1:] if has_mode else a)
+            path, rest = (args[0], args[1:]) if args else ("", [])
+            listed = next((r for r in rest if isinstance(r, (list, tuple))), None)
+            words = list(listed) if listed is not None else [r for r in rest if isinstance(r, str)]
+            check([path, *words[1:]])
+            return original(*a, **kw)
+
+        return guarded
+
+    for name in dir(os):
+        if re.fullmatch(r"exec(l|v)p?e?", name) or re.fullmatch(r"spawn(l|v)p?e?", name):
+            monkeypatch.setattr(os, name, wrap_exec(getattr(os, name), has_mode=name[0] == "s"))
+
+    original_pty_spawn = pty.spawn
+
+    def guarded_pty_spawn(argv: Any, *a: Any, **kw: Any) -> Any:
+        check(argv)
+        return original_pty_spawn(argv, *a, **kw)
+
+    monkeypatch.setattr(pty, "spawn", guarded_pty_spawn)
     monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
     monkeypatch.setattr(os, "system", guarded_system)
     monkeypatch.setattr(os, "posix_spawn", guarded_spawn)

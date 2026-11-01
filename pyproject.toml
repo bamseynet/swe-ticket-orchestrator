@@ -46,11 +46,11 @@ pythonpath = ["src", "tests"]
 
 [tool.coverage.run]
 source = ["sto", "tools", "scripts"]
-omit = ["*/test_*.py"] # test files cover themselves; they would inflate the number
+omit = ["*/tests/*", "*/tools/*/test_*.py"] # test files cover themselves; scripts/test_changed.py is code
 branch = true
 
 [tool.coverage.report]
-# Measured at about 56% on the code that exists today (sto has no statements yet; the gap is
+# Measured at about 61% on the code that exists today (sto has no statements yet; the gap is
 # tools/backlog/sync_issues.py). The floor sits just under it and is ratcheted up as code
 # lands. Per-package floors (engine, gates, effects, budget highest) arrive with those packages.
-fail_under = 55
+fail_under = 58
