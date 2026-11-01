@@ -15,22 +15,23 @@ canonical JSON text; the version counter is a column.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+# One definition of the condition rules, shared with MemoryStore (private to the store package).
+from .memory import _holds
 from .ports import (
     MAIN,
-    Absent,
     Addr,
     Condition,
     ConditionFailedError,
     Delete,
-    Exists,
-    FieldEquals,
     Item,
     Key,
     Op,
@@ -38,7 +39,7 @@ from .ports import (
     Prepared,
     Put,
     Scope,
-    VersionIs,
+    TransactionConflictError,
     check_query_args,
     decode_cursor,
     encode_cursor,
@@ -52,8 +53,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
     partition TEXT NOT NULL,
     tbl       TEXT NOT NULL,
-    pk        TEXT NOT NULL,
-    sk        TEXT NOT NULL,
+    pk        BLOB NOT NULL,
+    sk        BLOB NOT NULL,
     data      TEXT NOT NULL,
     version   INTEGER NOT NULL,
     PRIMARY KEY (partition, tbl, pk, sk)
@@ -63,40 +64,61 @@ CREATE TABLE IF NOT EXISTS items (
 _BUSY_TIMEOUT_S = 30.0
 
 
-def _holds(condition: Condition | None, current: Item | None) -> bool:
-    match condition:
-        case None:
-            return True
-        case Absent():
-            return current is None
-        case Exists():
-            return current is not None
-        case VersionIs(version=v):
-            return current is not None and current.version == v
-        case FieldEquals(field=f, value=v):
-            if current is None or f not in current.data:
-                return False
-            actual = current.data[f]
-            return type(actual) is type(v) and actual == v  # 1 is not True, as in DynamoDB
-    raise TypeError(f"unknown condition {condition!r}")
+_SQLITE_BUSY, _SQLITE_LOCKED = 5, 6
 
 
-def _row_to_item(sk_key: Key, data: str, version: int) -> Item:
-    return Item(sk_key, json.loads(data), version)
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return bool(code & 0xFF in (_SQLITE_BUSY, _SQLITE_LOCKED))
+    return "locked" in str(exc) or "busy" in str(exc)
+
+
+def _b(text: str) -> bytes:
+    # Keys are stored as UTF-8 bytes (surrogates allowed) rather than TEXT: SQLite TEXT cannot
+    # hold a lone surrogate, and stops at NUL in substr(). Byte order equals code point order.
+    return text.encode("utf-8", "surrogatepass")
+
+
+def _s(blob: bytes) -> str:
+    return blob.decode("utf-8", "surrogatepass")
+
+
+def _json(data: dict[str, Any]) -> str:
+    return json.dumps(data, separators=(",", ":"))  # ASCII only: safe for any string content
 
 
 class SqliteStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, timeout: float = _BUSY_TIMEOUT_S) -> None:
         self._lock = threading.RLock()
         self._closed = False
         # isolation_level=None: we issue BEGIN/COMMIT ourselves. One connection guarded by a lock
         # serves all threads; the file lock covers other connections and processes.
         self._conn = sqlite3.connect(
-            str(path), timeout=_BUSY_TIMEOUT_S, isolation_level=None, check_same_thread=False
+            str(path), timeout=timeout, isolation_level=None, check_same_thread=False
         )
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute(_SCHEMA)
+        try:
+            self._init(timeout)
+        except BaseException:
+            self._conn.close()
+            raise
+
+    def _init(self, timeout: float) -> None:
+        # Switching to WAL on a fresh file needs a lock that the busy timeout does not always
+        # cover when several processes open it together, so retry until the deadline.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                self._conn.execute("PRAGMA synchronous=FULL")
+                if str(mode).lower() != "wal":
+                    raise RuntimeError(f"cannot use WAL journaling here (got {mode!r})")
+                self._conn.execute(_SCHEMA)
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
     def close(self) -> None:
         with self._lock:
@@ -111,17 +133,19 @@ class SqliteStore:
     def _read(self, addr: Addr) -> Item | None:
         row = self._conn.execute(
             "SELECT data, version FROM items WHERE partition=? AND tbl=? AND pk=? AND sk=?",
-            (addr.partition, addr.table, addr.pk, addr.sk),
+            (addr.partition, addr.table, _b(addr.pk), _b(addr.sk)),
         ).fetchone()
-        return None if row is None else _row_to_item(Key(addr.pk or "-", addr.sk), *row)
+        return (
+            None if row is None else Item(Key(addr.pk or "-", addr.sk), json.loads(row[0]), row[1])
+        )
 
     def get(self, scope: Scope, key: Key) -> Item | None:
         addr = resolve(require_scope(scope), require_key(key))
         with self._lock:
             self._check_open()
-            row = self._read(addr)
+            found = self._read(addr)
         # Rebuild with the caller's key (it may be the TEAM_ROOT pseudo pk, stored as "").
-        return None if row is None else Item(key, row.data, row.version)
+        return None if found is None else Item(key, found.data, found.version)
 
     def query(
         self,
@@ -140,24 +164,25 @@ class SqliteStore:
             None if cursor is None else decode_cursor(cursor, root.partition, table, pk, sk_prefix)
         )
         sql = "SELECT sk, data, version FROM items WHERE partition=? AND tbl=? AND pk=?"
-        args: list[Any] = [root.partition, table, root.pk]
-        if sk_prefix:  # substr, not LIKE: the prefix is literal
+        args: list[Any] = [root.partition, table, _b(root.pk)]
+        if sk_prefix:  # a byte-wise substr, not LIKE: the prefix is literal, NUL included
+            prefix = _b(sk_prefix)
             sql += " AND substr(sk, 1, ?) = ?"
-            args += [len(sk_prefix), sk_prefix]
+            args += [len(prefix), prefix]
         if after is not None:
             sql += " AND sk > ?"
-            args.append(after)
+            args.append(_b(after))
         sql += " ORDER BY sk"
         if limit is not None:
             sql += " LIMIT ?"
-            args.append(limit + 1)
+            args.append(min(limit, 2**62) + 1)  # SQLite integers are 64-bit
         with self._lock:
             self._check_open()
             rows = self._conn.execute(sql, args).fetchall()
         more = limit is not None and len(rows) > limit
         if limit is not None:
             rows = rows[:limit]
-        items = tuple(Item(Key(pk, sk, table), json.loads(data), v) for sk, data, v in rows)
+        items = tuple(Item(Key(pk, _s(sk), table), json.loads(d), v) for sk, d, v in rows)
         return Page(
             items,
             encode_cursor(root.partition, table, pk, sk_prefix, items[-1].key.sk) if more else None,
@@ -168,13 +193,22 @@ class SqliteStore:
         prepared = validate_ops(scope, tuple(ops))
         with self._lock:
             self._check_open()
-            self._conn.execute("BEGIN IMMEDIATE")  # take the write lock before reading
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")  # take the write lock before reading
+            except sqlite3.OperationalError as exc:
+                if _is_busy(exc):
+                    raise TransactionConflictError(f"store file is busy: {exc}") from exc
+                raise
             try:
                 self._apply(prepared)
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                # SQLite may already have rolled back by itself (full disk); only undo what is
+                # still open, and never let a rollback error hide the real one.
+                if self._conn.in_transaction:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
                 raise
-            self._conn.execute("COMMIT")
 
     def _apply(self, prepared: tuple[Prepared, ...]) -> None:
         current = {p.addr: self._read(p.addr) for p in prepared}
@@ -192,16 +226,16 @@ class SqliteStore:
                         (
                             a.partition,
                             a.table,
-                            a.pk,
-                            a.sk,
-                            json.dumps(d, separators=(",", ":"), ensure_ascii=False),
+                            _b(a.pk),
+                            _b(a.sk),
+                            _json(d),
                             1 if old is None else old.version + 1,
                         ),
                     )
                 case Prepared(op=Delete()):
                     self._conn.execute(
                         "DELETE FROM items WHERE partition=? AND tbl=? AND pk=? AND sk=?",
-                        (a.partition, a.table, a.pk, a.sk),
+                        (a.partition, a.table, _b(a.pk), _b(a.sk)),
                     )
 
     def put(
