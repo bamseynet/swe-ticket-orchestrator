@@ -1,7 +1,7 @@
-"""Smoke test for the e2e job (D0-09): the local stack's DynamoDB Local is up and answering.
+"""Placeholder for the e2e job (D0-09): the whole local stack is up and answering.
 
-The job selects by the ``e2e`` marker (anything under ``tests/e2e/`` is in that tier). This test
-also carries ``integration``. The walking-skeleton journey is ``test_skeleton.py`` (D1-10).
+Selected by path (``pytest -m integration tests/e2e``). It carries the ``integration`` marker
+because there is no ``e2e`` tier marker yet (D0-09a). D1-10 adds the walking-skeleton journey here.
 """
 
 from __future__ import annotations
