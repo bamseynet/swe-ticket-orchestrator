@@ -20,7 +20,8 @@ After a squash merge the frozen subject carries ``merge_sha``, so staging QA che
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Iterable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import assert_never
@@ -30,7 +31,7 @@ from sto.domain import Subject
 OLDER_BASE_NOTE = "evidence from an older base"
 
 # tested_sha -> the SHAs that deployment contains; None means "not known".
-Containment = Callable[[str], Collection[str] | None]
+Containment = Callable[[str], AbstractSet[str] | None]
 
 
 class Validity(StrEnum):
@@ -94,6 +95,16 @@ class EvidenceCheck:
         return tuple(seen)
 
 
+def _check_answer(held: object) -> None:
+    """A containment answer is a set of SHAs. A string, a generator or a list would make
+    ``merge_sha in held`` a substring test or lose members, so refuse them (fail closed)."""
+    if not isinstance(held, set | frozenset):
+        raise TypeError(f"containment answer must be a set, not {type(held).__name__}")
+    for sha in held:
+        if not isinstance(sha, str) or not sha.strip():
+            raise TypeError(f"containment answer members must be non-blank strings, not {sha!r}")
+
+
 def check_evidence(
     evidence: Evidence, subject: Subject, contained: Containment | None = None
 ) -> Verdict:
@@ -133,6 +144,7 @@ def check_evidence(
                 return Verdict(
                     evidence, False, f"containment of {evidence.tested_sha} is not known"
                 )
+            _check_answer(held)
             if subject.merge_sha not in held:
                 return Verdict(
                     evidence,

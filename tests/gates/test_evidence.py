@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
+from collections.abc import Set as AbstractSet
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -13,9 +13,7 @@ from sto.gates.evidence import (
     OLDER_BASE_NOTE,
     Containment,
     Evidence,
-    EvidenceCheck,
     Validity,
-    Verdict,
     check_all,
     check_evidence,
 )
@@ -42,19 +40,13 @@ def subject(**kw: object) -> Subject:
     return Subject(**base)  # type: ignore[arg-type]
 
 
-def ev(validity: Validity, **kw: object) -> Evidence:
-    base: dict[str, object] = {"tested_sha": HEAD, "patch_id": PATCH, "validity": validity}
-    base.update(kw)
-    return Evidence(**base)  # type: ignore[arg-type]
-
-
 PRE_PUSH = {"head_sha": None, "base_sha": OLD, "evidence_digest": None, "attention_digest": None}
 
 
-def fake_containment(answers: dict[str, Collection[str] | None]) -> Containment:
+def fake_containment(answers: dict[str, AbstractSet[str] | None]) -> Containment:
     """A hermetic stand-in for D8-02's answer. A sha it has no entry for is unknown."""
 
-    def contained(tested_sha: str) -> Collection[str] | None:
+    def contained(tested_sha: str) -> AbstractSet[str] | None:
         return answers.get(tested_sha)
 
     return contained
@@ -116,7 +108,7 @@ def test_validity_table(
 
 
 def test_exact_and_same_patch_never_consult_containment() -> None:
-    def boom(_: str) -> Collection[str] | None:
+    def boom(_: str) -> AbstractSet[str] | None:
         raise AssertionError("containment must only be asked for contains_sha")
 
     assert check_evidence(ev_(Validity.EXACT_SHA), subject(), boom).valid
@@ -158,7 +150,7 @@ def test_contains_sha_table(answer: set[str], valid: bool, notes: tuple[str, ...
 def test_contains_sha_asks_about_the_tested_sha() -> None:
     asked: list[str] = []
 
-    def contained(sha: str) -> Collection[str] | None:
+    def contained(sha: str) -> AbstractSet[str] | None:
         asked.append(sha)
         return {MERGE}
 
@@ -177,7 +169,10 @@ def test_contains_sha_without_an_answer_is_refused_not_valid() -> None:
     # unknown and empty are different facts, and the reasons say so
     assert "not known" in unknown.reason
     assert "lacks" in empty.reason
-    assert unknown.reason != empty.reason != no_resolver.reason
+    assert no_resolver.reason
+    assert unknown.reason != empty.reason
+    assert empty.reason != no_resolver.reason
+    assert unknown.reason != no_resolver.reason
 
 
 def test_contains_sha_before_a_merge_is_refused() -> None:
@@ -278,5 +273,64 @@ def test_records_are_frozen() -> None:
     for obj, field in ((e, "tested_sha"), (v, "valid"), (c, "verdicts")):
         with pytest.raises(FrozenInstanceError):
             setattr(obj, field, None)
-    assert isinstance(v, Verdict)
-    assert isinstance(c, EvidenceCheck)
+
+
+MERGED_BAD_ANSWERS = [
+    pytest.param(f"deployment does NOT contain {MERGE}", id="error-text-string"),
+    pytest.param(MERGE, id="bare-sha-string"),
+    pytest.param(iter([EXTRA, MERGE, NEW]), id="generator"),
+    pytest.param([MERGE, EXTRA], id="list"),
+    pytest.param((MERGE, EXTRA), id="tuple"),
+    pytest.param({MERGE, None}, id="none-member"),
+    pytest.param({MERGE, " "}, id="blank-member"),
+    pytest.param({MERGE, 7}, id="non-str-member"),
+]
+
+
+@pytest.mark.parametrize("answer", MERGED_BAD_ANSWERS)
+def test_a_malformed_containment_answer_raises_never_valid(answer: object) -> None:
+    e = ev_(Validity.CONTAINS_SHA, STAGING)
+    with pytest.raises(TypeError, match="containment"):
+        check_evidence(e, subject(**MERGED), lambda _: answer)  # type: ignore[arg-type,return-value]
+    with pytest.raises(TypeError, match="containment"):
+        check_all([e], subject(**MERGED), lambda _: answer)  # type: ignore[arg-type,return-value]
+
+
+def test_a_frozenset_answer_is_accepted() -> None:
+    contained = fake_containment({STAGING: frozenset({MERGE, EXTRA})})
+    verdict = check_evidence(ev_(Validity.CONTAINS_SHA, STAGING), subject(**MERGED), contained)
+    assert verdict.valid
+    assert verdict.notes == (f"also contains {EXTRA}",)
+
+
+def test_check_all_does_not_drop_an_unknown_verdict() -> None:
+    result = check_all(
+        [ev_(Validity.EXACT_SHA), ev_(Validity.CONTAINS_SHA, STAGING)],
+        subject(**MERGED),
+        fake_containment({}),
+    )
+    assert not result.valid
+    assert len(result.failures) == 1
+    assert "not known" in result.failures[0].reason
+
+
+class Boom(Exception):
+    pass
+
+
+def test_a_raising_containment_answer_propagates() -> None:
+    def contained(_: str) -> AbstractSet[str] | None:
+        raise Boom
+
+    e = ev_(Validity.CONTAINS_SHA, STAGING)
+    with pytest.raises(Boom):
+        check_evidence(e, subject(**MERGED), contained)
+    with pytest.raises(Boom):
+        check_all([e], subject(**MERGED), contained)
+
+
+def test_an_unknown_validity_is_a_bug_not_a_verdict() -> None:
+    e = ev_(Validity.EXACT_SHA)
+    object.__setattr__(e, "validity", "bogus")
+    with pytest.raises(AssertionError):
+        check_evidence(e, subject())
