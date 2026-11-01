@@ -5,14 +5,23 @@ takes team, run and step identity **from the claims**. No argument names a team 
 cannot ask for another team's rows. Refreshing a token needs the per-attempt secret that the
 dispatcher delivered at invoke (``(step, attempt)`` is guessable, the secret is not).
 
+The broker has **no signing power**: it holds a ``StepReissuer``, a narrow callback to the
+dispatcher that takes a verified context and returns a token. A broker that could sign could mint
+for any team.
+
 Rules, all fail-closed:
 
-* Reads, flags and refreshes are refused once the step is not live (ended, unknown or
+* Reads, flags and refreshes are refused once the step is not live (ended, superseded, unknown, or
   past its deadline).
-* A refresh copies the old token's context unchanged. It takes no claims, so it cannot widen
-  stage, tools, repo or SHA. The new expiry never passes the step's deadline.
+* A refresh passes the verified context unchanged, so it cannot widen stage, tools, repo or SHA. The
+  new token is verified again against the broker's pinned issuer, audience and algorithm, and must
+  carry the same context. The reissuer clamps the expiry to the deadline.
 * Only agent-readable ledger rows can be read (``READABLE_PREFIXES``), never ``TOK#`` rows.
 * The directory keeps a SHA-256 digest of each secret, compared in constant time.
+* A failing dependency (store, directory, flag sink, reissuer) propagates; nothing is swallowed.
+
+Note for later issues: "ledger" has two meanings. ``read_ledger`` covers run rows only; ``BUD#``
+rows are refused. D10-03 and D11-04 settle what an agent may read of the budget.
 """
 
 from __future__ import annotations
@@ -24,18 +33,18 @@ from dataclasses import dataclass
 from typing import Final, Protocol, runtime_checkable
 
 from sto.agents.step_token import (
-    DEFAULT_TTL,
     StepContext,
+    StepReissuer,
     StepToken,
     StepTokenError,
     StepTokenVerifier,
-    mint_step_token,
 )
-from sto.signing.port import Signer
 from sto.store.ports import Item, Key, Store, TeamScope
 
 SECRET_BYTES: Final = 32
-READABLE_PREFIXES: Final = ("TICKET#", "EV#", "ROUTE#", "STEP#")
+# Rows of the caller's own run that a session may read. Not STEP# (it holds other attempts' fences
+# and session IDs), and never TOK#, FX#, OUT#, CHAIN or META.
+READABLE_PREFIXES: Final = ("TICKET#", "EV#", "ROUTE#")
 MAX_SK_LEN: Final = 200
 MAX_FLAG_NAME: Final = 64
 MAX_FLAG_DETAIL: Final = 2048
@@ -52,15 +61,37 @@ class AttemptRecord:
     deadline: int
     live: bool = True
 
-    def __repr__(self) -> str:
+    def __post_init__(self) -> None:
+        if not isinstance(self.secret_digest, bytes) or len(self.secret_digest) != 32:
+            raise StepTokenError("invalid attempt record")
+        if type(self.deadline) is not int or self.deadline < 0:
+            raise StepTokenError("invalid attempt record")
+        if type(self.live) is not bool:
+            raise StepTokenError("invalid attempt record")
+
+    def __repr__(self) -> str:  # never show the digest
         return f"AttemptRecord(deadline={self.deadline}, live={self.live})"
 
 
 @runtime_checkable
 class AttemptDirectory(Protocol):
-    """Which step attempts are live, with the digest of each attempt's secret."""
+    """Which step attempts are live, with the digest of each attempt's secret.
 
-    def attempt(self, context: StepContext) -> AttemptRecord | None: ...
+    A *step* is ``(team, run, stage, visit)``; an *attempt* adds ``attempt``. Rules every
+    implementation must keep:
+
+    * Registering attempt N **supersedes** every lower attempt of the same step. Their ``attempt()``
+      reports ``live=False`` from then on, so attempt 1 cannot refresh or read once 2 is registered.
+    * Registering a lower attempt than one already registered, an attempt that has ended, or an
+      attempt that is already registered, is refused. An ended attempt is never revived.
+    * ``end()`` is permanent and also works **before** ``register()``: a cancel that arrives first
+      sticks, and the later ``register()`` is refused.
+    * ``deadline`` is an ``int`` (epoch seconds); anything else is refused.
+    """
+
+    def attempt(self, context: StepContext) -> AttemptRecord | None:
+        """The record, with ``live`` False once ended or superseded, or ``None`` if unknown."""
+        ...
 
 
 class InMemoryAttemptDirectory:
@@ -68,27 +99,43 @@ class InMemoryAttemptDirectory:
 
     def __init__(self) -> None:
         self._records: dict[tuple[str, str, str, int, int], AttemptRecord] = {}
+        self._latest: dict[tuple[str, str, str, int], int] = {}
+        self._ended: set[tuple[str, str, str, int, int]] = set()
 
     @staticmethod
-    def _key(c: StepContext) -> tuple[str, str, str, int, int]:
-        return (c.team, c.run, c.stage, c.visit, c.attempt)
+    def _step(c: StepContext) -> tuple[str, str, str, int]:
+        return (c.team, c.run, c.stage, c.visit)
+
+    @classmethod
+    def _key(cls, c: StepContext) -> tuple[str, str, str, int, int]:
+        return (*cls._step(c), c.attempt)
 
     def register(self, context: StepContext, secret: bytes, *, deadline: int) -> None:
         if not isinstance(secret, bytes) or len(secret) < SECRET_BYTES:
             raise StepTokenError("invalid attempt secret")
-        self._records[self._key(context)] = AttemptRecord(
-            secret_digest=hashlib.sha256(secret).digest(), deadline=deadline
-        )
+        record = AttemptRecord(secret_digest=hashlib.sha256(secret).digest(), deadline=deadline)
+        key = self._key(context)
+        if key in self._ended:
+            raise StepTokenError("attempt ended")
+        if key in self._records:
+            raise StepTokenError("attempt already registered")
+        if context.attempt <= self._latest.get(self._step(context), 0):
+            raise StepTokenError("attempt superseded")
+        self._records[key] = record
+        self._latest[self._step(context)] = context.attempt
 
     def end(self, context: StepContext) -> None:
-        record = self._records.get(self._key(context))
-        if record is not None:
-            self._records[self._key(context)] = AttemptRecord(
-                secret_digest=record.secret_digest, deadline=record.deadline, live=False
-            )
+        self._ended.add(self._key(context))
 
     def attempt(self, context: StepContext) -> AttemptRecord | None:
-        return self._records.get(self._key(context))
+        key = self._key(context)
+        record = self._records.get(key)
+        if record is None:
+            return None
+        current = self._latest[self._step(context)] == context.attempt
+        if key in self._ended or not current:
+            return AttemptRecord(record.secret_digest, record.deadline, live=False)
+        return record
 
 
 class FlagSink(Protocol):
@@ -99,19 +146,19 @@ class StepBroker:
     def __init__(
         self,
         *,
-        signer: Signer,
         verifier: StepTokenVerifier,
+        reissuer: StepReissuer,
         directory: AttemptDirectory,
         store: Store,
         flags: FlagSink,
-        ttl: int = DEFAULT_TTL,
     ) -> None:
-        self._signer = signer
+        if type(reissuer.ttl) is not int or not 0 < reissuer.ttl <= verifier.max_ttl:
+            raise StepTokenError("reissuer ttl must be positive and within the verifier's max_ttl")
         self._verifier = verifier
+        self._reissuer = reissuer
         self._directory = directory
         self._store = store
         self._flags = flags
-        self._ttl = ttl
 
     def _live(self, token: str, now: int) -> tuple[StepToken, AttemptRecord]:
         verified = self._verifier.verify(token, now=now)
@@ -149,11 +196,17 @@ class StepBroker:
         self._flags.raise_flag(verified.context, name, detail)
 
     def refresh(self, token: str, secret: bytes, *, now: int) -> str:
-        """Mint a new token with the same context, if the step is live and the secret is right."""
+        """Ask the dispatcher for a new token with the same context, if the step is live."""
         verified, record = self._live(token, now)
         if not isinstance(secret, bytes) or not hmac.compare_digest(
             hashlib.sha256(secret).digest(), record.secret_digest
         ):
             raise StepTokenError("bad attempt secret")
-        ttl = min(self._ttl, record.deadline - now)
-        return mint_step_token(self._signer, verified.context, now=now, ttl=ttl)
+        new = self._reissuer.reissue(verified.context, now=now)
+        # The reissuer is outside this process in a deployment: trust nothing it returns.
+        again = self._verifier.verify(new, now=now)
+        if again.context != verified.context:
+            raise StepTokenError("reissued token changed the context")
+        if again.exp > record.deadline:
+            raise StepTokenError("reissued token outlives the step")
+        return new

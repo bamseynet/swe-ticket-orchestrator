@@ -9,7 +9,7 @@ Verification fails closed. Every refusal raises ``StepTokenError`` with a stable
 * The algorithm is **pinned by the verifier**, never read from the token. A header that says
   ``none``, or the other family (an ``HS256`` token signed with a published RSA key, the
   key-confusion attack), is refused before any key is touched. The signature is then checked
-  as the pinned algorithm whatever the header claims.
+  as the pinned algorithm.
 * The header holds exactly ``alg``, ``kid``, ``typ``; ``jku``, ``jwk``, ``crit`` etc. are refused.
 * The payload holds exactly the claims below, each with its exact type. ``iss`` and ``aud`` must
   equal what the verifier was built for (``aud`` is a single string, not a list). A missing,
@@ -30,9 +30,9 @@ import binascii
 import json
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from sto.domain.errors import PermanentError
 from sto.signing.port import Signature, Signer, SigningError, Verifier
@@ -45,7 +45,15 @@ MAX_TTL: Final = 900
 MAX_LEEWAY: Final = 60
 MAX_TOKEN_BYTES: Final = 8 * 1024
 MAX_TOOLS: Final = 64
+MAX_TOOL_NAME: Final = 128
+MAX_JTI: Final = 64
 MIN_RSA_BITS: Final = 2048
+MAX_RSA_BITS: Final = 8192
+MIN_RSA_EXPONENT: Final = 65537
+# Private RSA/symmetric members (RFC 7517/7518). A document holding any of them is refused whole.
+PRIVATE_JWK_MEMBERS: Final = frozenset({"d", "p", "q", "dp", "dq", "qi", "oth", "k"})
+# Only these members are kept on load and returned by ``public_keys``.
+PUBLIC_JWK_MEMBERS: Final = ("kid", "kty", "alg", "use", "n", "e")
 
 _HEADER_KEYS = frozenset({"alg", "kid", "typ"})
 _CLAIMS = frozenset(
@@ -102,6 +110,8 @@ class StepContext:
                 raise _bad(f"invalid {name}")
             if not value.isprintable():
                 raise _bad(f"invalid {name}")
+        if "#" in self.team:  # a key separator in the store; keep it out of identities
+            raise _bad("invalid team")
         for name in ("visit", "attempt"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -111,7 +121,14 @@ class StepContext:
         if (
             not isinstance(self.tools, tuple)
             or len(self.tools) > MAX_TOOLS
-            or any(not isinstance(t, str) or not t or not t.isprintable() for t in self.tools)
+            or any(
+                not isinstance(t, str)
+                or not t
+                or len(t) > MAX_TOOL_NAME
+                or t != t.strip()
+                or not t.isprintable()
+                for t in self.tools
+            )
             or len(set(self.tools)) != len(self.tools)
         ):
             raise _bad("invalid tools")
@@ -158,8 +175,9 @@ def _json(raw: bytes) -> dict[str, Any]:
 
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=no_constant)
-    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
-        raise _bad("malformed token") from exc
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # ``from None``: ``__cause__`` of a JSONDecodeError holds the decoded payload text.
+        raise _bad("malformed token") from None
     if not isinstance(value, dict):
         raise _bad("malformed token")
     return value
@@ -206,13 +224,20 @@ def mint_step_token(
     sig = signer.sign(signing_input.encode("ascii"))
     if sig.algorithm != signer.algorithm or sig.key_id != signer.key_id:
         raise _bad("signer returned an inconsistent signature")
-    return f"{signing_input}.{_b64(sig.value)}"
+    token = f"{signing_input}.{_b64(sig.value)}"
+    if len(token) > MAX_TOKEN_BYTES:
+        raise _bad("token too large")
+    return token
 
 
 class StepTokenVerifier:
     """Checks tokens against one pinned algorithm, issuer and audience."""
 
     __slots__ = ("_algorithm", "_audience", "_issuer", "_leeway", "_max_ttl", "_verifier")
+
+    @property
+    def max_ttl(self) -> int:
+        return self._max_ttl
 
     def __init__(
         self,
@@ -286,13 +311,19 @@ class StepTokenVerifier:
             times[name] = value
         iat, nbf, exp = times["iat"], times["nbf"], times["exp"]
         jti = claims["jti"]
-        if not isinstance(jti, str) or not jti:
+        if (
+            not isinstance(jti, str)
+            or not jti
+            or len(jti) > MAX_JTI
+            or not jti.isascii()
+            or not jti.isprintable()
+        ):
             raise _bad("bad claims")
         if not iat <= nbf < exp or exp - iat > self._max_ttl:
             raise _bad("bad lifetime")
         if now >= exp + self._leeway:
             raise _bad("expired")
-        if now < nbf - self._leeway or now < iat - self._leeway:
+        if now < nbf - self._leeway:  # nbf >= iat, so this also covers iat
             raise _bad("not yet valid")
         tools = claims["tools"]
         if not isinstance(tools, list):
@@ -316,25 +347,44 @@ class StepTokenVerifier:
 
 
 def _int_from_b64(text: object) -> int:
-    if not isinstance(text, str):
-        raise SigningError("invalid JWKS key")
-    return int.from_bytes(_unb64_key(text), "big")
-
-
-def _unb64_key(text: str) -> bytes:
-    if not _B64URL.fullmatch(text):
+    if not isinstance(text, str) or not text or not _B64URL.fullmatch(text):
         raise SigningError("invalid JWKS key")
     try:
-        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-    except (binascii.Error, ValueError) as exc:
-        raise SigningError("invalid JWKS key") from exc
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (binascii.Error, ValueError):
+        raise SigningError("invalid JWKS key") from None
+    return int.from_bytes(raw, "big")
+
+
+def _public_jwk(jwk: Mapping[str, Any]) -> dict[str, str]:
+    """Validate one JWK and return only its allow-listed public members."""
+    if PRIVATE_JWK_MEMBERS & set(jwk):
+        raise SigningError("JWKS must not contain private key material")
+    kid = jwk.get("kid")
+    if not isinstance(kid, str) or not kid or not kid.isprintable():
+        raise SigningError("invalid JWKS key")
+    if jwk.get("kty") != "RSA" or jwk.get("alg") != "RS256":
+        raise SigningError("invalid JWKS key")
+    if "use" in jwk and jwk["use"] != "sig":
+        raise SigningError("invalid JWKS key")
+    if "key_ops" in jwk:
+        ops = jwk["key_ops"]
+        if not isinstance(ops, list) or "verify" not in ops:
+            raise SigningError("invalid JWKS key")
+    out = {name: jwk[name] for name in PUBLIC_JWK_MEMBERS if name in jwk}
+    if any(not isinstance(v, str) for v in out.values()):
+        raise SigningError("invalid JWKS key")
+    return out
 
 
 class JwksVerifier:
     """A ``Verifier`` built from a JWKS document: RSA public keys only, ``RS256`` only.
 
-    Holds no signing power. A key that is not RSA, not marked ``RS256``, too small, or has no
-    ``kid`` is refused when the document is loaded, so a bad document fails at startup.
+    Holds no signing power. A bad document fails at load, not when a token arrives: any private
+    member, a ``use`` other than ``sig``, ``key_ops`` without ``verify``, a non-printable or
+    repeated ``kid``, a modulus that is even or outside 2048..8192 bits, or an exponent below
+    65537. Members outside ``PUBLIC_JWK_MEMBERS`` (``x5u``, ``jku``, ...) are dropped, so
+    ``public_keys`` returns nothing the document did not need to publish.
     """
 
     __slots__ = ("_keys",)
@@ -349,20 +399,19 @@ class JwksVerifier:
         for jwk in raw:
             if not isinstance(jwk, Mapping):
                 raise SigningError("invalid JWKS key")
-            kid = jwk.get("kid")
-            if not isinstance(kid, str) or not kid or kid in keys:
+            public = _public_jwk(jwk)
+            kid = public["kid"]
+            if kid in keys:
                 raise SigningError("invalid JWKS key")
-            if jwk.get("kty") != "RSA" or jwk.get("alg") != "RS256":
+            n, e = _int_from_b64(public.get("n")), _int_from_b64(public.get("e"))
+            if not MIN_RSA_BITS <= n.bit_length() <= MAX_RSA_BITS or n % 2 == 0:
                 raise SigningError("invalid JWKS key")
-            if "d" in jwk or "p" in jwk or "q" in jwk:
-                raise SigningError("JWKS must not contain private key material")
-            n, e = _int_from_b64(jwk.get("n")), _int_from_b64(jwk.get("e"))
-            if n.bit_length() < MIN_RSA_BITS or e < 3 or e % 2 == 0:
+            if e < MIN_RSA_EXPONENT or e % 2 == 0 or e >= n:
                 raise SigningError("invalid JWKS key")
             try:
-                keys[kid] = (RSAPublicNumbers(e, n).public_key(), dict(jwk))
-            except ValueError as exc:
-                raise SigningError("invalid JWKS key") from exc
+                keys[kid] = (RSAPublicNumbers(e, n).public_key(), public)
+            except ValueError:
+                raise SigningError("invalid JWKS key") from None
         self._keys = keys
 
     def verify(self, message: bytes, signature: Signature) -> bool:
@@ -382,4 +431,64 @@ class JwksVerifier:
         return True
 
     def public_keys(self) -> Sequence[Mapping[str, str]]:
-        return tuple({k: str(v) for k, v in jwk.items()} for _, jwk in self._keys.values())
+        return tuple(dict(public) for _, public in self._keys.values())
+
+
+class StepReissuer(Protocol):
+    """The dispatcher's side of a refresh. The broker holds this, never a ``Signer``.
+
+    ``reissue`` takes only a verified context: it accepts no claim to change, so a refresh cannot
+    widen stage, tools, repo or SHA. The dispatcher clamps the new expiry to the attempt's deadline
+    and refuses a step that is not live. ``ttl`` is the lifetime it asks for before clamping.
+    """
+
+    @property
+    def ttl(self) -> int: ...
+
+    def reissue(self, context: StepContext, *, now: int) -> str: ...
+
+
+class InProcessReissuer:
+    """``StepReissuer`` for one host and for tests. A deployed broker calls the dispatcher instead.
+
+    ``deadline_of`` answers for a context with the attempt's deadline, or ``None`` if the attempt
+    is not live. It is the dispatcher's own record, not the broker's.
+    """
+
+    __slots__ = ("_audience", "_deadline_of", "_issuer", "_signer", "_ttl")
+
+    def __init__(
+        self,
+        signer: Signer,
+        deadline_of: Callable[[StepContext], int | None],
+        *,
+        issuer: str = ISSUER,
+        audience: str = AUDIENCE,
+        ttl: int = DEFAULT_TTL,
+    ) -> None:
+        if type(ttl) is not int or not 0 < ttl <= MAX_TTL:
+            raise _bad("invalid ttl")
+        self._signer = signer
+        self._deadline_of = deadline_of
+        self._issuer = issuer
+        self._audience = audience
+        self._ttl = ttl
+
+    @property
+    def ttl(self) -> int:
+        return self._ttl
+
+    def reissue(self, context: StepContext, *, now: int) -> str:
+        deadline = self._deadline_of(context)
+        if type(deadline) is not int:
+            raise _bad("step not live")
+        if now >= deadline:
+            raise _bad("step deadline passed")
+        return mint_step_token(
+            self._signer,
+            context,
+            now=now,
+            ttl=min(self._ttl, deadline - now),
+            issuer=self._issuer,
+            audience=self._audience,
+        )
