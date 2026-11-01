@@ -21,6 +21,7 @@ from sto.agents.models.scripted import ScriptedModel, ScriptExhaustedError, Tool
 from sto.domain.errors import PermanentError, TransientError
 
 OUTCOMES = ("approved", "needs_changes")
+NO_OUTCOME_CALLS = 3  # text-only turns get two retries; see the comment on _LIMITS
 
 
 def test_structured_outcome_from_a_declared_list() -> None:
@@ -80,9 +81,10 @@ def test_max_tokens_is_a_failure_not_a_result() -> None:
 
 
 def test_no_outcome_at_all_fails_the_step() -> None:
-    model = ScriptedModel([Turn.text("no outcome"), Turn.text("still none")])
-    with pytest.raises(StepFailedError):
+    model = ScriptedModel([Turn.text("no outcome")] * 20)
+    with pytest.raises(StepFailedError, match="limit"):
         run_stage(model, system_prompt="s", prompt="p", outcomes=OUTCOMES)
+    assert model.calls == NO_OUTCOME_CALLS  # the limit stopped it, not script exhaustion
 
 
 def test_script_exhaustion_is_loud() -> None:
@@ -184,17 +186,19 @@ def test_endless_malformed_outcomes_stop_after_one_retry() -> None:
     model = ScriptedModel([bad] * 300)
     with pytest.raises(StepFailedError):
         run_stage(model, system_prompt="s", prompt="p", outcomes=OUTCOMES)
-    assert model.calls <= 3  # first attempt plus one retry; a little slack for the forced call
+    assert model.calls == 2  # first attempt plus exactly one retry
 
 
 def test_a_tool_loop_hits_the_turn_limit_and_fails() -> None:
     model = ScriptedModel([Turn.tool_call("fine", {})] * 200)
     with pytest.raises(StepFailedError, match="limit"):
         run_stage(model, system_prompt="s", prompt="p", outcomes=OUTCOMES, tools=[fine])
-    assert model.calls < 100
+    assert model.calls == 10  # the turn limit, exactly
 
 
-@pytest.mark.parametrize("stop", ["content_filtered", "guardrail_intervened", "max_tokens"])
+@pytest.mark.parametrize(
+    "stop", ["content_filtered", "guardrail_intervened", "max_tokens", "cancelled"]
+)
 def test_a_bad_stop_reason_beats_an_outcome_in_the_same_turn(stop: str) -> None:
     from dataclasses import replace
 
@@ -248,7 +252,38 @@ def test_stage_outcome_rejects_extra_fields_and_empty_summary() -> None:
         StageOutcome.model_validate({"outcome": "approved", "summary": "x", "extra": 1})
     with pytest.raises(ValidationError):
         StageOutcome(outcome="approved", summary="")
+    with pytest.raises(ValidationError):
+        StageOutcome(outcome="approved", summary="  \n\t ")
 
 
 def test_outcome_tool_name_is_derived_from_the_model_class() -> None:
     assert StageOutcome.__name__ == OUTCOME_TOOL
+
+
+# --- review pass 2: errors raised after the first model call are wrapped by the SDK ---------------
+
+_THROTTLE = ModelThrottledException("slow down")
+_STO = TransientError("budget service busy")
+_MALFORMED = Turn.tool_call(OUTCOME_TOOL, {"outcome": 7})
+
+
+@pytest.mark.parametrize(
+    "script_before",
+    [
+        pytest.param([Turn.tool_call("fine", {})], id="after-a-tool"),
+        pytest.param([_MALFORMED], id="after-malformed-output"),
+        pytest.param([Turn.text("no outcome")], id="on-the-forced-retry"),
+    ],
+)
+class TestErrorsOnLaterCalls:
+    def test_throttling_stays_transient(self, script_before: list[Turn]) -> None:
+        model = ScriptedModel([*script_before, Turn.raising(_THROTTLE)])
+        with pytest.raises(StepThrottledError):
+            run_stage(model, system_prompt="s", prompt="p", outcomes=OUTCOMES, tools=[fine])
+        assert model.calls == 2
+
+    def test_sto_error_passes_through_unchanged(self, script_before: list[Turn]) -> None:
+        model = ScriptedModel([*script_before, Turn.raising(_STO)])
+        with pytest.raises(TransientError) as exc:
+            run_stage(model, system_prompt="s", prompt="p", outcomes=OUTCOMES, tools=[fine])
+        assert exc.value is _STO
