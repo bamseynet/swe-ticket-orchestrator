@@ -6,7 +6,8 @@
   local runs stay hermetic. CI jobs select them with ``-m``.
 * Docker use without the ``integration`` marker fails, and so does launching a browser without
   ``ui_browser``. Every word of a command is inspected (``sh -c``, ``env docker`` and
-  ``shell=True`` strings included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
+  ``shell=True`` strings, ``xargs``, backtick and ``$(...)`` substitutions and
+  ``Popen(executable=...)`` included), across ``Popen``, ``os.system``, ``os.posix_spawn[p]`` and
   ``connect``/``connect_ex`` on ``docker.sock``. A test under a ``gate(s)/`` or ``contract(s)/``
   directory is in that tier even without the marker.
 
@@ -86,6 +87,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "ash"}
 WRAPPERS = {"env", "sudo", "nice", "nohup", "command", "exec", "time", "timeout", "stdbuf"}
+XARGS_VALUE_OPTIONS = {"-I", "-i", "-n", "-P", "-L", "-l", "-s", "-d", "-E", "-e", "-a", "-R", "-S"}
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -114,16 +116,57 @@ def _shell_segments(text: str) -> list[list[str]]:
     return [seg for seg in segments if seg]
 
 
+def _substitutions(text: str) -> list[str]:
+    """Bodies of backtick and ``$(...)`` command substitutions (not inside single quotes)."""
+    found: list[str] = []
+    i, n, single = 0, len(text), False
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and not single:
+            i += 2
+            continue
+        if ch == "'":
+            single = not single
+        elif not single and ch == "`":
+            end = text.find("`", i + 1)
+            end = n if end < 0 else end
+            found.append(text[i + 1 : end])
+            i = end
+        elif not single and text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += (text[j] == "(") - (text[j] == ")")
+                j += 1
+            found.append(text[i + 2 : j - 1 if depth == 0 else j])
+            i = j - 1
+        i += 1
+    return found
+
+
+def _xargs_command(rest: list[str]) -> list[str]:
+    """The command ``xargs`` runs: ``rest`` without xargs's own options."""
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        i += 2 if rest[i] in XARGS_VALUE_OPTIONS else 1
+    return rest[i:]
+
+
 def _programs(argv: list[str], *, shell_string: bool = False) -> list[str]:
     """The programs a command actually runs: argv[0], through env-like wrappers and ``sh -c``."""
     if shell_string:
-        return [p for seg in _shell_segments(" ".join(argv)) for p in _programs(seg)]
+        text = " ".join(argv)
+        found = [p for seg in _shell_segments(text) for p in _programs(seg)]
+        for body in _substitutions(text):
+            found.extend(_programs([body], shell_string=True))
+        return found
     while argv and _ASSIGNMENT.match(argv[0]):
         argv = argv[1:]
     if not argv:
         return []
     base = os.path.basename(argv[0]).lower()
     rest = argv[1:]
+    if base == "xargs":
+        return [argv[0], *_programs(_xargs_command(rest))]
     if base in WRAPPERS:
         # Skip options and VAR=value words; the next word is the wrapped program.
         i = 0
@@ -196,7 +239,11 @@ def _tier_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     original_connect_ex = socket.socket.connect_ex
 
     def guarded_init(self: Any, args: Any, *a: Any, **kw: Any) -> None:
-        check(args, shell_string=bool(kw.get("shell")) or (len(a) > 7 and bool(a[7])))
+        shell = bool(kw.get("shell")) or (len(a) > 7 and bool(a[7]))
+        executable = kw.get("executable", a[1] if len(a) > 1 else None)
+        if executable is not None and not shell:
+            check([executable, *_as_argv(args)[1:]])  # executable replaces argv[0] as the program
+        check(args, shell_string=shell)
         original_init(self, args, *a, **kw)
 
     def guarded_system(command: Any) -> int:

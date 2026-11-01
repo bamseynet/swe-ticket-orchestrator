@@ -320,6 +320,35 @@ BYPASSES = {
 }
 
 
+# ---- D0-08a: remaining Docker launch gaps ----
+
+GAPS = {
+    "backtick_in_shell_string": 'import subprocess\nsubprocess.run("echo `docker ps`", shell=True)',
+    "dollar_paren_in_shell_string": (
+        'import subprocess\nsubprocess.run("echo $(docker ps)", shell=True)'
+    ),
+    "substitution_inside_double_quotes": (
+        "import subprocess\nsubprocess.run('echo \"$(docker ps)\"', shell=True)"
+    ),
+    "popen_executable": 'import subprocess\nsubprocess.Popen(["x", "ps"], executable="docker")',
+    "xargs_wrapper": 'import subprocess\nsubprocess.run(["xargs", "docker", "rm"], input=b"")',
+    "xargs_with_options": (
+        'import subprocess\nsubprocess.run(["xargs", "-n", "1", "-I", "{}", "docker", "rm", "{}"])'
+    ),
+    "xargs_in_shell_string": (
+        'import subprocess\nsubprocess.run("echo a | xargs -r docker rm", shell=True)'
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(GAPS))
+def test_docker_launch_gap_is_blocked(tmp_path: Path, name: str) -> None:
+    body = textwrap.indent(GAPS[name], "    ")
+    result = run_pytest(tmp_path, f"def test_gap():\n{body}\n")
+    assert result.returncode == 1, result.stdout
+    assert "TierViolationError" in result.stdout
+
+
 @pytest.mark.parametrize("name", sorted(BYPASSES))
 def test_guard_bypass_is_blocked(tmp_path: Path, name: str) -> None:
     body = textwrap.indent(BYPASSES[name], "    ")
@@ -337,6 +366,13 @@ INNOCENT = [
     'subprocess.run(["cat", "node_modules/playwright/package.json"], check=True)',
     'subprocess.run(["sh", "-c", "echo docker"], check=True)',
     'assert os.system("echo chromium") == 0',
+    "subprocess.run(\"echo 'literal `docker ps` and $(docker ps)'\", shell=True, check=True)",
+    'subprocess.run("echo `echo hi`", shell=True, check=True)',
+    'subprocess.run("echo $(echo hi)", shell=True, check=True)',
+    'subprocess.run(["echo", "$(docker ps)"], check=True)',
+    'subprocess.run(["echo", "x"], executable="/bin/echo", check=True)',
+    'subprocess.run(["xargs", "echo", "docker"], input=b"a", check=True)',
+    'subprocess.run(["xargs", "-n", "1", "echo"], input=b"docker", check=True)',
 ]
 
 
