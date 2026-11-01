@@ -17,14 +17,29 @@ scope, never the file's ``metadata.team``: a file that names another team is its
 a pure function of a flattened workflow and a policy, so publish, migrate and the live re-check
 all call the same code.
 
-A path ends successfully at a ``done`` or ``done_with_incident`` terminal, or at any terminal once
-``pr.merge`` or ``release.trigger`` has succeeded: a merged change is shipped whatever the
-terminal is called. The search starts at ``start`` and at ``on_external_commit`` (every ``ci``
-checks stage when it is unset), because a commit by someone else re-enters the run there. Only a
-gate's ``approved`` edge passes it; its other outcomes are followed, so a rejection that goes
-on to ``done`` is a bypass, while one that loops back to an earlier stage is not.
+The search starts at ``start`` and at ``on_external_commit`` (every ``ci`` checks stage when it
+is unset), because a commit by someone else re-enters the run there. Only a gate's ``approved``
+edge passes it; its other outcomes are followed. It assumes the structural rules (V1: every edge
+names a stage) already hold, and skips an edge to an unknown stage rather than guessing.
 
-``FLOOR_TRACKING`` lists every floor in the schema with the issue that enforces it. A test pins
+What counts as getting round a required gate, with its approval removed:
+
+* A gate that is not QA (V6, ADR-0005 item 12 allow only QA to follow a merge): any ``done`` or
+  ``done_with_incident`` terminal, or any successful ``pr.merge`` or ``release.trigger``,
+  whatever terminal follows it. A non-QA gate may not sit behind a merge.
+* A QA gate after a merge: ``done`` always. After the merge, ``closed`` or
+  ``done_with_incident`` counts too, unless the gate has answered something other than approval
+  since the last merge or release (another merge or release clears that), and the run then
+  opened a revert (``pr.open_revert``). A rejection that ends in ``rejected`` or ``expired`` is
+  fine. Wait timeouts are ignored once merged, as in V6. A merge that ends in a terminal with no
+  QA gate on that path is tolerated, as V6 tolerates it.
+* For an entry without ``when``, every merge or release downstream of the gate's approval lists
+  the gate in ``requires_gates``, so the gate cannot approve before there is code (V4 and V5 do
+  the rest). The walk from the approval stops at the first merge or release that lists the gate.
+  An entry with ``when`` relies on the ratchet of PLAN 4.3 instead, and every route on its field
+  must carry an ``order`` that contains the value, so the value cannot be missed.
+
+``FLOOR_TRACKING`` lists every floor in the schema with the issues that enforce it. A test pins
 it to the schema fields, so a new floor must be named here, and ``open_floor_report`` says which
 issue each unenforced floor waits for.
 """
@@ -47,6 +62,7 @@ from sto.config.schema import (
     RouteStage,
     SchemaError,
     TerminalStage,
+    WaitStage,
     Workflow,
     load_document,
 )
@@ -225,9 +241,13 @@ def allowed_carry_over(policy: OrgPolicy, team: str) -> frozenset[str] | None:
 
 # --- V17 -----------------------------------------------------------------------------------
 
-_SUCCESS = frozenset({"done", "done_with_incident"})
 _SHIPPING_EFFECTS = frozenset({"pr.merge", "release.trigger"})
-_State = tuple[str, bool, bool]  # (stage, a merge or release succeeded, the gate was reached)
+
+# Where a path is, for a QA gate that follows a merge.
+_NOT_SHIPPED = 0  # nothing merged yet
+_SHIPPED = 1  # merged (or released), and the gate has not answered since
+_ANSWERED = 2  # the gate answered something other than approval since the last merge
+_REVERTING = 3  # and a revert has been opened
 
 
 def _targets(edges: Mapping[str, str | Edge]) -> Iterable[tuple[str, str]]:
@@ -243,35 +263,88 @@ def _entry_points(wf: Workflow) -> list[str]:
 
 
 def _success_reachable_without(wf: Workflow, gate_id: str, when: tuple[str, str] | None) -> bool:
-    """Can a successful end be reached with ``gate_id`` never approved? With ``when`` =
-    (field, value), a route on that field takes only the edge for that value (its ``default`` if
-    none is named); every other edge is possible (PLAN 7.3: all edges count)."""
-    seen: set[_State] = set()
-    queue: deque[_State] = deque((sid, False, False) for sid in _entry_points(wf))
+    """Can the run get round ``gate_id`` with its approval removed? See the module docstring for
+    what counts. With ``when`` = (field, value), a route on that field takes only the edge for
+    that value (its ``default`` if none is named, and none at all if it has neither); every other
+    edge is possible (PLAN 7.3: all edges count)."""
+    gate = wf.stages[gate_id]
+    qa = isinstance(gate, GateStage) and gate.gate.type == "qa"
+    seen: set[tuple[str, int]] = set()
+    queue: deque[tuple[str, int]] = deque((sid, _NOT_SHIPPED) for sid in _entry_points(wf))
     while queue:
         state = queue.popleft()
-        sid, shipped, reached = state
-        if state in seen or sid not in wf.stages:
+        sid, phase = state
+        if state in seen or sid not in wf.stages:  # V1 has run: an unknown stage is not ours
             continue
         seen.add(state)
         stage = wf.stages[sid]
         if isinstance(stage, TerminalStage):
-            # After the gate has been reached, a merged change ending in a rejection is the gate
-            # doing its work (Kanban puts gates after the merge); only done still counts.
-            if stage.result in _SUCCESS or (shipped and not reached):
+            result = stage.result
+            if result == "done":
+                return True
+            if phase == _NOT_SHIPPED and result == "done_with_incident":
+                return True
+            if phase in (_SHIPPED, _ANSWERED) and result in ("done_with_incident", "closed"):
                 return True
             continue
         edges = dict(_targets(stage.next))
         if sid == gate_id:
             edges.pop("approved", None)  # approval is what passes it; everything else goes on
-            reached = True
+            if phase >= _SHIPPED:
+                phase = _ANSWERED
         if isinstance(stage, RouteStage) and when is not None and stage.field == when[0]:
             taken = edges.get(when[1], edges.get("default"))
             edges = {} if taken is None else {"taken": taken}
+        if phase >= _SHIPPED and isinstance(stage, WaitStage):
+            edges.pop("timeout", None)  # as V6: a timeout is not a way out once merged
+        if isinstance(stage, EffectStage) and stage.effect == "pr.open_revert":
+            phase = _REVERTING if phase == _ANSWERED else phase
+        ships = isinstance(stage, EffectStage) and stage.effect in _SHIPPING_EFFECTS
         for outcome, target in edges.items():
-            ships = isinstance(stage, EffectStage) and stage.effect in _SHIPPING_EFFECTS
-            queue.append((target, shipped or (ships and outcome == "done"), reached))
+            onward = phase
+            if ships and outcome == "done":
+                if not qa:
+                    return True  # only a QA gate may follow a merge
+                onward = _SHIPPED  # a new merge or release clears what the gate answered
+            queue.append((target, onward))
     return False
+
+
+def _shipping_effects_after(wf: Workflow, gate: GateStage, gate_id: str) -> list[str]:
+    """Merge and release stages that follow the gate's approval without requiring it.
+
+    The walk goes on past a merge or release only when it lists the gate. One that lists it is
+    the effect the approval is for, and what follows it (Kanban sends a stale release back round
+    through QA and the implementer to another merge) is judged by that effect's own claim."""
+    first = dict(_targets(gate.next)).get("approved")
+    seen: set[str] = set()
+    queue = deque([first] if first else [])
+    found: list[str] = []
+    while queue:
+        sid = queue.popleft()
+        if sid in seen or sid not in wf.stages:
+            continue
+        seen.add(sid)
+        stage = wf.stages[sid]
+        if isinstance(stage, TerminalStage):
+            continue
+        if isinstance(stage, EffectStage) and stage.effect in _SHIPPING_EFFECTS:
+            if gate_id not in (stage.requires_gates or ()):
+                found.append(sid)
+            continue
+        queue.extend(t for _, t in _targets(stage.next))
+    return sorted(found)
+
+
+def _routes_missing_value(wf: Workflow, field_name: str, value: str) -> list[str]:
+    """Routes on ``field_name`` whose ``order`` is absent or does not contain ``value``."""
+    return [
+        rid
+        for rid, st in wf.stages.items()
+        if isinstance(st, RouteStage)
+        and st.field == field_name
+        and (st.order is None or value not in st.order)
+    ]
 
 
 def _decided_by(stage: GateStage, role: str) -> bool:
@@ -318,16 +391,39 @@ def _required(wf: Workflow, entry: RequiredGate) -> list[Issue]:
             )
         ]
     when = (entry.when.field, entry.when.value) if entry.when else None
+    issues: list[Issue] = []
+    if entry.when is not None:
+        for rid in _routes_missing_value(wf, entry.when.field, entry.when.value):
+            issues.append(
+                Issue(
+                    None,
+                    f"stages.{rid}.order",
+                    f"org policy requires gate {entry.id}{cond}, so route {rid} needs an order "
+                    f"that contains {entry.when.value}; without it a value outside the order "
+                    "takes the default and skips the gate",
+                )
+            )
     if _success_reachable_without(wf, entry.id, when):
-        return [
+        issues.append(
             Issue(
                 None,
                 where,
-                f"org policy requires gate {entry.id}{cond}, but a path reaches a successful end "
-                f"without its approval; route every such path through {entry.id}",
+                f"org policy requires gate {entry.id}{cond}, but a path gets round its approval "
+                f"(to a successful end, or through a merge or release); route every such path "
+                f"through {entry.id}, and put any non-QA gate before the merge",
             )
-        ]
-    return []
+        )
+    if entry.when is None:
+        for eid in _shipping_effects_after(wf, stage, entry.id):
+            issues.append(
+                Issue(
+                    None,
+                    f"stages.{eid}.requires_gates",
+                    f"org policy requires gate {entry.id}, and {eid} comes after its approval; "
+                    f"add {entry.id} to requires_gates",
+                )
+            )
+    return issues
 
 
 def check_org_required_gates(wf: Workflow, policy: OrgPolicy, *, team: str) -> list[Issue]:
@@ -402,7 +498,7 @@ FLOOR_TRACKING: Mapping[str, FloorStatus] = {
     "floors.single_human_allowed": _one("D3-05"),
     "floors.requester_excluded_from": _one("D3-05"),
     "floors.mandatory_gate_roles": _one("D2-03"),
-    "floors.decision_surfaces": _one("D3-16"),
+    "floors.decision_surfaces": FloorStatus(("D2-03", "D3-16")),
     "floors.waive_allowed": _one("D2-03"),
     "floors.hold_after_approval_min": _one("D4-11"),
     "floors.require_up_to_date": _one("D4-11"),
