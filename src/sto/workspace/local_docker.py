@@ -27,8 +27,13 @@ Stated limits (this provider is for development and tests, not for hostile produ
 * Where Yama ``ptrace_scope`` is 0, code in the container can ptrace the sweep or inject into the
   keeper, and the task count cannot see that. CI logs ``ptrace_scope`` so we know what it proved.
   There is no seccomp profile here.
-* A hostile process can keep itself alive only by outrunning the sweep, and the repeated count
-  below makes that unlikely, not impossible.
+* Apart from ptrace, no way is known for code in the container to survive a session reported
+  clean: every live task in the cgroup is counted, whatever it does to its own name or state.
+* The readiness marker lives in writable ``/tmp``. A command that removes it makes ``is_alive``
+  False: the start looks unfinished (a transient error) and, past the stale threshold, the session
+  is rebuilt from the branch, losing unpushed work. At the pids limit ``is_alive`` can fail with a
+  retryable error while a leftover fork bomb runs. ``is_alive`` takes no lock, so a sweep can kill
+  the very ``test`` exec it is running; that also surfaces as a transient error.
 
 What is not classified: a command's own stderr. Whether a session still exists is asked of Docker
 (``docker ps``), never read out of what the command printed.
@@ -79,6 +84,9 @@ _CHUNK = 64 * 1024
 _KILL_GRACE_S = 2  # `timeout -k`: seconds between TERM and KILL inside the container
 _HOST_GRACE_S = 10  # host deadline sits this far above the in-container timeout
 _ADMIN_TIMEOUT_S = 60.0
+_START_TIMEOUT_S = _ADMIN_TIMEOUT_S  # docker start
+_EXTRACT_TIMEOUT_S = _ADMIN_TIMEOUT_S * 5  # unpacking the snapshot
+_MARK_TIMEOUT_S = _ADMIN_TIMEOUT_S  # writing the readiness marker
 _PULL_TIMEOUT_S = 600.0
 _SWEEP_TIMEOUT_S = 30.0
 _READY = "/tmp/.sto-ready"  # noqa: S108 - written inside the container after the snapshot is unpacked
@@ -88,7 +96,9 @@ _MAX_SAMPLES = 15
 _SAMPLE_PAUSE_S = 0.2
 _SETTLE_CHECKS = 3
 _SETTLE_PAUSE_S = 0.5
-_STALE_START_S = 300.0  # an unfinished start older than this is a crashed one and is taken over
+# An unfinished start older than this is a crashed one and is taken over. It must exceed the
+# slowest legitimate start (start + unpack + mark, measured from the container's creation).
+_STALE_START_S = _START_TIMEOUT_S + _EXTRACT_TIMEOUT_S + _MARK_TIMEOUT_S + 60.0
 _EXIT_TIMEOUT = 124  # `timeout` when the command timed out
 _EXIT_KILLED = 137  # 128 + SIGKILL, when `-k` had to escalate
 _WORKSPACE = "/workspace"
@@ -242,6 +252,10 @@ def run_capped(
     )
 
 
+class _StatsTimeout(Exception):
+    """`docker stats` did not answer in time."""
+
+
 class LocalDockerProvider:
     """``WorkspaceProvider`` backed by one local container per session."""
 
@@ -355,8 +369,10 @@ class LocalDockerProvider:
     def _clear_leftover(self, session_id: str, name: str, state: str) -> None:
         """Make the name free, or say why not. Never touches a start that is still in progress."""
         if state in ("exited", "dead"):
-            # A dead leftover. No `-f`: if it is not dead any more, someone else owns the name.
-            if not self._remove(name, force=False) and self._state(session_id) != "absent":
+            # A dead leftover, removed by the id we inspected (the name may already belong to a
+            # peer's new container) and without `-f` (it may have been restarted since).
+            cid, _age = self._age_s(name)
+            if not self._remove(cid, force=False) and self._state(session_id) != "absent":
                 raise SessionExistsError("session already exists")
             return
         if state == "running" and self._ready(name, session_id):
@@ -383,15 +399,15 @@ class LocalDockerProvider:
                 raise SessionExistsError("session was created by another caller")
             raise self._fail(f"could not create the workspace container: {created.stderr[:500]}")
         try:
-            started = self._call("start", cid)
+            started = self._call("start", cid, timeout_s=_START_TIMEOUT_S)
             if started.exit_code != 0:
                 raise self._fail(f"could not start the workspace container: {started.stderr[:500]}")
             extracted = self._call(
-                *self._extract_args(cid), timeout_s=_ADMIN_TIMEOUT_S * 5, stdin=plain
+                *self._extract_args(cid), timeout_s=_EXTRACT_TIMEOUT_S, stdin=plain
             )
             if extracted.exit_code != 0:
                 raise self._fail(f"could not unpack the snapshot: {extracted.stderr[:500]}")
-            marked = self._call("exec", cid, "touch", _READY)
+            marked = self._call("exec", cid, "touch", _READY, timeout_s=_MARK_TIMEOUT_S)
             if marked.exit_code != 0:
                 raise self._fail(f"could not mark the workspace ready: {marked.stderr[:500]}")
         except BaseException:
@@ -491,7 +507,10 @@ class LocalDockerProvider:
             )  # fmt: skip
         # `timeout` reports 124 (or 137 after -k); only the clock tells that from a command that
         # exits with those codes itself, or is killed by the OOM killer.
-        killed_at_cap = res.truncated and res.exit_code is None  # else: finished, text re-capped
+        client_killed = (
+            res.exit_code is not None and res.exit_code < 0
+        )  # e.g. the host's OOM killer
+        killed_at_cap = (res.truncated and res.exit_code is None) or client_killed
         hit_timeout = (
             not killed_at_cap
             and res.exit_code in (_EXIT_TIMEOUT, _EXIT_KILLED)
@@ -538,13 +557,19 @@ class LocalDockerProvider:
     def _tasks(self, name: str) -> int | None:
         """Tasks in the container cgroup (threads and zombies included), counted by the host."""
         res = self._call("stats", "--no-stream", "--format", "{{.PIDs}}", name)
+        if res.timed_out:
+            raise _StatsTimeout  # a hung daemon: do not wait out every remaining sample
         text = res.stdout.strip()
         return int(text) if res.exit_code == 0 and text.isdigit() else None
 
     def _host_sees_quiet(self, name: str) -> bool:
         streak = 0
         for _ in range(_MAX_SAMPLES):
-            streak = streak + 1 if self._tasks(name) == _BASELINE_TASKS else 0
+            try:
+                count = self._tasks(name)
+            except _StatsTimeout:
+                return False
+            streak = streak + 1 if count == _BASELINE_TASKS else 0
             if streak >= _QUIET_SAMPLES:
                 return True
             self._sleep(_SAMPLE_PAUSE_S)

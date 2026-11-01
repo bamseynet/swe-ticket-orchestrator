@@ -30,6 +30,10 @@ from pathlib import Path
 import pytest
 
 from sto.workspace.local_docker import (
+    _EXTRACT_TIMEOUT_S,
+    _MARK_TIMEOUT_S,
+    _STALE_START_S,
+    _START_TIMEOUT_S,
     ENV_ALLOWLIST,
     SWEEP_BODY,
     SWEEP_SCRIPT,
@@ -333,6 +337,19 @@ def test_ensure_session_only_starts_a_dead_session_and_never_stops_it_first() ->
     assert rec.calls == ["start"]
 
 
+def test_ensure_session_losing_a_race_to_an_unfinished_peer_is_a_retry() -> None:
+    class Unfinished(FakeWorkspaceProvider):
+        def is_alive(self, session_id: str) -> bool:
+            return False  # the peer exists but has not finished unpacking
+
+        def start(self, session_id: str, snapshot: bytes) -> None:
+            raise SessionExistsError("peer won")
+
+    with pytest.raises(WorkspaceUnavailableError) as raised:
+        ensure_session(Unfinished(), SID, "b", lambda _b: pack_snapshot({}))
+    assert raised.value.retryable
+
+
 def test_ensure_session_accepts_losing_a_creation_race() -> None:
     class Raced(FakeWorkspaceProvider):
         def __init__(self) -> None:
@@ -526,6 +543,8 @@ class FakeDocker:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.stdins: list[bytes | None] = []
+        self.timeouts: list[float] = []
+        self.stats_hang = False  # `docker stats` never answers (the runner reports a timeout)
         self.containers: dict[str, Box] = {}
         self.down = False
         self.down_on: str | None = None  # the daemon dies as this verb is called
@@ -564,6 +583,7 @@ class FakeDocker:
         args = list(argv)
         self.calls.append(args)
         self.stdins.append(stdin)
+        self.timeouts.append(timeout_s)
         verb = args[1]
         if verb == self.down_on:
             self.down = True
@@ -593,6 +613,8 @@ class FakeDocker:
         return ok(f"{box.cid} {created}\n")
 
     def _stats(self, args: list[str]) -> ExecResult:
+        if self.stats_hang:
+            return ExecResult(None, "", "", timed_out=True, truncated=False)
         count = self.task_counts.pop(0) if len(self.task_counts) > 1 else self.task_counts[0]
         return ok(f"{count}\n")
 
@@ -811,6 +833,81 @@ def test_losing_the_create_race_is_session_exists_so_ensure_session_does_not_blo
     assert ensure_session(provider, SID, "b", lambda _b: pack_snapshot({})) is False
 
 
+def test_a_dead_leftover_is_removed_by_id_so_a_peers_new_container_is_never_deleted(
+    provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    docker.containers[NAME] = Box(OTHER, "exited")
+    original = docker._rm  # noqa: SLF001
+    peer = Box(f"{77:064x}", "created", created=docker.wall_time)
+
+    def peer_replaces_it(args: list[str]) -> ExecResult:
+        docker.containers[NAME] = peer  # the peer removed the leftover and created its own
+        return original(args)
+
+    docker._rm = peer_replaces_it  # type: ignore[method-assign]  # noqa: SLF001
+    with pytest.raises(SessionExistsError):
+        provider.start(SID, pack_snapshot({}))
+    assert docker.containers[NAME] is peer
+
+
+def test_losing_the_create_race_to_a_peer_that_is_still_unpacking_is_a_retry_not_a_block(
+    provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    # The usual case: both callers see the name absent, the peer's create wins, ours conflicts,
+    # and the peer is still created/unpacking, so it is not ready yet.
+    peer = Box(OTHER, "created", created=docker.wall_time)
+    first = {"ps": True}
+    original_ps, original_create = docker._ps, docker._create  # noqa: SLF001
+
+    def ps_once_absent(args: list[str]) -> ExecResult:
+        if first.pop("ps", False):
+            return ok("")
+        return original_ps(args)
+
+    def peer_wins(args: list[str]) -> ExecResult:
+        docker.containers[NAME] = peer
+        return original_create(args)  # a real "Conflict. The container name ... is in use"
+
+    docker._ps = ps_once_absent  # type: ignore[method-assign]  # noqa: SLF001
+    docker._create = peer_wins  # type: ignore[method-assign]  # noqa: SLF001
+    with pytest.raises(WorkspaceUnavailableError) as raised:
+        ensure_session(provider, SID, "b", lambda _b: pack_snapshot({}))
+    assert raised.value.retryable
+    assert "rm" not in docker.verbs()
+    assert docker.containers[NAME] is peer
+
+
+def test_a_docker_client_killed_by_a_signal_is_a_killed_command_not_a_signal_number(
+    live_provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    docker.exec_script["cmd"] = (ExecResult(-9, "", "", False, False), 0.0)
+    res = live_provider.exec(SID, "cmd", timeout_s=30)
+    assert res.exit_code is None  # never -9
+    assert not res.session_destroyed
+    assert len(docker.sweeps()) == 1  # the command may still be running in the container
+
+
+def test_the_stale_threshold_exceeds_the_slowest_legitimate_start(
+    provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    assert _STALE_START_S > _START_TIMEOUT_S + _EXTRACT_TIMEOUT_S + _MARK_TIMEOUT_S
+    provider.start(SID, pack_snapshot({}))
+    by_verb = {c[1] + (c[5] if c[1] == "exec" and c[2] == "-i" else ""): t
+               for c, t in zip(docker.calls, docker.timeouts, strict=True)}  # fmt: skip
+    assert by_verb["start"] == _START_TIMEOUT_S
+    assert _EXTRACT_TIMEOUT_S in docker.timeouts  # the unpack
+    assert docker.timeouts[-1] == _MARK_TIMEOUT_S  # the marker is the last call
+
+
+def test_a_hung_stats_call_gives_up_at_once_instead_of_waiting_out_every_sample(
+    live_provider: LocalDockerProvider, docker: FakeDocker
+) -> None:
+    docker.stats_hang = True
+    res = _swept(live_provider, docker)
+    assert res.session_destroyed
+    assert docker.verbs().count("stats") == 1
+
+
 def test_a_young_unfinished_start_is_transient_and_is_left_alone(
     provider: LocalDockerProvider, docker: FakeDocker
 ) -> None:
@@ -861,7 +958,7 @@ def test_a_dead_leftover_is_removed_without_force(
     docker.containers[NAME] = Box(OTHER, state)
     provider.start(SID, pack_snapshot({}))
     rm = next(c for c in docker.calls if c[1] == "rm")
-    assert rm == ["docker", "rm", "-v", NAME]  # no -f: a live container would be refused
+    assert rm == ["docker", "rm", "-v", OTHER]  # by the id we inspected, and no -f
     assert docker.containers[NAME].cid == CID
 
 
@@ -1100,8 +1197,12 @@ def test_a_sigkill_exit_is_rechecked_because_a_killed_keeper_stops_the_container
     docker: FakeDocker,
 ) -> None:
     # Docker still says "running" for a moment after the keeper dies; the next look says exited.
+    looks = {"n": 0}
+
     def flip(_seconds: float) -> None:
-        docker.containers[NAME].state = "exited"
+        looks["n"] += 1
+        if looks["n"] == 3:  # only the third look sees it, so fewer looks would miss it
+            docker.containers[NAME].state = "exited"
 
     provider = LocalDockerProvider(
         image=IMAGE,
@@ -1434,11 +1535,17 @@ def live(docker_provider: LocalDockerProvider) -> LocalDockerProvider:
     return docker_provider
 
 
-def stable(p: LocalDockerProvider, path: str) -> tuple[str, str]:
-    """A marker file's content, then again after a pause: equal means its writer is gone."""
-    first = p.exec("itest-main", f"cat {path}").stdout
+def size(p: LocalDockerProvider, path: str) -> int:
+    out = p.exec("itest-main", f"wc -c < {path}").stdout.strip()
+    return int(out) if out.isdigit() else -1
+
+
+def stable(p: LocalDockerProvider, path: str) -> tuple[int, int]:
+    """A marker's size, then again after a pause. Writers append, so equal sizes mean the writer
+    is gone, and a kill between truncate and write (which empties a file) cannot fake a result."""
+    first = size(p, path)
     time.sleep(1.5)
-    return first, p.exec("itest-main", f"cat {path}").stdout
+    return first, size(p, path)
 
 
 @pytest.mark.integration
@@ -1552,8 +1659,8 @@ def test_docker_container_has_no_host_credentials(
 @pytest.mark.integration
 def test_docker_timeout_leaves_nothing_running(live: LocalDockerProvider) -> None:
     command = (
-        "(trap '' TERM; while :; do date +%s%N > /workspace/m_term; sleep 0.1; done) & "
-        "setsid sh -c 'while :; do date +%s%N > /workspace/m_setsid; sleep 0.1; done' & "
+        "(trap '' TERM; while :; do date +%s%N >> /workspace/m_term; sleep 0.1; done) & "
+        "setsid sh -c 'while :; do date +%s%N >> /workspace/m_setsid; sleep 0.1; done' & "
         "sleep 100"
     )
     start = time.monotonic()
@@ -1563,21 +1670,21 @@ def test_docker_timeout_leaves_nothing_running(live: LocalDockerProvider) -> Non
     assert time.monotonic() - start < 60
     for marker in ("m_term", "m_setsid"):
         before, after = stable(live, f"/workspace/{marker}")
-        assert before != "", f"{marker}: the child never ran, so the test proves nothing"
+        assert before > 0, f"{marker}: the child never ran, so the test proves nothing"
         assert before == after, f"{marker} is still being written: a child survived the timeout"
     assert live.exec("itest-main", "echo usable").stdout == "usable\n"
 
 
 @pytest.mark.integration
 def test_docker_output_cap_leaves_nothing_running(live: LocalDockerProvider) -> None:
-    command = "(while :; do date +%s%N > /workspace/m_cap; sleep 0.1; done) & yes 0123456789"
+    command = "(while :; do date +%s%N >> /workspace/m_cap; sleep 0.1; done) & yes 0123456789"
     res = live.exec("itest-main", command, timeout_s=60, max_output_bytes=2000)
     assert res.truncated
     assert res.exit_code is None
     assert not res.timed_out
     assert not res.session_destroyed, res
     before, after = stable(live, "/workspace/m_cap")
-    assert before != ""
+    assert before > 0
     assert before == after, "a background writer survived the output cap"
     # nothing writes into /workspace while the next command (or a patch capture) runs
     assert live.exec("itest-main", "ls /workspace").stdout.split() == [
@@ -1592,7 +1699,7 @@ m = sys.argv[1]
 def work():
     end = time.time() + float(sys.argv[2])
     while time.time() < end:
-        open(m, "w").write(str(time.time())); time.sleep(0.05)
+        open(m, "a").write(str(time.time()) + "\\n"); time.sleep(0.05)
     os._exit(0)
 threading.Thread(target=work, daemon=True).start()
 time.sleep(0.2)
@@ -1609,12 +1716,12 @@ except OSError as exc:
 open("/workspace/comm_status", "w").write(status)
 end = time.time() + float(sys.argv[2])
 while time.time() < end:
-    open(sys.argv[1], "w").write(str(time.time())); time.sleep(0.05)
+    open(sys.argv[1], "a").write(str(time.time()) + "\\n"); time.sleep(0.05)
 """,
     # Every generation writes, forks its successor and exits: the PID keeps changing.
     "hop.py": b"""import os, sys, time
 while True:
-    open(sys.argv[1], "w").write(str(time.time()))
+    open(sys.argv[1], "a").write(str(time.time()) + "\\n")
     if os.fork():
         os._exit(0)
     time.sleep(0.02)
@@ -1634,13 +1741,20 @@ while True:
     time.sleep(0.001)
 """,
 }
-WRITER = "(while :; do date +%s%N > /workspace/{m}; sleep 0.05; done) &"
+WRITER = "(while :; do date +%s%N >> /workspace/{m}; sleep 0.05; done) &"
 
 
 @pytest.fixture
 def hostile(docker_provider: LocalDockerProvider) -> LocalDockerProvider:
     docker_provider.start("itest-main", pack_snapshot(HOSTILE))
     return docker_provider
+
+
+def say(request: pytest.FixtureRequest, line: str) -> None:
+    """Write a line straight into the CI log, whatever pytest captures."""
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"  [{request.node.name}] {line}")
 
 
 def contained(
@@ -1650,7 +1764,9 @@ def contained(
     *,
     precondition: tuple[str, str] | None = None,
 ) -> str:
-    """Run hostile code to a timeout. Either its marker stops changing, or the session is gone."""
+    """Run hostile code to a timeout and say how it ended: ``swept`` (its marker stopped),
+    ``destroyed`` (the session was removed) or ``lost`` (the container died). Callers assert which
+    outcomes they accept; a path that skips the marker checks is reported, not hidden."""
     try:
         res = p.exec("itest-main", command, timeout_s=2)
     except SessionLostError:
@@ -1661,7 +1777,7 @@ def contained(
         return "destroyed"
     assert res.timed_out, res
     before, after = stable(p, f"/workspace/{marker}")
-    assert before != "", f"{marker}: the hostile code never ran, so this proves nothing"
+    assert before > 0, f"{marker}: the hostile code never ran, so this proves nothing"
     assert before == after, f"{marker} is still changing after a sweep that reported clean"
     if precondition:  # the trick under test really was applied
         path, expected = precondition
@@ -1671,49 +1787,81 @@ def contained(
 
 @pytest.mark.integration
 def test_docker_a_zombie_leader_with_live_threads_does_not_survive(
-    hostile: LocalDockerProvider,
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
 ) -> None:
-    contained(hostile, "python zleader.py /workspace/m_zl 600 & sleep 100", "m_zl")
+    command = (
+        "python zleader.py /workspace/m_zl 600 & z=$!; sleep 1; "
+        "grep ^State /proc/$z/status > /workspace/zl_state; sleep 100"
+    )
+    outcome = contained(
+        hostile, command, "m_zl", precondition=("/workspace/zl_state", "State:\tZ (zombie)\n")
+    )
+    say(request, f"outcome={outcome}")
+    assert outcome == "swept"
 
 
 @pytest.mark.integration
 def test_docker_a_comm_that_imitates_a_stat_line_does_not_fool_the_sweep(
-    hostile: LocalDockerProvider,
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
 ) -> None:
-    contained(
+    outcome = contained(
         hostile,
         "python comm.py /workspace/m_comm 600 & sleep 100",
         "m_comm",
         precondition=("/workspace/comm_status", "ok"),
     )
+    say(request, f"outcome={outcome}")
+    assert outcome == "swept"
 
 
 @pytest.mark.integration
 def test_docker_a_process_that_changes_its_pid_every_few_milliseconds_does_not_survive(
-    hostile: LocalDockerProvider,
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
 ) -> None:
-    contained(hostile, "python hop.py /workspace/m_hop & sleep 100", "m_hop")
+    outcome = contained(hostile, "python hop.py /workspace/m_hop & sleep 100", "m_hop")
+    say(request, f"outcome={outcome}")
+    assert outcome == "swept"
 
 
 @pytest.mark.integration
 def test_docker_a_process_that_freezes_the_sweep_gets_the_session_destroyed_or_loses(
-    hostile: LocalDockerProvider,
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
 ) -> None:
     command = "python stopper.py & " + WRITER.format(m="m_stop") + " sleep 100"
-    contained(hostile, command, "m_stop")
+    outcome = contained(hostile, command, "m_stop")
+    say(request, f"outcome={outcome}")
+    assert outcome in {"swept", "destroyed"}  # a real race between the freezer and the sweep
 
 
 @pytest.mark.integration
 def test_docker_a_killed_keeper_ends_the_session_instead_of_hiding_in_it(
-    hostile: LocalDockerProvider,
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
 ) -> None:
     keeper = (
         'k=; for d in /proc/[0-9]*; do p=${d#/proc/}; [ "$p" -gt 1 ] || continue; '
         '[ -z "$k" ] || [ "$p" -lt "$k" ] && k=$p; done; kill -9 "$k"; '
     )
-    # A killed keeper stops the container: the command's exec fails (lost) or the sweep cannot
-    # verify (destroyed). Reaching "swept" would mean the marker stopped, which is also contained.
-    contained(hostile, keeper + WRITER.format(m="m_keep") + " sleep 100", "m_keep")
+    outcome = contained(hostile, keeper + WRITER.format(m="m_keep") + " sleep 100", "m_keep")
+    say(request, f"outcome={outcome}")
+    assert outcome in {"lost", "destroyed"}  # "swept" would mean the kill itself failed
+
+
+@pytest.mark.integration
+def test_docker_the_task_count_does_catch_a_survivor(
+    hostile: LocalDockerProvider, request: pytest.FixtureRequest
+) -> None:
+    """The control the ruling relies on: with a survivor present, the count is not the baseline."""
+    res = hostile.exec(
+        "itest-main", "python zleader.py /workspace/m 30 >/dev/null 2>&1 &", timeout_s=30
+    )
+    assert res.exit_code == 0  # exited by itself, so it was not swept and the survivor is running
+    time.sleep(1)
+    name = hostile.container_name("itest-main")
+    tasks = hostile._tasks(name)  # noqa: SLF001
+    say(request, f"tasks with a survivor={tasks}")
+    assert tasks is not None
+    assert tasks >= 3
+    assert not hostile._host_sees_quiet(name)  # noqa: SLF001
 
 
 @pytest.mark.integration
@@ -1724,7 +1872,14 @@ def test_docker_environment_report(
     ptrace = Path("/proc/sys/kernel/yama/ptrace_scope")
     scope = ptrace.read_text().strip() if ptrace.exists() else "absent"
     server = subprocess.run(
-        ["docker", "version", "--format", "{{.Server.Version}} cgroup={{.Server.CgroupVersion}}"],
+        ["docker", "version", "--format", "{{.Server.Version}}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    ).stdout.strip()
+    cgroup = subprocess.run(
+        ["docker", "info", "--format", "{{.CgroupVersion}}"],
         capture_output=True,
         text=True,
         timeout=60,
@@ -1732,7 +1887,11 @@ def test_docker_environment_report(
     ).stdout.strip()
     names = [i.nodeid for i in request.session.items if i.get_closest_marker("integration")]
     reporter = request.config.pluginmanager.get_plugin("terminalreporter")
-    lines = [f"docker server: {server}", f"yama ptrace_scope (host): {scope}", "integration tests:"]
+    lines = [
+        f"docker server: {server} cgroup={cgroup}",
+        f"yama ptrace_scope (host): {scope}",
+        "integration tests:",
+    ]
     lines += [f"  {name}" for name in names]
     if reporter is not None:
         reporter.write_line("")

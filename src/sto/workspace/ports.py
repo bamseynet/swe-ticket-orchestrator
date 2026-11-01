@@ -26,10 +26,13 @@ against Docker):
   ``session_destroyed`` so the caller recovers from the branch. A command that exits by itself is
   never swept: a caller that needs a quiet workspace (patch capture) must check for itself.
 * **One command at a time per session.** ``exec`` calls on one session are serialized by the
-  provider: a second call waits until the first has finished and been cleaned up, so one command's
-  cleanup can never kill another command.
+  provider *instance* (the lock is not shared between instances or processes): a second call
+  waits until the first has finished and been cleaned up, so one command's cleanup can never kill
+  another command.
 * ``timed_out`` is set only when the time really elapsed. A command that exits with 124 or 137 on
   its own reports that exit code.
+* A runner that reports a negative status (the Docker client itself killed by a signal) is a
+  killed command: it is swept and reported with ``exit_code`` ``None``, never a signal number.
 * Infrastructure failures are never command results: a daemon that does not answer raises
   ``WorkspaceUnavailableError`` (transient), a missing session raises ``SessionLostError``.
 
@@ -115,7 +118,8 @@ class WorkspaceProvider(Protocol):
         ...
 
     def is_alive(self, session_id: str) -> bool:
-        """True if the session is running. Raises ``WorkspaceUnavailableError`` if unknown."""
+        """True if the session is running and ready (its snapshot fully unpacked). A half-made
+        session is not alive. Raises ``WorkspaceUnavailableError`` if that cannot be told."""
         ...
 
     def stop(self, session_id: str) -> None:
@@ -280,16 +284,19 @@ def ensure_session(
 
     It never destroys anything: if ``is_alive`` cannot tell (``WorkspaceUnavailableError``) that
     error propagates, because a session that may be alive must not be replaced. A concurrent
-    caller that wins the race to create the session is not an error.
+    caller that wins the race to create the session is not an error; if that caller has not
+    finished unpacking, the result is a retryable ``WorkspaceUnavailableError``.
     """
     if provider.is_alive(session_id):
         return False
     try:
         provider.start(session_id, source(branch))
-    except SessionExistsError:
+    except SessionExistsError as exc:
         if provider.is_alive(session_id):
             return False
-        raise
+        # A peer's start is still unpacking (or a crashed one left a stub): not ready yet, so
+        # this is a retry, never a permanent failure.
+        raise WorkspaceUnavailableError("another start of this session is not finished") from exc
     return True
 
 
