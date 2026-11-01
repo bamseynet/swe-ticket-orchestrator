@@ -416,7 +416,7 @@ This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can 
 Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert.
 Stopping model calls mid-step and session stopping arrive in D10-06.
 **AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`.
-**Deps:** D2-06, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `tests/engine/test_cancel.py`.
+**Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `tests/engine/test_cancel.py`.
 
 #### D2-12: Timers and business calendar
 Timer port, a local implementation, and business-time maths from `TeamConfig` calendars.
