@@ -271,8 +271,8 @@ def test_closing_an_older_round_never_invalidates_a_newer_one(
 
 
 class _FlipBetweenReads(MemoryStore):
-    """On the third ``GATE#`` query (the confirming re-read), approve round 1 behind the service's back: the state
-    changed between its first look and the moment it reads the audit chain head."""
+    """On the third ``GATE#`` query (the confirming re-read), approve round 1 behind the
+    service's back: the state changed after its first look, before it commits."""
 
     def __init__(self) -> None:
         super().__init__()
