@@ -45,7 +45,7 @@ D0 to D2.
 | Integrations | GitHub, Jira and Slack are all first-class and fully built. GitHub is tested live on a throwaway repo. Jira and Slack are contract-tested against recorded and fake APIs until credentials arrive | [ADR-0009](adr/0009-integration-spi-webhooks-as-nudges.md), D4, D6, D7 |
 | Auth | Enterprise SSO through OIDC and SAML federation, IdP-agnostic, with team and role mapping from IdP groups | [ADR-0008](adr/0008-sso-cognito-as-federation-broker.md), D3 |
 | Autonomy | The orchestrator merges reviewed, green PRs itself | [ADR-0010](adr/0010-autonomous-merge-github-app.md), D4 |
-| Budget | No ceiling. A full-featured product, with issues still one PR each | [STAGES.md](STAGES.md) |
+| Budget | Build: no ceiling, with issues still one PR each. **AWS: $75 in total for D12 and D14**, set 2026-11-01, so live verification is cut down to fit and the pilot waits for funding | [STAGES.md](STAGES.md) D12 spend rules |
 | Build capacity | Up to 8 workers on one 7.4 GB laptop, so heavy verification is in GitHub Actions. Workers run targeted, hermetic tests | Section 15.1, D0-05, D0-08, D0-09 |
 
 A trial of FF-07 by someone who did not build this needs a person, and you are the only one so far. It moves to the pilot (D14-03).
@@ -1772,8 +1772,8 @@ chain and config version, for regulated teams and audits.
 
 ### 14.1 Budgets
 
-Levels: step, stage, run, team per month, org per month. Peter's "no ceiling" applies to this project's
-scope. The product still needs cost controls, because customers will. Values are live from `TeamConfig`, so a raised budget applies to a blocked run.
+Levels: step, stage, run, team per month, org per month. This project's own AWS spend is capped
+at $75 (STAGES.md, D12 spend rules). The product still needs cost controls, because customers will. Values are live from `TeamConfig`, so a raised budget applies to a blocked run.
 
 **Tokens are not the only cost.** Runtime memory is billed while a session runs [S19], and a looping `workspace.exec` has no token cost at all. So budgets also cover **session-seconds per run and per stage**, and `max_commands_per_step`. Browser and Code Interpreter time count too. Team CI minutes stay with the team, and are reported, not limited.
 
