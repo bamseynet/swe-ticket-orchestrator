@@ -1663,13 +1663,22 @@ If it does not, the alternative is a Gateway interceptor or a per-stage role, de
 
 ## D12: First real deploy and live Bedrock verification
 
-**Status: BLOCKED on AWS credentials from Peter.** Nothing else depends on D12 except D14. **When credentials arrive, start with D12-00, then D12-18,** whatever else is in progress. Its result may change D5, D8 and D11 designs. D12-01 and every deploy wait for the spike.
+**Status: BLOCKED on AWS credentials from Peter. AWS spend for D12 and D14 together is capped at $75 (Peter, 2026-11-01).** Nothing else depends on D12 except D14. **When credentials arrive, start with D12-00, then D12-18,** whatever else is in progress. Its result may change D5, D8 and D11 designs. D12-01 and every deploy wait for the spike.
 
 **Goal:** turn "should work" into "does work", in a controlled order, stopping cost surprises first.
 
+**Spend rules.** The cap is $75 in total, for the whole project, across D12 and D14. The per-issue caps below add up to $55; the other $20 covers billing lag and anything left running by mistake.
+- **Backstop:** D12-00 creates one AWS Budget for the project's whole period, not a monthly one, with alerts at $25 and $50 actual and at $50 forecast, and a budget action at $60 that attaches a deny policy for Bedrock and AgentCore invocation to every deployed role. Billing data lags by hours, so this catches mistakes; it is not the brake.
+- **Brake:** each issue's cap. Before a live session starts, its worker checks the ledger. An issue that would pass its cap stops and asks Peter; it never carries on to finish.
+- **Same-day sessions:** every live session deploys, tests and destroys in one day. Only the D12-14 soak stack stays up overnight.
+- **Cheap models:** live runs map every tier to Haiku unless an issue names another model. Opus gets one small call, in D12-05. Prompt caching stays on.
+- **Nothing unattended:** every real run has its run budget set below its issue's cap, and someone watches it.
+- **Ledger:** `docs/findings/cost.md` has one row per session: date, issue, what ran, the cap, and the billed cost once billing shows it.
+
+
 **Scope:** first deploy, every hypothesis offline tests could not prove, and fixing what breaks.
 
-**Exit criteria:** every [A] item from FF-01 to FF-23, except FF-07, holds in AWS. The README's "never deployed" warning is replaced by what was proved, on what date,
+**Exit criteria:** every [A] item from FF-01 to FF-23, except FF-07, holds in AWS, within the $75 cap. FF-01 is proved with Haiku agents and Sonnet for implementation only, so Opus-tier quality stays unproven and the README says so. The README's "never deployed" warning is replaced by what was proved, on what date,
 in which Region. Findings are written up in `docs/findings/first-deploy.md`.
 
 **Hypotheses to confirm or correct:**
@@ -1712,115 +1721,134 @@ in which Region. Findings are written up in `docs/findings/first-deploy.md`.
 #### D12-01: Account readiness for the stacks
 Turn on Transaction Search, confirm the spike's results are reflected in D5, D8 and D11, and record any design changes made.
 Deploying waits for this, so a failed spike cannot be skipped.
+**Cap:** $1 of AWS spend.
 **AC:** the checklist links the spike's result for each design; Transaction Search is on; no account details are committed.
 **Deps:** D11-18, D12-18. **Size:** S. **Run:** serial. **Files:** `docs/findings/first-deploy.md`.
 
 #### D12-02: Model verification
 `sto doctor --aws` calls `GetInferenceProfile` for each catalog entry from the source Region, one small `Converse` per model, and reports Bedrock quotas.
 It corrects the catalog and IAM wherever the docs and reality differ.
+**Cap:** $1 of AWS spend. One small `Converse` per model, a few hundred tokens each.
 **AC:** L1 confirmed or fixed; the tool exits non-zero on any mismatch; quotas are compared with expected use; costs recorded.
 **Deps:** D12-01, D2-14, D5-12. **Size:** S. **Run:** serial. **Files:** `src/sto/cli/doctor_aws.py`, `src/sto/catalog/models.yaml`, `tests/cli/test_doctor_aws.py`.
 
 #### D12-03: Deploy control plane on fake LLM
 Deploy Foundation, Identity, ControlPlane, and Web with the fake LLM, and run the demo with no Bedrock cost.
 Small fixes land here, and anything larger becomes its own issue, so this stays one PR. Update the guide.
-**AC:** L3 confirmed or its failures filed; demo run reaches a gate; alarms are live; a clean-account retry follows only the guide.
+**Cap:** $3 of AWS spend. Fake LLM only, with no Bedrock spend.
+**AC:** L3 confirmed or its failures filed; demo run reaches a gate; alarms are live; a clean-account retry follows only the guide; the guide ends each session with a full destroy, and nothing is left running.
 **Deps:** D12-01, D12-18. **Size:** M. **Run:** serial. **Files:** `infra/lib/control-plane-stack.ts`, `docs/DEPLOY.md`.
 
 #### D12-04: Deploy agent plane with scripted model
 Deploy Runtime and sandbox, with a scripted model baked in, to prove hosting without tokens.
 Test heartbeats, session stop and a killed session.
+**Cap:** $3 of AWS spend. Scripted model only.
 **AC:** L4 confirmed or fixed; a killed session retries per policy; ping behaviour observed under load.
 **Deps:** D12-03. **Size:** M. **Run:** serial. **Files:** `infra/lib/agent-plane-stack.ts`, `src/sto/agents/runtime.py`.
 
 #### D12-05: First live Bedrock call
 One triage step on real Haiku, with a low budget, then one each for Sonnet and Opus. Compare real usage to estimates, including thinking against output.
 Calibrate the reservation estimator and D10-13 policy.
+**Cap:** $2 of AWS spend. Haiku and Sonnet get one triage step each; Opus gets one call of under 20,000 tokens in all.
 **AC:** L5 confirmed; estimator updated; `max_tokens` per tier revised with data; trace shows usage; no call escaped the budget hook.
 **Deps:** D12-02, D12-04, D10-13. **Size:** S. **Run:** serial. **Files:** `src/sto/budget/reservation.py`, `docs/findings/first-deploy.md`.
 
 #### D12-06: First full live run
-A real ticket on the throwaway repo, on real models, with fake Jira and Slack, through both gates to a real merge.
+A real ticket on the throwaway repo, on real models, with fake Jira and Slack, through both gates to a real merge. Haiku runs every role except implementation, which runs on Sonnet. One small ticket, at most one retry, and both within the cap.
 Record quality problems as issues for D14.
-**AC:** FF-01 holds with real models; cost and trace recorded; every gate invariant smoke-tested live.
+**Cap:** $8 of AWS spend. The run budget is set to $6.
+**AC:** FF-01 holds with real models; the models used are recorded, and Opus-tier quality is listed as unproven; cost and trace recorded; every gate invariant smoke-tested live.
 **Deps:** D12-05, D8-09, D5-16, D4-24. **Size:** M. **Run:** serial. **Files:** `docs/findings/first-run.md`, `src/sto/agents/prompts/`.
 
 #### D12-07: Verify engine and enforcement
 Run `TestState` and real callbacks on the interpreter. Try forbidden actions for real with session keys, Gateway auth and Cedar, including reaching another session's prefix and another team's data.
 The cross-team tests also try a real Slack and Jira resource binding once those are connected.
+**Cap:** $3 of AWS spend. Scripted model only; the conflict test needs DynamoDB, not tokens.
 **AC:** L7 and L8 confirmed or fixed; G14 live; D11-03 gaps closed. A real `TransactionConflict` from live DynamoDB proves the retry contract in PLAN section 11: DynamoDB Local produced none at 32 threads by 150 iterations.
 **Deps:** D12-04, D11-03, D11-10. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_enforcement.py`, `docs/findings/enforcement.md`.
 
 #### D12-08: Verify sandbox
 Run real team images with `InvokeAgentRuntimeCommand`, test timeouts and output caps, test egress blocking from inside, and try **canary exfiltration by DNS and by allowed hosts**.
 Measure startup and build times.
+**Cap:** $3 of AWS spend. Scripted model only.
 **AC:** L9 confirmed or fixed; a denied host and a DNS exfiltration attempt are refused; no credentials found from inside except the minimal role; measured limits are documented.
 **Deps:** D12-04, D11-21. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_sandbox.py`, `docs/findings/sandbox.md`.
 
 #### D12-09: Verify QA tools
 Real Browser against a test site, with recording and live view, proving the block-all rule and the team's `test_domains`, redirects outside the allowlist, and real Code Interpreter in VPC mode, with a canary exfiltration test.
-Confirm artifacts arrive, and allowlists hold.
+Confirm artifacts arrive, and allowlists hold. QA agents are scripted; Browser and Code Interpreter are real.
+**Cap:** $3 of AWS spend.
 **AC:** L10 confirmed or fixed; `URLBlocklist` plus `URLAllowlist` behaviour is answered; a QA gate shows real evidence; Sandbox mode's DNS behaviour is answered; costs recorded.
 **Deps:** D12-06, D11-12. **Size:** M. **Run:** parallel. **Files:** `tests/live/aws/test_qa_tools.py`, `docs/findings/qa-tools.md`.
 
 #### D12-10: Verify SSO
 Real OIDC and SAML sign-in, with group mapping, a large group list, `prompt=login`, removal of a group, a reused session cookie, a blank attribute from the trigger, and an attempt by a federated user to overwrite a mapped attribute.
 Update ADR-0008 with what is proved.
+**Cap:** $1 of AWS spend. IdPs on free developer tenants, which cost no AWS money.
 **AC:** L11 answered; FF-13 holds; a removed group really is cleared; `as_of` and `auth_time` behave as designed on a reused session; a self-write attempt fails; unverified items in the ADR closed or given a fallback.
 **Deps:** D12-03. **Size:** M. **Run:** parallel. **Files:** `docs/SSO.md`, `docs/adr/0008-sso-cognito-as-federation-broker.md`, `docs/findings/sso.md`.
 
 #### D12-11: Jira live
 Run the contract suite against a real Jira site, and fix differences in the fake and the adapter, including who authors comments under 3LO.
-Then run the Scrum overlay end to end.
+Then run the Scrum overlay end to end, with scripted agents. Jira runs on a free site.
+**Cap:** $2 of AWS spend.
 **AC:** L12 for Jira; FF-10 holds; fake updated wherever reality differed.
 **Deps:** D12-06, D6-08. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/jira/`, `src/sto/adapters/jira/`.
 
 #### D12-12: Slack live
 Run the contract suite in a real workspace, including 3 second timing from a cold start.
-Fix differences, and tune provisioned concurrency if needed.
+Fix differences, with scripted agents in a free workspace. If cold starts need provisioned concurrency, measure it for at most an hour, turn it off, and record its monthly cost for Peter to decide.
+**Cap:** $2 of AWS spend.
 **AC:** L12 for Slack; FF-11 holds; real gate decision from Slack; p99 ack under 3 seconds measured.
 **Deps:** D12-06, D7-08. **Size:** M. **Run:** parallel. **Files:** `tests/fakes/slack/`, `src/sto/adapters/slack/`.
 
 #### D12-13: Cancel and kill switch live
-Cancel mid-generation and measure Bedrock usage afterwards, including **whether Bedrock keeps billing after a disconnect or session stop**. Exercise each kill level, including break-glass IAM.
+Cancel mid-generation on Haiku, with a long output, and measure Bedrock usage afterwards, including **whether Bedrock keeps billing after a disconnect or session stop**. Exercise each kill level, including break-glass IAM.
 Practise the runbook.
+**Cap:** $2 of AWS spend.
 **AC:** L13 confirmed; FF-15 and FF-16 hold; runbook corrected; time to stop measured.
 **Deps:** D12-06, D10-07. **Size:** S. **Run:** parallel. **Files:** `docs/runbooks/kill-switch.md`, `docs/findings/cancel.md`.
 
 #### D12-14: Durable wait soak
-Leave gates open across at least 14 days, a redeploy and forced restarts, then decide them.
+Leave gates open across at least 14 days, a redeploy and forced restarts, then decide them. A scripted run opens the gates, since the wait is what is tested. Only the control plane stays up: no VPC, NAT, WAF or Runtime.
 Other work continues in parallel.
+**Cap:** $4 of AWS spend. For the whole 14 days.
 **AC:** L14 confirmed; FF-02 holds; costs while waiting recorded.
 **Deps:** D12-06. **Size:** S. **Run:** parallel. **Files:** `docs/findings/soak.md`.
 
 #### D12-15: Edge verification
 Use the UI through real CloudFront on HTTPS: sign-in, GET with auth, POST, nudge channel, webhooks through the edge.
 Check WAF rules do not block webhooks.
+**Cap:** $1 of AWS spend.
 **AC:** L15 confirmed or fixed; H1 proved live; GitHub, Jira and Slack deliveries arrive through the edge.
 **Deps:** D12-03. **Size:** S. **Run:** parallel. **Files:** `infra/lib/web-stack.ts`, `docs/findings/edge.md`.
 
 #### D12-16: Cost reconciliation
-Compare a period's estimates against real billing by inference profile tag, and set the accepted margin.
+Compare the estimates for D12's own real calls against billing by inference profile tag, and set the accepted margin. No new runs are made for this.
 Update placeholder budgets in the docs and templates using real data.
+**Cap:** $1 of AWS spend.
 **AC:** L16 answered; FF-23 holds; template budgets updated with evidence.
 **Deps:** D12-06, D10-11, D2-05. **Size:** S. **Run:** parallel. **Files:** `src/sto/budget/reconcile.py`, `templates/`, `docs/findings/cost.md`.
 
 #### D12-17: Close out
-Destroy and redeploy from clean. Confirm audit data is retained. Update the README and all "unverified" notes.
+Destroy and redeploy from clean, on the fake LLM. Confirm audit data is retained. Update the README and all "unverified" notes.
 Write the first-deploy report, with what surprised us.
-**AC:** FF-21 and FF-22 hold; the README says what was proved and when; every L row has an answer.
+**Cap:** $3 of AWS spend.
+**AC:** FF-21 and FF-22 hold; the README says what was proved and when; every L row has an answer; everything is destroyed at the end, and the ledger's total is in the report.
 **Deps:** D12-07, D12-08, D12-09, D12-10, D12-11, D12-12, D12-13, D12-14, D12-15, D12-16, D1-10. **Size:** S. **Run:** serial. **Files:** `README.md`, `docs/findings/first-deploy.md`, `docs/DEPLOY.md`.
 
 #### D12-18: AWS spike
 **The first work on a guarded account, with no dependency on D11.** One day of throwaway code on the five designs no fake can prove: a sandbox on a second Runtime, Gateway accepting a per-step JWT with claims reaching Cedar, session keys across resume, VPC egress with DNS Firewall, and Identity holding a bot token.
 A failure changes D5, D8 and D11 before they harden, so this is deliberately early, and D5-13, D11-08, D11-09 and D11-23 stay provisional until it runs.
+**Cap:** $3 of AWS spend. Each of the five designs is tried once, and everything is destroyed the same day.
 **AC:** each design has a written yes or no, with the alternative named on a no; affected issues are updated; spike code is not kept.
 **Deps:** D12-00. **Size:** M. **Run:** serial. **Files:** `docs/findings/aws-spike.md`.
 
 #### D12-00: Cost guard and bootstrap
 Before anything else on a new account: AWS Budgets alarms, CDK bootstrap, the Anthropic first-time-use form, and a one-time subscribing invocation from a separate identity. Confirm the Region and residency choice (Q4).
 This has no dependency on D11, so the spike never runs unguarded.
-**AC:** a budget alarm fires on a test threshold; deployed roles have no Marketplace permissions; a checklist is committed with no account details.
+**Cap:** $1 of AWS spend.
+**AC:** the project budget, its three alerts and the $60 budget action exist, and the action's deny policy is shown to work on a throwaway role; a budget alarm fires on a test threshold; `docs/findings/cost.md` is started with the ledger's columns; deployed roles have no Marketplace permissions; a checklist is committed with no account details.
 **Deps:** D0-05. **Size:** S. **Run:** serial. **Files:** `docs/findings/bootstrap.md`.
 
 ---
@@ -1932,14 +1960,13 @@ Artifacts get a review and redaction path.
 
 ## D14: Pilot and release
 
-**Status: BLOCKED on D12.**
+**Status: BLOCKED on D12. Inside the same $75 AWS cap (see D12's spend rules). The pilot is parked until Peter funds it.**
 
-**Goal:** a real team uses it, and agent quality is measured rather than assumed.
+**Goal:** agent quality is measured rather than assumed, on a small set within the cap, and a real team uses it once a pilot is funded.
 
 **Scope:** labelled evals, prompt tuning, first team, release checklist.
 
-**Exit criteria:** FF-24 holds. A pilot team has completed real tickets, with measured approve, change and reject rates, and cycle time.
-Every FF item in PLAN.md section 17 is true.
+**Exit criteria:** FF-24 is measured on a five-ticket set. The release lists every FF item as proved, with its evidence, or as open, with the reason. FF-07's [A] part and the pilot stay open until a pilot is funded, so the product is not called fully functional before then.
 
 <!-- waves:D14 -->
 | Wave | Parallel | Serial, one at a time |
@@ -1950,27 +1977,29 @@ Every FF item in PLAN.md section 17 is true.
 | 4 | - | D14-04 |
 
 #### D14-01: Eval set
-Build a labelled ticket set with the pilot's stack (Q3), covering triage, planning, implementation, review and QA, with agreed thresholds.
+Build a labelled set of five tickets with the pilot's stack (Q3), covering triage, planning, implementation, review and QA, with agreed thresholds. Evals run on Haiku, with Sonnet for implementation, as in D12-06.
 Includes bugs seeded for reviewers to find.
+**Cap:** $5 of AWS spend. One baseline run of the five tickets.
 **AC:** thresholds agreed with Peter; baseline recorded; cost per eval run known.
 **Deps:** D12-06, D5-18. **Size:** M. **Run:** serial. **Files:** `evals/sets/`, `docs/findings/evals-baseline.md`.
 
 #### D14-02: First prompt tuning pass
-Make the single change with the largest expected effect on evals, with before and after numbers. Further passes are new issues, one each.
+Make the single change with the largest expected effect on evals, with before and after numbers on the same five tickets. Further passes are new issues, one each.
 Security corpus must still pass.
+**Cap:** $3 of AWS spend. One after-run.
 **AC:** eval scores improve, and the remaining gap to FF-24 is listed as issues; prompt versions are recorded; no injection regressions.
 **Deps:** D14-01, D5-12, D10-01. **Size:** M. **Run:** serial. **Files:** `src/sto/agents/prompts/`, `src/sto/catalog/`.
 
 #### D14-03: Pilot team onboarding
-Onboard the first team using only the docs and UI, with nobody who built it helping, starting with low-risk tickets. Fix what blocks them.
+**Parked until Peter funds a pilot.** Its cost depends on the team's ticket volume, so it gets its own estimate and cap first. Then onboard the first team using only the docs and UI, with nobody who built it helping, starting with low-risk tickets. Fix what blocks them.
 Watch rubber-stamping and fatigue metrics.
 **AC:** FF-07 holds with a real team, in under an hour; feedback captured as issues; approve-unchanged rate reported.
 **Deps:** D14-02, D13-10. **Size:** M. **Run:** serial. **Files:** `docs/findings/pilot.md`.
 
 #### D14-04: Release checklist
 Confirm all FF items, tag a version, publish a changelog and upgrade notes, and write the honest list of known limitations.
-This is the "fully functional" call.
-**AC:** every FF item links to its evidence; Peter signs off.
+This is the "fully functional" call, or, while the pilot is unfunded, an honest release candidate.
+**AC:** every FF item links to its evidence, or is listed as open with its reason; the README does not say fully functional while an [A] item is open; the ledger's total is under $75; Peter signs off.
 **Deps:** D14-03. **Size:** S. **Run:** serial. **Files:** `CHANGELOG.md`, `docs/RELEASE.md`.
 
 ---
