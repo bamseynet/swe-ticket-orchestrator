@@ -349,7 +349,7 @@ Property tests pass over all templates, with crash injection.
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
 | 6 | D2-09, D2-23, D2-25, D2-36, D2-37, D2-38 | D2-29, D2-30, D2-32, D2-33 |
 | 7 | D2-14, D2-15, D2-19, D2-28 | D2-31, D2-34 |
-| 8 | D2-20, D2-35 | D2-39 |
+| 8 | D2-20, D2-35 | D2-39, D2-40 |
 
 #### D2-01: Workflow schema
 Typed models for the whole schema in PLAN.md section 7.2, generating a JSON Schema for editors.
@@ -576,6 +576,11 @@ Found in review of D2-28. The driver emits `EffectFailed(gate_invalid)`, so `reg
 **AC:** the driver emits `EffectDisposed` instead of `EffectFailed(gate_invalid)`, so the run returns to the first invalid gate end to end on the local driver; the `failures.py` docstring says so; a late `max_steps_exceeded` block either leaves approvals and the subject untouched or documents and tests that it drops them; `_holds` treats a `None` head as not holding.
 **Deps:** D2-28. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/engine/handlers/regate.py`, `src/sto/engine/handlers/failures.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_regate.py`, `tests/engine/test_local_driver.py`.
 
+#### D2-40: Stop watch in production
+Found in review of D2-11. `StopWatch` exists but nothing schedules it, and its merge probe can claim merges the orchestrator never made.
+**AC:** a scheduler calls `StopWatch.sweep` and `StopWatch.recheck`; the SCM port's `find_merge` reports only merges the orchestrator made (matched by idempotency key or actor), and its contract states that the request timeout is below the effect lease (D4-06); the `sto-scm` client pool is one shared, sized pool (or per-request client timeouts) instead of one per executor, with production `close()` callers; a Stop confirms or annotates the effect record from the `find_merge` receipt; blocked effects on ended runs appear in an operator view.
+**Deps:** D2-11, D4-06. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `src/sto/api/runtime.py`, `src/sto/api/routers/runs.py`, `tests/engine/test_cancel.py`, `tests/engine/test_local_driver.py`, `tests/adapters/test_fake.py`.
+
 ## D3: Identity and complete gates
 
 **Goal:** real identities, roles and every gate rule in PLAN.md section 4.
@@ -707,7 +712,7 @@ This plugs into the D1-06 hook points.
 #### D3-17: Write conflicts and concurrency
 A write conflict while a gate is open retries instead of returning a false `409`, on every store, with 50 concurrent decisions.
 Runs on DynamoDB Local in CI, because the fast stores may not model `TransactionConflict`.
-**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3, G5 and G6 also pass in the integration job. Retry paths handle `TransactionOutcomeUnknownError`: a decision whose write landed must not return a 409 for the person's own vote, and `LocalDriver.submit` must not queue an event twice. Reconcile by re-reading. Stop being offered on a 409 survives a read conflict from `can_stop`.
+**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3 and G5 also pass in the integration job. Retry paths handle `TransactionOutcomeUnknownError`: a decision whose write landed must not return a 409 for the person's own vote. Reconcile by re-reading. The rest moved to D3-28.
 **Deps:** D3-06, D3-09. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/retry.py`, `src/sto/gates/service.py` (retry and backoff in the decision and `open_gate` contention loops), `tests/gates/test_service.py`, `tests/integration/test_gate_concurrency.py`.
 
 #### D3-18: First org admin
