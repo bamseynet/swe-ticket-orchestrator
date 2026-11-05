@@ -13,7 +13,7 @@ instead of raising, because a refused event is dropped by the driver and the run
 * ``max_steps_exceeded``: the entry would exceed ``limits.max_steps_per_run``.
 * ``stage_unsupported``: ``route`` stages arrive in D2-23. They are not skipped. (``wait`` and
   ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``. A caller's own
-  ``graph_registry=`` must register their handlers: see ``StageEntry``.)
+  ``graph_registry=`` that cannot leave them blocks the entry ``stage_unhandled``: see ``next``.)
 * ``checks_timed_out`` and ``checks_unresolved`` (``waits.py``): a checks stage timed out
   (PLAN 6.2, WAITING_EXTERNAL to BLOCKED), or its ``team_default`` resolved to no checks.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
@@ -243,10 +243,8 @@ class StageEntry:
     ``refuse`` runs with the other entry checks, before any counter moves, and returns a blocked
     reason or ``None``. ``enter`` runs once the visit is counted and returns the transition.
 
-    A caller that passes its own ``graph_registry=`` to ``next`` must register the wait and checks
-    handlers (``WaitResumed``, ``StageTimedOut``, ``CheckResults``) in it. Entry does not check:
-    the pure handlers cannot see which registry is running, so a registry without them parks the
-    run with nothing able to end the wait. (A reducer-side check is a follow-up.)"""
+    A caller's own ``graph_registry=`` must register the handlers that leave the stage
+    (``LEAVING_EVENTS`` in ``reducer.py``); ``next`` blocks the entry ``stage_unhandled`` if not."""
 
     refuse: Callable[[RunState, Any], str | None]
     enter: Callable[[RunState, Run, str, Any, int], Transition]

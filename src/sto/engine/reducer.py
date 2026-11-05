@@ -16,10 +16,20 @@ handled by ``HANDLERS``. A validated graph ``Workflow`` from ``sto.config.schema
 by D2-03) is handled by ``GRAPH_HANDLERS`` (reducer v1, ``handlers/stages.py``), which relies on
 the structural validator instead of re-checking it. The two registries are separate because an
 event type has one handler per workflow kind.
+
+A graph registry passed as ``graph_registry=`` must also be able to *leave* every stage kind
+the run can enter. ``LEAVING_EVENTS`` names, per stage kind, the events that end its wait
+(``waits.py`` fills it for ``wait`` and ``checks``). ``next`` looks at what the handler did: if
+it entered such a stage and the registry in use has no handler for one of those events, nothing
+could ever end the wait, so it returns the run BLOCKED ``stage_unhandled`` instead, on the stage
+it was leaving, with no counter moved and no command. This is a return value, never an
+exception, and the registry is an argument: there are no context variables or other implicit
+state.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import pkgutil
 from collections.abc import Callable
@@ -28,12 +38,14 @@ from typing import Any, Literal, Protocol
 
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import (
+    BLOCKED_REASONS,
     DecisionId,
     DecisionKind,
     GateType,
     PermanentError,
     Run,
     RunId,
+    RunStatus,
     Subject,
 )
 
@@ -226,6 +238,9 @@ class HandlerRegistry:
     def get(self, event_type: type) -> Handler | None:
         return self._handlers.get(event_type)
 
+    def event_types(self) -> frozenset[type]:
+        return frozenset(self._handlers)
+
 
 HANDLERS = HandlerRegistry()
 GRAPH_HANDLERS = HandlerRegistry()
@@ -244,6 +259,48 @@ def handles(
 def handles_graph(event_type: type) -> Callable[[Handler], Handler]:
     """Register a handler for runs of a graph ``Workflow`` (reducer v1)."""
     return handles(event_type, registry=GRAPH_HANDLERS)
+
+
+# Per stage kind (a ``sto.config.schema`` stage class): the events that end its wait. A kind not
+# listed here is left by events every registry already has (a step, a gate close, an effect).
+LEAVING_EVENTS: dict[type, tuple[type, ...]] = {}
+
+
+@BLOCKED_REASONS.register("stage_unhandled")
+class StageUnhandled:
+    """The registry in use has no handler for an event that ends the stage just entered."""
+
+
+def _uncovered_entry(
+    before: RunState, out: Transition, workflow: GraphWorkflow, registry: HandlerRegistry
+) -> bool:
+    """Did ``out`` enter a stage whose leaving events ``registry`` cannot handle?"""
+    after = out.state
+    if after.steps <= before.steps or after.run.stage is None:
+        return False  # nothing was entered (an entry counts a step)
+    stage = workflow.stages.get(after.run.stage)
+    leaving = LEAVING_EVENTS.get(type(stage), ())
+    return any(registry.get(event_type) is None for event_type in leaving)
+
+
+def _block_uncovered(before: RunState, out: Transition) -> Transition:
+    """The refused entry, as if it had never counted: the run stays on the stage it was leaving
+    and the counters are the ones it had. What the handler decided before the entry (approvals,
+    subject) stands, as for any other blocked entry."""
+    run = dataclasses.replace(out.state.run, stage=before.run.stage)
+    blocked = run.advance(RunStatus.BLOCKED, blocked_reason="stage_unhandled")
+    return Transition(
+        dataclasses.replace(
+            out.state,
+            run=blocked,
+            steps=before.steps,
+            visits=before.visits,
+            loops=before.loops,
+            visit=before.visit,
+            attempt=before.attempt,
+            round=before.round,
+        )
+    )
 
 
 def workflow_version(workflow: Workflow | GraphWorkflow) -> str:
@@ -298,4 +355,11 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     version = workflow_version(workflow)
     if state.run.workflow_version not in (None, version):
         raise WorkflowMismatchError(f"run is on {state.run.workflow_version!r}, not {version!r}")
-    return handler(state, event, workflow)
+    out = handler(state, event, workflow)
+    if (
+        isinstance(workflow, GraphWorkflow)
+        and graph_registry is not None
+        and _uncovered_entry(state, out, workflow, chosen)
+    ):
+        return _block_uncovered(state, out)
+    return out

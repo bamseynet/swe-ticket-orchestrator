@@ -39,7 +39,13 @@ from sto.config.schema import ChecksStage, WaitStage, duration_seconds
 from sto.config.schema import Workflow as Graph
 from sto.domain import BLOCKED_REASONS, COMMANDS, EVENTS, Run, RunId, RunStatus
 from sto.engine.handlers.stages import STAGE_ENTRY, StageEntry, _block, _goto, _out, _target, _with
-from sto.engine.reducer import MalformedEventError, RunState, Transition, handles_graph
+from sto.engine.reducer import (
+    LEAVING_EVENTS,
+    MalformedEventError,
+    RunState,
+    Transition,
+    handles_graph,
+)
 
 _PASSING = frozenset({"passed", "neutral"})  # neutral counts as passing (PLAN, [S59])
 _STATUSES = _PASSING | {"failed", "pending"}
@@ -174,6 +180,9 @@ def _enter(rs: RunState, run: Run, name: str, stage: object, count: int) -> Tran
 
 STAGE_ENTRY[WaitStage] = StageEntry(_refuse, _enter)
 STAGE_ENTRY[ChecksStage] = StageEntry(_refuse, _enter)
+# What ends each wait: ``next`` blocks entry when the registry in use lacks one (D2-29).
+LEAVING_EVENTS[WaitStage] = (WaitResumed, StageTimedOut)
+LEAVING_EVENTS[ChecksStage] = (CheckResults, StageTimedOut)
 
 
 # --- the live position ---------------------------------------------------------------------
