@@ -30,16 +30,20 @@ same person completing it again refreshes the expiry.
 
 Unlink (:meth:`~AccountLinking.unlink`) is the owner's, works on an expired link, and writes
 ``link.removed`` in the same transaction; creation writes ``link.created``. Entries are append-only
-items in the audit table under the user's partition, numbered by a per-user counter that moves in
-the same transaction, so two writes can never share a number. They are not yet in the per-run hash
-chain (there is no run); that chain is D3-08's and a user-level chain is a follow-up.
+items (this module only ever puts them under ``Absent`` and never reads one back to change it)
+under the user's partition, numbered by a per-user counter that moves in the same transaction, so
+two writes can never share a number. They are **not** in the audit table: its writers are a
+registered set (``tests/audit/test_writer_conformance.py``, an invariant that needs an ADR to
+change) and its chain is per run, and a link belongs to no run. A tamper-evident user-level chain
+is a follow-up for D3-08.
 
 Every write goes through the store port as a conditional transaction (``Absent`` or the version
 that was read), retried on a lost race with fresh reads. Items (platform scope; PLAN 11 has
 ``USER#u / LINK#surface#id``)::
 
     USER#<actor>  LINK#<vendor>#<account>   the link: expiry, when linked
-    USER#<actor>  LINKSEQ                   audit counter
+    USER#<actor>  LINKSEQ                   log counter
+    USER#<actor>  LINKLOG#<seq>             the append-only log entries
     ORG           LINKED#<vendor>#<account> reverse lookup: who holds the account
     ORG           LINKTOKEN#<sha256>        a pending token
 
@@ -59,7 +63,6 @@ from typing import Any, Protocol
 from sto.domain.errors import PermanentError
 from sto.identity.mapping import InvalidMappingError, UserIdentity, check_text
 from sto.store.ports import (
-    AUDIT,
     PLATFORM,
     Absent,
     ConditionFailedError,
@@ -101,6 +104,7 @@ _TOKEN = "LINKTOKEN#"
 _LINKED = "LINKED#"
 _LINK = "LINK#"
 _SEQ = "LINKSEQ"
+_LOG = "LINKLOG#"
 
 
 class LinkRefusedError(PermanentError):
@@ -424,7 +428,7 @@ class AccountLinking:
                  "data": data}  # fmt: skip
         return [
             Put(seq_key, {"seq": seq}, Absent() if head is None else VersionIs(head.version)),
-            Put(Key(_user_pk(owner), f"LINK#{seq:012d}", AUDIT), entry, Absent()),
+            Put(Key(_user_pk(owner), f"{_LOG}{seq:012d}"), entry, Absent()),
         ]
 
 

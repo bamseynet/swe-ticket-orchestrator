@@ -36,7 +36,7 @@ from sto.identity.linking import (
 from sto.identity.mapping import RoleMapping, UserIdentity
 from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks
 from sto.store.memory import MemoryStore
-from sto.store.ports import AUDIT, PLATFORM, Key
+from sto.store.ports import PLATFORM, Key
 
 ISS = "https://idp.example.test"
 CLIENT = "sto-client"
@@ -106,7 +106,7 @@ def link_jira(rig: Rig, who: UserIdentity = ANN, code: str = "jira-code-ann") ->
 
 def audit_entries(store: MemoryStore, who: UserIdentity) -> list[dict[str, Any]]:
     pk = f"USER#{who.issuer}|{who.subject}"
-    return [i.data for i in store.query(PLATFORM, pk, table=AUDIT).items]
+    return [i.data for i in store.query(PLATFORM, pk, sk_prefix="LINKLOG#").items]
 
 
 # --- AC 2: a Jira account ID resolves to an SSO identity ---------------------------------------
