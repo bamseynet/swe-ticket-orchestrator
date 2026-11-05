@@ -40,9 +40,10 @@ attributed a commit, cleared an exclusion or extended eligibility is ineligible 
 action affects (``admin_self_service``). Attributing and clearing are read from the commit records;
 the other kinds arrive as :class:`AdminAction`. Because any gate that opens later snapshots a
 grant, every kind but an extension is run-wide (see :class:`AdminAction`); an extension covers
-exactly its round. An admin who
-resolves a term (:class:`Resolution`) is ineligible the same way, and a resolution naming nobody
-resolves nothing. A person cannot clear their own exclusion.
+exactly its round. An admin who resolves a term (:class:`Resolution`) is ineligible the same way,
+and a resolution naming nobody resolves nothing. A person cannot clear their own exclusion.
+
+Records carry a gate's **name** (``Gate.name``), never its id.
 
 Not here: writing these records (the attribute, clear and resolve endpoints), the audit entries
 for them, and wiring ``evaluate`` into ``GateService.decide`` (D3-06 owns that path).
@@ -79,6 +80,9 @@ AdminKind = Literal[
     "extend_eligibility",
     "resolve_term",
 ]
+
+
+_TERMS = ("requester", "author")
 
 
 def _actor(label: str, value: object) -> str:
@@ -149,6 +153,9 @@ class Commit:
     pushers: tuple[Pusher, ...] = ()
 
     def __post_init__(self) -> None:
+        _name("commit sha", self.sha)
+        if not isinstance(self.in_receipts, bool):
+            raise ValueError("commit in_receipts must be a bool")
         _opt_actor("commit attributed_to", self.attributed_to)
         _opt_actor("commit attributed_by", self.attributed_by)
 
@@ -160,9 +167,16 @@ class Approval:
     actor: str
 
     def __post_init__(self) -> None:
+        _name("approval gate_name", self.gate_name)
         _actor("approval actor", self.actor)
         # a plain string from a store is coerced; an unknown one raises ValueError
         object.__setattr__(self, "gate_type", GateType(self.gate_type))
+
+
+def _name(label: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
 
 
 def _round(value: object) -> int | None:
@@ -181,9 +195,9 @@ class AdminAction:
     Coverage. ``extend_eligibility`` covers exactly its ``gate`` and ``round`` (both required).
     Every other kind (``mapping``, ``eligible_roles``, ``attribute``, ``clear_exclusion``,
     ``resolve_term``) is run-wide, because any gate that opens later snapshots the grant too: it
-    covers every gate of the run, and with ``gate`` and ``round`` given, that gate only from
-    ``round`` onward (rounds of different gates cannot be ordered, so the others are all covered).
-    A ``round`` without a ``gate`` is refused."""
+    covers every gate and round of the run, whatever ``gate`` and ``round`` say, so a wrongly
+    recorded round cannot un-bar the actor. ``gate`` is a gate name, not an id. A ``round`` without
+    a ``gate`` is refused."""
 
     actor: str
     kind: AdminKind
@@ -194,6 +208,8 @@ class AdminAction:
         _actor("admin action actor", self.actor)
         if self.kind not in get_args(AdminKind):
             raise ValueError(f"unknown admin action kind {self.kind!r}")
+        if self.gate is not None:
+            _name("admin action gate", self.gate)
         _round(self.round)
         if self.round is not None and self.gate is None:
             raise ValueError("an admin action with a round must name its gate")
@@ -203,9 +219,9 @@ class AdminAction:
     def covers(self, gate: Gate) -> bool:
         if self.kind == "extend_eligibility":
             return self.gate == gate.name and self.round == gate.round
-        if self.gate is None or self.gate != gate.name or self.round is None:
-            return True
-        return gate.round >= self.round
+        # run-wide: any gate that opens later snapshots the grant, so ``gate`` and ``round`` are
+        # kept for the record but never narrow the coverage
+        return True
 
 
 @dataclass(frozen=True)
@@ -222,7 +238,7 @@ class Resolution:
     round: int | None = None
 
     def __post_init__(self) -> None:
-        if self.term not in ("requester", "author"):
+        if self.term not in _TERMS:
             raise ValueError(f"cannot resolve term {self.term!r}: only requester or author")
         if isinstance(self.actors, str) or not isinstance(self.actors, Collection):
             raise ValueError("resolution actors must be a collection of actors, not a string")
@@ -256,6 +272,12 @@ class RunFacts:
         _opt_actor("requester", self.requester)
         for a in self.assignees:
             _actor("assignee", a)
+        if isinstance(self.unresolved, str) or not isinstance(self.unresolved, Collection):
+            raise ValueError("unresolved must be a collection of term names, not a string")
+        bad = [t for t in self.unresolved if t not in _TERMS]
+        if bad:
+            raise ValueError(f"unresolved names unknown terms {bad!r}: only requester or author")
+        object.__setattr__(self, "unresolved", frozenset(self.unresolved))
 
 
 @dataclass(frozen=True)
