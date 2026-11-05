@@ -10,6 +10,7 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from store_contract import A, B
@@ -307,6 +308,10 @@ class TestRecord:
             with pytest.raises(ValueError, match="not text"):
                 I.IntakeRecord.from_data(data)
 
+    def test_the_start_time_is_written_in_utc_whatever_zone_the_clock_is_in(self) -> None:
+        sydney = dt.datetime(2026, 11, 4, 21, 0, tzinfo=ZoneInfo("Australia/Sydney"))
+        assert I.record(ticket(), "w", sydney).started_at == "2026-11-04T10:00:00+00:00"
+
     def test_a_naive_clock_is_refused(self) -> None:
         with pytest.raises(ValueError, match="timezone"):
             I.record(ticket(), "w", NOW.replace(tzinfo=None))
@@ -336,6 +341,7 @@ class StoreContract:
         wip_limit: int | None = None,
         now: dt.datetime = NOW,
         wf: dict[str, Intake] | None = None,
+        members: Any = None,
         **kw: Any,
     ) -> I.IntakeOutcome:
         return I.open_run(
@@ -345,7 +351,7 @@ class StoreContract:
             ticket=ticket(ref=ref, **kw),
             public_repo_intake=False,
             wip_limit=wip_limit,
-            members=Members(ALICE),
+            members=members or Members(ALICE),
             run_id=f"r{n}",
             now=now,
         )
@@ -448,10 +454,12 @@ class StoreContract:
     def test_a_sequential_burst_never_exceeds_the_limit(self, store: IndexedStore) -> None:
         outs = [self.open(store, n, ref=f"T-{n}", wip_limit=1) for n in range(5)]
         assert [o.admitted for o in outs] == [True, False, False, False, False]
-        # raising the limit does not let a newcomer pass the four held runs
-        outs = [self.open(store, n, ref=f"T-{n}", wip_limit=3) for n in range(5, 7)]
-        assert [o.admitted for o in outs] == [False, False]
-        assert I.admit_queued(store, A, wip_limit=3) == ["r1", "r2"]  # two more slots
+        # raising the limit does not let a newcomer pass the four held runs: the newcomer's own
+        # admission releases the two oldest into the two new slots, and it waits behind them
+        first = self.open(store, 5, ref="T-5", wip_limit=3)
+        assert (first.status, first.released) == ("queued", ("r1", "r2"))
+        assert self.open(store, 6, ref="T-6", wip_limit=3).released == ()
+        assert I.active_count(store, A, wip_limit=3) == 3
 
     def test_an_admitted_run_counts_while_it_is_still_queued(self, store: IndexedStore) -> None:
         self.open(store, 1, ref="T-1", wip_limit=2)
@@ -494,7 +502,9 @@ class StoreContract:
         self.finish(store, 0)  # the slot is free, and r1 is waiting for it
         new = self.open(store, 2, ref="T-2", wip_limit=1)
         assert (new.status, new.admitted) == ("queued", False)
-        assert I.admit_queued(store, A, wip_limit=1) == ["r1"]
+        assert new.released == ("r1",)  # its own admission gave the slot to the older run
+        assert self.admitted(store, 1) is True
+        assert I.admit_queued(store, A, wip_limit=1) == []
 
     def test_admit_queued_releases_the_oldest_first_up_to_the_free_slots(
         self, store: IndexedStore
@@ -537,6 +547,7 @@ class StoreContract:
         for n in range(3):
             self.open(store, n, ref=f"T-{n}", wip_limit=3)
         self.open(store, 3, ref="T-3", wip_limit=3)  # held
+        assert I.active_count(store, A, wip_limit=1) == 1  # only slot 0 is below the limit
         assert I.admit_queued(store, A, wip_limit=1) == []
         assert I.admit_queued(store, A, wip_limit=0) == []
         self.finish(store, 0)
@@ -557,6 +568,118 @@ class StoreContract:
             out = self.open(store, 1, ref=ref)
             assert (out.status, out.reason) == ("skipped", "invalid_ticket_key"), ref
         assert store.get(A, Key("RUN#r1", "META")) is None
+
+    # --- pass 2: every limited intake goes through the queue ---------------------------------
+
+    def test_a_started_outcome_lists_its_own_run_as_released(self, store: IndexedStore) -> None:
+        out = self.open(store, 1, ref="T-1", wip_limit=1)
+        assert (out.status, out.released) == ("started", ("r1",))
+        held = self.open(store, 2, ref="T-2", wip_limit=1)
+        assert (held.status, held.released) == ("queued", ())
+
+    def test_a_run_released_by_another_caller_reports_started(
+        self, store: IndexedStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = I.admit_queued
+
+        def another_caller_released_it(*a: Any, **k: Any) -> list[str]:
+            real(*a, **k)
+            return []  # this caller's own list is empty: someone else did the release
+
+        monkeypatch.setattr(I, "admit_queued", another_caller_released_it)
+        out = self.open(store, 1, ref="T-1", wip_limit=1)
+        assert (out.status, out.admitted, out.released) == ("started", True, ())
+
+    def test_an_unlimited_run_is_stored_admitted(self, store: IndexedStore) -> None:
+        out = self.open(store, 1, ref="T-1", wip_limit=None)
+        assert (out.status, out.released) == ("started", ("r1",))
+        assert self.admitted(store, 1) is True
+
+    def test_a_held_run_written_after_the_holder_finishes_does_not_stall_intake(
+        self, store: IndexedStore
+    ) -> None:
+        # A is live; B reads the slots (full); A finishes and its on-finish admit_queued runs
+        # (nothing is held yet); then B writes itself. B must still get the free slot.
+        self.open(store, 0, ref="T-0", wip_limit=1)
+        self.finish(store, 0, "RUNNING")
+        racer = Interleaving(store)
+
+        def a_finishes() -> None:
+            self.finish(store, 0, "DONE")
+            assert I.admit_queued(store, A, wip_limit=1) == []
+
+        racer.before_next_transact(a_finishes)
+        b = self.open(racer, 1, ref="T-1", wip_limit=1)
+        c = self.open(store, 2, ref="T-2", wip_limit=1)
+        d = self.open(store, 3, ref="T-3", wip_limit=1)
+        assert (b.status, b.admitted) == ("started", True)
+        assert (c.status, d.status) == ("queued", "queued")
+        assert I.active_count(store, A, wip_limit=1) == 1  # not stalled with every slot free
+
+    def test_a_newcomer_never_passes_an_older_run_that_appears_while_it_reads(
+        self, store: IndexedStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # C lists the queue; B (older) is written held; A finishes; C must not take the slot
+        self.open(store, 0, ref="T-0", wip_limit=1)
+        self.finish(store, 0, "RUNNING")
+        real = I._queued
+        fired: list[Any] = []
+
+        def listing(st: Any, sc: Any, size: int) -> Any:
+            out = real(st, sc, size)
+            if not fired:
+                fired.append(None)  # first, so the nested open does not fire the hook again
+                fired[0] = self.open(
+                    store, 1, ref="T-1", wip_limit=1, now=NOW - dt.timedelta(minutes=5)
+                )
+                self.finish(store, 0, "DONE")
+            return out
+
+        monkeypatch.setattr(I, "_queued", listing)
+        c = self.open(store, 2, ref="T-2", wip_limit=1)
+        assert fired[0].status == "queued"
+        assert (c.status, c.admitted) == ("queued", False)
+        assert self.admitted(store, 1) is True  # the older run got the slot
+        assert self.admitted(store, 2) is False
+
+    def test_admit_does_not_release_a_run_cancelled_after_it_was_listed(
+        self, store: IndexedStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.open(store, 1, ref="T-1", wip_limit=0)  # held
+        real = I._queued
+        fired: list[Any] = []
+
+        def listing(st: Any, sc: Any, size: int) -> Any:
+            out = real(st, sc, size)
+            if not fired:
+                fired.append(1)
+                for status in ("CANCELLING", "CANCELLED"):
+                    self.set_status(store, 1, status, ref="T-1")
+            return out
+
+        monkeypatch.setattr(I, "_queued", listing)
+        assert I.admit_queued(store, A, wip_limit=1) == []
+        assert self.admitted(store, 1) is False
+        item = store.get(A, Key("RUN#r1", "META"))
+        assert item is not None
+        assert item.data["status"] == "CANCELLED"
+        assert I.active_count(store, A, wip_limit=1) == 0  # no slot was given to a dead run
+
+    def test_a_takeover_is_refused_if_the_holder_is_no_longer_shown_ended(
+        self, store: IndexedStore
+    ) -> None:
+        self.open(store, 0, ref="T-0", wip_limit=1)
+        self.open(store, 1, ref="T-1", wip_limit=1)  # held
+        self.finish(store, 0)  # DONE: the slot can be taken over
+        racer = Interleaving(store)
+        racer.before_next_transact(lambda: self.finish(store, 0, "RUNNING"))  # not ended after all
+        assert I.admit_queued(racer, A, wip_limit=1) == []
+        assert self.admitted(store, 1) is False
+
+    def test_open_run_asks_membership_for_the_scope_team(self, store: IndexedStore) -> None:
+        spy = Members(ALICE)
+        assert self.open(store, 1, scope=B, members=spy).status == "started"
+        assert spy.asked == [("team-b", ALICE)]
 
     # --- the other side of a race, played deterministically ----------------------------------
 
@@ -679,8 +802,11 @@ class StoreContract:
         outs = race([lambda n=n: self.open(store, n, ref=f"T-{n}", wip_limit=2) for n in range(8)])
         assert all(isinstance(o, I.IntakeOutcome) for o in outs), outs
         got = [o for o in outs if isinstance(o, I.IntakeOutcome)]
-        assert sum(o.admitted for o in got) == 2
-        assert sum(o.status == "queued" for o in got) == 6
+        started = {f"r{n}" for n, o in enumerate(got) if o.admitted}
+        in_store = {f"r{n}" for n in range(8) if self.admitted(store, n) is True}
+        assert len(in_store) == 2
+        assert started == in_store  # each outcome tells the truth about its own run
+        assert {r for o in got for r in o.released} <= in_store
         assert I.active_count(store, A, wip_limit=2) == 2
 
     def test_two_concurrent_admit_queued_release_each_run_once(self, store: IndexedStore) -> None:
@@ -975,6 +1101,15 @@ class TestMergeWindow:
         w = self.cron_at("* * * * *", NOW)
         assert not w.open
         assert "not a valid cron" in (w.reason or "")
+
+    def test_an_hour_freeze_across_a_clock_change_is_absolute(self) -> None:
+        # London sprint ends 2026-11-02 00:00Z; 200h before that is 2026-10-24 16:00Z in absolute
+        # time (wall-clock arithmetic would say 15:00Z, an hour early, across the 10-25 change)
+        cfg = team_cfg(
+            LONDON + "sprint: {cadence: 2w, anchor: 2026-10-19, merge_freeze_before_end: 200h}\n"
+        )
+        assert I.merge_window(cfg, dt.datetime(2026, 10, 24, 15, 59, tzinfo=UTC)).open
+        assert not I.merge_window(cfg, dt.datetime(2026, 10, 24, 16, 0, tzinfo=UTC)).open
 
     def test_a_sprint_without_merge_freeze_never_freezes(self) -> None:
         assert I.merge_window(team_cfg("sprint: {cadence: 1w, anchor: 2026-11-02}\n"), NOW).open

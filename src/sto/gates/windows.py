@@ -123,8 +123,10 @@ def _local(t: dt.datetime, tz: ZoneInfo | dt.tzinfo) -> dt.datetime:
 
 def _next_match(cron: _Cron, after: dt.datetime, tz: ZoneInfo | dt.tzinfo) -> dt.datetime | None:
     """The first matching minute strictly after ``after`` (UTC), scanning local days. A local time
-    that does not exist (the hour skipped in spring) is not a match; a repeated autumn hour is
-    matched at its first pass."""
+    that does not exist (the hour skipped in spring) is not a match. A local time in the repeated
+    autumn hour is looked up at its first pass only, so ``until`` can name the first pass; the
+    second pass is still recognised as open when the caller re-evaluates, because ``matches``
+    reads each instant."""
     start = _local(after, tz)
     hours, minutes = sorted(cron.hour), sorted(cron.minute)
     for offset in range(_CRON_SCAN_DAYS):

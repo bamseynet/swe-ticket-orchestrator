@@ -15,21 +15,26 @@ here reads one, and the reducer is not touched.
   closed. A skip is returned to the caller with its reason; nothing is written for it, because a
   record per hostile trigger would let an outsider fill the store.
 * **Start and WIP.** ``open_run`` creates the run ``QUEUED`` and claims its ticket in one
-  transaction (``queries.start_run``), so a duplicate active run starts nothing. A run that is
-  *admitted* also holds one of the team's WIP slots, claimed in that same transaction: slot items
-  ``WIP/SLOT#k`` (k below the limit) are created with ``Absent()``, so of any number of racing
-  intakes exactly ``limit`` get one. A slot whose holder run is terminal is taken over in the same
-  transaction (a version-guarded overwrite plus a check that the holder still has the terminal
-  status that was read), so nothing has to release it. ``active_count`` is the number of slots
-  with a live holder, whatever status the run is in; an admitted run that is still ``QUEUED``
-  counts. A run that gets no slot, or that arrives while an older run is held (strict FIFO), is
-  stored ``admitted: false`` and waits. ``admit_queued`` releases the oldest held runs into free
-  slots, each release guarded by the run's version, so a run is released once even if two callers
-  race. Without a limit nothing is claimed and every run is admitted, so runs admitted while
-  unlimited do not count once a limit is set. Lowering a limit never evicts a run: slots at or
-  above the new limit keep their holders and stop being counted, so the team can briefly exceed a
-  lowered limit. Reads of the queued list are eventually consistent on DynamoDB, so a held run
-  that was written a moment ago may not yet block a newcomer from taking a free slot.
+  transaction (``queries.start_run``), so a duplicate active run starts nothing. Under a WIP limit
+  every run is written *held* (``admitted: false``) and then goes through ``admit_queued``, which
+  releases the oldest held runs into free slots; ``open_run`` reports ``started`` if its own run
+  was among them. So there is one admission path, oldest first, and a newcomer cannot pass an
+  older run. A release is one transaction that claims a WIP slot (``WIP/SLOT#k``, k below the
+  limit: created with ``Absent()``, or a version-guarded takeover of a slot whose holder run is
+  terminal, with a check that the holder still has that status) and flips ``admitted``, guarded
+  by the run's version, so a run is released once however many callers race and the slots never
+  exceed the limit. Nothing has to release a slot when a run ends. ``active_count`` is the number
+  of slots with a live holder in any status; an admitted run that is still ``QUEUED`` counts.
+  The queue is read with ``admit_queued`` listing the status index again before each release;
+  between that read and the write a still-older run could appear, which is a window of one index
+  read, and on DynamoDB the index is eventually consistent, so "oldest first" is as strict as
+  the index allows and not a serialised guarantee. Another caller's ``admit_queued`` can release
+  *your* run: a caller starts its own run if ``admitted`` and every id in
+  ``IntakeOutcome.released``, and starting must be idempotent.
+  Without a limit nothing is claimed and every run is admitted, so runs admitted while unlimited
+  do not count once a limit is set. Lowering a limit never evicts a run: slots at or above the
+  new limit keep their holders and stop being counted, so the team can briefly exceed a lowered
+  limit.
 * **Record.** The run keeps the intake actor, the ``ticket_revision`` and the frozen route inputs,
   computed by ``sto.gates.subject`` (which refuses keys that collide after normalising).
 * **Windows.** ``merge_window`` says whether merge may happen now. A deny window, a closed
@@ -59,7 +64,9 @@ from sto.gates.windows import Instant, MergeWindow, merge_window, utc_text
 from sto.store import queries
 from sto.store.ports import (
     Absent,
+    Check,
     ConditionFailedError,
+    FieldEquals,
     IndexedStore,
     Item,
     Key,
@@ -343,23 +350,32 @@ def _slots(store: IndexedStore, scope: TeamScope) -> dict[str, Item]:
         cursor = page.cursor
 
 
-def _holder_ended(store: IndexedStore, scope: TeamScope, slot: Item) -> bool:
-    """Is the slot's holder shown to have ended? A holder whose run is missing, or whose status
-    is not terminal, is live and is never displaced. Terminal statuses never change, so a
-    takeover guarded by the slot's version cannot displace a run that is still going."""
+def _ended_holder(store: IndexedStore, scope: TeamScope, slot: Item) -> tuple[Key, str] | None:
+    """The slot holder's run key and terminal status, or ``None`` if it cannot be shown to have
+    ended: a holder whose run is missing, or whose status is not terminal, is live and is never
+    displaced. Terminal statuses never change, so a takeover that also checks the status read
+    cannot displace a run that is still going.
+
+    A run item that is deleted (say by a retention job) reads as live here, so a retention job
+    must free the run's slot in the same transaction that deletes the run."""
     pk, sk = slot.data.get("run_pk"), slot.data.get("run_sk")
     if not isinstance(pk, str) or not isinstance(sk, str) or not pk or not sk:
-        return False
+        return None
     run = store.get(scope, Key(pk, sk))
-    return run is not None and run.data.get("status") in _TERMINAL
+    status = None if run is None else run.data.get("status")
+    if isinstance(status, str) and status in _TERMINAL:
+        return Key(pk, sk), status
+    return None
 
 
 def _claim_ops(
     store: IndexedStore, scope: TeamScope, limit: int, run_id: str, run_key: Key
 ) -> list[Op] | None:
     """The write that gives ``run_id`` the lowest free slot below ``limit``: a create of an empty
-    slot, or a version-guarded overwrite of one whose holder ended. ``None`` if all are held.
-    It commits only if the slot is still as read, so of any number of racing claims one wins."""
+    slot, or a version-guarded overwrite of one whose holder ended (plus a check that the holder
+    still has the terminal status that was read, as ``queries.start_run`` does for a ticket).
+    ``None`` if all are held. It commits only if the slots are still as read, so of any number of
+    racing claims one wins."""
     slots = _slots(store, scope)
     mine = {"run_id": run_id, "run_pk": run_key.pk, "run_sk": run_key.sk}
     for k in range(limit):
@@ -367,8 +383,12 @@ def _claim_ops(
         held = slots.get(key.sk)
         if held is None:
             return [Put(key, mine, when=Absent())]
-        if _holder_ended(store, scope, held):
-            return [Put(key, mine, when=VersionIs(held.version))]
+        ended = _ended_holder(store, scope, held)
+        if ended is not None:
+            return [
+                Put(key, mine, when=VersionIs(held.version)),
+                Check(ended[0], FieldEquals("status", ended[1])),
+            ]
     return None
 
 
@@ -382,8 +402,12 @@ def active_count(store: IndexedStore, scope: TeamScope, *, wip_limit: int) -> in
         1
         for k in range(limit)
         if (held := slots.get(_slot_key(k).sk)) is not None
-        and not _holder_ended(store, scope, held)
+        and _ended_holder(store, scope, held) is None
     )
+
+
+def _held_runs(store: IndexedStore, scope: TeamScope, size: int) -> list[Item]:
+    return [i for i in _queued(store, scope, size) if _is_held(i)]
 
 
 def admit_queued(
@@ -393,47 +417,70 @@ def admit_queued(
 
     Each release is one transaction that claims a slot and flips the run's ``admitted`` flag,
     guarded by the run's version, so a run is released once however many callers race: the loser
-    re-reads, finds it admitted, and moves on. Stops at the first run that finds every slot
-    taken, so a younger run never passes an older one. The caller moves each released run on
-    (``QUEUED`` to ``RUNNING``)."""
+    re-reads, finds it admitted, and moves on. The queue is listed again before every release,
+    so a run that appears while we work (an older one included) is seen; the run is re-read
+    first and must still be ``QUEUED`` and held, so one cancelled after it was listed is not
+    given a slot. Stops at the first run that finds every slot taken, so a younger run never
+    passes an older one. The caller moves each released run on (``QUEUED`` to ``RUNNING``)."""
     limit = _limit(wip_limit)
     released: list[str] = []
-    for head in (i for i in _queued(store, scope, page_size) if _is_held(i)):
-        for _ in range((limit or 0) + 2):
-            item = store.get(scope, head.key)
-            run_id = None if item is None else item.data.get("id")
-            if item is None or not _is_held(item) or not isinstance(run_id, str) or not run_id:
-                break  # released by someone else, or not a run we can release
-            ops: list[Op] = []
-            if limit is not None:
-                claim = _claim_ops(store, scope, limit, run_id, head.key)
-                if claim is None:
-                    return released  # every slot is taken
-                ops = claim
-            run = Put(
-                head.key,
-                dict(item.data) | {"admitted": True},
-                when=VersionIs(item.version),
-                attrs=item.attrs,
-            )
-            try:
-                store.transact(scope, [*ops, run])
-            except ConditionFailedError:
-                continue  # lost the run or the slot to another caller: look again
-            released.append(run_id)
-            break
-        else:
-            return released  # kept losing races: stop here rather than pass the oldest run
+    budget = 4 + 2 * len(_held_runs(store, scope, page_size))  # each pass makes progress or loses
+    while budget > 0:
+        budget -= 1
+        held = _held_runs(store, scope, page_size)
+        if not held:
+            return released
+        head = held[0]
+        item = store.get(scope, head.key)
+        run_id = None if item is None else item.data.get("id")
+        if (
+            item is None
+            or not _is_held(item)
+            or item.data.get("status") != RunStatus.QUEUED.value
+            or not isinstance(run_id, str)
+            or not run_id
+        ):
+            continue  # released, ended or gone since it was listed: list again
+        ops: list[Op] = []
+        if limit is not None:
+            claim = _claim_ops(store, scope, limit, run_id, head.key)
+            if claim is None:
+                return released  # every slot is taken
+            ops = claim
+        run = Put(
+            head.key,
+            dict(item.data) | {"admitted": True},
+            when=VersionIs(item.version),
+            attrs=item.attrs,
+        )
+        try:
+            store.transact(scope, [*ops, run])
+        except ConditionFailedError:
+            continue  # lost the run or a slot to another caller: list again
+        released.append(run_id)
     return released
+
+
+def _is_admitted(store: IndexedStore, scope: TeamScope, key: Key) -> bool:
+    item = store.get(scope, key)
+    return item is not None and item.data.get("admitted") is True
 
 
 @dataclass(frozen=True)
 class IntakeOutcome:
+    """``admitted`` is whether this call's own run holds a slot when the call returns, whoever
+    released it. ``released`` lists every run this call released into a slot: the caller starts
+    all of them too, because another caller's run may be among them (that caller may already
+    have returned ``queued``). A run can therefore be started by its own caller and by the one
+    that released it, so starting a run (``QUEUED`` to ``RUNNING``) must be idempotent, which
+    the reducer's transition table gives: a second start of a running run is refused."""
+
     status: Literal["started", "queued", "skipped"]
     admitted: bool
     reason: str | None = None
     run_id: str | None = None  # the run that holds the ticket, for a duplicate
     workflows: tuple[str, ...] = ()
+    released: tuple[str, ...] = ()
 
 
 def open_run(
@@ -448,12 +495,13 @@ def open_run(
     run_id: str,
     now: Instant,
 ) -> IntakeOutcome:
-    """Decide, then create the run ``QUEUED`` and claim its ticket (and, if admitted, a WIP slot)
-    in one transaction.
+    """Decide, then create the run ``QUEUED`` and claim its ticket in one transaction. Under a
+    limit the run is written held and released through ``admit_queued`` (oldest first).
 
-    ``started`` means the run holds a slot and may go ahead (the caller moves it to ``RUNNING``);
-    ``queued`` means WIP, or an older held run, keeps it waiting for ``admit_queued``. ``skipped``
-    wrote nothing: it carries the reason, and for a duplicate the run that holds the ticket."""
+    ``started`` means this run holds a slot and may go ahead (the caller moves it to
+    ``RUNNING``, along with every id in ``released``); ``queued`` means WIP, or an older run,
+    keeps it waiting for ``admit_queued``. ``skipped`` wrote nothing: it carries the reason, and
+    for a duplicate the run that holds the ticket."""
     limit = _limit(wip_limit)
     verdict = decide(
         workflows=workflows,
@@ -471,16 +519,15 @@ def open_run(
         queries.ticket_attrs(ticket.source, ticket.ref, stamp, key)  # the key parts are valid
     except ValueError:
         return IntakeOutcome("skipped", False, "invalid_ticket_key")
-
-    def start(admitted: bool, extra: list[Op]) -> None:
-        data = {
-            "id": run_id,
-            "team": scope.team,
-            "status": RunStatus.QUEUED.value,
-            "workflow": verdict.workflow,
-            "intake": rec.to_data(),
-            "admitted": admitted,
-        }
+    data = {
+        "id": run_id,
+        "team": scope.team,
+        "status": RunStatus.QUEUED.value,
+        "workflow": verdict.workflow,
+        "intake": rec.to_data(),
+        "admitted": limit is None,
+    }
+    try:
         queries.start_run(
             store,
             scope,
@@ -490,27 +537,15 @@ def open_run(
             status=RunStatus.QUEUED,
             updated_at=stamp,
             ticket=(ticket.source, ticket.ref),
-            extra_ops=extra,
         )
-
-    try:
-        if limit is None:
-            start(True, [])
-            return IntakeOutcome("started", True)
-        if limit > 0 and not any(_is_held(i) for i in _queued(store, scope, _PAGE)):
-            for _ in range(limit + 1):
-                claim = _claim_ops(store, scope, limit, run_id, key)
-                if claim is None:
-                    break
-                try:
-                    start(True, claim)
-                except ConditionFailedError:
-                    continue  # another intake took that slot first: look again
-                return IntakeOutcome("started", True)
-        start(False, [])
     except queries.ActiveRunExistsError as exc:
         return IntakeOutcome("skipped", False, "duplicate_active", run_id=exc.run_id)
-    return IntakeOutcome("queued", False, "wip_limit")
+    if limit is None:
+        return IntakeOutcome("started", True, released=(run_id,))
+    released = tuple(admit_queued(store, scope, wip_limit=limit)) if limit > 0 else ()
+    if run_id in released or _is_admitted(store, scope, key):
+        return IntakeOutcome("started", True, released=released)
+    return IntakeOutcome("queued", False, "wip_limit", released=released)
 
 
 # --- T11: edits --------------------------------------------------------------------------------
