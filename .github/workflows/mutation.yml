@@ -1,0 +1,97 @@
+# Mutation report for the Python source a PR changes. NON-BLOCKING by design.
+#
+# Not part of `ci-required` and never added to the ruleset: every step that could fail has
+# `continue-on-error`, and scripts/mutate_changed.py exits 0 whatever it finds. Agents read the
+# surviving-mutant report (job summary, one PR comment, artifact) instead of hand-writing mutants.
+#
+# Security: `pull_request` (never `pull_request_target`), so PR code runs with a read-only token
+# for fork PRs; the comment step then fails harmlessly (continue-on-error). No secrets are used.
+name: Mutation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.13.6"
+
+jobs:
+  mutation:
+    name: mutation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write # create or update the single report comment
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+        continue-on-error: true
+      - name: Mutate the changed source files
+        id: mutate
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p mutation-out
+          # The merge base, not the base tip: a PR must not be blamed for what main did since.
+          base="$(git merge-base "$BASE_SHA" HEAD || echo "$BASE_SHA")"
+          uv run python scripts/mutate_changed.py --base "$base" --out mutation-out \
+            --total-seconds 1020
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f mutation-out/mutation-report.md ]; then
+            cat mutation-out/mutation-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Mutation report (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+            echo "The mutation script produced no report (see the job log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        continue-on-error: true
+        with:
+          name: mutation-report
+          path: |
+            mutation-out/mutation-report.md
+            mutation-out/mutation-report.json
+          if-no-files-found: ignore
+      - name: Post or update the PR comment
+        if: always() && hashFiles('mutation-out/mutation-report.md') != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          marker='<!-- mutation-report -->'
+          {
+            echo "$marker"
+            cat mutation-out/mutation-report.md
+            echo
+            echo "_Non-blocking. [Run and artifact]($RUN_URL). Updated on every push._"
+          } > comment.md
+          id="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"$marker\"))][0].id // empty")"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@comment.md >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@comment.md >/dev/null
+          fi

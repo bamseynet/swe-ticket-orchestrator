@@ -58,6 +58,29 @@ file: `.github/workflows/ci.yml`, `src/sto/engine/reducer.py`, `src/sto/engine/c
 - **A heavy CI job is never moved to a laptop to save time.** If a test is too slow for its tier, fix it or move it to a
   CI-only tier.
 
+## Mutation report
+
+Every PR gets a non-blocking `Mutation` workflow (`.github/workflows/mutation.yml`, not part of `ci-required`, it never fails
+a PR). It mutates the Python files under `src/` that the PR changes, only on the lines the PR touched, and runs only
+their direct tests (the `scripts/test_changed.py` mapping) plus the tests the PR changes. Do not hand-write mutants: read the report
+in the job summary, the single PR comment (updated on each push) or the `mutation-report` artifact (`.md` and `.json`).
+
+- **Surviving mutant**: `file:line`, the original line and the mutated line. No test failed, so that behaviour is not pinned.
+  Add a test that fails on the mutant, or say in the PR why the change is equivalent or does not matter. A line can be
+  excluded with `# pragma: no mutate` when a mutant there is meaningless.
+- **Killed**: a test failed, which is what you want. **Timeout** and **memory** (each mutant has a hard timeout and a
+  1.5 GB address-space cap) are counted separately and never as kills.
+- A docs-only or test-only PR reports "No Python source changed". Past 17 minutes the run stops and reports what finished.
+
+Run the same script locally for one file (small files only; it is one pytest process per mutant):
+
+```
+uv run python scripts/mutate_changed.py --files src/sto/domain/registry.py --all-lines --out /tmp/mutation-out
+```
+
+Drop `--all-lines` to mutate only the lines changed against `--base` (default `origin/main`); without `--files` it takes
+every changed `src/` file. Keep the run to one small file locally, the CI job does the rest.
+
 ## Adding a CI job
 
 Add the job with `needs: filter`, then add its id to the `needs:` list of `ci-required`. Never add a work job to the
