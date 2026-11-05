@@ -347,8 +347,8 @@ Property tests pass over all templates, with crash injection.
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
-| 6 | D2-09, D2-19, D2-23, D2-25, D2-28 | D2-29 |
-| 7 | D2-14, D2-15 | - |
+| 6 | D2-09, D2-23, D2-25 | D2-29, D2-30 |
+| 7 | D2-14, D2-15, D2-19, D2-28 | - |
 | 8 | D2-20 | - |
 
 #### D2-01: Workflow schema
@@ -466,7 +466,7 @@ Duplicate active runs and tickets matching two workflows start nothing, and a no
 Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage and meets `OrgPolicy.teams`, and it is audited.
 An `apiVersion` change comes with a migration rule, tested here.
 **AC:** migration to an invalid position is refused; migration onto a version lacking an org-required gate is refused; `POST /runs/{id}:migrate` is enforced by role; a stored older run migrates in a test. Migration re-runs V17 and the `min_quorum` check against the live `OrgPolicy`.
-**Deps:** D2-07, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/config/migrate.py`, `src/sto/api/routers/migrate.py`, `tests/config/test_migrate.py`.
+**Deps:** D2-07, D2-30, D1-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/config/migrate.py`, `src/sto/api/routers/migrate.py`, `tests/config/test_migrate.py`.
 
 #### D2-20: State compatibility
 Replay stored fixtures of older run states through the current reducer, required on every engine change from here on.
@@ -525,6 +525,11 @@ Found in review of D2-10. PLAN section 6.3 sends a run whose effect is voided wi
 Found in review of D2-13. Wait and checks stages are entered through `STAGE_ENTRY` in `handlers/stages.py`, but `next()` with an explicit `graph_registry=` can enter a stage whose leaving events that registry cannot handle, so the run waits for ever.
 **AC:** `next()` refuses, as a BLOCKED reason and not an exception, to enter a stage kind whose leaving events the registry in use has no handler for; the default registry is unaffected; a test builds a registry without the wait handlers and shows the block. The reducer stays pure: no context variables or other implicit state.
 **Deps:** D2-13. **Size:** S. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `tests/engine/test_reducer_v1.py`.
+
+#### D2-30: Runs pin the published digest
+Found in review of D2-07. Publishing stores immutable manifests and `load_pinned` reads one back by digest, but no run records a digest: `workflow_version()` in `reducer.py` still pins the workflow name, so "publish during a run changes nothing for that run" holds only at the storage level.
+**AC:** the run starter reads `Publisher.latest` for the team and workflow, records `(team, name, version, digest)` on the run at start, and every later step loads the manifest through `load_pinned`; `workflow_version()` returns the pin and the reducer docstring says so; a publish during a run, including a changed profile outcome or prompt, changes nothing for that run in an end-to-end test on the local driver; a run whose pinned manifest no longer loads blocks with a reason instead of raising. `FLOOR_TRACKING` in `org_policy.py` drops D2-07.
+**Deps:** D2-07, D2-26. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/handlers/stages.py`, `src/sto/api/runtime.py`, `src/sto/config/org_policy.py`, `tests/engine/test_pinning.py`, `tests/config/test_policy.py`.
 
 ## D3: Identity and complete gates
 
