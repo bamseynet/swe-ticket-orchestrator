@@ -26,7 +26,8 @@ PLAN.md section 7.7 first: staging holds other runs' merges, and release checks 
 The overlay's `qa_gate` has `eligible_roles: [qa, reviewer]` and no `quorum`. An
 `OrgPolicy.teams.<team>.required_gates` entry `{ id: qa_gate, role: qa }` is satisfied only by a
 gate whose decider really is `qa`: with no `quorum`, that means `eligible_roles` is exactly
-`[qa]`. So add a quorum to the team's overlay:
+`[qa]`. Without the quorum, `eligible_roles: [qa, reviewer]` lets QA pass with no QA person: a reviewer
+alone can decide the gate. So add a quorum to the team's overlay:
 
 ```yaml
 stages:

@@ -13,16 +13,17 @@ suite, `qa_gate`, merge, post-merge checks, ticket done.
 Both gates use `carry_over: patch_id`. Merging after QA means any other merge moves the base, so a
 clean update re-runs CI and the QA suite and asks nobody again unless the code changed.
 
-Do not use it for trunk-based teams that must release straight after merge (see `kanban/`), or
-where an extra approver is mandatory (see `regulated/`).
+For a trunk-based team that releases straight after merge, use the `kanban` overlay on it. Where
+an extra approver is mandatory, use the `regulated` overlay on it. Both extend this template.
 
 ## Checks to require
 
 Require these in the repository's branch protection, and in `TeamConfig` / the org policy:
 
-- `sto/review-gate`: the platform's status for the review gate. It is the one check that must be
-  required, because the QA check cannot pass before merge in the Kanban flow, and a merge needs a
-  valid review approval for that code.
+- `sto/review-gate`: the platform's status for the review gate. A merge needs a valid review
+  approval for that code, so branch protection should require this check. (QA comes before the merge
+  in this template, so a team may also require the QA gate's status. An overlay that merges before
+  QA, such as `kanban`, must not.)
 - The CI checks your repo needs, named by `team_default`. A `checks` stage with `required:
   team_default` must resolve to at least one, or the run blocks.
 - QA suite checks `integration` and `e2e` (the `qa_auto` stage waits for both).
