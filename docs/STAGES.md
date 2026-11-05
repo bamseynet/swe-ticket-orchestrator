@@ -706,7 +706,7 @@ Tokens are narrowed per call, cached under an hour, never logged, and refused fo
 Generic ingest: verify on the raw body, dedupe, enqueue, respond inside the vendor's deadline.
 Consumers treat the delivery as a nudge and re-read state.
 **AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries. This issue owns the `WebhookVerifier` port and the queue failure path, and the port says a delivery ID outside the signature does not stop an attacker, so a decision-shaped delivery must re-read. Header names are normalised. For a vendor with no signed timestamp the dedupe record is the only replay bound, so it does not expire; the TTL on `SEEN` applies only to vendors with signed timestamps (PLAN.md section on the data model).
-**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
+**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`, `tests/ingest/__init__.py`.
 
 #### D4-04: GitHub webhooks
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
