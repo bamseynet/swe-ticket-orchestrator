@@ -43,9 +43,11 @@ from sto.api.auth import (
     routes_of,
     undeclared_routes,
 )
-from sto.api.runtime import Runtime
+from sto.api.runtime import Runtime, default_gate_roles
 from sto.config.org_policy import ORG_ADMIN, Principal
+from sto.domain import Gate, GateType, RunId, Subject
 from sto.effects.core import EffectExecutor
+from sto.engine.commands import OpenGate
 from sto.gates.service import GateService
 from sto.identity.fake_issuer import FakeIssuer
 from sto.identity.mapping import RoleMapping
@@ -60,6 +62,7 @@ NOW = 1_800_000_000.0
 ALPHA, BETA = "alpha", "beta"
 CUSTOM = "security_officer"
 ROOT = Principal("root", frozenset({ORG_ADMIN}))
+CANCEL = ("POST", "/runs/{run_id}/cancel")
 TEAM_ROLES = ("developer", "reviewer", "qa", "team_admin", "auditor", CUSTOM)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,6 +73,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 class _NoSteps:
     async def execute(self, key: str, command: object) -> Any:
         raise AssertionError("no step runs in a tenancy test")
+
+
+def gate_roles(gate: Gate) -> frozenset[str] | None:
+    """The template defaults, plus a team's own role for its custom gates."""
+    return frozenset({CUSTOM}) if gate.type is GateType.CUSTOM else default_gate_roles(gate)
 
 
 class World:
@@ -93,6 +101,7 @@ class World:
             store,
             self.scope,
             gates=GateService(store),
+            gate_roles=gate_roles,
             effects=EffectExecutor(store, self.scope),
             steps=_NoSteps(),
             merges=lambda effect: (_ for _ in ()).throw(AssertionError("no merge")),
@@ -489,12 +498,14 @@ def flags(world: World, route: tuple[str, str], *groups: str) -> tuple[int, tupl
 
 
 def test_an_own_grant_admits_only_where_the_route_checks_ownership(world: World) -> None:
-    """A developer may cancel their own run: that needs a handler that checks, so on the real
-    cancel route (which does not) they are refused, and where one declares it, flagged."""
+    """A developer may cancel their own run: that needs a handler that checks, so a route that
+    declares no check refuses them, and one that declares it flags them. (The real cancel route
+    declares it now: see the D3-22 tests below.)"""
     for role in ("developer", "reviewer", "qa"):
         assert flags(world, OWN, f"{ALPHA}-{role}") == (200, (True, False)), role
+    undeclared = {**ROUTES, CANCEL: replace(ROUTES[CANCEL], checks_own=False, checks_gate=False)}
     refused(
-        send(world.app(), "POST", "/runs/x/cancel", world.user(ALPHA, "developer")),
+        send(world.app(undeclared), "POST", "/runs/x/cancel", world.user(ALPHA, "developer")),
         403,
         "forbidden",
     )
@@ -507,7 +518,11 @@ def test_a_stop_at_gate_grant_admits_only_where_the_route_checks_the_gate(world:
     cancel route until a handler checks that, flagged where one declares it."""
     for role in ("reviewer", "qa", CUSTOM):
         assert flags(world, GATE, f"{ALPHA}-{role}") == (200, (False, True)), role
-        real = send(world.app(), "POST", "/runs/x/cancel", world.user(ALPHA, role))
+        undeclared = {
+            **ROUTES,
+            CANCEL: replace(ROUTES[CANCEL], checks_own=False, checks_gate=False),
+        }
+        real = send(world.app(undeclared), "POST", "/runs/x/cancel", world.user(ALPHA, role))
         refused(real, 403, "forbidden", role)
     # a plain developer holds only the own grant, which this route does not check
     assert flags(world, GATE, f"{ALPHA}-developer")[0] == 403
@@ -515,11 +530,11 @@ def test_a_stop_at_gate_grant_admits_only_where_the_route_checks_the_gate(world:
 
 
 def test_the_cancel_route_takes_cancel_or_stop_at_gate(world: World) -> None:
-    """The real cancel route names both permissions, so once its handler checks the gate (here:
-    declared on a copy of the table) a gate role gets in and a plain developer still does not."""
+    """The real cancel route names both permissions: with only the gate check declared (a copy
+    of the table) a gate role gets in and a plain developer does not."""
     key = ("POST", "/runs/{run_id}/cancel")
     assert ROUTES[key].also == (Permission.STOP_AT_GATE,)
-    app = world.app({**ROUTES, key: replace(ROUTES[key], checks_gate=True)})
+    app = world.app({**ROUTES, key: replace(ROUTES[key], checks_own=False, checks_gate=True)})
     for role in ("reviewer", "qa", CUSTOM):
         assert send(app, "POST", "/runs/x/cancel", world.user(ALPHA, role)).status_code not in (
             401,
@@ -908,3 +923,213 @@ assert "sto.api.auth" in sys.modules and "sto.api.app" in sys.modules, failed
         [sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=120
     )
     assert done.returncode == 0, done.stderr[-800:]
+
+
+# --- D3-22: the cancel and decide handlers enforce the conditional grants ----------
+
+SOD_ACTOR = f"{ISS}|"  # the actor key is issuer|subject (sto.gates.sod)
+
+
+def actor_of(team: str, role: str) -> str:
+    return f"{SOD_ACTOR}{team}-{role}-user"
+
+
+def seed_run(world: World, *, started_by: str | None, gate: GateType | None = None) -> RunId:
+    """A real run in the world's runtime, started by ``started_by``, optionally at an open gate."""
+    run = asyncio.run(world.runtime.create_run("T-1", started_by=started_by))
+    if gate is not None:
+        subject = Subject(
+            head_sha="b" * 40,
+            patch_id="p1",
+            ticket_revision="r1",
+            evidence_digest="e1",
+            attention_digest="t1",
+        )
+        world.runtime._gates.open_gate(world.scope, OpenGate(run.id, "g", gate, 1, subject))
+    return run.id
+
+
+def digest_of(world: World, run_id: RunId) -> str:
+    (g,) = asyncio.run(world.runtime.gates(run_id))
+    return g.subject.digest()
+
+
+def post(app: FastAPI, path: str, token: str, body: dict[str, Any]) -> httpx.Response:
+    async def go() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(path, headers={"Authorization": f"Bearer {token}"}, json=body)
+
+    return asyncio.run(asyncio.wait_for(go(), 20))
+
+
+def test_the_real_cancel_route_declares_both_checks() -> None:
+    rule = ROUTES[CANCEL]
+    assert (rule.checks_own, rule.checks_gate) == (True, True)
+    assert rule.also == (Permission.STOP_AT_GATE,)
+
+
+def test_an_own_holder_cancels_only_a_run_they_started(world: World) -> None:
+    app = world.app()
+    mine = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    theirs = seed_run(world, started_by=actor_of(ALPHA, "qa"))
+    nobody = seed_run(world, started_by=None)
+    dev = world.user(ALPHA, "developer")
+    assert send(app, "POST", f"/runs/{mine}/cancel", dev).status_code == 202
+    refused(send(app, "POST", f"/runs/{theirs}/cancel", dev), 403, "forbidden")
+    refused(send(app, "POST", f"/runs/{nobody}/cancel", dev), 403, "forbidden")
+
+
+def test_ownership_is_issuer_and_subject_not_the_subject_alone(world: World) -> None:
+    app = world.app()
+    other_issuer = seed_run(world, started_by="https://other.example.test|alpha-developer-user")
+    refused(
+        send(app, "POST", f"/runs/{other_issuer}/cancel", world.user(ALPHA, "developer")),
+        403,
+        "forbidden",
+    )
+
+
+def test_an_admin_cancels_any_run(world: World) -> None:
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    r = send(world.app(), "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "team_admin"))
+    assert r.status_code == 202
+
+
+def test_a_stop_at_gate_holder_cancels_only_a_run_waiting_at_a_gate_their_role_may_decide(
+    world: World,
+) -> None:
+    app = world.app()
+    at_review = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    at_custom = seed_run(world, started_by=None, gate=GateType.CUSTOM)
+    no_gate = seed_run(world, started_by=None)
+    reviewer, qa = world.user(ALPHA, "reviewer"), world.user(ALPHA, "qa")
+    officer = world.user(ALPHA, CUSTOM)
+    assert send(app, "POST", f"/runs/{at_review}/cancel", reviewer).status_code == 202
+    assert send(app, "POST", f"/runs/{at_custom}/cancel", officer).status_code == 202
+    for who, kind in (
+        (qa, GateType.REVIEW),
+        (reviewer, GateType.CUSTOM),
+        (officer, GateType.REVIEW),
+    ):
+        other = seed_run(world, started_by=None, gate=kind)
+        refused(send(app, "POST", f"/runs/{other}/cancel", who), 403, "forbidden")
+    refused(send(app, "POST", f"/runs/{no_gate}/cancel", reviewer), 403, "forbidden")
+    refused(send(app, "POST", f"/runs/{no_gate}/cancel", officer), 403, "forbidden")
+
+
+def test_a_closed_gate_no_longer_lets_its_role_stop_the_run(world: World) -> None:
+    app = world.app()
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    d = post(
+        app,
+        f"/runs/{run_id}/gates/g/1/decisions",
+        world.user(ALPHA, "reviewer"),
+        {"kind": "approve", "subject_digest": digest_of(world, run_id)},
+    )
+    assert d.status_code == 202, d.text
+    refused(
+        send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "reviewer")), 403, "forbidden"
+    )
+
+
+def test_an_unknown_run_is_404_for_a_holder_the_middleware_admitted(world: World) -> None:
+    r = send(world.app(), "POST", f"/runs/{RunId.new()}/cancel", world.user(ALPHA, "developer"))
+    refused(r, 404, "run_not_found")
+
+
+def test_a_user_holding_both_grants_may_stop_through_either(world: World) -> None:
+    """A qa user holds own and stop-at-gate: their own run, or one at a gate qa may decide."""
+    app = world.app()
+    own = seed_run(world, started_by=actor_of(ALPHA, "qa"))
+    at_qa = seed_run(world, started_by=None, gate=GateType.QA)
+    neither = seed_run(world, started_by=None)
+    qa = world.user(ALPHA, "qa")
+    assert send(app, "POST", f"/runs/{own}/cancel", qa).status_code == 202
+    assert send(app, "POST", f"/runs/{at_qa}/cancel", qa).status_code == 202
+    refused(send(app, "POST", f"/runs/{neither}/cancel", qa), 403, "forbidden")
+
+
+def test_decide_records_the_authenticated_actor_never_a_constant(world: World) -> None:
+    app = world.app()
+    for role in ("reviewer", "team_admin"):
+        run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+        r = post(
+            app,
+            f"/runs/{run_id}/gates/g/1/decisions",
+            world.user(ALPHA, role),
+            {"kind": "approve", "subject_digest": digest_of(world, run_id)},
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["gate"]["closed_by"] == actor_of(ALPHA, role)
+    org = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    r = post(
+        app,
+        f"/runs/{org}/gates/g/1/decisions",
+        world.token("root-user", ["org-admins"]),
+        {"kind": "approve", "subject_digest": digest_of(world, org)},
+    )
+    assert r.json()["gate"]["closed_by"] == f"{ISS}|root-user"
+
+
+def decide_twice(world: World, run_id: RunId, token: str) -> httpx.Response:
+    """The second decision on a closed gate: a 409 that may offer the stop link."""
+    return post(
+        world.app(),
+        f"/runs/{run_id}/gates/g/1/decisions",
+        token,
+        {"kind": "reject", "comment": "no"},
+    )
+
+
+def test_the_409_stop_link_is_offered_only_to_roles_that_can_use_it(world: World) -> None:
+    app = world.app()
+    owner_actor = actor_of(ALPHA, "developer")
+    run_id = seed_run(world, started_by=owner_actor, gate=GateType.REVIEW)
+    first = post(
+        app,
+        f"/runs/{run_id}/gates/g/1/decisions",
+        world.user(ALPHA, "team_admin"),
+        {"kind": "approve", "subject_digest": digest_of(world, run_id)},
+    )
+    assert first.status_code == 202, first.text
+    # a second gate stays open for a custom gate role, so that role is offered the link too
+    subject = Subject(
+        head_sha="b" * 40,
+        patch_id="p2",
+        ticket_revision="r1",
+        evidence_digest="e1",
+        attention_digest="t1",
+    )
+    world.runtime._gates.open_gate(
+        world.scope, OpenGate(run_id, "sec", GateType.CUSTOM, 1, subject)
+    )
+    link = {"method": "POST", "href": f"/runs/{run_id}/cancel"}
+    offered = {
+        "developer": link,  # the owner
+        "team_admin": link,
+        "qa": None,  # not the owner, and no open gate qa may decide
+        "reviewer": None,
+        CUSTOM: link,
+    }
+    for role, want in offered.items():
+        r = decide_twice(world, run_id, world.user(ALPHA, role))
+        assert (r.status_code, code(r)) == (409, "gate_closed"), (role, r.text)
+        assert r.json()["error"].get("stop") == want, role
+    # the link works for every role it was offered to (checked on separate runs: a Stop is final)
+    for role, want in offered.items():
+        if want is None:
+            continue
+        fresh = seed_run(world, started_by=actor_of(ALPHA, role), gate=GateType.REVIEW)
+        post(
+            app,
+            f"/runs/{fresh}/gates/g/1/decisions",
+            world.user(ALPHA, "team_admin"),
+            {"kind": "approve", "subject_digest": digest_of(world, fresh)},
+        )
+        world.runtime._gates.open_gate(
+            world.scope, OpenGate(fresh, "sec", GateType.CUSTOM, 1, subject)
+        )
+        r = decide_twice(world, fresh, world.user(ALPHA, role))
+        href = r.json()["error"]["stop"]["href"]
+        assert send(app, "POST", href, world.user(ALPHA, role)).status_code == 202, role

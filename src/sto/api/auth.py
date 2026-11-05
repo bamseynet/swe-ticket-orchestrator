@@ -46,8 +46,10 @@ mapping or a disable applies at once; ``403`` ``no_access`` or ``user_disabled``
 see. An "own" grant (a developer cancelling *their own* run) and a ``STOP_AT_GATE`` grant (stop
 a run while eligible for its open gate) admit a request only on a route whose rule declares
 ``checks_own`` or ``checks_gate``: a promise that the handler checks it, which the handler
-reads as ``own_only`` and ``gate_only`` on :class:`Authorized`. No route declares either yet
-(the cancel handler checks neither), so those roles are refused there until one does.
+reads as ``own_only`` and ``gate_only`` on :class:`Authorized`. Only the cancel route declares
+them (D3-22), and its handler applies :func:`may_stop`; the decide handler records
+:func:`actor_key` (``issuer|subject``, as separation of duties keys actors), and offers the 409's
+stop link only to a caller who passes the same check.
 
 Custom gate roles (``security_officer``...) are declared per team (D3-02). They are admitted to
 the rows that gate work needs (view runs, stop at a gate, decide a gate); whether they may decide
@@ -100,8 +102,10 @@ __all__ = [
     "Permission",
     "RouteRule",
     "RouteTableError",
+    "actor_key",
     "grants",
     "install_authorization",
+    "may_stop",
     "routes_of",
     "undeclared_routes",
 ]
@@ -184,16 +188,20 @@ class RouteRule:
 
 
 WEBSOCKET = "WEBSOCKET"
+STOP_ROUTE = ("POST", "/runs/{run_id}/cancel")
 
 ROUTES: dict[tuple[str, str], RouteRule] = {
     ("GET", "/runs"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs"): RouteRule(Permission.START_RUN),
     ("GET", "/runs/{run_id}"): RouteRule(Permission.VIEW_RUNS),
     ("GET", "/runs/{run_id}/events"): RouteRule(Permission.VIEW_RUNS),
-    # Stop: a run's own owner (own) or someone eligible for its gate (STOP_AT_GATE) may stop it,
-    # and the handler checks neither yet, so only an admin gets through (D3-03 review).
-    ("POST", "/runs/{run_id}/cancel"): RouteRule(
-        Permission.CANCEL_RUN, also=(Permission.STOP_AT_GATE,)
+    # Stop: a run's own owner (own) or someone eligible for its gate (STOP_AT_GATE) may stop it.
+    # The handler checks both with ``may_stop`` (D3-22); an admin holds the permission outright.
+    STOP_ROUTE: RouteRule(
+        Permission.CANCEL_RUN,
+        also=(Permission.STOP_AT_GATE,),
+        checks_own=True,
+        checks_gate=True,
     ),
     ("GET", "/runs/{run_id}/gates"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs/{run_id}/gates/{name}/{round}/decisions"): RouteRule(Permission.DECIDE_GATE),
@@ -224,6 +232,42 @@ class Authorized:
     scope: TeamScope | PlatformScope  # ``PLATFORM`` for a service
     own_only: bool = False
     gate_only: bool = False
+
+
+def actor_key(identity: UserIdentity | ServiceIdentity) -> str:
+    """``issuer|subject``: the actor key of separation of duties (``sto.gates.sod``)."""
+    return f"{identity.issuer}|{identity.subject}"
+
+
+def may_stop(auth: Authorized, *, started_by: str | None, gate_roles: frozenset[str]) -> bool:
+    """The check a handler promises when its route declares ``checks_own`` / ``checks_gate``.
+
+    Judged by the cancel route's rule for the caller's roles, wherever it is asked. A holder of
+    the permission outright may. An "own" holder may if they started the
+    run; a stop-at-gate holder may if a role they hold that carries ``STOP_AT_GATE`` is among
+    ``gate_roles``, the roles that may decide the run's open gates. A holder of both grants
+    needs either. Anything else, including a service or an unknown starter, may not.
+    """
+    identity = auth.identity
+    if not isinstance(identity, UserIdentity) or not isinstance(auth.scope, TeamScope):
+        return False
+    team = auth.scope.team
+    roles = set(identity.roles_in(team))
+    if (None, ORG_ADMIN) in identity.memberships:
+        roles.add(ORG_ADMIN)
+    # Always the cancel rule's admission, not the flags of the route being served: the decide
+    # route admits a reviewer outright, but the Stop it offers is the cancel route's.
+    admitted = _admission(ROUTES[STOP_ROUTE], roles)
+    if admitted is None:
+        return False
+    own_only, gate_only = admitted
+    if not (own_only or gate_only):
+        return True
+    if own_only and started_by is not None and started_by == actor_key(identity):
+        return True
+    return gate_only and any(
+        r in gate_roles and grants(Permission.STOP_AT_GATE, r) is not None for r in roles
+    )
 
 
 TeamOf = Callable[[HTTPConnection], str | None]

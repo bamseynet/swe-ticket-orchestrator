@@ -247,6 +247,16 @@ class _TaggedDriver(LocalDriver):
 # --- the runtime --------------------------------------------------------------------------------
 
 
+GateRoles = Callable[[Gate], frozenset[str] | None]
+
+
+def default_gate_roles(gate: Gate) -> frozenset[str] | None:
+    """Who may decide a gate until its snapshotted ``eligible_roles`` are stored (D3-08a): the
+    template defaults (PLAN 9.3: ``reviewer`` for review, ``qa`` for QA). Any other gate names
+    nobody, so a Stop through it fails closed."""
+    return {GateType.REVIEW: frozenset({"reviewer"}), GateType.QA: frozenset({"qa"})}.get(gate.type)
+
+
 class Runtime:
     def __init__(
         self,
@@ -259,6 +269,7 @@ class Runtime:
         merges: MergeFactory,
         live: LiveSubject,
         workflow: Workflow = LINEAR_V0,
+        gate_roles: GateRoles = default_gate_roles,
         clock: Callable[[], float] = time.time,
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
         owner: str = "api",
@@ -272,6 +283,7 @@ class Runtime:
         load_handlers()  # before anything stored is decoded (the driver needs the registries)
         self.store, self.scope, self._wf = store, scope, workflow
         self._gates = gates
+        self._gate_roles = gate_roles
         self._api_sleep, self._backoff = api_sleep, backoff
         self._cooldown, self._mono = cooldown, mono
         self._wake: dict[RunId, asyncio.Event] = {}
@@ -565,12 +577,12 @@ class Runtime:
 
     # --- runs ---------------------------------------------------------------------------------
 
-    async def create_run(self, ticket: str | None) -> Run:
+    async def create_run(self, ticket: str | None, started_by: str | None = None) -> Run:
+        """``started_by``: the starter's actor key (``issuer|subject``), None for the dev token."""
         run = Run(id=RunId.new(), team=self.scope.team)
+        data = {"ticket": ticket, "started_by": started_by}
         await self._store(
-            lambda: self.store.put(
-                self.scope, Key(API_INDEX, str(run.id)), {"ticket": ticket}, when=Absent()
-            )
+            lambda: self.store.put(self.scope, Key(API_INDEX, str(run.id)), data, when=Absent())
         )
         try:
             await self.driver.start(run)
@@ -631,6 +643,21 @@ class Runtime:
         await self._ensure_driven(run_id)
         everything = await self._store(self.driver.timeline, run_id)
         return [e for e in everything if e["seq"] > after][:limit]
+
+    async def started_by(self, run_id: RunId) -> str | None:
+        """Who started the run (actor key), or None if unknown or started with the dev token."""
+        await self._astate(run_id)  # 404 for an unknown run
+        item = await self._store(self.store.get, self.scope, Key(API_INDEX, str(run_id)))
+        found = item.data.get("started_by") if item else None
+        return found if isinstance(found, str) else None
+
+    async def open_gate_roles(self, run_id: RunId) -> frozenset[str]:
+        """The roles that may decide any gate of the run that is open now."""
+        roles: set[str] = set()
+        for gate in await self.gates(run_id):
+            if gate.is_open:
+                roles |= self._gate_roles(gate) or frozenset()
+        return frozenset(roles)
 
     async def can_stop(self, run_id: RunId) -> bool:
         """Is there anything left to stop? (A finished or already stopping run offers no Stop.)"""
@@ -782,6 +809,8 @@ def _closed_event(gate: Gate, decision: DecisionRecord) -> GateClosed:
 
 
 __all__ = [
+    "GateRoles",
+    "default_gate_roles",
     "API_INDEX",
     "CancelRequested",
     "DeliveryFailedError",
