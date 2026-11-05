@@ -23,6 +23,11 @@ the standard library are loaded, so a cold start of the Slack function stays far
   both ``200`` with an empty body. A bad signature or stale timestamp is ``401``, a genuine but
   malformed body is ``400`` (counted ``reason=malformed``, never ``signature``), and a failed store
   or queue is ``503`` (Slack retries).
+* ``app_rate_limited`` is Slack's own notice that the app is throttled. It has no ``event_id`` and
+  is not an event to act on: it is answered 200 (a 4xx would count against the app), counted
+  ``webhook.ignored reason=rate_limited`` and never queued. IDs may not contain ``:``, so the
+  ``<api_app_id>:<event_id>`` key cannot collide (``A:B`` + ``C`` against ``A`` + ``B:C``).
+* The timestamp has one spelling (no leading zero), so no two header values mean one instant.
 * ``url_verification`` (https://docs.slack.dev/reference/events/url_verification/) is decided from
   the verified, parsed body: it is answered with its string ``challenge`` and never queued. One
   without a string ``challenge`` is malformed.
@@ -63,7 +68,7 @@ TIMESTAMP_HEADER = "x-slack-request-timestamp"
 VERSION = "v0"
 MALFORMED = 400
 
-_TIMESTAMP = re.compile(r"[0-9]{1,12}", re.ASCII)
+_TIMESTAMP = re.compile(r"[1-9][0-9]{0,11}", re.ASCII)  # no leading zero: one spelling each
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.\-]{1,128}", re.ASCII)
 
 Kind = Literal["events", "interactivity"]
@@ -71,10 +76,12 @@ Kind = Literal["events", "interactivity"]
 
 @dataclass(frozen=True)
 class Verified:
-    """A genuine delivery, parsed. ``challenge`` is set for ``url_verification`` only."""
+    """A genuine delivery, parsed. ``challenge`` is set for ``url_verification`` only, and
+    ``rate_limited`` for Slack's own ``app_rate_limited`` notice. Neither has a delivery ID."""
 
     delivery_id: str
     challenge: str | None = None
+    rate_limited: bool = False
 
 
 def _safe_id(value: object, what: str) -> str:
@@ -86,7 +93,7 @@ def _safe_id(value: object, what: str) -> str:
 def _parse_events(raw_body: bytes) -> Verified:
     try:
         obj = json.loads(raw_body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:  # deep nesting from a genuine signer
         raise MalformedWebhookError("event body is not JSON") from exc
     if not isinstance(obj, dict):
         raise MalformedWebhookError("event body is not an object")
@@ -95,6 +102,8 @@ def _parse_events(raw_body: bytes) -> Verified:
         if not isinstance(challenge, str):
             raise MalformedWebhookError("url_verification without a string challenge")
         return Verified("", challenge)
+    if obj.get("type") == "app_rate_limited":
+        return Verified("", rate_limited=True)
     event_id = _safe_id(obj.get("event_id"), "event_id")
     if "api_app_id" not in obj:
         return Verified(event_id)
@@ -106,7 +115,7 @@ def _parse_interaction(raw_body: bytes) -> Verified:
         fields = parse_qs(raw_body.decode("ascii"), keep_blank_values=True)
         (text,) = fields["payload"]
         payload: Any = json.loads(text)
-    except (ValueError, KeyError, UnicodeError) as exc:
+    except (ValueError, KeyError, UnicodeError, RecursionError) as exc:
         raise MalformedWebhookError("interaction body has no single JSON payload") from exc
     if not isinstance(payload, dict):
         raise MalformedWebhookError("interaction payload is not an object")
@@ -137,8 +146,8 @@ class SlackVerifier:
     def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
         """The delivery ID. A handshake has none, so it is refused here: it is never queued."""
         verified = self.parse(headers, raw_body)
-        if verified.challenge is not None:
-            raise MalformedWebhookError("a url_verification handshake is not a delivery")
+        if verified.challenge is not None or verified.rate_limited:
+            raise MalformedWebhookError("a handshake or rate-limit notice is not a delivery")
         return verified.delivery_id
 
     def parse(self, headers: Mapping[str, str], raw_body: bytes) -> Verified:
@@ -199,6 +208,11 @@ class SlackIngest:
             return early
         if verified is not None and verified.challenge is not None:
             return IngestResponse(200, verified.challenge)  # a verified handshake, never queued
+        if verified is not None and verified.rate_limited:
+            # Slack's own notice has no event_id: 400 would count as a failed delivery. Ack it,
+            # queue nothing, and count it so an operator sees the app is being throttled.
+            self._metrics.incr("webhook.ignored", surface=EVENTS_SURFACE, reason="rate_limited")
+            return IngestResponse(200, "")
         return _ack(self._events.handle(headers, raw_body))
 
     def interactivity(self, headers: Mapping[str, str], raw_body: bytes) -> IngestResponse:

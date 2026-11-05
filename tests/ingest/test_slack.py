@@ -317,6 +317,19 @@ def test_dedupe_record_expires_past_twice_the_window(rig: Rig) -> None:
 _DIGEST_CALLS = {"new", "sha256", "sha1", "sha512", "md5", "blake2b", "digest", "hexdigest"}
 
 
+_FORBIDDEN_CALLS = {
+    "startswith",
+    "endswith",
+    "eq",
+    "ne",
+    "__eq__",
+    "__ne__",
+    "index",
+    "find",
+    "count",
+}
+
+
 def _computes_digest(fn: ast.FunctionDef) -> bool:
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
@@ -334,10 +347,12 @@ def _comparison_problems(fn: ast.FunctionDef) -> list[str]:
             for op in node.ops:
                 if isinstance(op, ast.Eq | ast.NotEq | ast.In | ast.NotIn):
                     problems.append(f"{type(op).__name__} at line {node.lineno}")
+        elif isinstance(node, ast.Match):
+            problems.append(f"match at line {node.lineno}")
         elif isinstance(node, ast.Call):
             f = node.func
             name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
-            if name in {"startswith", "endswith", "eq", "ne", "index", "find", "count"}:
+            if name in _FORBIDDEN_CALLS:
                 problems.append(f"{name}() at line {node.lineno}")
     return problems
 
@@ -373,6 +388,9 @@ def test_the_static_check_catches_each_forbidden_comparison() -> None:
         "def f(a, b):\n    hmac.new(k, m, h)\n    return a in (b,)",
         "def f(a, b):\n    hmac.new(k, m, h)\n    return a.startswith(b)",
         "def f(a, b):\n    hmac.new(k, m, h)\n    return operator.eq(a, b)",
+        "def f(a, b):\n    hmac.new(k, m, h)\n    return a.__eq__(b)",
+        "def f(a, b):\n    hmac.new(k, m, h)\n    return a.__ne__(b)",
+        "def f(a, b):\n    hmac.new(k, m, h)\n    match a:\n        case 1:\n            return b",
     ]
     for src in bad:
         fn = ast.parse(src).body[0]
@@ -852,3 +870,74 @@ def test_two_payload_fields_are_malformed_not_first_wins(rig: Rig) -> None:
 def test_an_empty_signing_secret_is_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="signing secret"):
         SlackVerifier(b"", Clock(), kind="events")
+
+
+# --- review pass 2 ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("depth", [100_000, 200_000])
+def test_deeply_nested_json_from_a_genuine_signer_is_malformed_not_an_uncaught_crash(
+    rig: Rig, depth: int
+) -> None:
+    deep = b"[" * depth + b"]" * depth
+    assert rig.events(signed(deep))[0] == 400
+    form = b"payload=" + quote(deep.decode(), safe="").encode()
+    assert rig.interact(signed(form))[0] == 400
+    assert rig.queue.items == []
+    assert rig.metrics.reasons == [("webhook.rejected", "malformed")] * 2
+
+
+def test_slacks_app_rate_limited_notice_is_acked_200_counted_and_never_queued(rig: Rig) -> None:
+    body = json.dumps(
+        {
+            "token": "t",
+            "type": "app_rate_limited",
+            "team_id": "T1",
+            "minute_rate_limited": 1518467820,
+            "api_app_id": "A1",
+        }
+    ).encode()
+    assert rig.events(signed(body)) == (200, "")
+    assert rig.queue.items == []
+    assert rig.metrics.reasons == [("webhook.ignored", "rate_limited")]
+    assert rig.metrics.counts.get("webhook.rejected") is None
+
+
+def test_a_forged_rate_limited_notice_is_refused_and_not_counted_as_one(rig: Rig) -> None:
+    body = b'{"type":"app_rate_limited","api_app_id":"A1"}'
+    assert rig.events(rig.slack.forge(signed(body)))[0] == 401
+    assert rig.metrics.reasons == [("webhook.rejected", "signature")]
+
+
+def test_the_production_verifier_refuses_a_rate_limit_notice_as_a_delivery() -> None:
+    v = SlackVerifier(SIGNING_SECRET, Clock(), kind="events")
+    raw = signed(b'{"type":"app_rate_limited"}')
+    with pytest.raises(MalformedWebhookError):
+        v.verify(raw.headers, raw.body)
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [("A", "B:C"), ("A:B", "C"), ("A", ":C"), ("A:", "C"), (":", "C"), ("A", "B:")],
+)
+def test_a_colon_in_an_id_is_malformed_so_two_keys_can_never_collide(
+    rig: Rig, ids: tuple[str, str]
+) -> None:
+    app, event = ids
+    body = json.dumps({"type": "event_callback", "api_app_id": app, "event_id": event}).encode()
+    assert rig.events(signed(body))[0] == 400
+    assert rig.queue.items == []
+
+
+def test_a_trailing_blank_payload_field_is_malformed_not_ignored(rig: Rig) -> None:
+    good = quote('{"trigger_id":"t1"}', safe="")
+    assert rig.interact(signed(f"payload={good}&payload=".encode()))[0] == 400
+    assert rig.interact(signed(f"payload=&payload={good}".encode()))[0] == 400
+    assert rig.interact(signed(f"payload={good}".encode()))[0] == 200
+
+
+@pytest.mark.parametrize("stamp", ["0", "01700000000", "00000000001", "0001700000000"])
+def test_a_timestamp_with_a_leading_zero_is_refused(rig: Rig, stamp: str) -> None:
+    raw = _signed_at_stamp(b'{"type":"event_callback","event_id":"Ev1"}', stamp)
+    assert rig.ingest.events(raw.headers, raw.body).status == 401
+    assert rig.queue.items == []
