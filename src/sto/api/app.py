@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
+from sto.api.auth import DOCS, Authorization, install_authorization
 from sto.api.routers import gates, runs
 from sto.api.routers.runs import ApiError, ErrorResponse
 from sto.api.runtime import Runtime, scm_merge_factory
@@ -82,29 +83,41 @@ def create_app(
     token: str,
     mode: str,
     services: Sequence[Service] = (),
+    authorization: Authorization | None = None,
 ) -> FastAPI:
     """The app. ``services`` are background coroutines that run while it is up (the local
-    stack's simulated merge queue)."""
-    if mode != "local":
-        raise DevAuthRefusedError(
-            f"dev auth only runs in local mode (STO_MODE=local); this is {mode!r}"
-        )
-    if not token:
-        raise DevAuthRefusedError("the dev token must not be empty")
-
-    bearer = HTTPBearer(auto_error=False, description="The dev token (local mode only).")
-
-    def authorize(
-        creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-    ) -> None:
-        # Compared in constant time; the token is never echoed.
-        if creds is None or not hmac.compare_digest(creds.credentials.encode(), token.encode()):
-            raise ApiError(
-                401,
-                "unauthorized",
-                "a valid dev token is required",
-                headers={"WWW-Authenticate": "Bearer"},
+    stack's simulated merge queue). With ``authorization`` (D3-03) every request is authorised by
+    the middleware in ``sto.api.auth`` instead of the dev token, which is then neither checked
+    nor built, and the mode is not restricted to local. The interactive docs are served (and
+    public) only in local mode."""
+    if authorization is None:
+        if mode != "local":
+            raise DevAuthRefusedError(
+                f"dev auth only runs in local mode (STO_MODE=local); this is {mode!r}"
             )
+        if not token:
+            raise DevAuthRefusedError("the dev token must not be empty")
+
+    protected: list[Any] = []
+    if authorization is None:  # the dev token: not even built when the middleware is in charge
+        bearer = HTTPBearer(auto_error=False, description="The dev token (local mode only).")
+
+        def authorize(
+            creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+        ) -> None:
+            # Compared in constant time; the token is never echoed.
+            if creds is None or not hmac.compare_digest(creds.credentials.encode(), token.encode()):
+                raise ApiError(
+                    401,
+                    "unauthorized",
+                    "a valid dev token is required",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+        protected = [Depends(authorize)]
+    docs = authorization is None or mode == "local"  # the interactive docs: local mode only
+    if authorization is not None and docs:
+        authorization = dataclasses.replace(authorization, public=authorization.public | DOCS)
 
     failed: dict[str, str] = {}
 
@@ -130,6 +143,9 @@ def create_app(
         version="0.0.0",
         summary="Runs, events by cursor, gates and decisions (v0, dev token).",
         lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
     app.state.runtime = runtime
     app.state.failed_services = failed
@@ -167,13 +183,14 @@ def create_app(
             "runs_with_errors": runtime.errors(),
         }
 
-    protected = [Depends(authorize)]
     shared: dict[int | str, dict[str, Any]] = {
         401: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
     }
     app.include_router(runs.router, dependencies=protected, responses=shared)
     app.include_router(gates.router, dependencies=protected, responses=shared)
+    if authorization is not None:
+        install_authorization(app, authorization)
     return app
 
 
