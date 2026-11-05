@@ -460,7 +460,7 @@ Checks are a registry of named evaluators, with no free-form expressions.
 Start runs from closed intake selectors, honour active-sprint filtering, WIP limits and freeze and change windows, and record the intake actor, ticket revision and frozen route inputs.
 Duplicate active runs and tickets matching two workflows start nothing, and a non-member's edit pauses the run for a member to confirm.
 **AC:** a ticket outside the active sprint does not start; WIP holds runs queued; a freeze holds merge in `WAITING_EXTERNAL`; overlapping selectors are refused at publish (V12); T11: public repos need opt-in, and an edit by a non-member or unknown editor pauses the run.
-**Deps:** D2-06, D2-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/intake.py`, `tests/engine/test_intake.py`.
+**Deps:** D2-06, D2-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/intake.py`, `src/sto/gates/windows.py`, `tests/engine/test_intake.py`.
 
 #### D2-19: Run migration
 Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage and meets `OrgPolicy.teams`, and it is audited.
@@ -524,7 +524,7 @@ Found in review of D2-10. PLAN section 6.3 sends a run whose effect is voided wi
 #### D2-29: The graph registry covers every stage it can enter
 Found in review of D2-13. Wait and checks stages are entered through `STAGE_ENTRY` in `handlers/stages.py`, but `next()` with an explicit `graph_registry=` can enter a stage whose leaving events that registry cannot handle, so the run waits for ever.
 **AC:** `next()` refuses, as a BLOCKED reason and not an exception, to enter a stage kind whose leaving events the registry in use has no handler for; the default registry is unaffected; a test builds a registry without the wait handlers and shows the block. The reducer stays pure: no context variables or other implicit state.
-**Deps:** D2-13. **Size:** S. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `tests/engine/test_reducer_v1.py`.
+**Deps:** D2-13. **Size:** S. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/handlers/stages.py`, `src/sto/engine/handlers/waits.py`, `tests/engine/test_reducer_v1.py`.
 
 #### D2-30: Runs pin the published digest
 Found in review of D2-07. Publishing stores immutable manifests and `load_pinned` reads one back by digest, but no run records a digest: `workflow_version()` in `reducer.py` still pins the workflow name, so "publish during a run changes nothing for that run" holds only at the storage level.
