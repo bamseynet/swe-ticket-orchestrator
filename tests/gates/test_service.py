@@ -41,6 +41,7 @@ from sto.gates.hooks import (
     ReadOnly,
     audit_pk,
 )
+from sto.gates.retry import Backoff
 from sto.gates.service import (
     MAX_ROUNDS_PER_GATE,
     CommentRequiredError,
@@ -317,7 +318,8 @@ def test_exhausted_recheck_retries_raise_a_typed_retryable_error() -> None:
     from sto.domain import TransientError
 
     store = _AlwaysFlip()
-    service = GateService(store)
+    # the fake's invented round numbers are calibrated to 25 attempts (they pass round 200 after)
+    service = GateService(store, retry=Backoff(attempts=25, sleep=lambda _: None))
     _plant(store, "review", 1, "APPROVED")
     g2 = _plant(store, "review", 200, "OPEN", tag="b")
     with pytest.raises(GateContentionError) as err:
