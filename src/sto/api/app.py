@@ -255,7 +255,9 @@ class DevDirectory:
 
     def __init__(self, team: str) -> None:
         self._me = UserIdentity(
-            self.ISSUER, DEV_ACTOR, frozenset({(team, "reviewer"), (team, "qa")})
+            subject=DEV_ACTOR,
+            issuer=self.ISSUER,
+            memberships=frozenset({(team, "reviewer"), (team, "qa")}),
         )
 
     @property
@@ -295,6 +297,7 @@ def gate_policy(
             snapshot=lambda scope, gate: frozenset({directory.actor}),
         ),
         floors=floors,
+        actor_key=lambda who: DEV_ACTOR,  # the dev token's one actor string is "dev"
     )
 
 

@@ -877,3 +877,109 @@ def test_the_local_policy_gives_each_linear_gate_only_its_own_role(store: Store)
     qa = Gate(GateId.new(), RUN, "qa_gate", GateType.QA, 1, SUBJECT)
     assert policy.roles(SCOPE, review, "dev") == frozenset({"reviewer"})
     assert policy.roles(SCOPE, qa, "dev") == frozenset({"qa"})
+
+
+# --- review pass 1: bindings, frozen quorum, paging ---------------------------------------------
+
+
+def test_a_gate_opened_without_a_quorum_cannot_be_closed_by_a_quorum_that_appears_later(
+    store: Store,
+) -> None:
+    rig = Rig(store, quorum=None)  # the gate opens with no quorum record
+    a = rig.join("alice")
+    rig.open()
+    later = Rig(store, quorum=[{"role": "reviewer", "count": 2}])  # the config gains a quorum
+    later.people, later.snapshot = rig.people, rig.snapshot
+    later.policy = GatePolicy(
+        rules=later.rules,
+        directory=rig.people,
+        records=rig.records,
+        floors=org_policy().floors,
+    )
+    later.service = GateService(store, policy=later.policy)
+    assert "quorum_not_frozen" in refused(later, a)
+    assert "quorum_not_frozen" in refused(later, a, DecisionKind.REJECT)
+    assert rig.stored_gate().data["status"] == "OPEN"
+    assert rig.decide(a).closed  # the policy the gate opened under still decides it
+
+
+def test_a_gate_with_its_quorum_frozen_is_not_refused_for_it(store: Store) -> None:
+    rig = Rig(store, quorum=[{"role": "reviewer", "count": 2}])
+    a = rig.join("alice")
+    rig.open()
+    assert "quorum_not_frozen" not in rig.policy.refusals(SCOPE, rig.open(), a, negative=False)
+
+
+def test_an_identity_whose_key_is_not_the_decisions_actor_is_refused(store: Store) -> None:
+    rig = Rig(store, quorum=None)
+    rig.join("alice")
+    rig.open()
+    liar = actor("mallory")
+    rig.people.found[liar] = person("alice")  # the directory answers with someone else
+    assert "actor_mismatch" in refused(rig, liar)
+    assert "actor_mismatch" in refused(rig, liar, DecisionKind.REJECT)
+
+
+def test_a_gate_whose_config_type_differs_from_the_gates_type_is_refused(store: Store) -> None:
+    class WrongType(WorkflowGates):
+        def gate(self, scope: Scope, gate: Gate) -> GateConfig | None:
+            return super().gate(scope, Gate(gate.id, gate.run_id, "qa_gate", gate.type, 1, SUBJECT))
+
+    rig = Rig(store, rules=WrongType(workflow_with()))
+    a = rig.join("alice", "reviewer", "qa")
+    gate = rig.open()  # a REVIEW gate that the config calls a qa gate
+    assert "gate_type_mismatch" in rig.policy.refusals(SCOPE, gate, a, negative=False)
+    assert "gate_type_mismatch" in rig.policy.refusals(SCOPE, gate, a, negative=True)
+
+
+def test_the_dev_identity_is_issuer_local_subject_dev() -> None:
+    me = DevDirectory(TEAM).who(SCOPE, "dev")
+    assert isinstance(me, UserIdentity)
+    assert (me.issuer, me.subject) == ("local", "dev")
+
+
+def test_the_org_quorum_floor_is_asked_with_the_team_and_the_gate_type(store: Store) -> None:
+    asked: list[tuple[str, str]] = []
+
+    def floor(team: str, gate_type: str) -> int:
+        asked.append((team, gate_type))
+        return 1
+
+    rig = Rig(store, quorum_floor=floor)
+    rig.open()
+    assert asked == [(TEAM, "review")]
+
+
+class PagingStore:
+    """A store that answers every prefix query one item at a time, with a cursor."""
+
+    def __init__(self, inner: Store) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
+        from sto.store.ports import Page
+
+        cursor = kw.pop("cursor", None)
+        kw.pop("limit", None)
+        everything = self._inner.query(scope, pk, **kw).items
+        i = int(cursor or 0)
+        more = i + 1 < len(everything)
+        return Page(everything[i : i + 1], str(i + 1) if more else None)
+
+
+def test_the_records_follow_the_paging_cursor_to_every_approval(store: Store) -> None:
+    rig = Rig(store, quorum=[{"role": "reviewer", "count": 3}])
+    people = [rig.join(n) for n in ("alice", "bob", "carol")]
+    gate = rig.open()
+    for p in people:
+        rig.decide(p)
+    paged = StoreRecords(
+        PagingStore(store),
+        read=lambda s, sc, run: ((), ()),
+        requester_of=lambda sc, run: None,
+    )
+    facts = paged.facts(SCOPE, gate)
+    assert sorted(a.actor for a in facts.approvals) == sorted(people)  # two votes and the close

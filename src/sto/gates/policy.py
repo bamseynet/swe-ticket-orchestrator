@@ -20,10 +20,16 @@ What fails closed, and how:
 * **Unknown identity, a service identity, an unlinked account, no snapshot**: ``evaluate`` or the
   directory refuses (``unknown_identity``, ``service_identity``, ``unlinked``,
   ``not_eligible_at_open``).
+* **Binding**: the identity the directory returns must be the decision's actor
+  (``actor_mismatch``), the config's gate type must be the gate's (``gate_type_mismatch``), and a
+  config that has a quorum needs the quorum record frozen when the gate opened
+  (``quorum_not_frozen``), so a config that gains a quorum later cannot close an old gate on one
+  approval.
 * **Any error** while resolving the identity, reading the records or evaluating: the decision is
   refused with ``sod_error:<ExceptionType>``. Nothing is swallowed into an allow.
 * **No policy at all** is the service's own refusal (``QuorumConfigError`` for a gate with a
-  quorum); the app never builds a service without one, and ``build_gate_service`` has no default.
+  quorum). Nothing here makes a service without a policy refuse a gate that has none to read: a
+  production builder must refuse to build one without a policy.
 
 A quorum the config validator would refuse (V7: a role that is not eligible, listed twice, a count
 below 1; and the org's ``min_quorum`` for the gate type) is refused at ``quorum``, which is read by
@@ -50,7 +56,7 @@ from sto.gates.hooks import run_pk
 from sto.gates.service import QuorumConfigError, QuorumRule
 from sto.gates.sod import Approval, Commit, Resolution, RunFacts, evaluate
 from sto.identity.mapping import ServiceIdentity, UserIdentity
-from sto.store.ports import Scope, Store, TeamScope
+from sto.store.ports import Key, Scope, Store, TeamScope
 
 __all__ = [
     "Directory",
@@ -91,6 +97,10 @@ class Records(Protocol):
 
     def opened_with(self, scope: Scope, gate: Gate) -> frozenset[str] | None:
         """Who was eligible when the gate opened; ``None`` when there is no snapshot."""
+        ...
+
+    def quorum_frozen(self, scope: Scope, gate: Gate) -> bool:
+        """Was a quorum record written when the gate opened?"""
         ...
 
 
@@ -170,7 +180,9 @@ class GatePolicy:
         records: Records,
         floors: Floors,
         quorum_floor: Callable[[str, str], int] = lambda team, gate_type: 1,
+        actor_key: Callable[[Who], str] = lambda who: f"{who.issuer}|{who.subject}",
     ) -> None:
+        self._actor_key = actor_key
         self._rules, self._directory, self._records = rules, directory, records
         self._floors, self._quorum_floor = floors, quorum_floor
 
@@ -201,9 +213,15 @@ class GatePolicy:
             return ["unknown_gate"]
         if not isinstance(scope, TeamScope):
             return ["no_team"]
+        if cfg.type != gate.type.value:
+            return ["gate_type_mismatch"]
+        if check_quorum(cfg) and not self._records.quorum_frozen(scope, gate):
+            return ["quorum_not_frozen"]
         who = self._directory.who(scope, actor)
         if who is None:
             return ["unknown_identity"]
+        if self._actor_key(who) != actor:
+            return ["actor_mismatch"]
         verdict = evaluate(
             who=who,
             linked=self._directory.linked(scope, actor),
@@ -244,6 +262,10 @@ class StoreRecords:
 
     def opened_with(self, scope: Scope, gate: Gate) -> frozenset[str] | None:
         return self._snapshot(scope, gate)
+
+    def quorum_frozen(self, scope: Scope, gate: Gate) -> bool:
+        key = Key(run_pk(gate.run_id), f"QUO#{gate.name}#{gate.round}")
+        return self._store.get(scope, key) is not None
 
     def facts(self, scope: Scope, gate: Gate) -> RunFacts:
         if not isinstance(scope, TeamScope):
