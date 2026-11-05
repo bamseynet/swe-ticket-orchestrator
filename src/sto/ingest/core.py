@@ -21,6 +21,13 @@ signature or malformed headers (counted), ``503`` the store or queue failed, so 
   vendor's retry would be dropped as a duplicate and the nudge lost. If even that delete fails
   the 503 still goes out and ``webhook.release_failed`` is counted; the reconciler sweeps open
   runs, so a lost nudge is late, not missing.
+* **Size.** The queue carries at most ``SQS_MESSAGE_LIMIT`` bytes but the edge accepts far more
+  (GitHub deliveries reach 25 MB), so a nudge whose body does not fit would fail on every retry.
+  The body is therefore queued only when it is at most ``max_body_bytes`` (default 128 KiB, and
+  never above ``MAX_BODY_BYTES_CEILING``, well below the queue limit, leaving room for headers
+  and encoding). A larger one is verified on its full raw body like any other, then queued with
+  ``body=b""``, ``body_omitted=True`` and its ``body_size``; the consumer re-reads state, which it
+  must do anyway. The delivery stays claimed, so it is one nudge, accepted with a 202.
 * **A rejected delivery claims nothing**, so guessing a delivery ID cannot block the real one.
 * **Deadline.** The work is one verify, one conditional write and one enqueue; the store and queue
   adapters carry the timeouts, so a hung dependency becomes a 503 inside the vendor's deadline
@@ -57,6 +64,9 @@ SEEN_SK = "SEEN"
 MAX_DELIVERY_ID_CHARS = 512
 # Never queued: the nudge and its dead-letter queue are read by more people and tools than the
 # vendor's endpoint is. A verifier adds the vendor's own secret headers via ``secret_headers``.
+SQS_MESSAGE_LIMIT = 256 * 1024
+MAX_BODY_BYTES_CEILING = 192 * 1024
+DEFAULT_MAX_BODY_BYTES = 128 * 1024
 CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
 
 
@@ -95,7 +105,12 @@ class WebhookVerifier(Protocol):
 
 @dataclass(frozen=True)
 class Nudge:
-    """What is queued: that something changed. Never the truth. ``reread`` is always True."""
+    """What is queued: that something changed. Never the truth. ``reread`` is always True.
+
+    ``body`` is the raw delivery only when it fit under the ingest's size limit. Otherwise it is
+    empty and ``body_omitted`` is True; ``body_size`` is the delivery's real size either way.
+    ``event`` is the vendor's event name from the configured event header, if any.
+    """
 
     surface: str
     delivery_id: str
@@ -103,10 +118,18 @@ class Nudge:
     headers: Mapping[str, str]
     received_at: float
     reread: bool = True
+    body_omitted: bool = False
+    body_size: int = 0
+    event: str | None = None
 
     def __post_init__(self) -> None:
         if self.reread is not True:
             raise ValueError("a webhook delivery is a nudge: consumers must re-read state")
+        if self.body_omitted:
+            if self.body:
+                raise ValueError("a nudge that omits its body must carry no body")
+        elif self.body_size != len(self.body):
+            raise ValueError("body_size must match a carried body")
 
 
 class NudgeQueue(Protocol):
@@ -155,7 +178,16 @@ class WebhookIngest:
         metrics: Metrics,
         *,
         clock: Callable[[], float] = time.time,
+        max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        event_header: str | None = None,
     ) -> None:
+        if not 0 < max_body_bytes <= MAX_BODY_BYTES_CEILING:
+            raise ValueError(
+                f"max_body_bytes must be between 1 and {MAX_BODY_BYTES_CEILING}, "
+                f"well below the queue limit of {SQS_MESSAGE_LIMIT}"
+            )
+        self._max_body = max_body_bytes
+        self._event_header = event_header.strip().lower() if event_header else None
         if not surface or surface != surface.strip() or "#" in surface:
             raise ValueError("surface must be a non-empty name without '#' or surrounding space")
         window = verifier.replay_window
@@ -225,7 +257,19 @@ class WebhookIngest:
             return IngestResponse(UNAVAILABLE, "try again")
 
         safe = {k: v for k, v in norm.items() if k not in self._secret_headers}
-        nudge = Nudge(surface, delivery_id, raw_body, safe, now)
+        size = len(raw_body)
+        omit = size > self._max_body
+        event = norm.get(self._event_header) if self._event_header else None
+        nudge = Nudge(
+            surface,
+            delivery_id,
+            b"" if omit else raw_body,
+            safe,
+            now,
+            body_omitted=omit,
+            body_size=size,
+            event=event or None,
+        )
         try:
             self._queue.enqueue(nudge)
         except Exception:
@@ -233,6 +277,8 @@ class WebhookIngest:
             self._metrics.incr("webhook.enqueue_failed", surface=surface)
             self._release(key)
             return IngestResponse(UNAVAILABLE, "try again")
+        if omit:
+            self._metrics.incr("webhook.body_omitted", surface=surface)
         self._metrics.incr("webhook.accepted", surface=surface)
         return IngestResponse(ACCEPTED, "accepted")
 

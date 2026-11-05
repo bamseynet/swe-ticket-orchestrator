@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Mapping
+from typing import Any
 
 import pytest
 
@@ -122,6 +123,7 @@ def make(
     *,
     verifier: HmacVerifier | None = None,
     surface: str = "hub",
+    **options: Any,
 ) -> WebhookIngest:
     return WebhookIngest(
         surface=surface,
@@ -130,6 +132,7 @@ def make(
         queue=queue,
         metrics=metrics,
         clock=clock,
+        **options,
     )
 
 
@@ -271,6 +274,77 @@ def test_a_nudge_always_says_to_re_read_and_cannot_be_built_otherwise() -> None:
     assert n.reread is True
     with pytest.raises(ValueError, match="re-read"):
         Nudge(surface="hub", delivery_id="d", body=b"", headers={}, received_at=0.0, reread=False)
+
+
+# --- nudge size and shape (D4-29) -------------------------------------------------------------
+
+
+def test_a_body_under_the_limit_is_carried_and_not_marked(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    ingest = make(store, queue, metrics, clock, max_body_bytes=100)
+    headers, body = delivery(b"x" * 100)
+    assert ingest.handle(headers, body).status == 202
+    nudge = queue.items[0]
+    assert (nudge.body, nudge.body_omitted, nudge.body_size) == (body, False, 100)
+
+
+def test_a_body_over_the_limit_queues_one_bodyless_marked_nudge_and_no_503(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    ingest = make(store, queue, metrics, clock, max_body_bytes=100, event_header="x-event")
+    headers, body = delivery(b"x" * 101)
+    headers["X-Event"] = "push"
+    response = ingest.handle(headers, body)
+    assert response.status == 202
+    assert len(queue.items) == 1
+    nudge = queue.items[0]
+    assert nudge.body == b""
+    assert nudge.body_omitted is True
+    assert nudge.body_size == 101
+    assert nudge.reread is True
+    assert (nudge.surface, nudge.delivery_id, nudge.event) == ("hub", "d-1", "push")
+    assert nudge.headers["x-event"] == "push"
+    assert metrics.counts == {"webhook.accepted": 1, "webhook.body_omitted": 1}
+    # The delivery stays claimed: the vendor's retry is a duplicate, not a second nudge.
+    assert ingest.handle(headers, body).status == 200
+    assert len(queue.items) == 1
+
+
+def test_a_megabytes_delivery_is_verified_on_the_full_raw_body_before_being_dropped(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    verifier = HmacVerifier()
+    ingest = make(store, queue, metrics, clock, verifier=verifier)
+    headers, body = delivery(b"y" * (5 * 1024 * 1024))
+    assert ingest.handle(headers, body).status == 202
+    assert verifier.seen_bodies == [body]
+    assert queue.items[0].body_omitted is True
+    assert ingest.handle({**headers, "X-Signature": "00"}, body).status == 401
+
+
+def test_the_event_is_none_without_an_event_header(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    ingest = make(store, queue, metrics, clock, event_header="x-event")
+    headers, body = delivery()
+    ingest.handle(headers, body)
+    assert queue.items[0].event is None
+
+
+@pytest.mark.parametrize("limit", [0, -1, 192 * 1024 + 1])
+def test_a_body_limit_that_is_not_well_below_the_queue_limit_is_refused(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock, limit: int
+) -> None:
+    with pytest.raises(ValueError, match="max_body_bytes"):
+        make(store, queue, metrics, clock, max_body_bytes=limit)
+
+
+def test_a_nudge_that_omits_its_body_must_be_empty_and_a_carried_body_must_match_its_size() -> None:
+    with pytest.raises(ValueError, match="body"):
+        Nudge("hub", "d", b"abc", {}, 0.0, body_omitted=True, body_size=3)
+    with pytest.raises(ValueError, match="body"):
+        Nudge("hub", "d", b"abc", {}, 0.0, body_size=9)
 
 
 def test_a_duplicate_is_dropped_with_a_200_and_a_metric(
