@@ -40,6 +40,7 @@ beside ``GateService.decide``.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -55,8 +56,19 @@ from sto.domain import (
     from_wire,
     to_wire,
 )
-from sto.gates.hooks import Reader, record_with_audit, run_pk
-from sto.store.ports import Absent, Delete, Key, Op, Put, Scope, VersionIs
+from sto.gates.hooks import OpenContext, Reader, record_with_audit, run_pk
+from sto.store.ports import (
+    MAX_TRANSACTION_OPS,
+    Absent,
+    Check,
+    Delete,
+    Item,
+    Key,
+    Op,
+    Put,
+    Scope,
+    VersionIs,
+)
 
 __all__ = [
     "AcknowledgementRequiredError",
@@ -66,16 +78,19 @@ __all__ = [
     "MovingEvent",
     "MovingEventError",
     "MovingFacts",
+    "MovingTooLargeError",
     "PrClosed",
     "Reaction",
     "StaleMovingEventError",
     "TicketClosed",
     "TicketClosedError",
     "TicketEdited",
+    "acknowledge_ops",
     "apply_reaction",
     "check_decision",
     "load_state",
     "react",
+    "refuse_closed_ticket",
 ]
 
 STATE_KEY_SK = "MOVE#state"
@@ -88,6 +103,10 @@ class MovingEventError(PermanentError):
 
 class StaleMovingEventError(PermanentError):
     """The event was built for another run version than the live one. Nothing has changed."""
+
+
+class MovingTooLargeError(PermanentError):
+    """The change needs more operations than one store transaction takes."""
 
 
 class TicketClosedError(PermanentError):
@@ -154,10 +173,18 @@ class MovingFacts:
     """What the run looks like when the event arrives; built by the driver from the run and its
     receipts.
 
-    ``our_heads`` are the head SHAs our push effects produced, ``our_merges`` the merge SHAs in
-    our merge receipts. ``return_stage`` is the workflow's ``on_external_commit`` target, else its
-    CI stage (``None`` when it has neither). ``external_commits`` is how many times the
-    ``external_commit`` loop has been used, ``external_commit_cap`` its cap (default 3).
+    ``head_sha`` is the head the run holds. ``unadopted_heads`` are the head SHAs of our push
+    receipts that are newer than ``head_sha`` and that the run has not adopted yet (the push is
+    done, the run has not caught up). Heads we pushed *before* ``head_sha`` are not ours any more:
+    a force-push back to one is a person's commit. ``our_merges`` are the merge SHAs in our merge
+    receipts, and ``merge_in_progress`` says one of our merge effects is ``ATTEMPTING`` (its
+    receipt may not exist yet). ``return_stage`` is the workflow's ``on_external_commit`` target,
+    else its CI stage (``None`` when it has neither). ``external_commits`` is how many times the
+    ``external_commit`` loop has been used and ``external_commit_cap`` its cap, which the driver
+    reads from the workflow. PLAN says the default is 3, but the reducer treats an undeclared
+    loop as cap 0; this module takes the cap as given and does not pick a default.
+    ``seen_revision`` is the last ticket revision recorded in ``MOVE#state`` (``None`` before
+    any); a redelivered edit is recognised against it.
     """
 
     run_version: int
@@ -167,13 +194,15 @@ class MovingFacts:
     ticket_revision: str | None
     has_open_gate: bool
     merged: bool
-    our_heads: frozenset[str]
+    unadopted_heads: frozenset[str]
     our_merges: frozenset[str]
     push_attempting: bool
     return_stage: str | None
     external_commits: int
     external_commit_cap: int
     app_login: str
+    merge_in_progress: bool = False
+    seen_revision: str | None = None
 
     def __post_init__(self) -> None:
         _count("run_version", self.run_version)
@@ -184,13 +213,15 @@ class MovingFacts:
         _opt_text("ticket_revision", self.ticket_revision)
         _flag("has_open_gate", self.has_open_gate)
         _flag("merged", self.merged)
-        _shas("our_heads", self.our_heads)
+        _shas("unadopted_heads", self.unadopted_heads)
         _shas("our_merges", self.our_merges)
         _flag("push_attempting", self.push_attempting)
         _opt_text("return_stage", self.return_stage)
         _count("external_commits", self.external_commits)
         _count("external_commit_cap", self.external_commit_cap)
         _text("app_login", self.app_login)
+        _flag("merge_in_progress", self.merge_in_progress)
+        _opt_text("seen_revision", self.seen_revision)
 
     @property
     def ended(self) -> bool:
@@ -316,8 +347,8 @@ def react(facts: MovingFacts, event: MovingEvent) -> Reaction:
 
 def _commit(facts: MovingFacts, event: CommitPushed) -> Reaction:
     sha = event.sha
-    if sha == facts.head_sha or sha in facts.our_heads:
-        return Reaction()  # our own commit, or the head we already hold
+    if sha == facts.head_sha or sha in facts.unadopted_heads:
+        return Reaction()  # the head we hold, or our own push the run has not adopted yet
     if facts.ended:
         return Reaction()
     if facts.merged:
@@ -353,13 +384,15 @@ def _commit(facts: MovingFacts, event: CommitPushed) -> Reaction:
 
 
 def _edit(facts: MovingFacts, event: TicketEdited) -> Reaction:
+    # The baseline is the last revision recorded, so a redelivered webhook is a no-op.
+    baseline = facts.seen_revision if facts.seen_revision is not None else facts.ticket_revision
     data = {
-        "from": facts.ticket_revision,
+        "from": baseline,
         "to": event.revision,
         "editor": event.editor,
         "editor_is_member": event.editor_is_member,
     }
-    if event.revision == facts.ticket_revision:
+    if event.revision == baseline:
         return Reaction()
     if facts.ended:
         return Reaction()
@@ -388,7 +421,15 @@ def _edit(facts: MovingFacts, event: TicketEdited) -> Reaction:
 def _closed(facts: MovingFacts, event: TicketClosed) -> Reaction:
     reason = "ticket_deleted" if event.deleted else "ticket_closed"
     data = {"deleted": event.deleted, "merged": facts.merged}
-    if facts.ended:
+    if facts.status is RunStatus.CANCELLING:
+        # Already being cancelled: no second cancel, but a gate still open must not stay approvable.
+        return Reaction(
+            supersede_gates=True,
+            ticket_closed=True,
+            audit_action=f"moving.{reason}",
+            audit_data=data,
+        )
+    if facts.status.is_terminal:
         return Reaction(ticket_closed=True, audit_action=f"moving.{reason}", audit_data=data)
     action = Action.FINISH_WITH_INCIDENT if facts.merged else Action.CANCEL
     return Reaction(
@@ -419,6 +460,8 @@ def _pr(facts: MovingFacts, event: PrClosed) -> Reaction:
     )
     if ours:
         return Reaction()  # recognised from its receipt and author: not a movement
+    if facts.merge_in_progress and not facts.ended:
+        return Reaction(Action.DEFER)  # our merge may not have its receipt yet
     data = {"merge_sha": event.merge_sha, "merged_by": event.merged_by, "flagged": True}
     return Reaction(
         Action.NONE if facts.ended else Action.BLOCK,
@@ -438,6 +481,7 @@ class MoveState:
 
     ticket_closed: bool = False
     pending_revision: str | None = None
+    last_revision: str | None = None
 
 
 def check_decision(state: MoveState, kind: DecisionKind, *, acknowledged: str | None) -> None:
@@ -465,8 +509,49 @@ def load_state(reader: Reader, scope: Scope, run_id: RunId) -> MoveState:
     item = reader.get(scope, _state_key(run_id))
     if item is None:
         return MoveState()
-    pending = item.data.get("pending_revision")
-    return MoveState(bool(item.data.get("ticket_closed", False)), pending)
+    return _state_of(item)
+
+
+def _state_of(item: Item) -> MoveState:
+    return MoveState(
+        bool(item.data.get("ticket_closed", False)),
+        item.data.get("pending_revision"),
+        item.data.get("last_revision"),
+    )
+
+
+def _state_put(item: Item | None, run_id: RunId, state: MoveState) -> Put:
+    return Put(
+        _state_key(run_id),
+        {
+            "ticket_closed": state.ticket_closed,
+            "pending_revision": state.pending_revision,
+            "last_revision": state.last_revision,
+        },
+        Absent() if item is None else VersionIs(item.version),
+    )
+
+
+def acknowledge_ops(reader: Reader, scope: Scope, run_id: RunId, acknowledged: str) -> list[Op]:
+    """Ops that clear the pending revision once an approval has acknowledged it. Empty when
+    ``acknowledged`` is not the pending revision, so a wrong acknowledgement clears nothing."""
+    item = reader.get(scope, _state_key(run_id))
+    if item is None or _state_of(item).pending_revision != acknowledged:
+        return []
+    return [_state_put(item, run_id, dataclasses.replace(_state_of(item), pending_revision=None))]
+
+
+def refuse_closed_ticket(ctx: OpenContext) -> list[Op]:
+    """A gate-open hook (register with ``GateHooks.on_open``): no gate opens on a closed ticket.
+
+    The returned ``Check`` pins the ``MOVE#state`` version, so a ticket close that commits
+    between this read and the gate's write fails the open's transaction (the service retries and
+    this then raises). Open hooks run on every open."""
+    key = _state_key(ctx.gate.run_id)
+    item = ctx.reader.get(ctx.scope, key)
+    if item is not None and _state_of(item).ticket_closed:
+        raise TicketClosedError("the ticket is closed, so no gate can open")
+    return [Check(key, Absent() if item is None else VersionIs(item.version))]
 
 
 def _open_gates(reader: Reader, scope: Scope, run_id: RunId) -> list[tuple[Any, Gate]]:
@@ -517,29 +602,21 @@ def apply_reaction(
                 break
     if reaction.ticket_closed or reaction.require_ack or reaction.record_revision:
         existing = reader.get(scope, _state_key(run_id))
-        before = load_state(reader, scope, run_id)
-        pending = (
-            reaction.require_ack
-            if reaction.require_ack is not None
-            else (None if reaction.record_revision is not None else before.pending_revision)
+        before = MoveState() if existing is None else _state_of(existing)
+        # A later edit never clears a pending revision: only an acknowledgement does.
+        state = MoveState(
+            before.ticket_closed or reaction.ticket_closed,
+            reaction.require_ack if reaction.require_ack is not None else before.pending_revision,
+            reaction.record_revision or before.last_revision,
         )
-        ops.append(
-            Put(
-                _state_key(run_id),
-                {
-                    "ticket_closed": before.ticket_closed or reaction.ticket_closed,
-                    "pending_revision": pending,
-                },
-                Absent() if existing is None else VersionIs(existing.version),
-            )
-        )
+        ops.append(_state_put(existing, run_id, state))
     data = {
         **reaction.audit_data,
         "action": reaction.action.value,
         "superseded": superseded,
         "votes_dropped": reaction.drop_votes,
     }
-    return record_with_audit(
+    out = record_with_audit(
         reader,
         scope,
         run_id,
@@ -549,3 +626,8 @@ def apply_reaction(
         at=at,
         writes=ops,
     )
+    if len(out) > MAX_TRANSACTION_OPS:
+        raise MovingTooLargeError(
+            f"the change needs {len(out)} operations; the store takes {MAX_TRANSACTION_OPS}"
+        )
+    return out

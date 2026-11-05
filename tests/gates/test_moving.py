@@ -27,7 +27,7 @@ from sto.domain import (
     from_wire,
 )
 from sto.engine.commands import OpenGate
-from sto.gates.hooks import audit_pk
+from sto.gates.hooks import GateHooks, OpenContext, ReadOnly, audit_pk
 from sto.gates.moving import (
     AcknowledgementRequiredError,
     Action,
@@ -35,19 +35,22 @@ from sto.gates.moving import (
     MoveState,
     MovingEventError,
     MovingFacts,
+    MovingTooLargeError,
     PrClosed,
     StaleMovingEventError,
     TicketClosed,
     TicketClosedError,
     TicketEdited,
+    acknowledge_ops,
     apply_reaction,
     check_decision,
     load_state,
     react,
+    refuse_closed_ticket,
 )
 from sto.gates.service import GateClosedError, GateService
 from sto.store.memory import MemoryStore
-from sto.store.ports import AUDIT, Key, TeamScope
+from sto.store.ports import AUDIT, MAX_TRANSACTION_OPS, ConditionFailedError, Key, TeamScope
 
 pytestmark = pytest.mark.unit
 
@@ -65,13 +68,15 @@ def facts(**over: Any) -> MovingFacts:
         "ticket_revision": "rev1",
         "has_open_gate": True,
         "merged": False,
-        "our_heads": frozenset({"h1"}),
+        "unadopted_heads": frozenset(),
         "our_merges": frozenset(),
         "push_attempting": False,
         "return_stage": "ci",
         "external_commits": 0,
         "external_commit_cap": 3,
         "app_login": APP,
+        "merge_in_progress": False,
+        "seen_revision": None,
     }
     return MovingFacts(**{**base, **over})
 
@@ -119,9 +124,10 @@ def test_commit_without_a_target_stage_blocks() -> None:
     assert r.supersede_gates is True
 
 
-@pytest.mark.parametrize("sha", ["h1", "h0"])
+@pytest.mark.parametrize("sha", ["h1", "h2"])
 def test_commit_we_know_changes_nothing(sha: str) -> None:
-    r = react(facts(our_heads=frozenset({"h0", "h1"})), commit(sha))
+    # h1 is the head we hold; h2 is a receipt head the run has not adopted yet
+    r = react(facts(unadopted_heads=frozenset({"h2"})), commit(sha))
     assert r.action is Action.NONE and not r.supersede_gates
 
 
@@ -129,7 +135,8 @@ def test_commit_while_our_push_is_attempting_waits() -> None:
     r = react(facts(push_attempting=True), commit())
     assert r.action is Action.DEFER and not r.supersede_gates
     # ... but our own commit is recognised even then
-    assert react(facts(push_attempting=True), commit("h1")).action is Action.NONE
+    own = facts(push_attempting=True, unadopted_heads=frozenset({"h2"}))
+    assert react(own, commit("h2")).action is Action.NONE
 
 
 def test_commit_after_merge_or_on_an_ended_run_is_only_audited() -> None:
@@ -419,3 +426,148 @@ def test_facts_are_immutable_and_checked() -> None:
         facts().stage = "x"  # type: ignore[misc]
     with pytest.raises(MovingEventError):
         facts(external_commit_cap=-1)
+
+
+# --- review fixes (pass 1) --------------------------------------------------------------------
+
+
+def test_force_push_back_to_an_older_own_head_is_external() -> None:
+    # We pushed h1 then h2 (the run holds h2). A person force-pushes back to h1: not ours any more.
+    r = react(facts(head_sha="h2"), commit("h1"))
+    assert r.action is Action.RETURN_TO_STAGE
+    assert r.supersede_gates
+
+
+def test_a_redelivered_member_edit_changes_nothing() -> None:
+    seen = facts(seen_revision="rev2")  # rev2 was recorded (and maybe acknowledged) already
+    r = react(seen, edit("rev2"))
+    assert r.action is Action.NONE
+    assert not r.drop_votes
+    assert r.require_ack is None
+
+
+def test_a_redelivered_non_member_edit_does_not_block_again() -> None:
+    seen = facts(seen_revision="rev2")
+    assert react(seen, edit("rev2", editor_is_member=False)).action is Action.NONE
+
+
+def test_an_edit_back_to_the_run_revision_still_counts_as_an_edit() -> None:
+    r = react(facts(seen_revision="rev2"), edit("rev1"))
+    assert r.drop_votes is True
+    assert r.audit_data["from"] == "rev2"
+
+
+def test_our_merge_webhook_before_its_receipt_defers() -> None:
+    r = react(facts(merge_in_progress=True), merge())
+    assert r.action is Action.DEFER
+    assert not r.supersede_gates
+    assert r.audit_action is None
+    # a recognised merge is still recognised, and with no merge in progress it is outside
+    assert (
+        react(facts(merge_in_progress=True, our_merges=frozenset({"m1"})), merge()).action
+        is Action.NONE
+    )
+    assert react(facts(), merge()).action is Action.BLOCK
+
+
+def test_pr_closed_unmerged_does_nothing_to_an_ended_or_merged_run() -> None:
+    closed = PrClosed(run_version=7, merged=False)
+    assert react(facts(status=RunStatus.DONE), closed).action is Action.NONE
+    assert react(facts(merged=True), closed).action is Action.NONE
+    assert react(facts(status=RunStatus.DONE, merged=True), closed).action is Action.NONE
+    assert react(facts(), closed).action is Action.CANCEL
+
+
+@pytest.mark.parametrize("extra", [{"merge_sha": "m1"}, {"merged_by": APP}])
+def test_unmerged_pr_with_half_a_merge_is_malformed(extra: dict[str, Any]) -> None:
+    with pytest.raises(MovingEventError):
+        PrClosed(run_version=7, merged=False, **extra)
+
+
+@pytest.mark.parametrize("bad", [True, "3", 3.0, None])
+def test_run_version_must_be_an_int(bad: Any) -> None:
+    for build in (
+        lambda: CommitPushed(run_version=bad, sha="x"),
+        lambda: TicketClosed(run_version=bad),
+        lambda: PrClosed(run_version=bad, merged=False),
+    ):
+        with pytest.raises(MovingEventError):
+            build()
+    with pytest.raises(MovingEventError):
+        facts(run_version=bad)
+
+
+def test_ticket_close_on_a_cancelling_run_supersedes_gates_without_a_second_cancel() -> None:
+    r = react(facts(status=RunStatus.CANCELLING), TicketClosed(run_version=7))
+    assert r.action is Action.NONE
+    assert r.supersede_gates
+    assert r.ticket_closed
+    done = react(facts(status=RunStatus.DONE), TicketClosed(run_version=7))
+    assert not done.supersede_gates
+
+
+def test_the_state_remembers_the_last_revision_seen() -> None:
+    store = MemoryStore()
+    open_with_vote(store)
+    run_reaction(store, react(facts(), edit()))
+    assert load_state(store, TEAM, RUN).last_revision == "rev2"
+
+
+def test_acknowledging_clears_the_pending_revision() -> None:
+    store = MemoryStore()
+    open_with_vote(store)
+    run_reaction(store, react(facts(), edit()))
+    assert acknowledge_ops(store, TEAM, RUN, "rev1") == []  # the wrong revision clears nothing
+    store.transact(TEAM, acknowledge_ops(store, TEAM, RUN, "rev2"))
+    state = load_state(store, TEAM, RUN)
+    assert state.pending_revision is None
+    assert state.last_revision == "rev2"
+    check_decision(state, DecisionKind.APPROVE, acknowledged=None)
+
+
+def test_a_later_member_edit_never_clears_an_untrusted_pending_revision() -> None:
+    store = MemoryStore()
+    run_reaction(store, react(facts(has_open_gate=False), edit("rev2", editor_is_member=False)))
+    assert load_state(store, TEAM, RUN).pending_revision == "rev2"
+    later = facts(has_open_gate=False, seen_revision="rev2")
+    run_reaction(store, react(later, edit("rev3")))
+    state = load_state(store, TEAM, RUN)
+    assert state.pending_revision == "rev2"
+    assert state.last_revision == "rev3"
+
+
+def test_a_closed_ticket_refuses_a_new_gate_atomically() -> None:
+    store = MemoryStore()
+    hooks = GateHooks()
+    hooks.on_open(refuse_closed_ticket)
+    svc = GateService(store, hooks=hooks)
+    cmd = OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject())
+    run_reaction(store, react(facts(has_open_gate=False), TicketClosed(run_version=7)))
+    with pytest.raises(TicketClosedError):
+        svc.open_gate(TEAM, cmd)
+    assert store.get(TEAM, Key(f"RUN#{RUN}", "GATE#review#1")) is None
+
+
+def test_an_open_ticket_still_opens_gates_and_the_hook_checks_the_state_version() -> None:
+    store = MemoryStore()
+    hooks = GateHooks()
+    hooks.on_open(refuse_closed_ticket)
+    svc = GateService(store, hooks=hooks)
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject()))
+    assert stored_gate(store).is_open
+    # the hook returns a Check on MOVE#state, so a close that commits between the read and the
+    # write fails the open's transaction
+    gate = stored_gate(store)
+    ops = refuse_closed_ticket(OpenContext(ReadOnly(store), TEAM, gate))
+    run_reaction(store, react(facts(), TicketClosed(run_version=7)))
+    with pytest.raises(ConditionFailedError):
+        store.transact(TEAM, ops)
+
+
+def test_a_reaction_that_does_not_fit_one_transaction_is_refused() -> None:
+    store = MemoryStore()
+    svc = GateService(store)
+    for n in range(MAX_TRANSACTION_OPS):
+        svc.open_gate(TEAM, OpenGate(RUN, f"g{n}", GateType.REVIEW, 1, head_subject()))
+    with pytest.raises(MovingTooLargeError):
+        apply_reaction(store, TEAM, RUN, react(facts(), commit()), actor="system", at=1)
