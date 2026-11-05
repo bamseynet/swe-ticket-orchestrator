@@ -348,7 +348,7 @@ Property tests pass over all templates, with crash injection.
 | 4 | D2-05 | D2-06 |
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
 | 6 | D2-09, D2-23, D2-25 | D2-29, D2-30 |
-| 7 | D2-14, D2-15, D2-19, D2-28 | - |
+| 7 | D2-14, D2-15, D2-19, D2-28 | D2-31 |
 | 8 | D2-20 | - |
 
 #### D2-01: Workflow schema
@@ -530,6 +530,11 @@ Found in review of D2-13. Wait and checks stages are entered through `STAGE_ENTR
 Found in review of D2-07. Publishing stores immutable manifests and `load_pinned` reads one back by digest, but no run records a digest: `workflow_version()` in `reducer.py` still pins the workflow name, so "publish during a run changes nothing for that run" holds only at the storage level.
 **AC:** the run starter reads `Publisher.latest` for the team and workflow, records `(team, name, version, digest)` on the run at start, and every later step loads the manifest through `load_pinned`; `workflow_version()` returns the pin and the reducer docstring says so; a publish during a run, including a changed profile outcome or prompt, changes nothing for that run in an end-to-end test on the local driver; a run whose pinned manifest no longer loads blocks with a reason instead of raising. `FLOOR_TRACKING` in `org_policy.py` drops D2-07.
 **Deps:** D2-07, D2-26. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/handlers/stages.py`, `src/sto/api/runtime.py`, `src/sto/config/org_policy.py`, `tests/engine/test_pinning.py`, `tests/config/test_policy.py`.
+
+#### D2-31: Carry-over in the engine
+Found in review of D2-09. `gates/carry_over.py` decides whether a re-entered gate may close on an earlier approval, but nothing calls it, and G13 holds in production only if the engine feeds it true history and emits the close safely.
+**AC:** each gate round persists its `merge_base` and `carried_from`; the patch history passed to carry-over is every head the run has had since the origin decision (each push and each PR synchronize, with a computed `patch_id`; a head whose `patch_id` cannot be computed refuses), anchored to that decision; the full history of the gate name comes from the store, unfiltered; the approver check calls `sod.evaluate` per voted role with fresh identity and membership and passes only when allowed and not blocked; file lists come from `git diff --name-only -z --no-renames` with the trailing NUL required, surrogateescape decoding, and `complete` set only after a full read, measured from the merge base of the subject head; the carried close is a conditional write (gate still open, same subject, nothing new since the read), emitted only by the engine under a service identity with the `Citation` in audit, and a service approval without a citation is refused by the reducer and guard 2; `carry_over` is read from the pinned workflow and checked against the org's `allowed_carry_over`. G13 end-to-end tests on the local driver: P1, P2, P1 with P2 never reaching the gate asks again.
+**Deps:** D2-09, D2-26, D2-30, D3-06. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/handlers/carry.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_carry.py`.
 
 ## D3: Identity and complete gates
 
