@@ -706,7 +706,7 @@ Found in review of D2-10. The retry service accepts any non-blank actor. PLAN's 
 #### D3-24: Decisions use separation of duties and the gate's quorum
 Found in review of D3-06. The gate service takes a `DecisionPolicy`, but the app builds `GateService(store)` with none, so no quorum record is written and `sod.evaluate` (D3-05) decides nothing in production.
 **AC:** the app and runtime build the gate service with a policy that applies `sod.evaluate` and the workflow gate's quorum; a gate opened from a workflow with a quorum writes its quorum record; a sub-quorum vote never advances the run; an ineligible or SoD-excluded person is refused through the API, by the shared tenancy suite; a quorum the validator would refuse never reaches `open_gate`.
-**Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_policy.py`.
+**Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_gate_policy.py`.
 
 ## D4: GitHub, live
 
