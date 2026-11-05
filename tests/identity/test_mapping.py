@@ -18,6 +18,8 @@ from sto.identity.mapping import (
     ServiceIdentity,
     UserDisabledError,
     UserIdentity,
+    check_text,
+    map_key,
 )
 from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks, VerifiedToken
 from sto.store.memory import MemoryStore
@@ -331,9 +333,56 @@ def test_disable_with_the_right_idp_does_take_effect(mapping, issuer, validator)
 
 
 def test_needs_at_least_one_valid_issuer() -> None:
-    for bad in ([], [""], ["a#b"], ["x" * 500]):
+    for bad in ([], [""], ["a#b"], ["x" * 500], ["https://a|b"]):
         with pytest.raises(ValueError, match="issuer"):
             RoleMapping(MemoryStore(), issuers=bad)
+
+
+def test_issuer_with_pipe_is_refused_so_actor_keys_stay_unique() -> None:
+    """Two identities must not share the ``issuer|subject`` actor key SoD compares."""
+    with pytest.raises(ValueError, match="issuer"):
+        RoleMapping(MemoryStore(), issuers=[ISS, "https://a|b"])
+    with pytest.raises(ValueError, match="issuer"):
+        RoleMapping(MemoryStore(), issuers=["a|b"])
+
+
+@pytest.mark.parametrize(
+    "issuer", ["https://x ", " https://x", "https://x\n", "https://x\t", "https://x\u200b"]
+)
+def test_issuer_whitespace_or_control_is_refused_like_sod(issuer: str) -> None:
+    with pytest.raises(ValueError, match="issuer"):
+        RoleMapping(MemoryStore(), issuers=[issuer])
+
+
+def test_issuers_must_not_be_a_bare_string() -> None:
+    with pytest.raises(TypeError):
+        RoleMapping(MemoryStore(), issuers="https://x")
+
+
+def test_has_any_mapping_ignores_lookalike_prefixes() -> None:
+    store = MemoryStore()
+    m = RoleMapping(store, issuers=[ISS])
+    store.put(PLATFORM, Key("ORG", "MAPX#whatever"), {})
+    store.put(PLATFORM, Key("ORG", "MAP"), {})
+    assert not m.has_any_mapping()
+
+
+def test_public_helpers_check_text_and_issuer_and_report_stored_mappings(
+    mapping: RoleMapping,
+) -> None:
+    assert check_text("group", "g-1") == "g-1"
+    for bad in ("", " g", "g ", "a\x00b", "x" * (MAX_NAME_BYTES + 1), 3):
+        with pytest.raises(InvalidMappingError):
+            check_text("group", bad)
+    assert mapping.check_idp(ISS) == ISS
+    with pytest.raises(InvalidMappingError):
+        mapping.check_idp("https://unconfigured.example.test")
+    assert not mapping.has_any_mapping()
+    mapping.set_mapping(ORG, idp=ISS, group="g-1", team=None, role=ORG_ADMIN)
+    assert mapping.has_any_mapping()
+    assert map_key(ISS, "g-1") == Key("ORG", f"MAP#{ISS}#g-1")
+    mapping.remove_mapping(ORG, idp=ISS, group="g-1", team=None)
+    assert not mapping.has_any_mapping()
 
 
 # --- races between the check and the write -----------------------------------------------------

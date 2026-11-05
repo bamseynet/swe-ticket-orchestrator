@@ -25,10 +25,10 @@ matches the durable record; when neither exists the bootstrap is still open and
 by the recorded claimant succeeds (idempotent). A marker with its mapping gone is refused: the
 bootstrap stays closed.
 
-Private use, not done here: this module imports ``_check_text`` and calls ``_check_idp`` from
-``mapping.py`` and copies its ``ORG``/``MAP#`` key layout, because ``mapping.py`` is not in this
-issue's files. ``test_mapping_written_through_role_mapping_closes_bootstrap`` fails if the layout
-drifts.
+It reads and writes only through the ``RoleMapping`` it is given and its public surface
+(``check_text``, ``map_key``, ``check_idp``, ``has_any_mapping``, ``store``), so the mapping check
+and the claim always use one store. ``test_bootstrap_*_guard*`` in the tests fail on a private
+name from ``mapping.py`` (any import form, module alias, ``getattr``, or ``self._mapping._x``).
 
 Unverified until D12: that the bootstrap group ID is what Cognito emits for the real IdP.
 """
@@ -42,7 +42,7 @@ from typing import Any
 
 from sto.config.org_policy import ORG_ADMIN, Principal
 from sto.domain.errors import PermanentError, TransientError
-from sto.identity.mapping import NoAccessError, RoleMapping, ServiceIdentity, _check_text
+from sto.identity.mapping import NoAccessError, RoleMapping, ServiceIdentity, check_text, map_key
 from sto.identity.oidc import VerifiedToken
 from sto.store.ports import (
     PLATFORM,
@@ -50,7 +50,6 @@ from sto.store.ports import (
     ConditionFailedError,
     Key,
     Put,
-    Store,
     TransactionOutcomeUnknownError,
 )
 
@@ -58,7 +57,6 @@ __all__ = ["Bootstrap", "BootstrapRefusedError", "BootstrapRetryError"]
 
 _log = logging.getLogger(__name__)
 _USED = Key("ORG", "BOOTSTRAP#USED")
-_MAP_PREFIX = "MAP#"
 
 
 class BootstrapRefusedError(PermanentError):
@@ -72,7 +70,6 @@ class BootstrapRetryError(TransientError):
 class Bootstrap:
     def __init__(
         self,
-        store: Store,
         mapping: RoleMapping,
         *,
         idp: str,
@@ -83,18 +80,18 @@ class Bootstrap:
         if not callable(audit):
             raise ValueError("bad bootstrap configuration: audit must be callable")
         try:
-            _check_text("the bootstrap group", group)
-            mapping._check_idp(idp)
+            check_text("the bootstrap group", group)
+            mapping.check_idp(idp)
         except PermanentError as exc:
             raise ValueError(f"bad bootstrap configuration: {exc}") from exc
-        self._store, self._mapping, self._clock, self._audit = store, mapping, clock, audit
+        self._store, self._mapping, self._clock, self._audit = mapping.store, mapping, clock, audit
         self._idp, self._group = idp, group
 
     def is_open(self) -> bool:
         """True only while nothing has been claimed and no mapping exists."""
         if self._store.get(PLATFORM, _USED) is not None:
             return False
-        return not self._store.query(PLATFORM, "ORG", sk_prefix=_MAP_PREFIX, limit=1).items
+        return not self._mapping.has_any_mapping()
 
     def claim(self, token: VerifiedToken) -> Principal:
         """Map the bootstrap group to ``org_admin``. Works once. Returns the acting principal.
@@ -116,8 +113,8 @@ class Bootstrap:
             if isinstance(who, ServiceIdentity):
                 raise BootstrapRefusedError("a service identity cannot bootstrap")
         actor = f"{token.issuer}|{token.subject}"
-        map_key = Key("ORG", f"{_MAP_PREFIX}{self._idp}#{self._group}")
-        recorded = self._recorded(map_key, actor)
+        mkey = map_key(self._idp, self._group)
+        recorded = self._recorded(mkey, actor)
         if recorded is None:
             if not self.is_open():
                 raise BootstrapRefusedError("the bootstrap has been used or mappings exist")
@@ -127,28 +124,28 @@ class Bootstrap:
             try:
                 self._store.transact(
                     PLATFORM,
-                    [Put(_USED, marker, when=Absent()), Put(map_key, grant, when=Absent())],
+                    [Put(_USED, marker, when=Absent()), Put(mkey, grant, when=Absent())],
                 )
             except ConditionFailedError as exc:
                 raise BootstrapRefusedError("the bootstrap has been used") from exc
             except TransactionOutcomeUnknownError as exc:
-                recorded = self._reread(map_key, actor, exc)
+                recorded = self._reread(mkey, actor, exc)
             else:
                 recorded = marker
         self._notify({"event": "bootstrap.claimed", **recorded})
         return Principal(actor, frozenset({ORG_ADMIN}))
 
-    def _reread(self, map_key: Key, actor: str, cause: Exception) -> dict[str, Any]:
+    def _reread(self, key: Key, actor: str, cause: Exception) -> dict[str, Any]:
         """After an unknown outcome: the stored marker if this claim committed, else retry."""
         try:
-            recorded = self._recorded(map_key, actor)
+            recorded = self._recorded(key, actor)
         except TransientError as exc:
             raise BootstrapRetryError("outcome unknown and could not be confirmed") from exc
         if recorded is None:  # one transaction: no marker means nothing was written
             raise BootstrapRetryError("outcome unknown and nothing was written") from cause
         return recorded
 
-    def _recorded(self, map_key: Key, actor: str) -> dict[str, Any] | None:
+    def _recorded(self, key: Key, actor: str) -> dict[str, Any] | None:
         """The stored marker if it is this claimant's and complete; ``None`` if there is none.
 
         Refuses when the marker is someone else's, or this claimant's with the mapping gone."""
@@ -157,7 +154,7 @@ class Bootstrap:
             return None
         if used.data.get("by") != actor:
             raise BootstrapRefusedError("the bootstrap has been used by someone else")
-        if self._store.get(PLATFORM, map_key) is None:
+        if self._store.get(PLATFORM, key) is None:
             raise BootstrapRefusedError(
                 "the bootstrap was used and its mapping has since been removed; it stays closed"
             )
