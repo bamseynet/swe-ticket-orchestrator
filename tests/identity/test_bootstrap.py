@@ -46,7 +46,6 @@ class Env:
         self.mapping = RoleMapping(self.store, issuers=[ISS], clock=lambda: NOW)
         self.audit: list[dict[str, object]] = []
         self.boot = Bootstrap(
-            self.store,
             self.mapping,
             idp=ISS,
             group=BOOT,
@@ -157,7 +156,7 @@ def test_audit_failure_after_commit_is_logged_and_claim_succeeds(
         raise RuntimeError("audit sink down")
 
     env = Env(store)
-    boot = Bootstrap(store, env.mapping, idp=ISS, group=BOOT, clock=lambda: NOW, audit=boom)
+    boot = Bootstrap(env.mapping, idp=ISS, group=BOOT, clock=lambda: NOW, audit=boom)
     with caplog.at_level(logging.ERROR):
         who = boot.claim(_tok([BOOT]))
     assert who.is_org_admin
@@ -170,7 +169,7 @@ def test_audit_is_required() -> None:
     store = MemoryStore()
     mapping = RoleMapping(store, issuers=[ISS])
     with pytest.raises(TypeError):
-        Bootstrap(store, mapping, idp=ISS, group=BOOT)  # type: ignore[call-arg]
+        Bootstrap(mapping, idp=ISS, group=BOOT)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize("audit", [None, "log", 5])
@@ -178,7 +177,7 @@ def test_audit_must_be_callable(audit: object) -> None:
     store = MemoryStore()
     mapping = RoleMapping(store, issuers=[ISS])
     with pytest.raises(ValueError, match="audit must be callable"):
-        Bootstrap(store, mapping, idp=ISS, group=BOOT, audit=audit)  # type: ignore[arg-type]
+        Bootstrap(mapping, idp=ISS, group=BOOT, audit=audit)  # type: ignore[arg-type]
 
 
 class _Barrier(MemoryStore):
@@ -373,16 +372,13 @@ def test_stored_marker_group_is_the_bootstrap_group_among_many(env: Env) -> None
 def test_misconfigured_group_is_refused(group: str) -> None:
     store = MemoryStore()
     with pytest.raises(ValueError, match="bad bootstrap configuration"):
-        Bootstrap(
-            store, RoleMapping(store, issuers=[ISS]), idp=ISS, group=group, audit=lambda e: None
-        )
+        Bootstrap(RoleMapping(store, issuers=[ISS]), idp=ISS, group=group, audit=lambda e: None)
 
 
 def test_misconfigured_idp_is_refused() -> None:
     store = MemoryStore()
     with pytest.raises(ValueError, match="bad bootstrap configuration"):
         Bootstrap(
-            store,
             RoleMapping(store, issuers=[ISS]),
             idp="https://nope.example.test",
             group=BOOT,
@@ -390,22 +386,82 @@ def test_misconfigured_idp_is_refused() -> None:
         )
 
 
-def test_bootstrap_imports_no_private_name_from_mapping() -> None:
-    """The bootstrap uses RoleMapping's public helpers, not its private ones or key layout."""
+_MAPPING = "sto.identity.mapping"
+
+
+def _violations(src: str, module: str = "sto.identity.bootstrap") -> list[str]:
+    """Uses of a private name of ``mapping.py`` (or of private state of the mapping)."""
     import ast
+
+    tree = ast.parse(src)
+    pkg = module.rsplit(".", 1)[0]
+    bound: set[str] = set()  # local names bound to the mapping module
+    found: list[str] = []
+
+    def resolve(node: ast.ImportFrom) -> str:
+        if not node.level:
+            return node.module or ""
+        base = pkg.split(".")[: len(pkg.split(".")) - (node.level - 1)]
+        return ".".join([*base, *([node.module] if node.module else [])])
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            target = resolve(node)
+            for alias in node.names:
+                if target == _MAPPING and alias.name.startswith("_"):
+                    found.append(f"import {alias.name}")
+                if f"{target}.{alias.name}" == _MAPPING:
+                    bound.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == _MAPPING:
+                    bound.add(alias.asname or alias.name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            val = node.value
+            dotted = ast.unparse(val)
+            if dotted in bound or dotted == _MAPPING:
+                found.append(f"{dotted}.{node.attr}")
+            if isinstance(val, ast.Attribute) and val.attr in ("_mapping", "mapping"):
+                found.append(f"{dotted}.{node.attr}")
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "getattr":
+            found.append("getattr")
+    return found
+
+
+_BYPASSES = {
+    "relative import": "from .mapping import _check_text\n",
+    "from package": "from sto.identity import mapping\nmapping._too_long('x')\n",
+    "module alias": "import sto.identity.mapping as m\nm._disabled_key('a', 'b')\n",
+    "plain module import": "import sto.identity.mapping\nsto.identity.mapping._MAP\n",
+    "getattr": "import sto.identity.mapping as m\ngetattr(m, '_check_' + 'text')\n",
+    "instance privates": "def f(self):\n    return self._mapping._store, self._mapping._issuers\n",
+}
+
+
+@pytest.mark.parametrize("name", list(_BYPASSES))
+def test_bootstrap_guard_catches_each_bypass(name: str) -> None:
+    assert _violations(_BYPASSES[name]), name
+
+
+def test_bootstrap_guard_allows_public_names() -> None:
+    ok = "from .mapping import check_text\nfrom sto.identity import mapping\nmapping.map_key\n"
+    assert _violations(ok) == []
+
+
+def test_bootstrap_imports_no_private_name_from_mapping() -> None:
     import pathlib
 
     import sto.identity.bootstrap as mod
 
-    tree = ast.parse(pathlib.Path(mod.__file__).read_text())
-    private = [
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "sto.identity.mapping"
-        for alias in node.names
-        if alias.name.startswith("_")
-    ]
-    assert private == []
-    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    assert not {a for a in attrs if a.startswith("_check") or a == "_map_key"}
-    assert "MAP#" not in pathlib.Path(mod.__file__).read_text().split('"""', 2)[2]
+    text = pathlib.Path(mod.__file__).read_text()
+    assert _violations(text) == []
+    assert "MAP#" not in text.split('"""', 2)[2]  # best effort: no copied key layout
+
+
+def test_bootstrap_uses_the_mappings_store_only() -> None:
+    import inspect
+
+    assert "store" not in inspect.signature(Bootstrap).parameters
+    env = Env()
+    assert env.boot._store is env.mapping.store

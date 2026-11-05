@@ -346,6 +346,27 @@ def test_issuer_with_pipe_is_refused_so_actor_keys_stay_unique() -> None:
         RoleMapping(MemoryStore(), issuers=["a|b"])
 
 
+@pytest.mark.parametrize(
+    "issuer", ["https://x ", " https://x", "https://x\n", "https://x\t", "https://x\u200b"]
+)
+def test_issuer_whitespace_or_control_is_refused_like_sod(issuer: str) -> None:
+    with pytest.raises(ValueError, match="issuer"):
+        RoleMapping(MemoryStore(), issuers=[issuer])
+
+
+def test_issuers_must_not_be_a_bare_string() -> None:
+    with pytest.raises(TypeError):
+        RoleMapping(MemoryStore(), issuers="https://x")
+
+
+def test_has_any_mapping_ignores_lookalike_prefixes() -> None:
+    store = MemoryStore()
+    m = RoleMapping(store, issuers=[ISS])
+    store.put(PLATFORM, Key("ORG", "MAPX#whatever"), {})
+    store.put(PLATFORM, Key("ORG", "MAP"), {})
+    assert not m.has_any_mapping()
+
+
 def test_public_helpers_check_text_and_issuer_and_report_stored_mappings(
     mapping: RoleMapping,
 ) -> None:

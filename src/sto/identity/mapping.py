@@ -146,6 +146,10 @@ def _too_long(value: str) -> bool:
 
 
 def check_text(label: str, value: object) -> str:
+    """Return ``value`` if it is a usable name, else raise :class:`InvalidMappingError`.
+
+    Non-empty ``str``, at most :data:`MAX_NAME_BYTES` bytes, no surrounding whitespace, no control
+    or other Unicode ``C*`` characters. Exact: no folding or trimming."""
     if not isinstance(value, str) or not value:
         raise InvalidMappingError(f"{label} must be a non-empty string")
     if _too_long(value):
@@ -189,17 +193,23 @@ class RoleMapping:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._store, self._clock = store, clock
+        if isinstance(issuers, str):
+            raise TypeError("issuers must be a collection of strings, not one string")
         self._issuers = frozenset(issuers)
         if not self._issuers:
             raise ValueError("at least one issuer is required")
         for issuer in self._issuers:
-            if (
-                not isinstance(issuer, str)
-                or not issuer
-                or _BAD_ISSUER_CHARS.intersection(issuer)
-                or _too_long(issuer)
-            ):
+            try:
+                check_text("issuer", issuer)  # same rules separation of duties applies
+            except InvalidMappingError as exc:
+                raise ValueError(f"bad issuer: {exc}") from exc
+            if _BAD_ISSUER_CHARS.intersection(issuer):
                 raise ValueError("issuers must be short non-empty strings without '#' or '|'")
+
+    @property
+    def store(self) -> Store:
+        """The store every read and write here goes through."""
+        return self._store
 
     def has_any_mapping(self) -> bool:
         """True if any mapping item is stored, however it was written."""

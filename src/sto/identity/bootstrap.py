@@ -25,8 +25,10 @@ matches the durable record; when neither exists the bootstrap is still open and
 by the recorded claimant succeeds (idempotent). A marker with its mapping gone is refused: the
 bootstrap stays closed.
 
-It uses only the public helpers of ``mapping.py`` (``check_text``, ``map_key``, ``check_idp``,
-``has_any_mapping``); ``test_bootstrap_imports_no_private_name_from_mapping`` fails if that changes.
+It reads and writes only through the ``RoleMapping`` it is given and its public surface
+(``check_text``, ``map_key``, ``check_idp``, ``has_any_mapping``, ``store``), so the mapping check
+and the claim always use one store. ``test_bootstrap_*_guard*`` in the tests fail on a private
+name from ``mapping.py`` (any import form, module alias, ``getattr``, or ``self._mapping._x``).
 
 Unverified until D12: that the bootstrap group ID is what Cognito emits for the real IdP.
 """
@@ -48,7 +50,6 @@ from sto.store.ports import (
     ConditionFailedError,
     Key,
     Put,
-    Store,
     TransactionOutcomeUnknownError,
 )
 
@@ -69,7 +70,6 @@ class BootstrapRetryError(TransientError):
 class Bootstrap:
     def __init__(
         self,
-        store: Store,
         mapping: RoleMapping,
         *,
         idp: str,
@@ -84,7 +84,7 @@ class Bootstrap:
             mapping.check_idp(idp)
         except PermanentError as exc:
             raise ValueError(f"bad bootstrap configuration: {exc}") from exc
-        self._store, self._mapping, self._clock, self._audit = store, mapping, clock, audit
+        self._store, self._mapping, self._clock, self._audit = mapping.store, mapping, clock, audit
         self._idp, self._group = idp, group
 
     def is_open(self) -> bool:
