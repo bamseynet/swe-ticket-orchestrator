@@ -73,7 +73,12 @@ from sto.engine.drivers.ports import (
     StillRunning,
     command_key,
 )
-from sto.engine.handlers.cancel import EffectLandedDuringStop, EffectUnresolvedDuringStop
+from sto.engine.handlers.cancel import (
+    EffectLandedDuringStop,
+    EffectUnresolvedDuringStop,
+    bound_handler,
+    merged_head,
+)
 from sto.engine.handlers.core import (
     CancelRequested,
     EffectConfirmed,
@@ -745,9 +750,10 @@ class LocalDriver:
         if rs.run.status is not RunStatus.CANCELLING:
             return event
         if isinstance(event, EffectConfirmed):
-            head = rs.subject.head_sha if rs.subject else None
+            # The head is what the standing approvals cover (``merged_head``), not whatever the
+            # live subject is by now; unknown means uncovered, which gets the revert.
             return EffectLandedDuringStop(
-                event.run_id, event.effect, event.visit, event.merge_sha, head
+                event.run_id, event.effect, event.visit, event.merge_sha, merged_head(rs)
             )
         if isinstance(event, EffectFailed) and event.reason == "blocked":
             return EffectUnresolvedDuringStop(event.run_id, event.effect, event.visit, "blocked")
@@ -805,10 +811,23 @@ class EffectsExecutor:
         *,
         others: CommandExecutor | None = None,
         poll_interval: float = 1.0,
+        read_timeout: float | None = 10.0,
     ) -> None:
+        # Polls, stops and reconciles of the SCM have a deadline and a pool of their own, so a
+        # hung SCM holds one of its threads and not the default pool the API shares. ``None``
+        # leaves the handlers as given.
+        self._scm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sto-scm")
+        if read_timeout is not None:
+            handlers = {
+                name: bound_handler(h, timeout=read_timeout, pool=self._scm_pool)
+                for name, h in handlers.items()
+            }
         self._fx, self._handlers, self._live = effects, handlers, live
         self._status_of, self._others, self._poll = status_of, others, poll_interval
         self._streak: dict[str, int] = {}
+
+    def close(self) -> None:
+        self._scm_pool.shutdown(wait=False, cancel_futures=True)
 
     async def execute(self, key: str, command: object) -> Outcome:
         if not isinstance(command, RunEffect):

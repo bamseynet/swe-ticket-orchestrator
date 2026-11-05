@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -72,8 +73,13 @@ from sto.engine.commands import Finish, OpenRevert, StopRun
 from sto.engine.drivers.ports import Done, Outcome, StillRunning
 from sto.engine.handlers.core import CancelCompleted, CancelRequested
 from sto.engine.reducer import (
+    GRAPH_HANDLERS,
+    HANDLERS,
+    Handler,
+    HandlerRegistry,
     MalformedEventError,
     Merge,
+    NoHandlerError,
     OutOfOrderEventError,
     RunState,
     Transition,
@@ -83,6 +89,7 @@ from sto.engine.reducer import (
 from sto.store.ports import (
     Absent,
     ConditionFailedError,
+    Item,
     Key,
     Put,
     Scope,
@@ -116,6 +123,28 @@ class EffectUnresolvedDuringStop:
     effect: str
     visit: int
     reason: str = "blocked"
+    key: str = ""  # the effect's idempotency key, when a later check will want it
+
+
+@EVENTS.register("cancel.completed_unresolved")
+@dataclass(frozen=True)
+class CancelCompletedUnresolved:
+    """The Stop is done, but a ``pr.merge`` it could not resolve may still land (a writer stalled
+    past its lease). The run ends exactly as ``CancelCompleted`` ends it, flagged as an incident:
+    it is never plain ``CANCELLED``. The merge is then looked for until it resolves
+    (``StopWatch.recheck``)."""
+
+    run_id: RunId
+
+
+def merged_head(rs: RunState) -> str | None:
+    """The head a ``pr.merge`` merged, as far as the run's own record shows: the live subject's
+    head, but only while every standing approval covers that same head. Anything else is unknown
+    (``None``), which the end of the run treats as not covered by QA, so the merge is reverted. A
+    merge is never credited with a head it may not have merged."""
+    head = rs.subject.head_sha if rs.subject else None
+    heads = {a.head_sha for a in rs.approvals if a.head_sha is not None}
+    return head if head is not None and heads == {head} else None
 
 
 def _stopping(rs: RunState, what: str) -> None:
@@ -145,9 +174,30 @@ def on_effect_unresolved(rs: RunState, event: EffectUnresolvedDuringStop, wf: An
     return Transition(_bump(rs))
 
 
+def _unresolved_completion(registry: HandlerRegistry) -> Handler:
+    """``CancelCompleted`` as the workflow kind's own handler ends it, then flagged: the run and
+    its ``Finish`` carry the incident, so the driver alerts and nothing ends clean."""
+
+    def handler(rs: RunState, event: CancelCompletedUnresolved, wf: Any) -> Transition:
+        base = registry.get(CancelCompleted)
+        if base is None:
+            raise NoHandlerError("no handler for CancelCompleted")
+        done = base(rs, CancelCompleted(event.run_id), wf)
+        run = dataclasses.replace(done.state.run, incident=True)
+        commands = tuple(
+            dataclasses.replace(c, incident=True) if isinstance(c, Finish) else c
+            for c in done.commands
+        )
+        return Transition(dataclasses.replace(done.state, run=run), commands)
+
+    return handler
+
+
 for _register in (handles_graph, handles):
     _register(EffectLandedDuringStop)(on_effect_landed)
     _register(EffectUnresolvedDuringStop)(on_effect_unresolved)
+handles_graph(CancelCompletedUnresolved)(_unresolved_completion(GRAPH_HANDLERS))
+handles(CancelCompletedUnresolved)(_unresolved_completion(HANDLERS))
 del _register
 
 
@@ -208,6 +258,42 @@ def bounded_read[T](read: Callable[[], T], *, timeout: float, pool: ThreadPoolEx
         raise ScmReadTimeoutError(f"the SCM read did not answer within {timeout}s") from None
 
 
+class BoundedHandler:
+    """An effect handler whose reads and cancels (``poll``, ``stop``, ``reconcile``) have a
+    deadline and run on a pool of their own. ``execute`` is the write and is left alone: its
+    ambiguity is the effects service's lease, which an SCM request timeout must stay under."""
+
+    def __init__(self, inner: EffectHandler, *, timeout: float, pool: ThreadPoolExecutor) -> None:
+        self._inner, self._timeout, self._pool = inner, timeout, pool
+
+    def execute(self, effect: Effect) -> Any:
+        return self._inner.execute(effect)
+
+    def poll(self, effect: Effect) -> Any:
+        return bounded_read(
+            lambda: self._inner.poll(effect), timeout=self._timeout, pool=self._pool
+        )
+
+    def stop(self, effect: Effect) -> Any:
+        return bounded_read(
+            lambda: self._inner.stop(effect), timeout=self._timeout, pool=self._pool
+        )
+
+    def reconcile(self, effect: Effect) -> Any:
+        return bounded_read(
+            lambda: self._inner.reconcile(effect), timeout=self._timeout, pool=self._pool
+        )
+
+
+def bound_handler(
+    handler: EffectHandler, *, timeout: float, pool: ThreadPoolExecutor
+) -> EffectHandler:
+    if isinstance(handler, BoundedHandler):
+        return handler
+    return BoundedHandler(handler, timeout=timeout, pool=pool)
+
+
+WATCH_PK = "STOP_WATCH"  # merges still looked for after their run ended (team partition)
 MergeLookup = Callable[[Effect], MergeResult | None]
 RevertWriter = Callable[[RunId, str, str], Receipt]  # run, merge sha, idempotency key
 
@@ -221,6 +307,9 @@ class StopSettings:
     retry_after: float = 1.0
     max_retry_after: float = 30.0
     read_timeout: float = 10.0
+    # How long after a Stop an unresolved merge is still looked for. It must outlast the effect's
+    # lease plus the SCM request timeout (the timeout must be shorter than the lease: D4-06).
+    settle_after: float = 600.0
 
 
 class StopExecutor:
@@ -245,12 +334,18 @@ class StopExecutor:
         settings: StopSettings | None = None,
         read_pool: ThreadPoolExecutor | None = None,
     ) -> None:
-        self._store, self._scope, self._fx, self._handlers = store, scope, effects, handlers
+        self._store, self._scope, self._fx = store, scope, effects
         self._load, self._clock, self._alarm = load, clock, alarm
         self._lookup, self._revert, self._steps, self._gates = lookup, revert, steps, gates
         self._s = settings or StopSettings()
         self._pool = read_pool or ThreadPoolExecutor(max_workers=2, thread_name_prefix="sto-scm")
         self._own_pool = read_pool is None
+        # Every SCM call the Stop makes (dequeue, poll, through the effects service) has a deadline
+        # and runs on this pool, so a hung SCM holds one of its threads and never the API's.
+        self._handlers: dict[str, EffectHandler] = {
+            name: bound_handler(h, timeout=self._s.read_timeout, pool=self._pool)
+            for name, h in handlers.items()
+        }
         self._streak: dict[RunId, int] = {}
 
     def close(self) -> None:
@@ -274,14 +369,17 @@ class StopExecutor:
 
     async def _stop(self, run_id: RunId) -> Outcome:
         try:
-            events = await asyncio.to_thread(self._stop_once, run_id)
+            result = await asyncio.to_thread(self._stop_once, run_id)
         except Exception as exc:  # noqa: BLE001 - a Stop that fails is retried, never dropped
             return self._failing(run_id, exc)
-        if isinstance(events, StillRunning):
-            self._check_alarm(run_id, events.reason)
-            return events
+        if isinstance(result, StillRunning):
+            self._check_alarm(run_id, result.reason)
+            return result
         self._streak.pop(run_id, None)
-        return Done([*events, CancelCompleted(run_id)])
+        events, unresolved = result
+        # A merge the Stop could not resolve never ends the run clean (CancelCompletedUnresolved)
+        end = CancelCompletedUnresolved(run_id) if unresolved else CancelCompleted(run_id)
+        return Done([*events, end])
 
     def _failing(self, run_id: RunId, exc: Exception) -> StillRunning:
         n = self._streak.get(run_id, 0)
@@ -294,7 +392,7 @@ class StopExecutor:
         delay = min(self._s.retry_after * 2 ** min(n, 6), self._s.max_retry_after)
         return StillRunning(delay, reason)
 
-    def _stop_once(self, run_id: RunId) -> list[object] | StillRunning:
+    def _stop_once(self, run_id: RunId) -> tuple[list[object], bool] | StillRunning:
         rs = self._load(run_id)
         report = self._fx.void_planned(run_id)
         events: list[object] = [self._landed(e, rs) for e in report.landed]
@@ -312,15 +410,22 @@ class StopExecutor:
             self._steps.stop_step(run_id, rs.run.stage, rs.visit, rs.attempt)
         if self._gates is not None:
             self._gates.close_open_gates(run_id)
-        return events
+        unresolved = [
+            e
+            for e in events
+            if isinstance(e, EffectUnresolvedDuringStop) and e.effect == "pr.merge"
+        ]
+        for e in unresolved:
+            self._watch(run_id, e.key)
+        return events, bool(unresolved)
 
     @staticmethod
     def _landed(effect: Effect, rs: RunState) -> object:
         frozen = effect.frozen_subject
         sha = frozen.merge_sha if frozen else None
         head = frozen.head_sha if frozen else None
-        if effect.type == "pr.merge" and head is None and rs.subject is not None:
-            head = rs.subject.head_sha
+        if effect.type == "pr.merge" and head is None:
+            head = merged_head(rs)
         return EffectLandedDuringStop(effect.run_id, effect.type, effect.visit, sha, head)
 
     def _reconcile(self, effect: Effect, rs: RunState) -> list[object] | str:
@@ -364,16 +469,23 @@ class StopExecutor:
                     effect.type,
                     effect.visit,
                     found.merge_sha,
-                    effect.frozen_subject.head_sha
-                    if effect.frozen_subject
-                    else rs.subject.head_sha
-                    if rs.subject
-                    else None,
+                    effect.frozen_subject.head_sha if effect.frozen_subject else merged_head(rs),
                 )
             ]
         if found is not None and found.state is MergeState.PENDING:
             return f"{effect.type}:merge_queued"  # it may still land: the Stop stays open
-        return []  # the read succeeded and no merge landed or could
+        # The read succeeded and shows no merge. That is not "none will": a writer stalled past its
+        # lease may still send. The run ends as an incident and the merge is watched until it
+        # resolves (StopWatch.recheck).
+        return [
+            EffectUnresolvedDuringStop(
+                effect.run_id,
+                effect.type,
+                effect.visit,
+                "merge_unconfirmed",
+                effect.idempotency_key,
+            )
+        ]
 
     # --- the alarm and the durable note ---------------------------------------------------------
 
@@ -401,32 +513,87 @@ class StopExecutor:
     async def _open_revert(self, cmd: OpenRevert) -> Outcome:
         if self._revert is None:
             raise TypeError("no revert writer configured")
+        return await asyncio.to_thread(self._revert_once, cmd)
+
+    def _revert_once(self, cmd: OpenRevert) -> Outcome:
         revert = self._revert
+        if revert is None:
+            raise TypeError("no revert writer configured")
         digest = hashlib.sha256(cmd.merge_sha.encode()).hexdigest()
         fx = self._fx
-
-        def run() -> Outcome:
-            planned = fx.plan(
-                cmd.run_id,
-                "pr.open_revert",
-                f"revert:{cmd.merge_sha}",
-                1,
-                EffectClass.SCOPED,
-                digest,
+        planned = fx.plan(
+            cmd.run_id, "pr.open_revert", f"revert:{cmd.merge_sha}", 1, EffectClass.SCOPED, digest
+        )
+        handler = CallHandler(lambda k: revert(cmd.run_id, cmd.merge_sha, k))
+        result = fx.execute(cmd.run_id, planned.idempotency_key, handler)
+        status = result.effect.status
+        if result.blocked:
+            self._alarm.raise_alarm(
+                cmd.run_id, "revert_blocked", f"revert of {cmd.merge_sha} needs a person"
             )
-            handler = CallHandler(lambda k: revert(cmd.run_id, cmd.merge_sha, k))
-            result = fx.execute(cmd.run_id, planned.idempotency_key, handler)
-            status = result.effect.status
-            if result.blocked:
-                self._alarm.raise_alarm(
-                    cmd.run_id, "revert_blocked", f"revert of {cmd.merge_sha} needs a person"
-                )
-                return Done()
-            if status in (EffectStatus.CONFIRMED, EffectStatus.FAILED, EffectStatus.VOIDED):
-                return Done()
-            return StillRunning(self._s.retry_after, f"revert:{status.value.lower()}")
+            return Done()
+        if status in (EffectStatus.CONFIRMED, EffectStatus.FAILED, EffectStatus.VOIDED):
+            return Done()
+        return StillRunning(self._s.retry_after, f"revert:{status.value.lower()}")
 
-        return await asyncio.to_thread(run)
+    # --- merges watched after the run ended -------------------------------------------------
+
+    def _watch(self, run_id: RunId, effect_key: str) -> None:
+        """Remember a merge the Stop could not resolve, so it is looked for after the run is over.
+        The first note stands (its window is not restarted by a repeated Stop)."""
+        until = self._clock() + self._s.settle_after
+        entry = {"run_id": str(run_id), "effect_key": effect_key, "until": until}
+        with contextlib.suppress(ConditionFailedError):
+            self._store.transact(
+                self._scope, [Put(Key(WATCH_PK, f"{run_id}:{effect_key}"), entry, when=Absent())]
+            )
+
+    async def recheck_merges(self) -> list[tuple[RunId, str]]:
+        """Look again at every watched merge. A merge that landed alarms and gets its revert (the
+        run is over, so it is the engine's implicit effect, not an event); one nowhere to be found
+        once the window has passed is cleared; one still queued, or a read that failed, waits for
+        the next sweep. Returns ``(run, "landed" | "clear")`` for each one resolved."""
+        return await asyncio.to_thread(self._recheck)
+
+    def _recheck(self) -> list[tuple[RunId, str]]:
+        out: list[tuple[RunId, str]] = []
+        cursor: str | None = None
+        items: list[Item] = []
+        while True:
+            page = self._store.query(self._scope, WATCH_PK, cursor=cursor)
+            items += page.items
+            cursor = page.cursor
+            if cursor is None:
+                break
+        for item in items:
+            run_id = RunId.parse(item.data["run_id"])
+            effect = self._fx.get(run_id, item.data["effect_key"])
+            lookup = self._lookup
+            try:
+                found = (
+                    bounded_read(
+                        functools.partial(lookup, effect),
+                        timeout=self._s.read_timeout,
+                        pool=self._pool,
+                    )
+                    if lookup is not None
+                    else None
+                )
+            except TransientError:
+                continue  # an unanswered read is not "no merge": ask again next sweep
+            if found is not None and found.state is MergeState.MERGED and found.merge_sha:
+                self._alarm.raise_alarm(
+                    run_id, "merge_landed_after_stop", f"{found.merge_sha} landed after the Stop"
+                )
+                done = self._revert_once(OpenRevert(run_id, found.merge_sha))
+                if isinstance(done, StillRunning):
+                    continue  # the revert is not written yet: the watch stays
+                self._store.delete(self._scope, item.key)
+                out.append((run_id, "landed"))
+            elif found is None and self._clock() >= float(item.data["until"]):
+                self._store.delete(self._scope, item.key)
+                out.append((run_id, "clear"))
+        return out
 
 
 # --- the alarm ----------------------------------------------------------------------------------
@@ -481,9 +648,15 @@ class StopWatch:
         clock: Callable[[], float],
         alarm: Alarm,
         timeout: float = 60.0,
+        executor: StopExecutor | None = None,
     ) -> None:
         self._store, self._scope, self._active, self._load = store, scope, active_runs, load
         self._clock, self._alarm, self._timeout = clock, alarm, timeout
+        self._executor = executor
+
+    async def recheck(self) -> list[tuple[RunId, str]]:
+        """After a run has ended: look again at each merge its Stop could not resolve."""
+        return await self._executor.recheck_merges() if self._executor else []
 
     async def sweep(self) -> list[RunId]:
         raised: list[RunId] = []
@@ -588,7 +761,10 @@ class CancelService:
 
 
 __all__ = [
+    "WATCH_PK",
     "Alarm",
+    "BoundedHandler",
+    "CancelCompletedUnresolved",
     "CancelAudit",
     "CancelService",
     "EffectLandedDuringStop",
@@ -603,7 +779,9 @@ __all__ = [
     "StopSettings",
     "StopWatch",
     "StoreGateCloser",
+    "bound_handler",
     "bounded_read",
+    "merged_head",
     "cancel_key",
     "raise_stuck_stop_alarm",
 ]
