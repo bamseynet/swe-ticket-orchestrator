@@ -54,13 +54,14 @@ account ID each returns). Here the vendors are the :class:`VendorOAuth` port, fa
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from sto.domain.errors import PermanentError
+from sto.domain.errors import PermanentError, TransientError
 from sto.identity.mapping import InvalidMappingError, UserIdentity, check_text
 from sto.store.ports import (
     PLATFORM,
@@ -80,7 +81,9 @@ __all__ = [
     "AccountClaimedError",
     "AccountLinking",
     "Link",
+    "LinkContentionError",
     "LinkRefusedError",
+    "LinkStateError",
     "LinkStart",
     "LinkTokenExpiredError",
     "LinkTokenInvalidError",
@@ -98,6 +101,7 @@ VENDORS = ("slack", "github", "jira")
 MAX_TOKEN_TTL = 900.0
 DEFAULT_TOKEN_TTL = 600.0
 DEFAULT_LINK_TTL = 30 * 86_400.0
+MAX_LINK_TTL = 5 * 365 * 86_400.0
 _ATTEMPTS = 5
 _ORG = "ORG"
 _TOKEN = "LINKTOKEN#"
@@ -135,6 +139,15 @@ class NotLinkedError(LinkRefusedError):
     """No live link for that account (never linked, expired, or removed)."""
 
 
+class LinkStateError(LinkRefusedError):
+    """A stored item (the log counter) is not in the shape this module writes: refused, not
+    guessed at."""
+
+
+class LinkContentionError(TransientError):
+    """The store kept losing races on this write (not a used token): try again shortly."""
+
+
 class VendorExchangeError(LinkRefusedError):
     """The vendor refused the code, or answered with an account ID that cannot be used."""
 
@@ -149,7 +162,21 @@ class VendorAccount:
 
 class VendorOAuth(Protocol):
     """One vendor's OAuth flow. Real ones (D7, D4) hold client secrets and call the vendor; tests
-    use fakes. ``exchange`` raises :class:`VendorExchangeError` for a code the vendor refuses."""
+    use fakes. ``exchange`` raises :class:`VendorExchangeError` for a code the vendor refuses.
+
+    What a real adapter must return as ``account_id`` (the identity the link is keyed on):
+
+    * **GitHub:** the immutable numeric user ID, never the login, which can be renamed and
+      reclaimed by someone else.
+    * **Slack:** an ID scoped by the workspace (``team_id`` plus the user ID), since user IDs are
+      only unique within a workspace.
+    * **Jira:** Atlassian account IDs are global, so the exchange must also check the site (the
+      accessible-resources list) belongs to the org, or a stranger's account could be linked.
+
+    Not yet in this port: PKCE and ``redirect_uri`` binding. The link token is the OAuth
+    ``state`` and ``complete`` binds it to the SSO user, session and vendor, but an adapter that
+    exchanges a code must still send the registered redirect URI and a PKCE verifier when its
+    vendor supports one. Unverified until D12."""
 
     def authorize_url(self, state: str) -> str: ...
 
@@ -200,7 +227,10 @@ def _user_pk(actor: str) -> str:
 
 
 def _number(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+    """A finite number, else ``None`` (NaN and infinity never read as a usable time)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 class AccountLinking:
@@ -215,8 +245,8 @@ class AccountLinking:
     ) -> None:
         if not 0 < token_ttl <= MAX_TOKEN_TTL:
             raise ValueError(f"token_ttl must be above 0 and at most {MAX_TOKEN_TTL} seconds")
-        if link_ttl <= 0:
-            raise ValueError("link_ttl must be above 0")
+        if not (math.isfinite(link_ttl) and 0 < link_ttl <= MAX_LINK_TTL):
+            raise ValueError(f"link_ttl must be finite, above 0 and at most {MAX_LINK_TTL} seconds")
         unknown = set(vendors) - set(VENDORS)
         if unknown:
             raise ValueError(f"unknown vendors {sorted(unknown)}; use {VENDORS}")
@@ -287,9 +317,9 @@ class AccountLinking:
                 self._store.transact(PLATFORM, ops)
             except ConditionFailedError:
                 if attempt == _ATTEMPTS - 1:
-                    raise LinkTokenInvalidError(
-                        "the link could not be completed; start again"
-                    ) from None
+                    # a used-up or expired token says so; otherwise it is only contention
+                    self._read_token(token, actor, session_hash, vendor)
+                    raise LinkContentionError("the store is busy; try completing again") from None
                 continue
             return link
         raise AssertionError("unreachable")  # pragma: no cover
@@ -321,7 +351,7 @@ class AccountLinking:
                 self._store.transact(PLATFORM, ops)
             except ConditionFailedError:
                 if attempt == _ATTEMPTS - 1:
-                    raise
+                    raise LinkContentionError("the store is busy; try unlinking again") from None
                 continue
             return
 
@@ -388,6 +418,10 @@ class AccountLinking:
                 old = self._store.get(PLATFORM, _link_key(previous, vendor, account_id))
                 if old is not None:
                     ops.append(Delete(old.key, VersionIs(old.version)))
+                # the old owner's log records the loss, with the new owner as the actor
+                gone = {"vendor": vendor, "account_id": account_id, "owner": previous,
+                        "reason": "replaced"}  # fmt: skip
+                ops.extend(self._audit(previous, actor, "link.removed", gone))
         expires_at = now + self.link_ttl
         link = Link(vendor, account_id, now, expires_at)
         mine = self._store.get(PLATFORM, _link_key(actor, vendor, account_id))
@@ -423,7 +457,13 @@ class AccountLinking:
         """The counter bump and the append-only entry, for the caller's transaction."""
         seq_key = Key(_user_pk(owner), _SEQ)
         head = self._store.get(PLATFORM, seq_key)
-        seq = 1 if head is None else int(head.data["seq"]) + 1
+        if head is None:
+            seq = 1
+        else:
+            last = head.data.get("seq")
+            if type(last) is not int or last < 0:
+                raise LinkStateError("the link log counter is unreadable; refusing to write")
+            seq = last + 1
         entry = {"seq": seq, "at": int(self._clock() * 1000), "action": action, "actor": actor,
                  "data": data}  # fmt: skip
         return [

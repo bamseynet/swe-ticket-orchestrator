@@ -17,7 +17,15 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from sto.api.auth import ROUTES, Authorization, Permission, RouteRule, install_authorization
+from sto.api.auth import (
+    ROUTES,
+    Authorization,
+    Permission,
+    RouteRule,
+    install_authorization,
+    routes_of,
+    undeclared_routes,
+)
 from sto.api.routers.links import LINK_ROUTES, make_router
 from sto.api.routers.runs import ApiError
 from sto.config.org_policy import ORG_ADMIN, Principal
@@ -25,6 +33,8 @@ from sto.identity.fake_issuer import FakeIssuer
 from sto.identity.linking import (
     AccountClaimedError,
     AccountLinking,
+    LinkContentionError,
+    LinkStateError,
     LinkTokenExpiredError,
     LinkTokenInvalidError,
     LinkTokenMismatchError,
@@ -36,7 +46,7 @@ from sto.identity.linking import (
 from sto.identity.mapping import RoleMapping, UserIdentity
 from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks
 from sto.store.memory import MemoryStore
-from sto.store.ports import PLATFORM, Key
+from sto.store.ports import PLATFORM, ConditionFailedError, Key, TeamScope
 
 ISS = "https://idp.example.test"
 CLIENT = "sto-client"
@@ -540,6 +550,7 @@ class _Http:
 
         self.app.include_router(make_router(self.links, session_of=_session))
         authz = Authorization(validator, mapping, routes=_routes(), team_of=lambda conn: "alpha")
+        self.authz = Authorization(validator, mapping, team_of=lambda conn: "alpha")
         install_authorization(self.app, authz)
 
     def token(self, sub: str, role: str = "developer") -> str:
@@ -575,10 +586,8 @@ def http() -> _Http:
 
 
 def test_the_proposed_routes_are_declared_and_no_others_are_missing(http: _Http) -> None:
-    from sto.api.auth import undeclared_routes
-
     assert undeclared_routes(http.app, _routes()) == []
-    assert undeclared_routes(http.app, ROUTES) != []  # auth.py does not declare them yet
+    assert undeclared_routes(http.app, ROUTES) == []  # auth.py declares them (D3-04)
     assert all(isinstance(r.permission, Permission) for r in LINK_ROUTES.values())
 
 
@@ -664,3 +673,198 @@ def test_the_routes_need_a_signed_in_person(http: _Http) -> None:
     assert http.call("GET", "/links", None).status_code == 401
     assert http.call("POST", "/links/jira:start", None).status_code == 401
     assert http.call("POST", "/links/gitlab:start", http.token("ann-sub")).status_code == 404
+
+
+# --- review round 1 -----------------------------------------------------------------------------
+
+
+def log_of(store: MemoryStore, who: UserIdentity) -> list[dict[str, Any]]:
+    return audit_entries(store, who)
+
+
+def test_takeover_of_an_expired_claim_is_logged_under_the_old_owner(rig: Rig) -> None:
+    link_jira(rig)
+    rig.clock.now += rig.links.link_ttl + 1
+    rig.vendors["jira"].accounts["jira-code-bob"] = VendorAccount(JIRA_ID, None)
+    started = rig.links.start(BOB, "sess-bob", "jira")
+    rig.links.complete(BOB, "sess-bob", "jira", started.token, "jira-code-bob")
+    old = log_of(rig.store, ANN)
+    assert [e["action"] for e in old] == ["link.created", "link.removed"]
+    assert old[-1]["data"]["reason"] == "replaced"
+    assert old[-1]["actor"] == f"{ISS}|bob-sub"
+    assert old[-1]["data"]["owner"] == f"{ISS}|ann-sub"
+    assert [e["action"] for e in log_of(rig.store, BOB)] == ["link.created"]
+
+
+@pytest.mark.parametrize("bad", [{"seq": "x"}, {}, {"seq": -1}, {"seq": True}, {"seq": 1.5}])
+def test_a_malformed_counter_is_a_typed_refusal(rig: Rig, bad: dict[str, Any]) -> None:
+    rig.store.put(PLATFORM, Key(f"USER#{ISS}|ann-sub", "LINKSEQ"), bad, when=None)
+    started = rig.links.start(ANN, SESSION, "jira")
+    with pytest.raises(LinkStateError):
+        rig.links.complete(ANN, SESSION, "jira", started.token, "jira-code-ann")
+    assert rig.links.resolve("jira", JIRA_ID) is None
+
+
+class _AlwaysLosing(MemoryStore):
+    """Every transaction after ``armed`` fails its condition, as under endless contention."""
+
+    armed = False
+
+    def transact(self, scope: Any, ops: Any) -> None:
+        if self.armed:
+            raise ConditionFailedError([0])
+        super().transact(scope, ops)
+
+
+def test_complete_gives_up_with_contention_not_a_bare_store_error() -> None:
+    store = _AlwaysLosing()
+    links = AccountLinking(store, vendors=make_vendors(), clock=Clock())
+    started = links.start(ANN, SESSION, "jira")
+    store.armed = True
+    with pytest.raises(LinkContentionError):
+        links.complete(ANN, SESSION, "jira", started.token, "jira-code-ann")
+
+
+def test_unlink_gives_up_with_contention_not_a_bare_store_error() -> None:
+    store = _AlwaysLosing()
+    links = AccountLinking(store, vendors=make_vendors(), clock=Clock())
+    started = links.start(ANN, SESSION, "jira")
+    links.complete(ANN, SESSION, "jira", started.token, "jira-code-ann")
+    store.armed = True
+    with pytest.raises(LinkContentionError):
+        links.unlink(ANN, "jira", JIRA_ID)
+    store.armed = False
+    assert links.resolve("jira", JIRA_ID) is not None
+
+
+def test_contention_is_not_reported_as_a_used_token() -> None:
+    assert not issubclass(LinkContentionError, LinkTokenInvalidError)
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf"), 0, -1, 1e12])
+def test_link_ttl_must_be_finite_and_bounded(ttl: float) -> None:
+    with pytest.raises(ValueError, match="link_ttl"):
+        AccountLinking(MemoryStore(), vendors={}, link_ttl=ttl)
+
+
+def test_a_non_finite_or_boolean_time_is_not_a_time() -> None:
+    from sto.identity.linking import _number
+
+    assert _number(float("nan")) is None
+    assert _number(float("inf")) is None
+    assert _number(True) is None
+    assert _number(5) == 5.0
+
+
+def test_an_unreadable_claim_blocks_a_new_link(rig: Rig) -> None:
+    rig.store.put(PLATFORM, Key("ORG", f"LINKED#jira#{JIRA_ID}"), {"issuer": 5}, when=None)
+    started = rig.links.start(ANN, SESSION, "jira")
+    with pytest.raises(AccountClaimedError):
+        rig.links.complete(ANN, SESSION, "jira", started.token, "jira-code-ann")
+
+
+@pytest.mark.parametrize(("issuer", "subject"), [("", "ann-sub"), (ISS, "")])
+def test_an_empty_issuer_or_subject_never_resolves(rig: Rig, issuer: str, subject: str) -> None:
+    data = {"issuer": issuer, "subject": subject, "expires_at": NOW + 1e6}
+    rig.store.put(PLATFORM, Key("ORG", f"LINKED#jira#{JIRA_ID}"), data, when=None)
+    assert rig.links.resolve("jira", JIRA_ID) is None
+
+
+def test_a_stale_link_item_does_not_let_another_user_unlink(rig: Rig) -> None:
+    link_jira(rig)
+    stale = {"vendor": "jira", "account_id": JIRA_ID, "linked_at": NOW, "expires_at": NOW + 1e6}
+    rig.store.put(PLATFORM, Key(f"USER#{ISS}|bob-sub", f"LINK#jira#{JIRA_ID}"), stale, when=None)
+    with pytest.raises(NotLinkedError):
+        rig.links.unlink(BOB, "jira", JIRA_ID)
+    found = rig.links.resolve("jira", JIRA_ID)
+    assert found is not None
+    assert found.subject == "ann-sub"
+    assert audit_entries(rig.store, BOB) == []
+
+
+def test_account_claimed_and_vendor_refused_over_http(http: _Http) -> None:
+    ann, bob = http.token("ann-sub"), http.token("bob-sub", "reviewer")
+    state = http.call("POST", "/links/jira:start", ann).json()["state"]
+    http.call("POST", "/links/jira:complete", ann, {"state": state, "code": "jira-code-ann"})
+    http.vendors["jira"].accounts["bobs"] = VendorAccount(JIRA_ID, None)
+    state = http.call("POST", "/links/jira:start", bob, session="s-bob").json()["state"]
+    claimed = http.call(
+        "POST", "/links/jira:complete", bob, {"state": state, "code": "bobs"}, session="s-bob"
+    )
+    assert claimed.status_code == 409
+    assert claimed.json()["error"]["code"] == "account_already_linked"
+    refused = http.call(
+        "POST", "/links/jira:complete", bob, {"state": state, "code": "nope"}, session="s-bob"
+    )
+    assert refused.status_code == 422
+    assert refused.json()["error"]["code"] == "vendor_refused"
+
+
+def test_contention_and_corrupt_state_map_to_503_and_500(http: _Http) -> None:
+    from sto.api.routers.links import _refusal
+
+    assert _refusal(LinkContentionError("busy")).http_status == 503
+    assert _refusal(LinkStateError("bad")).http_status == 500
+
+
+def test_the_vendor_in_the_log_line_is_not_injectable(http: _Http, caplog: Any) -> None:
+    ann = http.token("ann-sub")
+    state = http.call("POST", "/links/jira:start", ann).json()["state"]
+    caplog.set_level("INFO", logger="sto.api")
+    http.vendors["jira"].accounts["x"] = VendorAccount(JIRA_ID, None)
+    http.call("POST", "/links/jira:complete", ann, {"state": state, "code": "bad"})
+    evil = "gitlab%0AINJECTED%20line"
+    http.call("POST", f"/links/{evil}:complete", ann, {"state": state, "code": "c"})
+    assert not any("\nINJECTED" in r.getMessage() for r in caplog.records)
+
+
+def test_create_app_mounts_links_only_when_given_with_a_session_reader() -> None:
+    from sto.api.app import create_app
+    from sto.api.runtime import Runtime
+    from sto.effects.core import EffectExecutor
+    from sto.gates.service import GateService
+
+    class NoSteps:
+        async def execute(self, key: str, command: object) -> Any:
+            raise AssertionError("no step runs here")
+
+    class World:  # the smallest runtime create_app accepts
+        def __init__(self) -> None:
+            store, scope = MemoryStore(), TeamScope("alpha")
+            self.runtime = Runtime(
+                store,
+                scope,
+                gates=GateService(store),
+                gate_roles=lambda gate: None,
+                effects=EffectExecutor(store, scope),
+                steps=NoSteps(),
+                merges=lambda effect: (_ for _ in ()).throw(AssertionError("no merge")),
+                live=lambda cmd: cmd.subject,
+            )
+            self.authz = _Http().authz
+
+    world = World()
+    links = AccountLinking(MemoryStore(), vendors=make_vendors(), clock=Clock())
+    plain = create_app(world.runtime, token="", mode="prod", authorization=world.authz)
+    assert not any(path.startswith("/links") for _, path in routes_of(plain))
+    with pytest.raises(ValueError, match="session_of"):
+        create_app(world.runtime, token="", mode="prod", authorization=world.authz, links=links)
+    app = create_app(
+        world.runtime,
+        token="",
+        mode="prod",
+        authorization=world.authz,
+        links=links,
+        session_of=_session,
+    )
+    assert undeclared_routes(app) == []
+    assert ("GET", "/links") in routes_of(app)
+    with pytest.raises(ValueError, match="links"):
+        create_app(
+            world.runtime, token="", mode="prod", authorization=world.authz, session_of=_session
+        )
+
+
+def test_auth_declares_exactly_the_link_routes() -> None:
+    for key, rule in LINK_ROUTES.items():
+        assert ROUTES[key] == rule

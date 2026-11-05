@@ -35,7 +35,9 @@ from sto.api.routers.runs import ApiError, ErrorResponse, authorization_of
 from sto.identity.linking import (
     AccountClaimedError,
     AccountLinking,
+    LinkContentionError,
     LinkRefusedError,
+    LinkStateError,
     LinkTokenExpiredError,
     LinkTokenInvalidError,
     LinkTokenMismatchError,
@@ -64,6 +66,7 @@ _STATUS: tuple[tuple[type[LinkRefusedError], int, str], ...] = (
     (NotLinkedError, 404, "link_not_found"),
     (UnknownVendorError, 404, "unknown_vendor"),
     (VendorExchangeError, 422, "vendor_refused"),
+    (LinkStateError, 500, "link_state_unreadable"),
 )
 
 
@@ -90,7 +93,9 @@ class LinkList(BaseModel):
     links: list[LinkOut]
 
 
-def _refusal(error: LinkRefusedError) -> ApiError:
+def _refusal(error: LinkRefusedError | LinkContentionError) -> ApiError:
+    if isinstance(error, LinkContentionError):
+        return ApiError(503, "link_busy", str(error), headers={"Retry-After": "1"})
     for kind, status, code in _STATUS:
         if isinstance(error, kind):
             return ApiError(status, code, str(error))
@@ -133,7 +138,7 @@ def make_router(links: AccountLinking, *, session_of: Callable[[Request], str | 
         who, sso = person(request), session(request)
         try:
             began = await asyncio.to_thread(links.start, who, sso, vendor)
-        except LinkRefusedError as e:
+        except (LinkRefusedError, LinkContentionError) as e:
             raise _refusal(e) from e
         return {
             "state": began.token,
@@ -151,8 +156,8 @@ def make_router(links: AccountLinking, *, session_of: Callable[[Request], str | 
         who, sso = person(request), session(request)
         try:
             link = await asyncio.to_thread(links.complete, who, sso, vendor, body.state, body.code)
-        except LinkRefusedError as e:
-            log.info("link refused for %s: %s", vendor, type(e).__name__)
+        except (LinkRefusedError, LinkContentionError) as e:
+            log.info("link refused for %r: %s", vendor, type(e).__name__)
             raise _refusal(e) from e
         return vars(link)
 
@@ -168,7 +173,7 @@ def make_router(links: AccountLinking, *, session_of: Callable[[Request], str | 
         who = person(request)
         try:
             await asyncio.to_thread(links.unlink, who, vendor, account_id)
-        except LinkRefusedError as e:
+        except (LinkRefusedError, LinkContentionError) as e:
             raise _refusal(e) from e
         return Response(status_code=204)
 

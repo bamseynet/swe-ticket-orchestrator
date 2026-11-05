@@ -211,6 +211,13 @@ ROUTES: dict[tuple[str, str], RouteRule] = {
     ("GET", "/runs/{run_id}/sod-blocks"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs/{run_id}/commits/{sha}:attribute"): RouteRule(Permission.ATTRIBUTE_COMMIT),
     ("POST", "/runs/{run_id}/sod-terms:resolve"): RouteRule(Permission.ATTRIBUTE_COMMIT),
+    # D3-04: a signed-in person links their own Slack, GitHub or Jira account. Every role holds
+    # VIEW_RUNS; a dedicated link-own-account row is a follow-up (PLAN 9.3). The handlers only
+    # ever act on the caller's own links.
+    ("GET", "/links"): RouteRule(Permission.VIEW_RUNS),
+    ("POST", "/links/{vendor}:start"): RouteRule(Permission.VIEW_RUNS),
+    ("POST", "/links/{vendor}:complete"): RouteRule(Permission.VIEW_RUNS),
+    ("DELETE", "/links/{vendor}/{account_id}"): RouteRule(Permission.VIEW_RUNS),
 }
 
 PUBLIC: frozenset[tuple[str, str]] = frozenset({("GET", "/healthz")})

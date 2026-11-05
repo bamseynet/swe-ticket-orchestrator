@@ -34,6 +34,7 @@ from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
 from sto.api.auth import DOCS, Authorization, install_authorization
 from sto.api.routers import attribution, gates, runs
+from sto.api.routers import links as links_router
 from sto.api.routers.attribution import read_records
 from sto.api.routers.gates import DEV_ACTOR
 from sto.api.routers.runs import ApiError, ErrorResponse
@@ -47,6 +48,7 @@ from sto.engine.handlers.core import StepSucceeded
 from sto.engine.reducer import LINEAR_V0
 from sto.gates.policy import GatePolicy, LinearGates, StoreRecords
 from sto.gates.service import GateService
+from sto.identity.linking import AccountLinking
 from sto.identity.mapping import ServiceIdentity, UserIdentity
 from sto.store.ports import Key, Scope, Store, TeamScope
 from sto.store.sqlite import SqliteStore
@@ -90,12 +92,21 @@ def create_app(
     mode: str,
     services: Sequence[Service] = (),
     authorization: Authorization | None = None,
+    links: AccountLinking | None = None,
+    session_of: Callable[[Request], str | None] | None = None,
 ) -> FastAPI:
     """The app. ``services`` are background coroutines that run while it is up (the local
     stack's simulated merge queue). With ``authorization`` (D3-03) every request is authorised by
     the middleware in ``sto.api.auth`` instead of the dev token, which is then neither checked
     nor built, and the mode is not restricted to local. The interactive docs are served (and
-    public) only in local mode."""
+    public) only in local mode.
+
+    ``links`` (D3-04) mounts the account-linking routes, only when given: v0 has no vendors.
+    ``session_of`` must come with it and says which SSO session a request belongs to. It is never
+    defaulted, and must not read a header the client can set: D3-27 adds a session field to
+    ``Authorized`` for it to read, and until then the caller supplies it."""
+    if (links is None) != (session_of is None):
+        raise ValueError("links and session_of go together: pass both or neither")
     if authorization is None:
         if mode != "local":
             raise DevAuthRefusedError(
@@ -196,6 +207,12 @@ def create_app(
     app.include_router(runs.router, dependencies=protected, responses=shared)
     app.include_router(gates.router, dependencies=protected, responses=shared)
     app.include_router(attribution.router, dependencies=protected, responses=shared)
+    if links is not None and session_of is not None:
+        app.include_router(
+            links_router.make_router(links, session_of=session_of),
+            dependencies=protected,
+            responses=shared,
+        )
     if authorization is not None:
         install_authorization(app, authorization)
     return app
