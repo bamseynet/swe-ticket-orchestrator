@@ -38,7 +38,11 @@ Rounds. :func:`plan_round` decides whether a gate round may open:
 * A malformed containment answer is a ``TypeError`` from ``check_all`` and propagates. It is a
   fault in the answer's producer, never a verdict.
 * Reducer agreement (D2-06). Approvals bind a ``head_sha`` and merged code is immutable: when the
-  run has merged heads (``merged_heads``), only a head subject for one of them may open. A
+  run has merges (``merges``, ``(merge_sha, head_sha)`` pairs like the reducer's ``Merge``), only
+  a head subject whose ``(merge_sha, head_sha)`` is one of them may open, so a forged
+  ``merge_sha`` cannot reach ``contains_sha`` evidence; with no merge, ``merge_sha`` must be
+  unset. An incomplete merge record (no head) is refused, and so is a pre-push subject once
+  anything has merged. A
   ``pr.update_branch`` clears the live subject, and the next gate round is planned with the
   subject reported afterwards; this module keeps no state of its own. Gates are named, as in
   the gate service and ``sod``: a record belongs to a gate name and a round number.
@@ -49,10 +53,13 @@ Not here: opening the gate (``GateService``), carry-over (D2-09) or reuse (D2-21
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import json
 import os
+import re
 import subprocess
+import tempfile
 import unicodedata
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -144,49 +151,89 @@ def _strings(label: str, value: object) -> tuple[str, ...]:
 # --- patch_id ---------------------------------------------------------------------------------
 
 
-def patch_id(diff: str) -> str:
-    """``git patch-id --verbatim`` of ``diff``, a canonical diff against the merge base
-    (``git diff --binary --no-color --no-ext-diff --full-index <merge_base> <head>``).
+_MIN_GIT = (2, 40)  # --verbatim is 2.31; mode-only and empty-file ids changed in 2.40
 
-    Raises ``ValueError`` when the diff holds no patch (so an empty change has no id), and
-    ``PatchIdError`` when git cannot run.
-    """
-    if not isinstance(diff, str):
-        raise TypeError(f"diff must be text, not {type(diff).__name__}")
+
+@functools.cache
+def _check_git() -> None:
+    """Refuse a git older than ``_MIN_GIT``, once per process (the version does not change)."""
+    try:
+        done = subprocess.run(
+            ["git", "version"],
+            capture_output=True,
+            timeout=_PATCH_ID_TIMEOUT_S,
+            check=False,
+            env=_git_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PatchIdError(f"git could not run: {exc}") from exc
+    text = done.stdout.decode(errors="replace")
+    found = re.search(r"(\d+)\.(\d+)", text)
+    if done.returncode != 0 or found is None:
+        raise PatchIdError(f"cannot read the git version from {text.strip()!r}")
+    if (int(found[1]), int(found[2])) < _MIN_GIT:
+        raise PatchIdError(
+            f"git {found[0]} is too old for patch_id; need {_MIN_GIT[0]}.{_MIN_GIT[1]} or newer"
+        )
+
+
+def _git_env() -> dict[str, str]:
     # A clean environment: no user or system git config can change how the diff is read.
-    env = {
+    return {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LC_ALL": "C",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
     }
+
+
+def patch_id(diff: bytes) -> str:
+    """``git patch-id --verbatim`` of ``diff``, a canonical diff against the merge base
+    (``git diff --binary --no-color --no-ext-diff --full-index <merge_base> <head>``).
+
+    Bytes, because that is what git produces: text would have to be encoded, and a diff that is
+    not UTF-8 would either fail or, if decoded with replacement, collide with another one.
+
+    Raises ``PatchIdError`` when the diff holds no patch (an empty change has no id), when git is
+    older than 2.40 or when git cannot run.
+    """
+    if not isinstance(diff, bytes):
+        raise TypeError(f"diff must be bytes, not {type(diff).__name__}")
+    _check_git()
     try:
-        done = subprocess.run(
-            ["git", "patch-id", "--verbatim"],
-            input=diff.encode(),
-            capture_output=True,
-            timeout=_PATCH_ID_TIMEOUT_S,
-            check=False,
-            env=env,
-        )
+        # cwd is an empty directory, so git finds no repository and reads no repo config.
+        with tempfile.TemporaryDirectory() as neutral:
+            done = subprocess.run(
+                ["git", "patch-id", "--verbatim"],
+                input=diff,
+                capture_output=True,
+                timeout=_PATCH_ID_TIMEOUT_S,
+                check=False,
+                env=_git_env(),
+                cwd=neutral,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PatchIdError(f"git patch-id could not run: {exc}") from exc
     if done.returncode != 0:
         raise PatchIdError(f"git patch-id failed: {done.stderr.decode(errors='replace').strip()}")
     lines = done.stdout.decode().splitlines()
     if not lines:
-        raise ValueError("diff holds no patch")
+        raise PatchIdError("diff holds no patch")
     if len(lines) > 1:
-        raise ValueError("diff holds more than one patch")
+        raise PatchIdError("diff holds more than one patch")
     return lines[0].split()[0]
 
 
 # --- ticket_revision --------------------------------------------------------------------------
 
 
-def _text(value: str) -> str:
+def _text(value: str, *, block: bool = False) -> str:
+    """NFC, ``\\n`` line ends, no trailing blanks. A one-line value is stripped fully; a
+    ``block`` (the description) loses only leading and trailing newlines, so the indentation of
+    its first line, which can be code or a list, still counts as an edit."""
     value = unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(line.rstrip() for line in value.split("\n")).strip()
+    lines = "\n".join(line.rstrip() for line in value.split("\n"))
+    return lines.strip("\n") if block else lines.strip()
 
 
 @dataclass(frozen=True)
@@ -214,7 +261,10 @@ class TicketFields:
         for k, v in self.route_inputs.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 raise TypeError("ticket route_inputs must map strings to strings")
-            inputs[_text(k)] = _text(v)
+            key = _text(k)
+            if key in inputs:
+                raise ValueError(f"ticket route_inputs has two keys that read as {key!r}")
+            inputs[key] = _text(v)
         object.__setattr__(self, "route_inputs", dict(sorted(inputs.items())))
 
 
@@ -244,7 +294,7 @@ def ticket_revision(fields: TicketFields) -> str:
         {
             "v": 1,
             "summary": _text(fields.summary),
-            "description": _text(fields.description),
+            "description": _text(fields.description, block=True),
             "acceptance_criteria": list(fields.acceptance_criteria),
             "route_inputs": dict(fields.route_inputs),
         }
@@ -291,7 +341,10 @@ class StoredEvidence(Evidence):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _strings("evidence artifact_refs", self.artifact_refs)
+        # a list is accepted and stored as a tuple, so equality and the hash see one form
+        object.__setattr__(
+            self, "artifact_refs", _strings("evidence artifact_refs", self.artifact_refs)
+        )
 
 
 def validate_verdict(verdict: Verdict) -> Verdict:
@@ -321,13 +374,21 @@ def validate_verdict(verdict: Verdict) -> Verdict:
 
 
 def verdict_to_data(verdict: Verdict) -> dict[str, Any]:
-    """The stored form of a validated verdict (plain JSON, ``canonical_data``)."""
-    return canonical_data(to_wire(validate_verdict(verdict)))
+    """The stored form of a validated verdict (plain JSON, ``canonical_data``).
+
+    Empty ``artifact_refs`` are left out, so a ``StoredEvidence`` with no refs and the plain
+    ``Evidence`` it extends store, load (as ``Evidence``) and digest the same. Otherwise an
+    honest gate whose evidence gained a ``StoredEvidence`` wrapper would see a changed digest.
+    """
+    wire = to_wire(validate_verdict(verdict))
+    if not wire["evidence"].get("artifact_refs", True):
+        del wire["evidence"]["artifact_refs"]
+    return canonical_data(wire)
 
 
 def verdict_from_data(data: Mapping[str, Any]) -> Verdict:
     """Rebuild and validate a stored verdict. Evidence with ``artifact_refs`` loads as
-    :class:`StoredEvidence`, anything else as ``Evidence``."""
+    :class:`StoredEvidence`, anything else (refs are not stored when empty) as ``Evidence``."""
     if not isinstance(data, Mapping):
         raise TypeError(f"verdict data must be an object, not {type(data).__name__}")
     extra = set(data) - {"evidence", "valid", "reason", "notes"}
@@ -420,6 +481,35 @@ def _rev(subject: Subject) -> str:
     return rev
 
 
+def _check_merges(
+    name: str, subject: Subject, merges: Collection[tuple[str | None, str | None]]
+) -> None:
+    pairs: set[tuple[str, str]] = set()
+    for merge in merges:
+        merge_sha, head_sha = merge
+        if not (
+            isinstance(merge_sha, str)
+            and merge_sha.strip()
+            and isinstance(head_sha, str)
+            and head_sha.strip()
+        ):
+            raise MergedCodeChangedError(f"gate {name!r}: merge record {merge!r} is incomplete")
+        pairs.add((merge_sha, head_sha))
+    if not pairs:
+        if subject.merge_sha is not None:
+            raise MergedCodeChangedError(
+                f"gate {name!r}: the subject names merge_sha {subject.merge_sha} but nothing merged"
+            )
+        return
+    if subject.head_sha is None:
+        raise MergedCodeChangedError(f"gate {name!r}: merged code cannot change; no head subject")
+    if (subject.merge_sha, subject.head_sha) not in pairs:
+        raise MergedCodeChangedError(
+            f"gate {name!r}: merged code cannot change; "
+            f"({subject.merge_sha}, {subject.head_sha}) is not a recorded merge"
+        )
+
+
 def plan_round(
     *,
     name: str,
@@ -430,13 +520,13 @@ def plan_round(
     evidence: Mapping[str, Sequence[Evidence]],
     expected_stages: Collection[str],
     contained: Containment | None = None,
-    merged_heads: Collection[str] = (),
+    merges: Collection[tuple[str | None, str | None]] = (),
 ) -> RoundPlan:
     """Decide whether round ``previous.round + 1`` of gate ``name`` may open, or raise.
 
     ``evidence`` maps a stage to its records; ``expected_stages`` are the stages whose evidence
-    the gate judges (for a ``qa`` gate, V14's evidence stages). ``merged_heads`` are the heads
-    the run has merged. See the module docstring for the rules.
+    the gate judges (for a ``qa`` gate, V14's evidence stages). ``merges`` are the run's
+    confirmed merges as ``(merge_sha, head_sha)`` pairs. See the module docstring for the rules.
     """
     _nonblank("gate name", name)
     _nonblank("diff_ref", diff_ref)
@@ -445,10 +535,7 @@ def plan_round(
         raise GateRoundError(
             f"gate {name!r}: only a pre_push gate takes a pre-push subject, and it must"
         )
-    if merged_heads and subject.head_sha not in set(merged_heads):
-        raise MergedCodeChangedError(
-            f"gate {name!r}: merged code cannot change; the subject is not for a merged head"
-        )
+    _check_merges(name, subject, merges)
     if previous is not None and previous.name != name:
         raise GateRoundError(
             f"gate {name!r} cannot follow round {previous.round} of gate {previous.name!r}"

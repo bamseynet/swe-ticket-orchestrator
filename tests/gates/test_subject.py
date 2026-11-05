@@ -16,6 +16,7 @@ from sto.gates.subject import (
     GateRoundError,
     IncompleteEvidenceError,
     MergedCodeChangedError,
+    PatchIdError,
     RoundRecord,
     StoredEvidence,
     TicketFields,
@@ -32,12 +33,13 @@ from sto.gates.subject import (
 from sto.store.ports import canonical_data
 
 HEAD = "a" * 40
+MERGED = (("d" * 40, "a" * 40),)  # (merge_sha, head_sha) of a confirmed pr.merge
 HEAD2 = "b" * 40
 BASE = "c" * 40
 MERGE = "d" * 40
 EXTRA = "e" * 40
 
-DIFF = """\
+DIFF = b"""\
 diff --git a/app.py b/app.py
 index 1111111..2222222 100644
 --- a/app.py
@@ -50,7 +52,7 @@ index 1111111..2222222 100644
 
 # The same change replayed on a newer base: other line numbers, other blob ids and other context
 # line numbers in the hunk header, same added line.
-DIFF_NEW_BASE = """\
+DIFF_NEW_BASE = b"""\
 diff --git a/app.py b/app.py
 index 3333333..4444444 100644
 --- a/app.py
@@ -61,8 +63,8 @@ index 3333333..4444444 100644
      return a
 """
 
-DIFF_WS = DIFF.replace("+    b = 2", "+    b  = 2")
-DIFF_RETAB = DIFF.replace("+    b = 2", "+\tb = 2")
+DIFF_WS = DIFF.replace(b"+    b = 2", b"+    b  = 2")
+DIFF_RETAB = DIFF.replace(b"+    b = 2", b"+\tb = 2")
 
 
 def head_subject(**kw: object) -> Subject:
@@ -96,18 +98,46 @@ def test_whitespace_only_change_gives_a_different_patch_id() -> None:
 
 
 def test_a_different_change_gives_a_different_patch_id() -> None:
-    assert patch_id(DIFF.replace("b = 2", "b = 3")) != patch_id(DIFF)
+    assert patch_id(DIFF.replace(b"b = 2", b"b = 3")) != patch_id(DIFF)
 
 
-@pytest.mark.parametrize("diff", ["", "\n", "not a diff at all\n"])
-def test_a_diff_with_no_patch_is_refused(diff: str) -> None:
-    with pytest.raises(ValueError, match="no patch"):
+@pytest.mark.parametrize("diff", [b"", b"\n", b"not a diff at all\n"])
+def test_a_diff_with_no_patch_is_a_permanent_error(diff: bytes) -> None:
+    with pytest.raises(PatchIdError, match="no patch") as exc:
         patch_id(diff)
+    assert isinstance(exc.value, PermanentError)
 
 
-def test_patch_id_wants_text() -> None:
-    with pytest.raises(TypeError):
-        patch_id(b"x")  # type: ignore[arg-type]
+def test_patch_id_wants_bytes() -> None:
+    with pytest.raises(TypeError, match="diff must be bytes"):
+        patch_id("diff")  # type: ignore[arg-type]
+
+
+def test_non_utf8_diffs_get_distinct_patch_ids() -> None:
+    # str text could not carry these: surrogateescape raises, errors="replace" makes them collide
+    a = DIFF.replace(b"b = 2", b"b = '\xff'")
+    b = DIFF.replace(b"b = 2", b"b = '\xfe'")
+    assert patch_id(a) != patch_id(b)
+    assert patch_id(a) == patch_id(a.replace(b"@@ -10,3 +10,4 @@", b"@@ -99,3 +99,4 @@"))
+
+
+def test_a_mode_only_change_moves_the_patch_id() -> None:
+    plain = b"diff --git a/run.sh b/run.sh\n"
+    mode = plain + b"old mode 100644\nnew mode 100755\n"
+    other = plain + b"old mode 100755\nnew mode 100644\n"
+    assert patch_id(mode) != patch_id(other)
+    assert patch_id(mode) != patch_id(
+        b"diff --git a/x.sh b/x.sh\nold mode 100644\nnew mode 100755\n"
+    )
+
+
+def test_patch_id_ignores_git_config() -> None:
+    # patchid.* and diff settings of the machine do not apply (clean env, neutral cwd)
+    import os
+
+    before = os.environ.get("GIT_CONFIG_COUNT")
+    assert patch_id(DIFF) == patch_id(DIFF_NEW_BASE)
+    assert os.environ.get("GIT_CONFIG_COUNT") == before
 
 
 # --- ticket_revision --------------------------------------------------------------------------
@@ -558,6 +588,7 @@ def test_also_contains_notes_reach_the_plan_and_the_digest() -> None:
         evidence=evidence,
         expected_stages=("staging",),
         contained=lambda _sha: {MERGE, EXTRA},
+        merges=MERGED,
     )
     assert p.check.notes == (f"also contains {EXTRA}",)
     assert sub.evidence_digest == evidence_digest(p.check.verdicts)
@@ -580,6 +611,7 @@ def test_a_malformed_containment_answer_propagates_as_a_type_error(answer: objec
             evidence=evidence,
             expected_stages=("staging",),
             contained=lambda _sha: answer,
+            merges=MERGED,
         )
 
 
@@ -592,6 +624,7 @@ def test_an_unknown_containment_answer_refuses_rather_than_opens() -> None:
             evidence=evidence,
             expected_stages=("staging",),
             contained=lambda _sha: None,
+            merges=MERGED,
         )
 
 
@@ -602,20 +635,49 @@ def test_merged_code_cannot_change_in_a_later_round() -> None:
     # reducer: once a merge is recorded a report of any other head is Malformed
     prev = record(1, subject=head_subject(merge_sha=MERGE))
     with pytest.raises(MergedCodeChangedError):
-        plan(previous=prev, subject=head_subject(head_sha=HEAD2), merged_heads=(HEAD,))
-    ok = plan(previous=prev, subject=head_subject(merge_sha=MERGE), merged_heads=(HEAD,))
+        plan(previous=prev, subject=head_subject(head_sha=HEAD2), merges=MERGED)
+    ok = plan(previous=prev, subject=head_subject(merge_sha=MERGE), merges=MERGED)
     assert ok.round == 2
 
 
-def test_merged_heads_bind_the_first_round_too() -> None:
+def test_merges_bind_the_first_round_too() -> None:
     with pytest.raises(MergedCodeChangedError):
-        plan(subject=head_subject(head_sha=HEAD2), merged_heads=(HEAD,))
+        plan(subject=head_subject(head_sha=HEAD2, merge_sha=MERGE), merges=MERGED)
+
+
+def test_a_forged_merge_sha_is_refused() -> None:
+    # the head was merged, but not by this merge: contains_sha would trust the forged one
+    with pytest.raises(MergedCodeChangedError, match="not a recorded merge"):
+        plan(subject=head_subject(merge_sha=EXTRA), merges=MERGED)
+    # a merged head with no merge_sha is not the recorded pair either
+    with pytest.raises(MergedCodeChangedError, match="not a recorded merge"):
+        plan(subject=head_subject(), merges=MERGED)
+    # a merge_sha when nothing has merged
+    with pytest.raises(MergedCodeChangedError, match="nothing merged"):
+        plan(subject=head_subject(merge_sha=MERGE))
+    # another merge's sha with this merge's head
+    two = ((MERGE, HEAD), (EXTRA, HEAD2))
+    with pytest.raises(MergedCodeChangedError, match="not a recorded merge"):
+        plan(subject=head_subject(merge_sha=EXTRA, head_sha=HEAD), merges=two)
+    assert plan(subject=head_subject(merge_sha=EXTRA, head_sha=HEAD2), merges=two).round == 1
+
+
+@pytest.mark.parametrize(
+    "merge", [(MERGE, None), (None, None), (None, HEAD), ("", HEAD), (MERGE, " ")]
+)
+def test_an_incomplete_merge_record_is_refused(merge: tuple[str | None, str | None]) -> None:
+    # reducer Merge.head_sha may be None; None must not match a pre-push subject's missing head
+    pre = Subject.pre_push(base_sha=BASE, patch_id="p1", ticket_revision="t1")
+    with pytest.raises(MergedCodeChangedError, match="incomplete"):
+        plan(gate_type=GateType.PRE_PUSH, subject=pre, merges=(merge,))
+    with pytest.raises(MergedCodeChangedError, match="incomplete"):
+        plan(subject=head_subject(merge_sha=MERGE), merges=(merge,))
 
 
 def test_a_pre_push_subject_cannot_open_after_a_merge() -> None:
     pre = Subject.pre_push(base_sha=BASE, patch_id="p1", ticket_revision="t1")
-    with pytest.raises(MergedCodeChangedError):
-        plan(gate_type=GateType.PRE_PUSH, subject=pre, merged_heads=(HEAD,))
+    with pytest.raises(MergedCodeChangedError, match="no head subject"):
+        plan(gate_type=GateType.PRE_PUSH, subject=pre, merges=MERGED)
 
 
 def test_subject_shape_must_match_the_gate_type() -> None:
@@ -641,6 +703,8 @@ def test_round_records_are_validated() -> None:
 def _fake_git(monkeypatch: pytest.MonkeyPatch, **result: object) -> None:
     import subprocess
 
+    patch_id(DIFF)  # real git once, so the version check is cached before the fake replaces it
+
     def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[bytes]:
         return subprocess.CompletedProcess(
             ["git"],
@@ -665,6 +729,8 @@ def test_git_not_runnable_is_a_patch_id_error(monkeypatch: pytest.MonkeyPatch) -
 
     from sto.gates.subject import PatchIdError
 
+    patch_id(DIFF)  # prime the version cache
+
     def run(*_a: object, **_k: object) -> None:
         raise subprocess.TimeoutExpired("git", 1)
 
@@ -675,7 +741,7 @@ def test_git_not_runnable_is_a_patch_id_error(monkeypatch: pytest.MonkeyPatch) -
 
 def test_more_than_one_patch_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_git(monkeypatch, out=b"a" * 40 + b" " + b"0" * 40 + b"\n" + b"b" * 40 + b" x\n")
-    with pytest.raises(ValueError, match="more than one"):
+    with pytest.raises(PatchIdError, match="more than one"):
         patch_id(DIFF)
 
 
@@ -771,3 +837,155 @@ def test_a_record_is_built_from_a_gate() -> None:
         gate.subject,
         "d9",
     )
+
+
+# --- review pass 1 -----------------------------------------------------------------------------
+
+
+def test_route_input_keys_that_read_the_same_are_refused_in_either_order() -> None:
+    with pytest.raises(ValueError, match="two keys"):
+        fields(route_inputs={"risk": "High", "risk ": "Low"})
+    with pytest.raises(ValueError, match="two keys"):
+        fields(route_inputs={"risk ": "Low", "risk": "High"})
+    with pytest.raises(ValueError, match="two keys"):
+        fields(route_inputs={"cafe\u0301": "a", "caf\u00e9": "b"})
+
+
+def test_route_input_keys_are_normalised() -> None:
+    padded = fields(route_inputs={" risk\t": "High"})
+    assert dict(padded.route_inputs) == {"risk": "High"}
+    assert ticket_revision(padded) == ticket_revision(fields())
+
+
+def test_the_description_keeps_its_first_line_indentation() -> None:
+    assert ticket_revision(fields(description="  code")) != ticket_revision(
+        fields(description="code")
+    )
+    assert ticket_revision(fields(description="\n\ncode\n\n")) == ticket_revision(
+        fields(description="code")
+    )
+    # one-line values are stripped fully
+    assert ticket_revision(fields(summary="  Fix login  ")) == ticket_revision(fields())
+
+
+@pytest.mark.parametrize("reason", ["", " ", "  ", "\t\n"])
+def test_a_refusal_with_a_blank_reason_is_refused(reason: str) -> None:
+    with pytest.raises(ValueError, match="needs a reason"):
+        validate_verdict(Verdict(ev(), False, reason))
+
+
+def test_a_list_of_artifact_refs_is_stored_as_a_tuple() -> None:
+    as_list = StoredEvidence(HEAD, "p1", Validity.EXACT_SHA, artifact_refs=["r"])  # type: ignore[arg-type]
+    as_tuple = StoredEvidence(HEAD, "p1", Validity.EXACT_SHA, artifact_refs=("r",))
+    assert as_list.artifact_refs == ("r",)
+    assert isinstance(as_list.artifact_refs, tuple)
+    assert as_list == as_tuple
+    assert hash(as_list) == hash(as_tuple)
+    assert evidence_digest(verdicts(as_list)) == evidence_digest(verdicts(as_tuple))
+
+
+def test_evidence_and_stored_evidence_without_refs_digest_the_same() -> None:
+    plain = Evidence(HEAD, "p1", Validity.EXACT_SHA)
+    stored = StoredEvidence(HEAD, "p1", Validity.EXACT_SHA)
+    assert verdict_to_data(Verdict(plain, True)) == verdict_to_data(Verdict(stored, True))
+    assert evidence_digest(verdicts(plain)) == evidence_digest(verdicts(stored))
+    assert "artifact_refs" not in verdict_to_data(Verdict(stored, True))["evidence"]
+    assert type(verdict_from_data(verdict_to_data(Verdict(stored, True))).evidence) is Evidence
+    with_ref = StoredEvidence(HEAD, "p1", Validity.EXACT_SHA, artifact_refs=("r",))
+    assert verdict_to_data(Verdict(with_ref, True))["evidence"]["artifact_refs"] == ["r"]
+
+
+def _git_says(monkeypatch: pytest.MonkeyPatch, text: bytes, rc: int = 0) -> None:
+    import subprocess
+
+    from sto.gates import subject as mod
+
+    mod._check_git.cache_clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(["git"], rc, text, b""),
+    )
+
+
+@pytest.mark.parametrize(
+    "version", [b"git version 2.39.5\n", b"git version 2.30.0\n", b"git version 1.9.1\n"]
+)
+def test_a_git_older_than_2_40_is_refused(monkeypatch: pytest.MonkeyPatch, version: bytes) -> None:
+    _git_says(monkeypatch, version)
+    try:
+        with pytest.raises(PatchIdError, match="too old"):
+            patch_id(DIFF)
+    finally:
+        monkeypatch.undo()
+        from sto.gates import subject as mod
+
+        mod._check_git.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "version", [b"git version 2.40.0\n", b"git version 2.43.0.windows.1\n", b"git version 3.0.1\n"]
+)
+def test_git_2_40_and_newer_is_accepted(monkeypatch: pytest.MonkeyPatch, version: bytes) -> None:
+    from sto.gates import subject as mod
+
+    _git_says(monkeypatch, version)
+    try:
+        mod._check_git()
+    finally:
+        monkeypatch.undo()
+        mod._check_git.cache_clear()
+
+
+@pytest.mark.parametrize(("text", "rc"), [(b"nonsense\n", 0), (b"git version 2.45.0\n", 1)])
+def test_an_unreadable_git_version_is_refused(
+    monkeypatch: pytest.MonkeyPatch, text: bytes, rc: int
+) -> None:
+    from sto.gates import subject as mod
+
+    _git_says(monkeypatch, text, rc)
+    try:
+        with pytest.raises(PatchIdError, match="git version"):
+            mod._check_git()
+    finally:
+        monkeypatch.undo()
+        mod._check_git.cache_clear()
+
+
+def test_the_version_is_checked_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from sto.gates import subject as mod
+
+    mod._check_git.cache_clear()
+    calls = []
+    real = subprocess.run
+
+    def counting(cmd: list[str], *a: object, **k: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(cmd[1])
+        return real(cmd, *a, **k)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(subprocess, "run", counting)
+    patch_id(DIFF)
+    patch_id(DIFF_NEW_BASE)
+    assert calls.count("version") == 1
+    assert calls.count("patch-id") == 2
+
+
+def test_git_runs_in_a_neutral_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import subprocess
+
+    seen = []
+    real = subprocess.run
+
+    def spy(cmd: list[str], *a: object, **k: object) -> subprocess.CompletedProcess[bytes]:
+        seen.append((cmd[1], k.get("cwd")))
+        return real(cmd, *a, **k)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    patch_id(DIFF)
+    cwds = [c for cmd, c in seen if cmd == "patch-id"]
+    assert len(cwds) == 1
+    assert cwds[0] is not None
+    assert str(cwds[0]) != os.getcwd()
