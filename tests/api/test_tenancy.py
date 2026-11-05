@@ -44,6 +44,7 @@ from sto.api.auth import (
     routes_of,
     undeclared_routes,
 )
+from sto.api.routers.links import LINK_ROUTES
 from sto.api.runtime import Runtime, default_gate_roles
 from sto.config.org_policy import ORG_ADMIN, Principal
 from sto.domain import DecisionId, Gate, GateId, GateStatus, GateType, RunId, Subject
@@ -183,10 +184,12 @@ ROUTE_IDS = [f"{m} {p}" for (m, p), _ in DECLARED]
 def test_every_route_of_the_real_app_declares_a_permission(world: World, app: FastAPI) -> None:
     assert undeclared_routes(app) == []
     seen = set(routes_of(app))
-    assert set(ROUTES) <= seen, f"stale entries in ROUTES: {set(ROUTES) - seen}"
-    assert set(ROUTES) | PUBLIC == seen  # no interactive docs outside local mode
+    # the link routes (D3-04) are mounted only when create_app is given a linking service
+    always = set(ROUTES) - set(LINK_ROUTES)
+    assert always <= seen, f"stale entries in ROUTES: {always - seen}"
+    assert always | PUBLIC == seen  # no interactive docs outside local mode
     local = world.app(mode="local")
-    assert set(ROUTES) | PUBLIC | DOCS == set(routes_of(local))
+    assert always | PUBLIC | DOCS == set(routes_of(local))
     assert undeclared_routes(local) == []
 
 
