@@ -250,13 +250,43 @@ class TestRequiredChecksBlock:
         assert gh.protection(1) == []
         assert merge(gh, tok, 1)["status"] == "merged"
 
-    def test_an_admin_bypass_on_the_merge_request_skips_the_block(
+    def test_bypass_rules_is_honoured_only_for_a_ruleset_that_names_this_app(
         self, gh: FakeGitHubChecks, tok: str
     ) -> None:
-        """unsourced: pulls' ``bypass_rules`` applies to a ruleset block too."""
-        ruleset(gh, tok, [required("ci")])
+        """RESEARCH [S42]: bypass lists need an organization-owned repository (acme is one). An
+        empty bypass list, or another actor, must not let ``bypass_rules`` through."""
         open_pr(gh, tok)
+        made = ruleset(gh, tok, [required("ci")])
+        assert merge(gh, tok, 1, bypass_rules=True)["status"] == "failed"  # empty bypass list
+        other = {"actor_id": 5, "actor_type": "Team", "bypass_mode": "always"}
+        lookalikes = [
+            other,
+            {"actor_id": 4242, "actor_type": "Integration", "bypass_mode": "always"},
+            {"actor_id": int(APP_ID), "actor_type": "Team", "bypass_mode": "always"},
+            {"actor_id": APP_ID, "actor_type": "Integration", "bypass_mode": "always"},
+        ]
+        for actors in ([a] for a in lookalikes):
+            put = call(gh, tok, "PUT", f"/rulesets/{made['id']}", json={"bypass_actors": actors})
+            assert put.status == 200
+            result = merge(gh, tok, 1, bypass_rules=True)
+            assert result["status"] == "failed", actors
+            assert 'Required status check "ci" is expected.' in result["details"]["message"]
+        app = {"actor_id": int(APP_ID), "actor_type": "Integration", "bypass_mode": "always"}
+        call(gh, tok, "PUT", f"/rulesets/{made['id']}", json={"bypass_actors": [other, app]})
+        assert merge(gh, tok, 1)["status"] == "failed"  # naming the App is not asking to bypass
         assert merge(gh, tok, 1, bypass_rules=True)["status"] == "merged"
+
+    def test_a_bypass_covers_only_the_rulesets_that_name_the_app(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        open_pr(gh, tok)
+        app = {"actor_id": int(APP_ID), "actor_type": "Integration", "bypass_mode": "always"}
+        ruleset(gh, tok, [required("ci")], name="mine", bypass_actors=[app])
+        ruleset(gh, tok, [reviews_rule(1)], name="theirs")
+        result = merge(gh, tok, 1, bypass_rules=True)
+        assert result["status"] == "failed"
+        assert "approving review" in result["details"]["message"]
+        assert "ci" not in result["details"]["message"]
 
     def test_a_scripted_block_and_a_ruleset_block_both_hold(
         self, gh: FakeGitHubChecks, tok: str
@@ -285,9 +315,7 @@ class TestNeutralPasses:
         assert state_of(gh, tok, 1) == "clean"
         assert merge(gh, tok, 1)["status"] == "merged"
 
-    @pytest.mark.parametrize(
-        "conclusion", ["failure", "cancelled", "timed_out", "action_required", "stale"]
-    )
+    @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required"])
     def test_these_conclusions_do_not(
         self, gh: FakeGitHubChecks, tok: str, conclusion: str
     ) -> None:
@@ -1206,3 +1234,154 @@ class TestEdgesFoundByMutation:
         assert [v.kind for v in gh.protection(1)] == ["check_expected"]
         call(gh, tok, "PATCH", "/pulls/1", json={"state": "closed"})
         assert gh.protection(1) == []
+
+
+class TestReviewPass1:
+    """Each case pins a point of the independent review of PR #354 (pass 1)."""
+
+    @pytest.mark.parametrize("rule", [reviews_rule(1), required("ci")], ids=["pr", "checks"])
+    def test_a_fast_forward_of_the_default_branch_needs_a_pull_request(
+        self, gh: FakeGitHubChecks, tok: str, rule: dict[str, Any]
+    ) -> None:
+        """Rules: "require that all changes ... be associated with a pull request" (docs:
+        available-rules-for-rulesets). The same rule kinds refuse ``POST /merges``, with the same
+        message."""
+        ruleset(gh, tok, [rule])
+        tip = gh.push(REPO, "feat", {"f.txt": "1"})
+        gh.push(REPO, "other", {"o.txt": "1"})
+        moved = call(gh, tok, "PATCH", "/git/refs/heads/main", json={"sha": tip})
+        assert moved.status == 422
+        merged = call(gh, tok, "POST", "/merges", json={"base": "main", "head": "other"})
+        assert merged.status == 409
+        assert moved.body["message"] == merged.body["message"]
+        assert moved.body["message"].endswith("Changes must be made through a pull request.")
+        assert gh.sha(REPO, "main") != tip
+
+    def test_a_branch_no_rule_applies_to_can_still_be_fast_forwarded(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        ruleset(gh, tok, [reviews_rule(1), required("ci")])
+        first = gh.push(REPO, "feat", {"f.txt": "1"})
+        made = call(gh, tok, "POST", "/git/refs", json={"ref": "refs/heads/side", "sha": first})
+        assert made.status == 201
+        tip = gh.push(REPO, "feat", {"f.txt": "2"})
+        assert call(gh, tok, "PATCH", "/git/refs/heads/side", json={"sha": tip}).status == 200
+
+    @pytest.mark.parametrize("how", ["create", "update"])
+    def test_an_app_cannot_set_the_stale_conclusion(
+        self, gh: FakeGitHubChecks, tok: str, how: str
+    ) -> None:
+        """https://docs.github.com/en/rest/checks/runs: ``stale`` "can only be set by GitHub"."""
+        sha = str(gh.sha(REPO, "main"))
+        if how == "create":
+            r = call(
+                gh, tok, "POST", "/check-runs",
+                json={"name": "ci", "head_sha": sha, "conclusion": "stale"},
+            )  # fmt: skip
+        else:
+            run = check(gh, tok, sha)
+            r = call(gh, tok, "PATCH", f"/check-runs/{run['id']}", json={"conclusion": "stale"})
+        assert r.status == 422
+        assert "stale" in r.body["message"]
+        assert gh.sha(REPO, "main") == sha
+
+    def test_a_stale_check_set_by_the_test_control_fails_the_required_check(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        ruleset(gh, tok, [required("ci")])
+        pr = open_pr(gh, tok)
+        gh.add_check_run(head_of(pr), "ci", conclusion="stale", app_id=4242)
+        assert [v.kind for v in gh.protection(1)] == ["check_failing"]
+        listed = call(gh, tok, "GET", "/commits/feat/check-runs").body["check_runs"]
+        assert listed[0]["conclusion"] == "stale"
+
+    def test_layered_rulesets_report_the_largest_approval_count(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        ruleset(gh, tok, [reviews_rule(1)], name="a")
+        ruleset(gh, tok, [reviews_rule(2)], name="b")
+        open_pr(gh, tok)
+        (missing,) = gh.protection(1)
+        assert (missing.kind, missing.subject) == ("approvals_missing", "2")
+        assert "At least 2 approving reviews are required" in missing.message
+        gh.add_review(1, "carol", "APPROVED")
+        assert gh.protection(1)[0].subject == "2"
+        gh.add_review(1, "dave", "APPROVED")
+        assert gh.protection(1) == []
+
+    def test_a_permission_above_the_extra_grant_is_a_422(self, gh: FakeGitHubChecks) -> None:
+        jwt = gh.app_jwt()
+        for level in ("admin", "owner", ""):
+            r = gh.create_installation_token(jwt, 200002, permissions={"actions": level})
+            assert r.status == 422, level
+        r = gh.create_installation_token(jwt, 200002, permissions={"administration": "admin"})
+        assert r.status == 422
+        ok = gh.create_installation_token(jwt, 200002, permissions={"actions": "read"})
+        assert (ok.status, ok.body["permissions"]) == (201, {"actions": "read"})
+
+    def test_another_apps_check_run_is_a_403_before_any_field_is_validated(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        theirs = gh.add_check_run(str(gh.sha(REPO, "main")), "ci", app_id=4242)
+        r = call(gh, tok, "PATCH", f"/check-runs/{theirs}", json={"status": "bogus"})
+        assert r.status == 403
+
+    def test_the_apps_own_approval_does_not_count_unless_configured(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        """unsourced: a merge guard must never approve its own path."""
+        ruleset(gh, tok, [reviews_rule(1)])
+        open_pr(gh, tok)
+        gh.set_author(1, "alice")
+        assert review(gh, tok, 1, event="APPROVE").status == 200
+        assert [v.kind for v in gh.protection(1)] == ["approvals_missing"]
+        assert merge(gh, tok, 1)["status"] == "failed"
+        gh.app_approvals_count = True
+        assert gh.protection(1) == []
+
+    def test_an_integration_id_must_be_an_integer(self, gh: FakeGitHubChecks, tok: str) -> None:
+        for bad in (True, "4242", 4.5):
+            rule = required("ci", integration_id=bad)
+            r = call(
+                gh, tok, "POST", "/rulesets",
+                json={"name": f"n{bad}", "enforcement": "active", "rules": [rule]},
+            )  # fmt: skip
+            assert r.status == 422, bad
+
+    def test_rules_for_a_branch_pages_and_keeps_the_query(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        ruleset(gh, tok, [{"type": "deletion"}, {"type": "creation"}, {"type": "update"}])
+        r = call(gh, tok, "GET", "/rules/branches/main", query={"per_page": "2"})
+        assert len(r.body) == 2
+        assert "per_page=2" in r.headers["link"]
+        assert (
+            len(
+                call(
+                    gh, tok, "GET", "/rules/branches/main", query={"page": "2", "per_page": "2"}
+                ).body
+            )
+            == 1
+        )
+
+    def test_a_control_naming_an_unknown_run_says_so(self, gh: FakeGitHubChecks) -> None:
+        with pytest.raises(AssertionError, match="no workflow run 999"):
+            gh.start_run(999)
+        with pytest.raises(AssertionError, match="no workflow run 999"):
+            gh.complete_run(999)
+
+    def test_started_at_is_set_when_a_check_starts_not_before(
+        self, gh: FakeGitHubChecks, tok: str
+    ) -> None:
+        sha = str(gh.sha(REPO, "main"))
+        queued = check(gh, tok, sha)
+        assert queued["started_at"] is None
+        started = call(
+            gh, tok, "PATCH", f"/check-runs/{queued['id']}", json={"status": "in_progress"}
+        )
+        assert started.body["started_at"] is not None
+        assert check(gh, tok, sha, "b", status="in_progress")["started_at"] is not None
+        assert check(gh, tok, sha, "c", conclusion="success")["started_at"] is not None
+        gh.add_check_run(sha, "d", status="queued", conclusion=None)
+        runs = call(gh, tok, "GET", "/commits/main/check-runs", query={"check_name": "d"}).body
+        assert runs["check_runs"][0]["started_at"] is None

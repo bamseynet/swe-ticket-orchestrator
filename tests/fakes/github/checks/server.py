@@ -30,10 +30,14 @@ Known departures, each deliberate:
   accepted by ``POST /rulesets`` and enforced. Other rule types are a 422 (unsourced: GitHub
   accepts more). Not enforced though accepted: ``require_code_owner_review``,
   ``require_last_push_approval``, ``required_review_thread_resolution``,
-  ``required_linear_history``, ``required_signatures``, ``bypass_actors`` (bypass lists need an
-  organization-owned repository, RESEARCH.md; ``bypass_rules`` on the merge request skips every
-  block, as in the pulls fake), ``evaluate`` mode (counts nothing, as if disabled), the ``push``
-  target, repository-property conditions and ``includes_parents``.
+  ``required_linear_history``, ``required_signatures``, ``evaluate`` mode (counts nothing, as if
+  disabled), the ``push`` target, repository-property conditions and ``includes_parents``.
+* Bypass: ``bypass_rules: true`` on a merge request skips a ruleset's rules only when THAT
+  ruleset's ``bypass_actors`` holds ``{"actor_type": "Integration", "actor_id": <this App's ID>}``
+  (RESEARCH.md [S42]: bypass lists need an organization-owned repository; the acme fake owner is
+  one). Otherwise the request fails with the violations. A scripted ``block_merge`` is still
+  skipped by ``bypass_rules`` as in the pulls fake (unsourced, D4-19's behaviour). Other bypass
+  actors are stored, not enforced.
 * Unsourced wording: every protection message, the 422 for a duplicate ruleset name, the messages
   of rule-blocked ref changes and ``POST /merges``, "Can not approve your own pull request",
   "No commit found for SHA", "No ref found for" and the dispatch input errors. Unsourced behaviour:
@@ -42,12 +46,23 @@ Known departures, each deliberate:
   ``refs/`` is taken as a branch name; a rule-blocked ``POST /merges`` is a 409; the 403 for
   updating another App's check run; check runs list oldest first; ``latest`` means the highest ID
   per (App, name); runs list newest first.
+* Required checks: a context not pinned by ``integration_id`` passes when ANY App's latest run of
+  that name passes (unsourced); an App cannot set ``conclusion: stale`` (422: "only GitHub can
+  set this", the checks/runs page); a test sets it with ``add_check_run``. A queued run has no
+  ``started_at``. ``mergeable_state`` keeps D4-19's order, so ``behind`` hides ``blocked`` (real
+  GitHub can report ``blocked`` for a PR that is also behind; unsourced). Boolean workflow inputs
+  accept any scalar value (unsourced).
 * Check runs: no annotations, images, ``actions`` buttons or check suites; ``rerequest`` is not
   modelled. A required check passes on ``success``, ``neutral`` or ``skipped`` (documented:
   about-status-checks) and fails on the other conclusions. Required contexts are matched against
   check run names only; commit statuses are not modelled.
 * Reviews: ``comments`` on a review are ignored; there is no review thread model. Only reviews by
-  people with write access count (``add_review(..., writer=False)`` makes one that does not).
+  people with write access count (``add_review(..., writer=False)`` makes one that does not). The
+  App's own approval of a PR someone else opened is unsourced: by default it does NOT count
+  (``app_approvals_count = True`` makes it count), because a merge guard must never be able to
+  approve its own path. Layered ``pull_request`` rules report the largest approval count. More
+  than one pending review per user is allowed here (GitHub refuses it with a 422, observed,
+  unsourced).
   Approvals older than the head are dismissed at push time only when a ``pull_request`` rule says
   ``dismiss_stale_reviews_on_push``. The App itself cannot approve or request changes on a PR it
   opened. A PR is opened by this fake's principal; ``set_author`` makes it someone else's.
@@ -146,6 +161,11 @@ _PLAIN_RULES = (
 _EVENTS = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}
 _HEADER = "Repository rule violations found"
 _WORKFLOWS = ".github/workflows/"
+# https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/
+# managing-rulesets/available-rules-for-rulesets: "require that all changes ... be associated with
+# a pull request" (the wording of the message is unsourced)
+_VIA_PR = "Changes must be made through a pull request."
+_PUSH_RULES = ("update", "pull_request", "required_status_checks")
 _MAX_INPUTS = 25
 
 
@@ -272,6 +292,7 @@ class FakeGitHubChecks(FakeGitHubPulls):
         self._manual: dict[tuple[str, int], str | None] = {}
         self._ids = 0
         self._run_ids = 5_000_000
+        self.app_approvals_count = False  # see the module docstring
 
     # --- tokens: the two extra permissions --------------------------------------------------
 
@@ -312,6 +333,8 @@ class FakeGitHubChecks(FakeGitHubPulls):
         run = self._new_check(repo, name, sha, int(APP_ID) if app_id is None else app_id)
         run.status = status
         run.conclusion = conclusion if status == "completed" else None
+        if status != "queued":
+            run.started_at = self.now
         if status == "completed":
             run.completed_at = self.now
         return run.id
@@ -378,20 +401,23 @@ class FakeGitHubChecks(FakeGitHubPulls):
         return self._ids
 
     def _find_run(self, repo: str, run_id: int) -> WorkflowRun:
-        return next(x for x in self._extra[repo].runs if x.id == run_id)
+        for run in self._extra[repo].runs:
+            if run.id == run_id:
+                return run
+        raise AssertionError(f"no workflow run {run_id} in {repo}")
 
     def _full(self, r: Repo) -> str:
         return next(name for name, repo in self.repos.items() if repo is r)
 
     # --- composition with the pulls fake ------------------------------------------------------
 
-    def _sync_block(self, r: Repo, pr: Pull) -> None:
+    def _sync_block(self, r: Repo, pr: Pull, *, bypass: bool = False) -> None:
         full = self._full(r)
         manual = self._manual.get((full, pr.number))
-        if manual:
+        if manual and not bypass:
             pr.blocked = manual
         else:
-            found = self._violations(full, pr)
+            found = self._violations(full, pr, bypass=bypass)
             pr.blocked = _HEADER + "\n\n" + "\n\n".join(v.message for v in found) if found else None
 
     def _pr_json(self, r: Repo, full: str, pr: Pull) -> dict[str, Any]:
@@ -399,8 +425,16 @@ class FakeGitHubChecks(FakeGitHubPulls):
         return super()._pr_json(r, full, pr)
 
     def _run(self, r: Repo, req: MergeRequest) -> None:
-        self._sync_block(r, self._pull(r, req.number))
-        super()._run(r, req)
+        # The pulls fake skips ``pr.blocked`` whenever ``bypass_rules`` is set. Here a bypass
+        # counts only for the rulesets that name this App, so the decision is made first and the
+        # pulls fake is told there is nothing left to bypass.
+        asked = req.bypass
+        self._sync_block(r, self._pull(r, req.number), bypass=asked)
+        req.bypass = False
+        try:
+            super()._run(r, req)
+        finally:
+            req.bypass = asked
 
     def _moved(self, r: Repo, ref: str) -> None:
         super()._moved(r, ref)
@@ -462,7 +496,16 @@ class FakeGitHubChecks(FakeGitHubPulls):
                 best[(run.app_id, run.name)] = run
         return best
 
-    def _violations(self, full: str, pr: Pull) -> list[Violation]:
+    @staticmethod
+    def _names_this_app(rs: Ruleset) -> bool:
+        return any(
+            isinstance(a, dict)
+            and a.get("actor_type") == "Integration"
+            and a.get("actor_id") == int(APP_ID)
+            for a in rs.bypass_actors
+        )
+
+    def _violations(self, full: str, pr: Pull, *, bypass: bool = False) -> list[Violation]:
         r = self.repos[full]
         head, base = r.refs.get(f"refs/heads/{pr.head}"), r.refs.get(f"refs/heads/{pr.base}")
         found: list[Violation] = []
@@ -476,7 +519,15 @@ class FakeGitHubChecks(FakeGitHubPulls):
         if head is None:
             return found
         latest = self._latest_checks(full, head)
-        for _, rule in self._rules(full, pr.base, "required_status_checks"):
+
+        def applying(kind: str) -> list[dict[str, Any]]:
+            return [
+                rule
+                for rs, rule in self._rules(full, pr.base, kind)
+                if not (bypass and self._names_this_app(rs))
+            ]
+
+        for rule in applying("required_status_checks"):
             params = rule["parameters"]
             for need in params["required_status_checks"]:
                 context, pin = need["context"], need.get("integration_id")
@@ -495,16 +546,15 @@ class FakeGitHubChecks(FakeGitHubPulls):
             if params["strict_required_status_checks_policy"] and behind:
                 text = "Required status checks require the branch to be up to date before merging."
                 add("not_up_to_date", "", text)
-        for _, rule in self._rules(full, pr.base, "pull_request"):
-            need_n = rule["parameters"]["required_approving_review_count"]
+        review_rules = applying("pull_request")
+        if review_rules:
+            need_n = max(r_["parameters"]["required_approving_review_count"] for r_ in review_rules)
             standing = self._standing(full, pr)
-            approvals = sum(1 for s in standing.values() if s == "APPROVED")
+            approvals = sum(1 for s_ in standing.values() if s_ == "APPROVED")
             if approvals < need_n:
-                add(
-                    "approvals_missing", "",
-                    f"At least {_plural(need_n)} "
-                    f"{'is' if need_n == 1 else 'are'} required by reviewers with write access.",
-                )  # fmt: skip
+                verb = "is" if need_n == 1 else "are"
+                text = f"At least {_plural(need_n)} {verb} required by reviewers with write access."
+                add("approvals_missing", str(need_n), text)
             if "CHANGES_REQUESTED" in standing.values():
                 add("changes_requested", "", "Changes have been requested by a reviewer.")
         return found
@@ -514,7 +564,8 @@ class FakeGitHubChecks(FakeGitHubPulls):
         DISMISSED review (a comment changes nothing)."""
         standing: dict[str, str] = {}
         for review in self._extra[full].reviews:
-            if review.number == pr.number and review.writer and review.state in (
+            counts = review.writer and (self.app_approvals_count or review.user != PRINCIPAL)
+            if review.number == pr.number and counts and review.state in (
                 "APPROVED", "CHANGES_REQUESTED", "DISMISSED",
             ):  # fmt: skip
                 standing[review.user] = review.state
@@ -522,7 +573,9 @@ class FakeGitHubChecks(FakeGitHubPulls):
 
     # --- ref routes under rules ---------------------------------------------------------------
 
-    def _ref_refusal(self, c: _Call, ref: str, kinds: Sequence[str]) -> Response | None:
+    def _ref_refusal(
+        self, c: _Call, ref: str, kinds: Sequence[str], status: int = 422
+    ) -> Response | None:
         for _, rule in self._ref_rules(c.full, ref):
             if rule["type"] in kinds:
                 words = {
@@ -530,8 +583,10 @@ class FakeGitHubChecks(FakeGitHubPulls):
                     "update": "Cannot update this protected ref.",
                     "deletion": "Cannot delete this protected ref.",
                     "non_fast_forward": "Cannot force-push to this ref.",
+                    "pull_request": _VIA_PR,
+                    "required_status_checks": _VIA_PR,
                 }
-                return _err(422, f"{_HEADER}\n\n{words[rule['type']]}", c.quota)
+                return _err(status, f"{_HEADER}\n\n{words[rule['type']]}", c.quota)
         return None
 
     def _h_delete_ref(self, c: _Call) -> Response:
@@ -553,7 +608,7 @@ class FakeGitHubChecks(FakeGitHubPulls):
     def _h_update_ref(self, c: _Call) -> Response:
         ref, sha = "refs/" + c.match[1], c.body.get("sha")
         if ref in c.repo.refs:
-            kinds = ["update"]
+            kinds = [*_PUSH_RULES]  # any update to the ref is a push: changes need a pull request
             rewinds = (
                 isinstance(sha, str)
                 and sha in c.repo.commits
@@ -569,12 +624,10 @@ class FakeGitHubChecks(FakeGitHubPulls):
     def _h_merge_branch(self, c: _Call) -> Response:
         base = c.body.get("base")
         if isinstance(base, str) and f"refs/heads/{base}" in c.repo.refs:
-            kinds = ("update", "pull_request", "required_status_checks")
-            for _, rule in self._ref_rules(c.full, f"refs/heads/{base}"):
-                if rule["type"] in kinds:  # unsourced: a direct merge is a push to the base
-                    return _err(
-                        409, f"{_HEADER}\n\nChanges must be made through a pull request.", c.quota
-                    )
+            # unsourced: a direct merge is a push to the base
+            refused = self._ref_refusal(c, f"refs/heads/{base}", _PUSH_RULES, 409)
+            if refused is not None:
+                return refused
         return super()._h_merge_branch(c)
 
     # --- routes -------------------------------------------------------------------------------
@@ -645,7 +698,7 @@ class FakeGitHubChecks(FakeGitHubPulls):
     # --- check runs ---------------------------------------------------------------------------
 
     def _new_check(self, full: str, name: str, sha: str, app_id: int) -> CheckRun:
-        run = CheckRun(self._next(), name, sha, app_id, started_at=self.now)
+        run = CheckRun(self._next(), name, sha, app_id)
         self._extra[full].checks.append(run)
         return run
 
@@ -700,6 +753,9 @@ class FakeGitHubChecks(FakeGitHubPulls):
             return _invalid(
                 "conclusion", f"{b['conclusion']!r} is not one of {list(_CONCLUSIONS)}", q
             )
+        if b.get("conclusion") == "stale":
+            # https://docs.github.com/en/rest/checks/runs: "stale ... only GitHub can set this"
+            return _invalid("conclusion", "'stale' can only be set by GitHub", q)
         for name in ("started_at", "completed_at"):
             if name in b and not _is_time(b[name]):
                 return _invalid(name, f"{b[name]!r} is not a date-time", q)
@@ -735,6 +791,8 @@ class FakeGitHubChecks(FakeGitHubPulls):
             run.started_at = datetime.fromisoformat(
                 b["started_at"].replace("Z", "+00:00")
             ).timestamp()
+        if run.status != "queued" and run.started_at is None:
+            run.started_at = self.now
         if run.status == "completed":
             run.completed_at = (
                 datetime.fromisoformat(b["completed_at"].replace("Z", "+00:00")).timestamp()
@@ -767,11 +825,11 @@ class FakeGitHubChecks(FakeGitHubPulls):
         run = self._find_check(c)
         if isinstance(run, Response):
             return run
+        if run.app_id != int(APP_ID):  # unsourced status: an App updates its own runs only
+            return _err(403, "Resource not accessible by integration", c.quota)
         refused = self._check_fields(c, creating=False) or self._completion(c, run)
         if refused is not None:
             return refused
-        if run.app_id != int(APP_ID):  # unsourced status: an App updates its own runs only
-            return _err(403, "Resource not accessible by integration", c.quota)
         self._apply_check(run, c.body)
         return _ok(200, self._check_json(c.full, run), c.quota)
 
@@ -861,7 +919,13 @@ class FakeGitHubChecks(FakeGitHubPulls):
                 if not isinstance(needs, list) or not all(
                     isinstance(n, dict)
                     and isinstance(n.get("context"), str)
-                    and (n.get("integration_id") is None or isinstance(n["integration_id"], int))
+                    and (
+                        n.get("integration_id") is None
+                        or (
+                            isinstance(n["integration_id"], int)
+                            and not isinstance(n["integration_id"], bool)
+                        )
+                    )
                     for n in needs
                 ):
                     return _invalid(
@@ -984,7 +1048,7 @@ class FakeGitHubChecks(FakeGitHubPulls):
         return _ok(204, None, c.quota)
 
     def _h_get_branch_rules(self, c: _Call) -> Response:
-        out = []
+        out: list[dict[str, Any]] = []
         for rs, rule in self._ref_rules(c.full, f"refs/heads/{c.match[1]}"):
             row: dict[str, Any] = {
                 "type": rule["type"],
@@ -995,7 +1059,8 @@ class FakeGitHubChecks(FakeGitHubPulls):
             if rule.get("parameters"):
                 row["parameters"] = rule["parameters"]
             out.append(row)
-        return _ok(200, out, c.quota)
+        chunk, headers = self._paginate(out, c, f"/repos/{c.full}/rules/branches/{c.match[1]}")
+        return _ok(200, chunk, c.quota, **headers)
 
     # --- reviews ------------------------------------------------------------------------------
 
