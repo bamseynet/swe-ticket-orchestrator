@@ -26,9 +26,8 @@ Known departures, each deliberate:
   test calls ``settle()``; GitHub gives no such number. Request results expire 24 hours after their
   last update (documented); the fake counts that on ``now``.
 * Unsourced answers, to prove live (D4-23): a ``sha`` that is not the head at request time is a 422
-  (the docs name no code); a PR that is closed or a draft is a 400 with the message "Pull Request
-  is not mergeable" (the docs say 400 for "not ready to merge, for example because it is closed",
-  and name no draft case); ``merge_action: merge_queue`` on a base with no queue, and
+  (the docs name no code); the 400 for a closed or draft PR is documented, its message "Pull
+  Request is not mergeable" is not; ``merge_action: merge_queue`` on a base with no queue, and
   ``direct_merge`` on a base with one, are 400s; the default action is the queue where the base has
   one; a request that runs after the head moved, the base conflicts or a protection blocks ends as
   ``failed`` with a message the fake words itself; ``enqueued`` is what a queue request resolves to
@@ -43,9 +42,13 @@ Known departures, each deliberate:
   and no others; real GitHub has more (unsourced limit).
 * Marking a draft ready is GraphQL on GitHub (``markPullRequestReadyForReview``); the fake offers
   ``mark_ready`` as a stand-in and the REST edit ignores ``draft``, as the docs list no such field.
-* ``POST /merges`` fast-forwards the base when it is an ancestor of the head (201, the head
-  commit), and answers 204 when the head is already in the base (documented). The fast forward is
-  unsourced. A conflict is 409 "Merge conflict" (documented 409).
+* ``POST /merges`` makes a two-parent merge commit (first parent: the base's old tip) and answers
+  204 when the head is already in the base (documented). With ``ff_merges = True`` it fast-forwards
+  instead when the base is an ancestor of the head (201, the head commit); whether GitHub ever
+  does is unsourced, for D4-23. A conflict is 409 "Merge conflict" (documented 409).
+* Deleting a branch closes its open PRs (head: GitHub does this; base: unsourced). Deleting the
+  default branch (``main``) is a 422 (unsourced wording). A queued PR whose head moves leaves the
+  queue (unsourced).
 * ``PUT .../update-branch`` checks ``expected_head_sha`` and a conflict at request time (both 422,
   unsourced for the conflict) and applies at ``settle()``, as it is a background job on GitHub.
 * Trees are flat (path to blob, no sub-trees, no symlinks or sub-modules), and merges are
@@ -59,9 +62,10 @@ Known departures, each deliberate:
   to, unsourced).
 * The 403 for a missing permission ("Resource not accessible by integration") and the 422
   texts for refs, trees, commits and field types are GitHub's wording from observation, not
-  from a docs page. The permission map is ours: refs, blobs, trees, commits, merges and
-  update-branch need ``contents``; pulls and merge-async need ``pull_requests``; comments need
-  ``issues`` or ``pull_requests``.
+  from a docs page. The permission map is ours except merge-async and its result, which need
+  Contents: write (https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps;
+  the endpoints' own page lists none): refs, blobs, trees, commits, merges and update-branch need
+  ``contents``; pulls need ``pull_requests``; comments need ``issues`` or ``pull_requests``.
 * Not modelled: reviews, check runs, labels, assignees, ``expand``-style options, GraphQL, and
   webhooks (the sender is ``fakes.github.webhooks``; nothing here sends one on a state change).
 """
@@ -73,6 +77,7 @@ import binascii
 import hashlib
 import json as jsonlib
 import re
+import urllib.parse
 import uuid as uuidlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -247,6 +252,7 @@ class FakeGitHubPulls(FakeGitHubAuth):
         }
         self.order = "oldest_first"  # documented: ascending by ID
         self.pending_polls = 1
+        self.ff_merges = False  # see the module docstring
         self.log: list[tuple[str, str]] = []
         self._cid = 100
         self._swallowed = -1
@@ -350,11 +356,12 @@ class FakeGitHubPulls(FakeGitHubAuth):
                     self._run(r, req)
             for number, expected in r.updates:
                 pr = self._pull(r, number)
-                if r.refs.get(f"refs/heads/{pr.head}") == expected and pr.state == "open":
+                base = r.refs.get(f"refs/heads/{pr.base}")
+                if base and r.refs.get(f"refs/heads/{pr.head}") == expected and pr.state == "open":
                     self._merge_into(
                         r,
                         pr.head,
-                        r.refs[f"refs/heads/{pr.base}"],
+                        base,
                         f"Merge branch '{pr.base}' into {pr.head}",
                     )
             r.updates.clear()
@@ -437,6 +444,8 @@ class FakeGitHubPulls(FakeGitHubAuth):
             if name in (pr.head, pr.base):
                 pr.computed = False
                 pr.updated = self.now
+            if name == pr.head:
+                pr.queued = False  # unsourced: a changed head leaves the queue
 
     def _merge_into(self, r: Repo, base: str, h: str, message: str) -> Commit | None | str:
         """Merge commit ``h`` into branch ``base``: the commit, None if there is nothing to
@@ -444,7 +453,7 @@ class FakeGitHubPulls(FakeGitHubAuth):
         b = r.refs[f"refs/heads/{base}"]
         if h in self._ancestors(r, b):
             return None
-        if b in self._ancestors(r, h):
+        if self.ff_merges and b in self._ancestors(r, h):
             commit = r.commits[h]
         else:
             tree = self._three_way(r, b, h)
@@ -468,10 +477,8 @@ class FakeGitHubPulls(FakeGitHubAuth):
         self._pull(r, number).updated = self.now
 
     def _conflicts(self, r: Repo, pr: Pull) -> bool:
-        return (
-            self._three_way(r, r.refs[f"refs/heads/{pr.base}"], r.refs[f"refs/heads/{pr.head}"])
-            is None
-        )
+        base, head = r.refs.get(f"refs/heads/{pr.base}"), r.refs.get(f"refs/heads/{pr.head}")
+        return base is not None and head is not None and self._three_way(r, base, head) is None
 
     def _pr_json(self, r: Repo, full: str, pr: Pull) -> dict[str, Any]:
         head, base = (
@@ -480,7 +487,7 @@ class FakeGitHubPulls(FakeGitHubAuth):
         )
         mergeable: bool | None = None
         state = "draft" if pr.draft else "unknown"
-        if pr.state == "open" and not pr.merged and pr.computed:
+        if pr.state == "open" and not pr.merged and pr.computed and head and base:
             if self._conflicts(r, pr):
                 mergeable, state = False, "dirty"
             else:
@@ -520,7 +527,9 @@ class FakeGitHubPulls(FakeGitHubAuth):
     def _do_merge(self, r: Repo, pr: Pull, method: str, title: str | None) -> str:
         """Merge the PR into its base now: the merge commit SHA, or the failure message."""
         base_ref, head_ref = f"refs/heads/{pr.base}", f"refs/heads/{pr.head}"
-        b, h = r.refs[base_ref], r.refs[head_ref]
+        b, h = r.refs.get(base_ref), r.refs.get(head_ref)
+        if b is None or h is None:
+            return "The base or the head branch no longer exists."
         tree = self._three_way(r, b, h)
         if tree is None:
             return "Merge conflict between the base and the head."
@@ -658,13 +667,13 @@ class FakeGitHubPulls(FakeGitHubAuth):
         ("POST", r"/pulls", "create-pull", "create-pull", _PULLS_W),
         ("PATCH", r"/pulls/(\d+)", "update-pull", "update-pull", _PULLS_W),
         ("PUT", r"/pulls/(\d+)/update-branch", "update-branch", "update-branch", _PULLS_W + _GIT_W),
-        ("PUT", r"/pulls/(\d+)/merge-async", "merge-async", "merge-async", _PULLS_W + _GIT_W),
+        ("PUT", r"/pulls/(\d+)/merge-async", "merge-async", "merge-async", _GIT_W),
         (
             "GET",
             r"/pulls/(\d+)/merge-async/([^/]+)",
             "merge-async-result",
             "merge-async-result",
-            _PULLS,
+            _GIT_W,
         ),
         (
             "GET",
@@ -736,7 +745,8 @@ class FakeGitHubPulls(FakeGitHubAuth):
         last = max(1, -(-len(rows) // per))
 
         def url(number: int, rel: str) -> str:
-            return f'<{HOST}{route}?page={number}&per_page={per}>; rel="{rel}"'
+            query = {**c.query, "page": str(number), "per_page": str(per)}
+            return f'<{HOST}{route}?{urllib.parse.urlencode(query)}>; rel="{rel}"'
 
         links = ([url(page - 1, "prev"), url(1, "first")] if page > 1 and chunk else []) + (
             [url(page + 1, "next"), url(last, "last")] if len(rows) > page * per else []
@@ -754,7 +764,9 @@ class FakeGitHubPulls(FakeGitHubAuth):
             return _invalid("body", f"{b['body']!r} is not a string", q)
         if "draft" in b and not isinstance(b["draft"], bool):
             return _invalid("draft", f"{b['draft']!r} is not a boolean", q)
-        head = str(b["head"]).split(":")[-1]
+        owner, _, head = str(b["head"]).rpartition(":")
+        if owner and owner.lower() != c.full.split("/")[0]:  # a fork's owner is not modelled
+            return _validation(q, "PullRequest", "head", "invalid")
         refs = c.repo.refs
         if f"refs/heads/{head}" not in refs:
             return _validation(q, "PullRequest", "head", "invalid")
@@ -792,6 +804,14 @@ class FakeGitHubPulls(FakeGitHubAuth):
             return _validation(
                 q, "PullRequest", "state", "custom", "Pull request is already merged."
             )
+        if b.get("state") == "open" and pr.state == "closed":
+            twin = any(
+                p.state == "open" and p is not pr and (p.head, p.base) == (pr.head, pr.base)
+                for p in c.repo.pulls
+            )
+            if twin:
+                message = f"A pull request already exists for {c.full.split('/')[0]}:{pr.head}."
+                return _validation(q, "PullRequest", "", "custom", message)
         # ``draft`` is not a field of this route: ignored (documented fields only).
         if "title" in b:
             pr.title = b["title"]
@@ -813,13 +833,15 @@ class FakeGitHubPulls(FakeGitHubAuth):
         expected = c.body.get("expected_head_sha")
         if expected is not None and not isinstance(expected, str):
             return _invalid("expected_head_sha", f"{expected!r} is not a string", c.quota)
+        if pr.state != "open":
+            return _validation(c.quota, "PullRequest", "", "custom", "the pull request is closed")
         head = c.repo.refs[f"refs/heads/{pr.head}"]
         if expected is not None and expected != head:
             return _validation(
                 c.quota, "PullRequest", "expected_head_sha", "custom",
                 "expected head sha didn't match current head ref.",
             )  # fmt: skip
-        if pr.state != "open" or self._conflicts(c.repo, pr):
+        if self._conflicts(c.repo, pr):
             return _validation(
                 c.quota, "PullRequest", "", "custom", "merge conflict between base and head"
             )
@@ -1077,7 +1099,13 @@ class FakeGitHubPulls(FakeGitHubAuth):
         ref = "refs/" + c.match[1]
         if ref not in c.repo.refs:
             return _err(422, "Reference does not exist", c.quota)
+        if ref == "refs/heads/main":  # the default branch; unsourced wording
+            return _err(422, "Cannot delete the default branch", c.quota)
         del c.repo.refs[ref]
+        name = ref.removeprefix("refs/heads/")
+        for pr in c.repo.pulls:  # GitHub closes a PR whose head branch is deleted
+            if pr.state == "open" and name in (pr.head, pr.base):
+                pr.state, pr.closed_at, pr.queued = "closed", self.now, False
         self._moved(c.repo, ref)
         return _ok(204, None, c.quota)
 

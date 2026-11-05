@@ -151,7 +151,6 @@ FAR_FUTURE = 10.0**10  # seconds; longer than any finite window an adapter could
 PAGE_SIZE = 100  # GitHub's maximum; the server pages at this size
 DEEP = 5100  # objects on each side of a marker (51 pages); caps up to about 150 pages are seen
 RETRIES = 5
-FAKE_MODULE = "sto.adapters.fake"
 STO_MODULE = "sto"
 REFERENCE_MODULE = "contract.test_suite"
 RESTART_MARK = "_conformance_restart_mark"
@@ -525,11 +524,6 @@ def _defined_under(cls: type, dotted: str, directories: Iterable[Path]) -> bool:
     return any(Path(str(file)).resolve().is_relative_to(d) for d in directories)
 
 
-def _fake_directories() -> list[Path]:
-    spec = importlib.util.find_spec(FAKE_MODULE)
-    return [Path(p).resolve() for p in (spec.submodule_search_locations or [])] if spec else []
-
-
 def _sto_directories() -> list[Path]:
     spec = importlib.util.find_spec(STO_MODULE)
     return [Path(p).resolve() for p in (spec.submodule_search_locations or [])] if spec else []
@@ -538,10 +532,6 @@ def _sto_directories() -> list[Path]:
 def is_sto_class(cls: type) -> bool:
     """``cls`` is REALLY defined under ``sto.``: not merely named so."""
     return _defined_under(cls, STO_MODULE, _sto_directories())
-
-
-def is_fake(cls: type) -> bool:
-    return _defined_under(cls, FAKE_MODULE, _fake_directories())
 
 
 def is_reference(cls: type) -> bool:

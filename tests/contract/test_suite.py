@@ -55,7 +55,6 @@ from contract.suite import (  # noqa: E402
     check_not_simulated,
     enforce_outcome,
     is_auth_error,
-    is_fake,
     is_reference,
     resolve,
     run_suite,
@@ -2642,25 +2641,6 @@ def test_a_missing_control_is_a_failure_for_every_control() -> None:
             Target().require(control)
 
 
-def test_is_fake_needs_a_dot_boundary_a_loaded_module_and_the_source_location() -> None:
-    assert is_fake(FakeTicketSource)
-    assert is_fake(FakeNotifier)
-    assert is_fake(FakeScm)
-
-    class Spoof(Adapter):
-        pass
-
-    for module in ("sto.adapters.fake.github", "sto.adapters.fake_github", "sto.adapters.fake"):
-        Spoof.__module__ = module
-        assert not is_fake(Spoof), module  # not loaded, or not this class, or elsewhere on disk
-
-    class Elsewhere:
-        pass
-
-    Elsewhere.__module__ = "sto.adapters.fake.tickets"  # a loaded fake module, but not its class
-    assert not is_fake(Elsewhere)
-
-
 def test_a_missing_control_fails_rather_than_skips() -> None:
     with pytest.raises(MissingControl, match="rate_limit"):
         Target().require(Control.RATE_LIMIT)
@@ -3530,7 +3510,6 @@ def test_the_merged_port_doubles_are_refused_as_conformance_targets(
 ) -> None:
     """``sto.adapters.fake.*`` name no vendor: they are doubles, not targets (D4-19, D4-05)."""
     adapter = make()
-    assert is_fake(type(adapter))
     for vendor in Vendor:
         for port in Port:
             target = types.SimpleNamespace(vendor=vendor, adapter=adapter)

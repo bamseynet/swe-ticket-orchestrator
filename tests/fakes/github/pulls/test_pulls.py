@@ -547,9 +547,23 @@ def test_merge_branch_validation(gh: FakeGitHubPulls, tok: str) -> None:
     assert call(gh, tok, "POST", "/merges", json={"base": "feat", "head": "nope"}).status == 404
 
 
-def test_merging_a_head_that_is_ahead_fast_forwards_the_base(gh: FakeGitHubPulls, tok: str) -> None:
-    """unsourced: no merge commit is made when the base is an ancestor of the head."""
+def test_merging_a_head_that_is_ahead_makes_a_two_parent_commit_by_default(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    """https://docs.github.com/en/rest/branches/branches#merge-a-branch: the result is a merge
+    commit. D4-12 reads back its FIRST parent, which must be the base's old tip."""
     gh.push(REPO, "feat", {"f": "f"})
+    main, feat = str(gh.sha(REPO, "main")), str(gh.sha(REPO, "feat"))
+    r = call(gh, tok, "POST", "/merges", json={"base": "main", "head": "feat"})
+    assert r.status == 201
+    assert [p["sha"] for p in r.body["parents"]] == [main, feat]
+    assert gh.sha(REPO, "main") == r.body["sha"] != feat
+
+
+def test_fast_forward_is_only_behind_an_explicit_switch(gh: FakeGitHubPulls, tok: str) -> None:
+    """unsourced: whether GitHub fast-forwards here is D4-23's to confirm."""
+    gh.push(REPO, "feat", {"f": "f"})
+    gh.ff_merges = True
     r = call(gh, tok, "POST", "/merges", json={"base": "main", "head": "feat"})
     assert r.status == 201
     assert r.body["sha"] == gh.sha(REPO, "feat") == gh.sha(REPO, "main")
@@ -757,13 +771,26 @@ def test_unknown_parameters_are_ignored_as_github_ignores_them(
     assert merge_async(gh, tok, 1, merge_methd="squash").status == 202
 
 
-def test_merge_async_needs_write_permissions_and_a_real_pull_request(
+def test_merge_async_needs_contents_write_and_a_real_pull_request(
     gh: FakeGitHubPulls, tok: str
 ) -> None:
+    """https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps lists
+    Contents: write for both merge-async routes (their own page lists none)."""
     open_pr(gh, tok)
-    ro = gh.mint(permissions={"pull_requests": "read", "contents": "write"})
+    ro = gh.mint(permissions={"pull_requests": "write", "contents": "read"})
     assert gh.request("PUT", f"{R}/pulls/1/merge-async", ro, json={}).status == 403
     assert merge_async(gh, tok, 99).status == 404
+
+
+def test_a_contents_write_only_token_can_request_and_poll(gh: FakeGitHubPulls, tok: str) -> None:
+    open_pr(gh, tok)
+    only = gh.mint(permissions={"contents": "write"})
+    first = gh.request("PUT", f"{R}/pulls/1/merge-async", only, json={})
+    assert first.status == 202
+    uuid = first.body["details"]["uuid"]
+    assert gh.request("GET", f"{R}/pulls/1/merge-async/{uuid}", only).status == 200
+    pr_read_only = gh.mint(permissions={"pull_requests": "read"})
+    assert gh.request("GET", f"{R}/pulls/1/merge-async/{uuid}", pr_read_only).status == 403
 
 
 def test_merge_queue_action_enqueues_and_enqueued_is_final(gh: FakeGitHubPulls, tok: str) -> None:
@@ -853,3 +880,156 @@ def test_update_branch_on_a_conflict_is_a_422(gh: FakeGitHubPulls, tok: str) -> 
     gh.push(REPO, "main", {"README.md": "theirs"})
     r = call(gh, tok, "PUT", "/pulls/1/update-branch", json={})
     assert r.status == 422
+
+
+# --- review pass 1 (#343) ---------------------------------------------------------------------
+
+
+def test_the_link_header_keeps_the_query_filters_and_changes_only_the_page(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    import urllib.parse as up
+
+    for i in range(3):
+        open_pr(gh, tok, f"c{i}")
+        call(gh, tok, "PATCH", f"/pulls/{i + 1}", json={"state": "closed"})
+    open_pr(gh, tok, "still-open")
+    q = {"state": "closed", "base": "main", "direction": "asc", "per_page": "2"}
+    first = call(gh, tok, "GET", "/pulls", query=q)
+    link = first.headers["link"]
+    for rel in ("next", "last"):
+        part = next(x for x in link.split(", ") if f'rel="{rel}"' in x)
+        params = dict(up.parse_qsl(up.urlparse(part.split(";")[0].strip("<>")).query))
+        assert {k: v for k, v in params.items() if k != "page"} == q
+    nxt = next(x for x in link.split(", ") if 'rel="next"' in x)
+    url = up.urlparse(nxt.split(";")[0].strip("<>"))
+    second = call(gh, tok, "GET", "/pulls", query=dict(up.parse_qsl(url.query)))
+    assert [(p["number"], p["state"]) for p in second.body] == [(3, "closed")]
+
+
+def test_a_last_page_that_is_exactly_full_has_no_next(gh: FakeGitHubPulls, tok: str) -> None:
+    open_pr(gh, tok)
+    for i in range(4):
+        call(gh, tok, "POST", "/issues/1/comments", json={"body": str(i)})
+    page1 = call(gh, tok, "GET", "/issues/1/comments", query={"per_page": "2"})
+    page2 = call(gh, tok, "GET", "/issues/1/comments", query={"per_page": "2", "page": "2"})
+    assert 'rel="next"' in page1.headers["link"]
+    assert 'rel="next"' not in page2.headers.get("link", "")
+    assert len(page2.body) == 2
+
+
+def test_deleting_the_head_branch_closes_the_pull_request_and_nothing_crashes(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    """GitHub closes a pull request whose head branch is deleted."""
+    open_pr(gh, tok)
+    assert call(gh, tok, "DELETE", "/git/refs/heads/feat").status == 204
+    got = call(gh, tok, "GET", "/pulls/1")
+    assert (got.status, got.body["state"]) == (200, "closed")
+    assert call(gh, tok, "GET", "/pulls/1").status == 200  # the second read too
+    assert [p["number"] for p in call(gh, tok, "GET", "/pulls", query={"state": "all"}).body] == [1]
+    assert merge_async(gh, tok, 1).status == 400
+    assert call(gh, tok, "PUT", "/pulls/1/update-branch", json={}).status == 422
+
+
+def test_a_merge_requested_before_the_head_was_deleted_fails_without_crashing(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    open_pr(gh, tok)
+    uuid = merge_async(gh, tok, 1).body["details"]["uuid"]
+    call(gh, tok, "DELETE", "/git/refs/heads/feat")
+    gh.settle()
+    assert poll(gh, tok, 1, uuid).body["status"] == "failed"
+
+
+def test_deleting_the_base_branch_closes_its_open_pull_requests(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    """unsourced: what GitHub does to PRs whose base is deleted."""
+    gh.push(REPO, "rel", {"r": "r"})
+    gh.push(REPO, "feat", {"f": "f"})
+    call(gh, tok, "POST", "/pulls", json={"title": "t", "head": "feat", "base": "rel"})
+    call(gh, tok, "DELETE", "/git/refs/heads/rel")
+    assert call(gh, tok, "GET", "/pulls/1").body["state"] == "closed"
+    assert call(gh, tok, "GET", "/pulls/1").status == 200
+
+
+def test_the_default_branch_cannot_be_deleted(gh: FakeGitHubPulls, tok: str) -> None:
+    """unsourced wording; GitHub refuses with a 422."""
+    r = call(gh, tok, "DELETE", "/git/refs/heads/main")
+    assert r.status == 422
+    assert gh.sha(REPO, "main") is not None
+
+
+def test_a_run_after_the_pull_request_was_closed_fails_and_stays_readable(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    open_pr(gh, tok)
+    uuid = merge_async(gh, tok, 1).body["details"]["uuid"]
+    call(gh, tok, "PATCH", "/pulls/1", json={"state": "closed"})
+    gh.settle()
+    for _ in range(2):
+        done = poll(gh, tok, 1, uuid)
+        assert (done.status, done.body["status"]) == (200, "failed")
+        assert "open" in done.body["details"]["message"]
+    assert not call(gh, tok, "GET", "/pulls/1").body["merged"]
+
+
+def test_blocked_state_goes_away_when_the_block_is_lifted(gh: FakeGitHubPulls, tok: str) -> None:
+    open_pr(gh, tok)
+    gh.block_merge(1, "no")
+    call(gh, tok, "GET", "/pulls/1")
+    assert call(gh, tok, "GET", "/pulls/1").body["mergeable_state"] == "blocked"
+    gh.block_merge(1, None)
+    assert call(gh, tok, "GET", "/pulls/1").body["mergeable_state"] == "clean"
+
+
+def test_a_draft_merge_request_is_the_documented_400(gh: FakeGitHubPulls, tok: str) -> None:
+    """https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request-asynchronously: a PR that
+    cannot be merged "(e.g. because it is closed, or still a draft)" is a 400."""
+    open_pr(gh, tok, draft=True)
+    assert merge_async(gh, tok, 1).status == 400
+    gh.mark_ready(1)
+    assert merge_async(gh, tok, 1).status == 202
+
+
+def test_a_head_owner_prefix_is_accepted_for_this_repository_and_refused_for_another(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    """https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request: ``head`` may be
+    ``user:branch``; a fork's owner is not modelled."""
+    gh.push(REPO, "feat", {"f": "f"})
+    other = call(
+        gh, tok, "POST", "/pulls", json={"title": "t", "head": "mallory:feat", "base": "main"}
+    )
+    assert other.status == 422
+    assert not gh.pulls(REPO)
+    same = call(gh, tok, "POST", "/pulls", json={"title": "t", "head": "ACME:feat", "base": "main"})
+    assert same.status == 201
+
+
+def test_reopening_is_refused_while_another_open_pull_request_has_the_same_head_and_base(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    open_pr(gh, tok)
+    call(gh, tok, "PATCH", "/pulls/1", json={"state": "closed"})
+    assert open_pr(gh, tok)["number"] == 2
+    r = call(gh, tok, "PATCH", "/pulls/1", json={"state": "open"})
+    assert r.status == 422
+    assert "already exists" in str(r.body["errors"])
+    call(gh, tok, "PATCH", "/pulls/2", json={"state": "closed"})
+    assert call(gh, tok, "PATCH", "/pulls/1", json={"state": "open"}).status == 200
+
+
+def test_a_head_that_moves_after_enqueue_leaves_the_queue_and_is_not_merged(
+    gh: FakeGitHubPulls, tok: str
+) -> None:
+    """unsourced: the queue drops an entry whose head changed."""
+    gh.enable_merge_queue(REPO, "main")
+    open_pr(gh, tok)
+    run_merge(gh, tok, 1, merge_action="merge_queue")
+    gh.push(REPO, "feat", {"evil": "e"})
+    with pytest.raises(AssertionError, match="not in a queue"):
+        gh.complete_queue(1)
+    assert "evil" not in gh.files(gh.tree_of(str(gh.sha(REPO, "main"))))
+    assert merge_async(gh, tok, 1, merge_action="merge_queue").status == 202
