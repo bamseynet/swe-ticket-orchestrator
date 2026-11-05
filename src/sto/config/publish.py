@@ -24,6 +24,13 @@ digest of the whole bundle, so two identical publishes share one item. ``load_pi
 the digest from what it read and refuses a mismatch, so an item altered after the fact cannot
 change what a run does.
 
+V12 (overlapping selectors) is checked at publish too, by ``intake.check_publish``, against the
+latest version of every *other* workflow the team has published; the workflow's own earlier
+versions are not another workflow. It runs before anything is stored, so a refusal leaves no
+version and no manifest item. If another workflow cannot be read, publish is refused
+(``PublishedUnreadableError``) rather than assumed not to clash. Two concurrent publishes of
+different workflows can still both pass; the intake decision refuses a ticket matching two.
+
 V17 is called with the team of the scope being published to (the caller's verified scope), never
 the ``metadata.team`` of the file; a file naming another team is refused by V17 itself.
 """
@@ -49,6 +56,7 @@ from sto.config.org_policy import (
 )
 from sto.config.overlays import flatten
 from sto.config.schema import (
+    Intake,
     Issue,
     OrgPolicy,
     SchemaError,
@@ -61,6 +69,7 @@ from sto.config.team_config import TEAM_ADMIN, TeamConfigStore
 from sto.config.validate_gates import check_gate_dominance
 from sto.config.validate_structure import validate_structure
 from sto.domain.errors import PermanentError
+from sto.engine.intake import check_publish
 from sto.store.ports import (
     PLATFORM,
     TEAM_ROOT,
@@ -82,6 +91,7 @@ __all__ = [
     "PinnedMissingError",
     "Prepared",
     "Published",
+    "PublishedUnreadableError",
     "Publisher",
     "SchemaError",
     "load_pinned",
@@ -110,6 +120,10 @@ class PinnedMissingError(PermanentError):
 
 class PinnedCorruptError(PermanentError):
     """What the store holds for a pin does not hash to the pinned digest."""
+
+
+class PublishedUnreadableError(PermanentError):
+    """Another published workflow of the team could not be read, so V12 cannot be checked."""
 
 
 @dataclass(frozen=True)
@@ -372,8 +386,13 @@ class Publisher:
             sandbox_images=self._images,
             team_config=TeamConfigStore(self._store).read(scope),
         )
-        self._store_manifest(prepared, manifest)
         name = prepared.workflow.metadata.name
+        # V12, before anything is stored
+        intake = prepared.workflow.intake
+        if intake is None:  # prepare refuses this; stay closed if that ever changes
+            raise PublishedUnreadableError(f"{name} has no intake to check")
+        check_publish((scope.team, name), intake, self._other_intakes(scope, name))
+        self._store_manifest(prepared, manifest)
         for _ in range(_ATTEMPTS):
             version = self._next_version(scope, name)
             try:
@@ -415,6 +434,36 @@ class Publisher:
             cursor = page.cursor
             if cursor is None:
                 return best
+
+    def _other_intakes(self, scope: TeamScope, own_name: str) -> dict[tuple[str, str], Intake]:
+        """The intake of the latest version of each published workflow except ``own_name``.
+        Anything that cannot be read raises, so V12 is never skipped."""
+        latest: dict[str, tuple[int, Mapping[str, Any]]] = {}
+        cursor: str | None = None
+        while True:
+            page = self._store.query(scope, TEAM_ROOT, sk_prefix="WF#", cursor=cursor)
+            for item in page.items:
+                name, _, tail = item.key.sk[len("WF#") :].rpartition("#")
+                if not name or not tail.isdigit():
+                    raise PublishedUnreadableError(f"cannot read the stored item {item.key.sk}")
+                if name != own_name and (name not in latest or int(tail) > latest[name][0]):
+                    latest[name] = (int(tail), item.data)
+            cursor = page.cursor
+            if cursor is None:
+                break
+        out: dict[tuple[str, str], Intake] = {}
+        for name, (version, data) in latest.items():
+            workflow = data.get("workflow")
+            try:
+                if not isinstance(workflow, Mapping):
+                    raise ValueError("no workflow")
+                out[(scope.team, name)] = Intake.model_validate(workflow["intake"])
+            except (KeyError, ValueError, ValidationError):
+                raise PublishedUnreadableError(
+                    f"cannot read the intake of {name} v{version}: "
+                    "V12 cannot be checked, so nothing is published"
+                ) from None
+        return out
 
     def _next_version(self, scope: TeamScope, name: str) -> int:
         best = self._latest_item(scope, name)
