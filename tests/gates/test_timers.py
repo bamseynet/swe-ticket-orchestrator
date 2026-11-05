@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -36,13 +37,14 @@ from sto.gates.timers import (
     FireOutcome,
     LocalTimers,
     Timer,
+    TimerConfigError,
     TimerHandler,
     TimerKind,
     schedule_gate_timers,
     schedule_run_age,
 )
 from sto.store.memory import MemoryStore
-from sto.store.ports import Key, Op, TeamScope
+from sto.store.ports import Key, Op, Scope, TeamScope
 
 pytestmark = pytest.mark.unit
 
@@ -552,10 +554,35 @@ class TestScheduling:
         assert t.kind is TimerKind.REMIND
         assert t.due_at == utc(2025, 1, 6, 17, 30)
 
-    def test_escalation_needs_a_role(self) -> None:
+    def test_a_role_with_no_escalate_after_escalates_after_two_business_days(self) -> None:
         timers = LocalTimers(cal())
-        schedule_gate_timers(timers, TEAM.team, RUN, "review", 1, T0, Timeouts(escalate_after="2d"))
-        assert {t.kind for t in timers.due(utc(2026, 1, 1))} == {TimerKind.REMIND}
+        schedule_gate_timers(
+            timers, TEAM.team, RUN, "review", 1, T0, Timeouts(escalate_to="team_admin")
+        )
+        got = {t.kind: t for t in timers.due(utc(2026, 1, 1))}
+        assert got[TimerKind.ESCALATE].due_at == utc(2025, 1, 7, 17, 30)
+        assert got[TimerKind.ESCALATE].escalate_to == "team_admin"
+
+    def test_escalate_after_without_a_role_is_refused_naming_the_gate(self) -> None:
+        timers = LocalTimers(cal())
+        with pytest.raises(TimerConfigError, match="'review'.*escalate_to"):
+            schedule_gate_timers(
+                timers, TEAM.team, RUN, "review", 1, T0, Timeouts(escalate_after="2d")
+            )
+        assert timers.due(utc(2026, 1, 1)) == []  # nothing half-scheduled
+
+    def test_rescheduling_keeps_the_first_due_time(self) -> None:
+        timers = LocalTimers(cal())
+        first = timer(TimerKind.REMIND, T0)
+        timers.schedule(first)
+        timers.schedule(timer(TimerKind.REMIND, T0 + dt.timedelta(days=9)))
+        assert timers.due(T0 + dt.timedelta(days=30)) == [first]
+
+    def test_two_rounds_of_one_gate_are_two_timers(self) -> None:
+        timers = LocalTimers(cal())
+        for rnd in (1, 2):
+            timers.schedule(Timer(TEAM.team, RUN, TimerKind.REMIND, T0, gate="review", round=rnd))
+        assert [t.round for t in timers.due(T0)] == [1, 2]
 
     def test_a_fired_timer_is_removed(self) -> None:
         timers = LocalTimers(cal())
@@ -579,3 +606,170 @@ class TestScheduling:
     def test_a_gate_timer_needs_its_gate(self) -> None:
         with pytest.raises(ValueError, match="gate"):
             Timer(TEAM.team, RUN, TimerKind.REMIND, T0)
+
+
+# --- review pass 1 ----------------------------------------------------------------------------
+
+
+class RacingStore(MemoryStore):
+    """Runs ``before`` once, just before the first ``transact`` after ``arm()``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.before: Callable[[], None] | None = None
+
+    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
+        hook, self.before = self.before, None
+        if hook is not None:
+            hook()
+        super().transact(scope, ops)
+
+
+class TestRaces:
+    def test_age_out_survives_a_concurrent_audit_write(self) -> None:
+        store = MemoryStore()
+        open_gate_with_run(store, RunStatus.BLOCKED)
+        raced: list[int] = []
+
+        def racing(
+            reader: Reader,
+            scope: TeamScope,
+            run_id: RunId,
+            action: str,
+            actor: str,
+            data: dict[str, Any],
+            at_ms: int,
+        ) -> Sequence[Op]:
+            ops = audit_through_chain(reader, scope, run_id, action, actor, data, at_ms)
+            if action == "run.max_age_exceeded" and not raced:
+                raced.append(1)  # another writer appends to the chain after our ops were built
+                store.transact(
+                    scope, list(audit_through_chain(reader, scope, run_id, "other", "x", {}, at_ms))
+                )
+            return ops
+
+        out = TimerHandler(store, audit_ops=racing).fire(TEAM, timer(TimerKind.MAX_RUN_AGE), T0)
+        assert out is FireOutcome.DONE
+        assert "run.max_age_exceeded" in kinds(store)
+        assert verify_audit_chain(store, TEAM, RUN) >= 3
+
+    def test_a_reminder_for_a_gate_closed_during_the_write_is_not_sent(self) -> None:
+        # The gate is closed by a write that leaves the audit chain alone, so only the reminder's
+        # own check on the gate's version can notice.
+        store = RacingStore()
+        gate = open_gate_with_run(store)
+        key = Key(f"RUN#{RUN}", "GATE#review#1")
+
+        def close_quietly() -> None:
+            store.put(TEAM, key, to_wire(gate.advance(GateStatus.REJECTED, closed_by="alice")))
+
+        store.before = close_quietly
+        out = handler(store).fire(TEAM, timer(TimerKind.REMIND), T0)
+        assert out is FireOutcome.NOOP
+        assert "gate.reminder" not in kinds(store)
+
+    def test_age_out_closes_every_open_gate(self) -> None:
+        store = MemoryStore()
+        open_gate_with_run(store)
+        svc = GateService(store)
+        for name in [f"g{i}" for i in range(15)]:  # more than any retry bound
+            svc.open_gate(TEAM, OpenGate(RUN, name, GateType.REVIEW, 1, head_subject(name)))
+        assert handler(store).fire(TEAM, timer(TimerKind.MAX_RUN_AGE), T0) is FireOutcome.DONE
+        statuses = {
+            from_wire(Gate, i.data).status
+            for i in store.query(TEAM, f"RUN#{RUN}", sk_prefix="GATE#").items
+        }
+        assert statuses == {GateStatus.EXPIRED}
+
+
+class TestInputs:
+    def test_run_age_adds_real_time_across_a_dst_change(self) -> None:
+        timers = LocalTimers(cal("America/New_York"))
+        start = dt.datetime(2025, 3, 8, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        schedule_run_age(timers, TEAM.team, RUN, start, "1d")
+        (t,) = timers.due(utc(2030, 1, 1))
+        # (two values on one ZoneInfo subtract as wall time, so compare the UTC instants)
+        real = t.due_at.astimezone(dt.UTC) - start.astimezone(dt.UTC)
+        assert real == dt.timedelta(hours=24)
+
+    def test_run_age_needs_an_aware_start(self) -> None:
+        with pytest.raises(ValueError, match="timezone"):
+            schedule_run_age(LocalTimers(cal()), TEAM.team, RUN, dt.datetime(2025, 1, 6), "1d")
+
+    def test_firing_needs_an_aware_clock(self) -> None:
+        store = MemoryStore()
+        open_gate_with_run(store)
+        with pytest.raises(ValueError, match="timezone"):
+            handler(store).fire(TEAM, timer(TimerKind.REMIND), dt.datetime(2025, 1, 6, 9))
+
+    def test_a_naive_pause_is_refused_and_leaves_nothing_paused(self) -> None:
+        timers = LocalTimers(cal())
+        timers.schedule(timer(TimerKind.REMIND))
+        with pytest.raises(ValueError, match="timezone"):
+            timers.pause(RUN, dt.datetime(2025, 1, 6, 15))
+        assert timers.due(T0) == [timer(TimerKind.REMIND)]  # not paused
+        with pytest.raises(ValueError, match="timezone"):
+            timers.resume(RUN, dt.datetime(2025, 1, 6, 15))
+
+    def test_a_cancelling_run_gets_no_reminders_or_expiry(self) -> None:
+        store = MemoryStore()
+        open_gate_with_run(store, RunStatus.CANCELLING)
+        h = handler(store)
+        for kind in (TimerKind.REMIND, TimerKind.ESCALATE, TimerKind.EXPIRE):
+            assert h.fire(TEAM, timer(kind), T0) is FireOutcome.NOOP
+        assert gate_status(store) is GateStatus.OPEN
+        assert outbox(store) == []
+
+    def test_a_calendar_naming_holidays_needs_them(self) -> None:
+        named = Calendar(
+            timezone="Europe/London", workdays=WEEKDAYS, hours="09:00-17:30", holidays="uk-bank"
+        )
+        with pytest.raises(ValueError, match="uk-bank"):
+            BusinessCalendar.from_config(named)
+        assert BusinessCalendar.from_config(named, holidays=()).holidays == frozenset()
+        day = dt.date(2025, 1, 7)
+        assert BusinessCalendar.from_config(named, holidays=[day]).holidays == {day}
+
+    def test_a_huge_duration_says_so(self) -> None:
+        with pytest.raises(ValueError, match="more than the next ten years"):
+            cal().add(utc(2025, 1, 6, 9), 5000 * 8 * 3600)
+
+
+class TestPauseWindow:
+    def test_a_timer_scheduled_during_the_pause_is_charged_only_from_when_it_started(self) -> None:
+        timers = LocalTimers(cal())
+        timers.pause(RUN, utc(2025, 1, 6, 9, 0))  # Mon
+        opened = utc(2025, 1, 8, 9, 0)  # Wed, while still paused
+        schedule_gate_timers(
+            timers, TEAM.team, RUN, "review", 1, opened, Timeouts(remind_after="4h")
+        )
+        timers.resume(RUN, opened)  # resumes the instant it opened
+        (t,) = timers.due(utc(2026, 1, 1))
+        assert t.due_at == utc(2025, 1, 8, 13, 0)  # the whole 4h are still ahead of it
+
+
+# --- calendar gaps ----------------------------------------------------------------------------
+
+
+class TestCalendarGaps:
+    def test_the_workday_is_the_local_date_west_of_utc(self) -> None:
+        # Los Angeles 09:00-17:30 is 17:00Z-01:30Z the next UTC day. Mon 16:30 PST is already
+        # Tue 00:30Z, so a UTC-date scan would skip the hour left on Monday.
+        la = cal("America/Los_Angeles")
+        assert la.add(utc(2025, 1, 7, 0, 30), 3600) == utc(2025, 1, 7, 1, 30)
+        assert la.add(utc(2025, 1, 7, 0, 30), 7200) == utc(2025, 1, 7, 18, 0)
+
+    def test_a_week_is_one_day_per_workday(self) -> None:
+        three = cal(days=("mon", "wed", "fri"))
+        assert three.add_duration(utc(2025, 1, 6, 9, 0), "1w") == utc(2025, 1, 10, 17, 30)
+        assert three.duration_seconds("1w") == 3 * 8.5 * 3600
+
+    def test_a_holiday_next_to_the_spring_change(self) -> None:
+        # BST starts Sun 2025-03-30; Monday 31st is a holiday. Fri 17:00 GMT + 1h -> Tue 09:30 BST.
+        c = cal(holidays=(dt.date(2025, 3, 31),))
+        assert c.add(utc(2025, 3, 28, 17, 0), 3600) == utc(2025, 4, 1, 8, 30)
+
+    def test_a_holiday_next_to_the_autumn_change(self) -> None:
+        # BST ends Sun 2025-10-26; Monday 27th is a holiday. Fri 16:00Z + 1h -> Tue 09:30 GMT.
+        c = cal(holidays=(dt.date(2025, 10, 27),))
+        assert c.add(utc(2025, 10, 24, 16, 0), 3600) == utc(2025, 10, 28, 9, 30)

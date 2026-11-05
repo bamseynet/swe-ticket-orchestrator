@@ -41,14 +41,24 @@ class BusinessCalendar:
             raise ValueError("a working day must end after it starts")
 
     @classmethod
-    def from_config(cls, cfg: Calendar, holidays: Iterable[dt.date] = ()) -> BusinessCalendar:
+    def from_config(
+        cls, cfg: Calendar, holidays: Iterable[dt.date] | None = None
+    ) -> BusinessCalendar:
+        """``holidays`` are the dates ``cfg.holidays`` names, resolved by the caller. A config
+        that names a holiday list and gets none is refused: treating it as "no holidays" would
+        run timers on days the team is off. Pass an empty collection for a list that is empty."""
+        if cfg.holidays is not None and holidays is None:
+            raise ValueError(
+                f"the calendar names holidays ({cfg.holidays!r}) but no dates were passed; "
+                "resolve them and pass them in"
+            )
         start, end = cfg.hours.split("-")
         return cls(
             ZoneInfo(cfg.timezone),
             frozenset(_WEEKDAYS.index(d) for d in cfg.workdays),
             dt.time.fromisoformat(start),
             dt.time.fromisoformat(end),
-            frozenset(holidays),
+            frozenset(holidays or ()),
         )
 
     # --- windows ----------------------------------------------------------------------------
@@ -84,15 +94,22 @@ class BusinessCalendar:
             return start.astimezone(dt.UTC)
         now = start.astimezone(dt.UTC)
         left = seconds
+        seen = False
         for day in self._days_from(now):
             win = self.window(day)
             if win is None or win[1] <= now:
                 continue
+            seen = True
             begin = max(win[0], now)
             room = int((win[1] - begin).total_seconds())
             if left <= room:
                 return begin + dt.timedelta(seconds=left)
             left -= room
+        if seen:
+            raise ValueError(
+                f"{seconds} business seconds is more than the next ten years of this calendar "
+                "hold; use a shorter duration"
+            )
         raise ValueError("the calendar has no business time in the next ten years")
 
     def business_seconds_between(self, start: dt.datetime, end: dt.datetime) -> int:
