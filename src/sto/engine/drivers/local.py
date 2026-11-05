@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -72,7 +73,14 @@ from sto.engine.drivers.ports import (
     StillRunning,
     command_key,
 )
-from sto.engine.handlers.core import EffectConfirmed, EffectFailed, RunStarted, StepFailed
+from sto.engine.handlers.cancel import EffectLandedDuringStop, EffectUnresolvedDuringStop
+from sto.engine.handlers.core import (
+    CancelRequested,
+    EffectConfirmed,
+    EffectFailed,
+    RunStarted,
+    StepFailed,
+)
 from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
 from sto.engine.reducer import (
     HandlerRegistry,
@@ -100,8 +108,12 @@ Kind = Literal["command", "event"]
 _REGISTRIES = {"command": COMMANDS, "event": EVENTS}
 _RETRIES = 8
 ACTIVE_PK = "RUNS_ACTIVE"
-# A run idle in one of these is not stuck: a person decides, or it is over.
-_IDLE_OK = frozenset({RunStatus.WAITING_HUMAN, RunStatus.BLOCKED})
+# A run idle in one of these is not stuck: a person decides, an outside result is awaited (a
+# handler enters WAITING_EXTERNAL and the timer or webhook brings the event), or it is over.
+_IDLE_OK = frozenset({RunStatus.WAITING_HUMAN, RunStatus.WAITING_EXTERNAL, RunStatus.BLOCKED})
+# What a stopping run no longer dispatches. A queued RunEffect stays: it may already have been
+# sent, and the Stop must reconcile it.
+_NEVER_AFTER_STOP = frozenset({"run_step", "open_gate"})
 
 
 class RunWedgedError(PermanentError):
@@ -208,6 +220,9 @@ class LocalDriver:
         self._retry_budget = retry_budget
         self._retrying: dict[str, float] = {}
         self._redriver = Redriver(self, redrive, clock=clock, sleep=sleep) if redrive else None
+        # The lease heartbeat has its own thread: a saturated default pool (handler calls, the
+        # API's reads) must not delay a renewal past the lease.
+        self._beat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sto-lease")
 
     @property
     def redriver(self) -> Redriver | None:
@@ -254,6 +269,23 @@ class LocalDriver:
         """Cancel and await the background re-drive tasks. Call it when the driver is done."""
         if self._redriver is not None:
             await self._redriver.aclose()
+        self._beat_pool.shutdown(wait=False, cancel_futures=True)
+
+    async def stop_background(self, run_id: RunId) -> None:
+        """End this run's background re-drive (if any) and wait for it, so nothing re-drives an
+        effect behind a Stop. A later transient failure may spawn a fresh one: that re-drive
+        finishes the Stop."""
+        if self._redriver is not None:
+            await self._redriver.cancel(run_id)
+
+    async def cancel(self, run_id: RunId) -> RunState:
+        """Stop the run through the driver: quiet the background re-drive, queue the request
+        (durable once it returns, whoever drives) and drive. The request is applied before any
+        queued command runs, so it beats an effect not yet sent, and an effect already sent is
+        reconciled by the Stop (see ``handlers/cancel.py``)."""
+        await self.stop_background(run_id)
+        await self.submit(run_id, CancelRequested(run_id))
+        return await self.run_until_idle(run_id)
 
     # --- storage ------------------------------------------------------------------------------
 
@@ -276,10 +308,24 @@ class LocalDriver:
             item.version,
         )
 
-    async def _aload(self, run_id: RunId) -> _Rec:
-        return await asyncio.to_thread(self._load, run_id)
+    @staticmethod
+    async def _in(pool: ThreadPoolExecutor | None, fn: Callable[..., Any], *args: Any) -> Any:
+        if pool is None:
+            return await asyncio.to_thread(fn, *args)
+        return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
 
-    async def _write(self, rec: _Rec, extra: tuple[Put, ...] = (), *, create: bool = False) -> None:
+    async def _aload(self, run_id: RunId, pool: ThreadPoolExecutor | None = None) -> _Rec:
+        rec: _Rec = await self._in(pool, self._load, run_id)
+        return rec
+
+    async def _write(
+        self,
+        rec: _Rec,
+        extra: tuple[Put, ...] = (),
+        *,
+        create: bool = False,
+        pool: ThreadPoolExecutor | None = None,
+    ) -> None:
         run = rec.state.run
         index = Key(ACTIVE_PK, str(run.id))
         finished = run.status.is_terminal and not rec.pending and not rec.inbox
@@ -290,21 +336,27 @@ class LocalDriver:
             Delete(index) if finished else Put(index, {"run_id": str(run.id)}),
             *extra,
         ]
-        await asyncio.to_thread(self._store.transact, self._scope, ops)
+        await self._in(pool, self._store.transact, self._scope, ops)
 
     async def _backoff_sleep(self, delay: float) -> float:
         await self._sleep(delay)
         return delay * 2
 
     async def _commit(
-        self, run_id: RunId, change: _Change, *, owner: bool = True, attempts: int = _RETRIES
+        self,
+        run_id: RunId,
+        change: _Change,
+        *,
+        owner: bool = True,
+        attempts: int = _RETRIES,
+        pool: ThreadPoolExecutor | None = None,
     ) -> None:
         """Load, apply ``change`` (pure), write. Reload and retry, with backoff, on a lost
         race or a conflict. ``owner`` commits require our lease and renew it."""
         delay = self._backoff
         for attempt in range(attempts):
             try:
-                rec = await self._aload(run_id)
+                rec = await self._aload(run_id, pool)
                 if owner and (rec.lease is None or rec.lease["owner"] != self._owner):
                     raise LeaseLostError(f"run {run_id} is no longer leased to {self._owner!r}")
                 new, extra = change(rec)
@@ -312,7 +364,7 @@ class LocalDriver:
                     return
                 if owner:
                     new = dataclasses.replace(new, lease=self._stamp())
-                await self._write(new, extra)
+                await self._write(new, extra, pool=pool)
                 return
             except (ConditionFailedError, TransactionConflictError):
                 if attempt == attempts - 1:
@@ -449,15 +501,23 @@ class LocalDriver:
         """Renew the lease while a command executes, so a long one does not lose the run. A
         store error that is not a lost lease is retried until the lease would run out; losing the
         lease for real ends the heartbeat (and so the command)."""
-        lease = (await self._aload(run_id)).lease
-        expires = lease["expires"] if lease else self._clock()
+        try:
+            lease = (await self._aload(run_id, self._beat_pool)).lease
+            expires = lease["expires"] if lease else self._clock()
+        except Exception:  # noqa: BLE001 - a store blip on the first read must not abort the command
+            # The lease was ours with more than half its time left when the command started
+            # (``_holds``), so that much is certain; the first renewal below proves the rest.
+            expires = self._clock() + self._ttl / 2
         while True:
             await asyncio.sleep(self._ttl / 3)
             for attempt in range(_RETRIES):
                 started = self._clock()
                 try:
                     await self._commit(
-                        run_id, lambda r: (dataclasses.replace(r), ()), attempts=1
+                        run_id,
+                        lambda r: (dataclasses.replace(r), ()),
+                        attempts=1,
+                        pool=self._beat_pool,
                     )  # one try: the retries below are bounded by the lease, not by backoff
                     expires = started + self._ttl  # the stamp is at least this late
                     break
@@ -625,6 +685,9 @@ class LocalDriver:
         wire, rest = rec.inbox[0], rec.inbox[1:]
         event = decode(wire, "event")
         run_id = rec.state.run.id
+        stopped = self._while_stopping(rec.state, event)
+        if stopped is not event:
+            event, wire = stopped, encode(stopped, "event")
 
         def entry(outcome: str, state: RunState, detail: str = "") -> tuple[Put, ...]:
             data = {
@@ -650,6 +713,14 @@ class LocalDriver:
             nxt = dataclasses.replace(rec, inbox=rest, next_evt=rec.next_evt + 1)
             return nxt, entry(reason, rec.state, str(e))
         seq = rec.next_seq
+        status = tr.state.run.status
+        kept = rec.pending
+        if status is RunStatus.CANCELLING or status.is_terminal:
+            # A stopping run dispatches no new step or gate: one not yet started is dropped (a
+            # step already running finds its result unwanted). A queued RunEffect stays even
+            # after the run ends: it may have been sent, and the executor reconciles or refuses
+            # it on a dead run, never writes it.
+            kept = tuple(c for c in rec.pending if c["cmd"]["type"] not in _NEVER_AFTER_STOP)
         cmds = tuple(
             {"key": command_key(c, seq + i), "cmd": encode(c, "command")}
             for i, c in enumerate(tr.commands)
@@ -658,11 +729,29 @@ class LocalDriver:
             rec,
             state=tr.state,
             inbox=rest,
-            pending=(*rec.pending, *cmds),
+            pending=(*kept, *cmds),
             next_seq=seq + len(cmds),
             next_evt=rec.next_evt + 1,
         )
         return nxt, entry("applied", tr.state)
+
+    @staticmethod
+    def _while_stopping(rs: RunState, event: Any) -> Any:
+        """A run that is stopping refuses ``EffectConfirmed`` and ``EffectFailed``, which would
+        lose an effect that was already sent. Turn them into the records ``handlers/cancel.py``
+        defines: a landed effect (a merge then gets its revert) and an unresolved one. Decided at
+        apply time, because that is the only moment the status is known: the effect may have been
+        sent while the run was RUNNING and heard about after the Stop was applied."""
+        if rs.run.status is not RunStatus.CANCELLING:
+            return event
+        if isinstance(event, EffectConfirmed):
+            head = rs.subject.head_sha if rs.subject else None
+            return EffectLandedDuringStop(
+                event.run_id, event.effect, event.visit, event.merge_sha, head
+            )
+        if isinstance(event, EffectFailed) and event.reason == "blocked":
+            return EffectUnresolvedDuringStop(event.run_id, event.effect, event.visit, "blocked")
+        return event
 
     @staticmethod
     def _done(

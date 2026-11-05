@@ -89,6 +89,8 @@ _DEAD = frozenset(
 )
 _APPROVING = frozenset({DecisionKind.APPROVE, DecisionKind.WAIVE})
 _TRIES = 8
+_VOID_BACKOFF = 0.005  # Stop's wait after a lost race on an effect, doubling to the cap
+_VOID_BACKOFF_CAP = 0.2
 _CARRIED = ("subject", "floor")  # envelope fields that outlive every state change
 # The lease. A worker that is slow but alive can lose its lease and still write: a second worker
 # takes over and calls the writer with the same key (reproduced: writer calls [A, B]). The fence
@@ -114,11 +116,13 @@ class ExecResult:
 
 @dataclass(frozen=True)
 class StopReport:
-    """What Stop found: effects it voided, and effects that were tried (ATTEMPTING, RETRYING,
-    ACCEPTED), which may have landed and need reconciling (PLAN 14.3)."""
+    """What Stop found: effects it voided, effects that were tried (ATTEMPTING, RETRYING,
+    ACCEPTED), which may have landed and need reconciling (PLAN 14.3), and effects already
+    CONFIRMED, which did land (D2-11: a confirmed merge must not vanish from Stop's report)."""
 
     voided: tuple[Effect, ...] = ()
     in_flight: tuple[Effect, ...] = ()
+    landed: tuple[Effect, ...] = ()  # CONFIRMED: the write happened (a merge needs its revert)
 
 
 @dataclass(frozen=True)
@@ -164,13 +168,14 @@ class EffectExecutor:
         max_attempts: int = 3,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self._store, self._scope, self._max = store, scope, max_attempts
-        self._lease, self._clock = lease_seconds, clock
+        self._lease, self._clock, self._sleep = lease_seconds, clock, sleep
 
     # --- records ----------------------------------------------------------------------------
 
@@ -670,16 +675,21 @@ class EffectExecutor:
         one wins."""
         voided: list[Effect] = []
         in_flight: list[Effect] = []
+        landed: list[Effect] = []
         for first in self._all(run_id):
             key = first.effect.idempotency_key
-            for _ in range(_TRIES):
+            for attempt in range(_TRIES):
                 rec = self._load(run_id, key)
                 if rec.effect.status is EffectStatus.PLANNED:
                     done = rec.effect.advance(EffectStatus.VOIDED)
                     try:
                         self._save(rec, done, {"reason": "cancelled"})
                     except (ConditionFailedError, TransactionConflictError):
-                        continue  # a claim won; re-read and report it as in flight
+                        # A claim, or another writer, won: back off, re-read and report what is
+                        # there. Giving up quietly would report an effect nobody looked at as
+                        # "nothing to stop", so a Stop that cannot settle it raises (below).
+                        self._sleep(min(_VOID_BACKOFF * 2**attempt, _VOID_BACKOFF_CAP))
+                        continue
                     voided.append(done)
                 elif rec.effect.status in (
                     EffectStatus.ATTEMPTING,
@@ -687,5 +697,12 @@ class EffectExecutor:
                     EffectStatus.ACCEPTED,
                 ):
                     in_flight.append(rec.effect)
+                elif rec.effect.status is EffectStatus.CONFIRMED:
+                    landed.append(rec.effect)
                 break
-        return StopReport(tuple(voided), tuple(in_flight))
+            else:
+                raise TransientError(
+                    f"effect {key!r} kept changing while the run was being stopped: "
+                    "its Stop is not settled, try again"
+                )
+        return StopReport(tuple(voided), tuple(in_flight), tuple(landed))

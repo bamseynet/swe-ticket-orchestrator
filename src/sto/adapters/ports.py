@@ -380,6 +380,14 @@ class ScmProvider(Protocol):
         self, pr: PrRef, expected_sha: str, method: MergeMethod, key: IdempotencyKey
     ) -> MergeHandle: ...
     def poll_merge(self, handle: MergeHandle) -> MergeResult: ...
+    def find_merge(self, pr: PrRef) -> MergeResult | None:
+        """Read-only: did a merge of this PR land, or is one queued? Stop needs it because
+        ``dequeue`` only cancels. ``MERGED`` (with ``merge_sha`` and a receipt) wins over
+        ``PENDING``; ``None`` means a merge neither landed nor could, which a failed or dequeued
+        one does not change. An unknown PR raises ``UnknownRefError`` and a failed read raises:
+        neither is ever answered with ``None``. D4-06 implements it for GitHub."""
+        ...
+
     def dequeue(self, pr: PrRef, expected_head: str) -> Receipt: ...
     def trigger_workflow(
         self, repo: RepoRef, spec: DispatchSpec, key: IdempotencyKey

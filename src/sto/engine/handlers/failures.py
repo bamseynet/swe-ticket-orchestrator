@@ -470,6 +470,14 @@ class Redriver:
         task.add_done_callback(lambda t: self._settle(run_id, t))
         return task
 
+    async def cancel(self, run_id: RunId) -> None:
+        """End this run's background drive, if any, and wait for it (D2-11: a Stop must not race
+        a re-drive that is about to run an effect). Asking again for the run starts a fresh one."""
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def aclose(self) -> None:
         """Cancel the background drives and wait for them to end."""
         tasks = [t for t in self._tasks.values() if not t.done()]

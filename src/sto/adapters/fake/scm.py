@@ -227,6 +227,15 @@ class FakeScm(FakeBase):
         merge = self._resolve(self._merge(handle))
         return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason)
 
+    def find_merge(self, pr: PrRef) -> MergeResult | None:
+        self._pr(pr)  # an unknown PR is an error, never "no merge"
+        found = [self._resolve(m) for m in self._merges.values() if m.pr == pr]
+        for state in (MergeState.MERGED, MergeState.PENDING):
+            for merge in found:
+                if merge.state is state:
+                    return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason)
+        return None
+
     def ci_trust(self, repo: RepoRef) -> CiTrustReport:
         return CiTrustReport(self.trusted, () if self.trusted else ("fake: untrusted",))
 
