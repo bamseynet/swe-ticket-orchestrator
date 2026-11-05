@@ -385,7 +385,7 @@ This is the static generalisation of the LangGraph PoC's topology test, and it a
 Ship `standard` as the template, and Kanban and regulated as overlays on it, each with a README.
 All later suites run against all of them.
 **AC:** all validate; each has a README on when to use it, and which checks to require; PLAN.md examples match, or a test explains why not. The bundled policy names the `pre_push` and custom surfaces. The Kanban README shows `quorum: [{role: qa, count: 1}]`, which an org requiring `qa_gate` with role `qa` needs.
-**Deps:** D2-02, D2-03, D2-04. **Size:** S. **Run:** parallel. **Files:** `templates/`, `tests/config/test_templates.py`.
+**Deps:** D2-02, D2-03, D2-04. **Size:** S. **Run:** parallel. **Files:** `templates/`, `tests/config/test_templates.py`, `tests/config/bundled_templates.py` (an importable helper so later suites can run against every bundled template).
 
 #### D2-06: Reducer v1
 Run any validated workflow for `agent`, `review_panel`, `gate`, `effect` and `terminal` stages through the handler registry, with named loops, step limits and the visited-gates rule.
