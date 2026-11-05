@@ -10,6 +10,12 @@ stage, visit, attempt, round or subject differs from the live state is refused w
 ``OutOfOrderEventError`` and changes nothing, so a late or duplicate event cannot act.
 A malformed event (missing subject, decision not allowed at the gate) raises
 ``MalformedEventError`` instead.
+
+Two kinds of workflow run through ``next``. The linear ``Workflow`` of D1-02 (``LINEAR_V0``) is
+handled by ``HANDLERS``. A validated graph ``Workflow`` from ``sto.config.schema`` (D2-01, passed
+by D2-03) is handled by ``GRAPH_HANDLERS`` (reducer v1, ``handlers/stages.py``), which relies on
+the structural validator instead of re-checking it. The two registries are separate because an
+event type has one handler per workflow kind.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import (
     DecisionId,
     DecisionKind,
@@ -169,9 +176,19 @@ class RunState:
     subject: Subject | None = None
     approvals: tuple[Approval, ...] = ()
     visits: tuple[tuple[str, int], ...] = ()
+    # Graph workflows (reducer v1): uses of each named loop, stage entries so far (against
+    # ``max_steps_per_run``), merge SHAs, and the gates reached by a ticket-field route, which
+    # stay required once visited (PLAN 4.3 rule 2; the route stage sets them, D2-23).
+    loops: tuple[tuple[str, int], ...] = ()
+    steps: int = 0
+    merges: tuple[str, ...] = ()
+    routed_gates: tuple[str, ...] = ()
 
     def count(self, node: str) -> int:
         return dict(self.visits).get(node, 0)
+
+    def loop_count(self, loop: str) -> int:
+        return dict(self.loops).get(loop, 0)
 
 
 @dataclass(frozen=True)
@@ -185,7 +202,7 @@ class Event(Protocol):
     def run_id(self) -> RunId: ...
 
 
-Handler = Callable[[RunState, Any, Workflow], Transition]
+Handler = Callable[[RunState, Any, Any], Transition]
 
 
 class HandlerRegistry:
@@ -202,6 +219,7 @@ class HandlerRegistry:
 
 
 HANDLERS = HandlerRegistry()
+GRAPH_HANDLERS = HandlerRegistry()
 
 
 def handles(
@@ -212,6 +230,16 @@ def handles(
         return fn
 
     return deco
+
+
+def handles_graph(event_type: type) -> Callable[[Handler], Handler]:
+    """Register a handler for runs of a graph ``Workflow`` (reducer v1)."""
+    return handles(event_type, registry=GRAPH_HANDLERS)
+
+
+def workflow_version(workflow: Workflow | GraphWorkflow) -> str:
+    """What a run pins: the linear version, or a graph workflow's name (D2-07 pins its digest)."""
+    return workflow.metadata.name if isinstance(workflow, GraphWorkflow) else workflow.version
 
 
 DEFAULT_PACKAGE = "sto.engine.handlers"
@@ -238,21 +266,27 @@ def load_handlers(package: str = DEFAULT_PACKAGE) -> None:
 def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     state: RunState,
     event: Event,
-    workflow: Workflow,
+    workflow: Workflow | GraphWorkflow,
     *,
     registry: HandlerRegistry | None = None,
+    graph_registry: HandlerRegistry | None = None,
 ) -> Transition:
-    if registry is None:
+    if isinstance(workflow, GraphWorkflow):
+        chosen = graph_registry
+        default = GRAPH_HANDLERS
+    else:
+        chosen = registry
+        default = HANDLERS
+    if chosen is None:
         if DEFAULT_PACKAGE not in _loaded:
             raise HandlersNotLoadedError("call load_handlers() at startup before next()")
-        registry = HANDLERS
-    handler = registry.get(type(event))
+        chosen = default
+    handler = chosen.get(type(event))
     if handler is None:
         raise NoHandlerError(f"no handler for {type(event).__name__}")
     if event.run_id != state.run.id:
         raise OutOfOrderEventError(f"{type(event).__name__} is for another run")
-    if state.run.workflow_version not in (None, workflow.version):
-        raise WorkflowMismatchError(
-            f"run is on {state.run.workflow_version!r}, not {workflow.version!r}"
-        )
+    version = workflow_version(workflow)
+    if state.run.workflow_version not in (None, version):
+        raise WorkflowMismatchError(f"run is on {state.run.workflow_version!r}, not {version!r}")
     return handler(state, event, workflow)
