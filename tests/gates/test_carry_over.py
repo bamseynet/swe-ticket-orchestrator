@@ -65,7 +65,7 @@ def vote(
     return Vote(who, role, kind)
 
 
-def allow_all(_actor: str, _gate: Gate) -> bool:
+def allow_all(_actor: str, _role: str, _gate: Gate) -> bool:
     return True
 
 
@@ -124,7 +124,8 @@ class World:
         merge_base: str = B1,
         patch_files: frozenset[str] = frozenset({"app.py"}),
         base_range: BaseRange | None = None,
-        recheck: Callable[[str, Gate], bool] | None = None,
+        recheck: Callable[[str, str, Gate], bool] | None = None,
+        patch_ids_since: tuple[str, ...] | None = None,
         previous_gate_id: GateId | None = None,
         round_: int | None = None,
         history: list[GateInstance] | None = None,
@@ -151,9 +152,9 @@ class World:
             plan = dataclasses.replace(plan, round=round_)
         gate = Gate(GateId.new(), self.run_id, NAME, self.gate_type, rnd, sub)
 
-        def port(who: str, g: Gate) -> bool:
+        def port(who: str, role: str, g: Gate) -> bool:
             self.asked.append(who)
-            return (recheck or allow_all)(who, g)
+            return (recheck or allow_all)(who, role, g)
 
         return evaluate_carry_over(
             gate=gate,
@@ -164,6 +165,7 @@ class World:
             merge_base=merge_base,
             patch_files=patch_files,
             base_range=base_range,
+            patch_ids_since=(patch,) if patch_ids_since is None else patch_ids_since,
             recheck=port,
         )
 
@@ -333,7 +335,7 @@ def test_G13_a_plan_linked_to_nothing_cannot_cite() -> None:
 
 def test_G13_a_round_that_skips_the_most_recent_cannot_cite() -> None:
     w, _ = approved_world()
-    refused(w.decide(round_=3), "not_most_recent")
+    refused(w.decide(round_=3), "inconsistent_history")
 
 
 def test_G13_history_of_another_gate_is_refused() -> None:
@@ -390,15 +392,23 @@ def test_G13_a_chain_that_crosses_a_retest_does_not_carry() -> None:
     w = World()
     r1 = w.add(A, "P1")
     w.add(X.RETEST, "P1")
-    w.add(A, "P1", carried_from=r1)  # forged: round 2 should have stopped this
-    refused(w.decide(), "non_approved_close_since")
+    w.add(A, "P1", carried_from=r1)  # forged: skips round 2, which should have stopped this
+    refused(w.decide(), "broken_chain")
+
+
+def test_G13_a_chain_through_a_retest_round_does_not_carry() -> None:
+    w = World()
+    r1 = w.add(A, "P1")
+    r2 = w.add(X.RETEST, "P1", carried_from=r1)
+    w.add(A, "P1", carried_from=r2)
+    refused(w.decide(), "non_approved_close_since:2:RETEST")
 
 
 def test_G13_a_chain_that_crosses_a_patch_change_does_not_carry() -> None:
     w = World()
     r1 = w.add(A, "P1")
-    w.add(A, "P2")
-    w.add(A, "P1", carried_from=r1)
+    r2 = w.add(A, "P2", carried_from=r1)
+    w.add(A, "P1", carried_from=r2)
     refused(w.decide(), "patch_changed")
 
 
@@ -497,28 +507,28 @@ def test_G13_a_vote_must_be_an_approval() -> None:
 
 def test_G13_an_approver_who_is_no_longer_eligible_blocks_carry_over() -> None:
     w, _ = approved_world()
-    refused(w.decide(recheck=lambda who, _g: False), f"approver_ineligible:{ALICE}")
+    refused(w.decide(recheck=lambda who, _r, _g: False), f"approver_ineligible:{ALICE}")
 
 
 def test_G13_one_ineligible_approver_among_several_blocks_carry_over() -> None:
     w = World()
     w.add(A, "P1", votes=(vote(ALICE), vote(BOB)))
-    result = w.decide(recheck=lambda who, _g: who != BOB)
+    result = w.decide(recheck=lambda who, _r, _g: who != BOB)
     refused(result, f"approver_ineligible:{BOB}")
     assert f"approver_ineligible:{ALICE}" not in result.reasons
 
 
 def test_G13_the_port_must_answer_true_exactly() -> None:
     w, _ = approved_world()
-    refused(w.decide(recheck=lambda who, _g: 1), f"approver_ineligible:{ALICE}")  # type: ignore[arg-type,return-value]
-    refused(w.decide(recheck=lambda who, _g: None), f"approver_ineligible:{ALICE}")  # type: ignore[arg-type,return-value]
+    refused(w.decide(recheck=lambda who, _r, _g: 1), f"approver_ineligible:{ALICE}")  # type: ignore[arg-type,return-value]
+    refused(w.decide(recheck=lambda who, _r, _g: None), f"approver_ineligible:{ALICE}")  # type: ignore[arg-type,return-value]
 
 
 def test_G13_the_port_is_asked_about_the_new_round() -> None:
     w, _ = approved_world()
     seen: list[Gate] = []
 
-    def port(_who: str, gate: Gate) -> bool:
+    def port(_who: str, _role: str, gate: Gate) -> bool:
         seen.append(gate)
         return True
 
@@ -529,7 +539,7 @@ def test_G13_the_port_is_asked_about_the_new_round() -> None:
 def test_G13_a_failing_port_is_a_fault_not_a_verdict() -> None:
     w, _ = approved_world()
 
-    def broken(_who: str, _g: Gate) -> bool:
+    def broken(_who: str, _role: str, _g: Gate) -> bool:
         raise RuntimeError("identity store down")
 
     with pytest.raises(RuntimeError, match="identity store down"):
@@ -735,6 +745,7 @@ def _decide_pre_push(w: World, *, patch: str = "P1", ticket: str = "T1") -> Carr
         merge_base=B1,
         patch_files=frozenset({"app.py"}),
         base_range=None,
+        patch_ids_since=(patch,),
         recheck=allow_all,
     )
 
@@ -812,14 +823,16 @@ def test_G13_a_patch_change_invalidates_approved_rounds_of_the_old_patch() -> No
     r1 = w.add(A, "P1")
     w.add(A, "P2")
     r3 = w.add(A, "P1", carried_from=r1)
-    assert invalidated_by_patch(tuple(w.history), "P2") == (r1.id, r3.id)
-    assert invalidated_by_patch(tuple(w.history), "P1") == (w.history[1].gate.id,)
+    assert invalidated_by_patch(tuple(w.history), "P2", gate=w.history[-1].gate) == (r1.id, r3.id)
+    assert invalidated_by_patch(tuple(w.history), "P1", gate=w.history[-1].gate) == (
+        w.history[1].gate.id,
+    )
 
 
 def test_G13_a_patch_change_leaves_closed_non_approved_rounds_alone() -> None:
     w = World()
     w.add(X.REJECTED, "P1")
-    assert invalidated_by_patch(tuple(w.history), "P2") == ()
+    assert invalidated_by_patch(tuple(w.history), "P2", gate=w.history[-1].gate) == ()
 
 
 def test_G13_a_patch_invalidated_round_is_not_revived_by_returning_to_the_patch() -> None:
@@ -905,6 +918,7 @@ def test_G13_a_gate_that_is_not_open_is_refused() -> None:
         "merge_base": B1,
         "patch_files": frozenset({"app.py"}),
         "base_range": None,
+        "patch_ids_since": ("P1",),
         "recheck": allow_all,
     }
     refused(evaluate_carry_over(gate=closed, plan=plan, **common), "plan_mismatch")  # type: ignore[arg-type]
@@ -932,6 +946,7 @@ def test_G13_evaluate_wants_a_gate_and_a_plan() -> None:
             merge_base=B1,
             patch_files=frozenset({"a"}),
             base_range=None,
+            patch_ids_since=("P1",),
             recheck=allow_all,
         )
 
@@ -939,8 +954,8 @@ def test_G13_evaluate_wants_a_gate_and_a_plan() -> None:
 def test_G13_the_blocking_round_is_named_in_the_reason() -> None:
     w = World()
     r1 = w.add(A, "P1")
-    w.add(X.RETEST, "P1")
-    w.add(A, "P1", carried_from=r1)
+    r2 = w.add(X.RETEST, "P1", carried_from=r1)
+    w.add(A, "P1", carried_from=r2)
     result = w.decide()
     assert "non_approved_close_since:2:RETEST" in result.reasons
 
@@ -948,7 +963,7 @@ def test_G13_the_blocking_round_is_named_in_the_reason() -> None:
 def test_G13_invalidation_by_patch_needs_a_patch_id() -> None:
     w, _ = approved_world()
     with pytest.raises(ValueError, match="patch_id"):
-        invalidated_by_patch(tuple(w.history), " ")
+        invalidated_by_patch(tuple(w.history), " ", gate=w.history[0].gate)
 
 
 @pytest.mark.parametrize("cls", [Vote, GateInstance, BaseRange, CarryOverDecision, Citation])
@@ -967,3 +982,176 @@ def test_G13_records_are_frozen(cls: type) -> None:
 
 def test_G13_a_base_range_stores_its_files_as_a_set() -> None:
     assert BaseRange(B1, B2, ["a.py", "a.py"]).files == frozenset({"a.py"})  # type: ignore[arg-type]
+
+
+# --- pass 1 review: fail-open inputs ----------------------------------------------------
+
+
+def test_G13_P1_P2_P1_asks_again_when_P2_never_reached_this_gate() -> None:
+    w, _ = approved_world()  # round 1 approved P1; the run then pushed P2 and back to P1
+    refused(w.decide(patch="P1", patch_ids_since=("P2", "P1")), "patch_changed_since")
+    assert w.decide(patch="P1", patch_ids_since=("P1", "P1")).carried  # twin: nothing moved
+
+
+def test_G13_patch_ids_since_is_required_and_must_not_be_empty() -> None:
+    w, _ = approved_world()
+    refused(w.decide(patch_ids_since=()), "patch_history_unknown")
+    with pytest.raises(TypeError, match="patch_ids_since"):
+        w.decide(patch_ids_since="P1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="patch id"):
+        w.decide(patch_ids_since=(" ",))
+
+
+def test_G13_patch_ids_since_is_measured_from_the_human_decision_not_the_last_hop() -> None:
+    w = World()
+    r1 = w.add(A, "P1")
+    w.add(A, "P1", carried_from=r1)
+    refused(w.decide(patch_ids_since=("P1", "P2", "P1")), "patch_changed_since")
+
+
+def test_G13_a_history_with_a_missing_round_does_not_carry() -> None:
+    w = World()
+    w.add(A, "P1")
+    w.add(X.CHANGES_REQUESTED, "P1")
+    w.add(A, "P1", votes=(vote(BOB),))
+    gap = [w.history[0], w.history[2]]  # round 2, the veto, is not in the list
+    refused(w.decide(history=gap), "inconsistent_history")
+    assert w.decide().carried  # twin: the whole history carries from round 3
+
+
+def test_G13_a_history_that_starts_after_round_one_does_not_carry() -> None:
+    w = World()
+    w.add(A, "P1")
+    w.add(A, "P1", votes=(vote(BOB),))
+    refused(w.decide(history=[w.history[1]]), "inconsistent_history")
+
+
+def test_G13_a_carried_round_must_cite_the_round_immediately_before() -> None:
+    w = World()
+    r1 = w.add(A, "P1")
+    w.add(A, "P1", votes=(vote(BOB),))  # round 2, decided by a person
+    w.add(A, "P1", carried_from=r1)  # skips round 2
+    refused(w.decide(), "broken_chain")
+
+
+def test_G13_the_port_confirms_the_role_a_person_voted_as() -> None:
+    w = World()
+    w.add(A, "P1", votes=(vote(ALICE, "qa"), vote(BOB, "dev")))
+    asked: list[tuple[str, str]] = []
+
+    def port(who: str, role: str, _g: Gate) -> bool:
+        asked.append((who, role))
+        return True
+
+    assert w.decide(recheck=port, quorum=(Quorum(role="qa", count=1),)).carried
+    assert asked == [(ALICE, "qa"), (BOB, "dev")]
+
+
+def test_G13_someone_who_lost_the_role_they_voted_as_does_not_count_for_it() -> None:
+    w = World()
+    w.add(A, "P1", votes=(vote(ALICE, "qa"),))
+    # alice kept another eligible role, but no longer holds qa
+    result = w.decide(
+        recheck=lambda who, role, _g: role != "qa",
+        quorum=(Quorum(role="qa", count=1),),
+    )
+    refused(result, f"approver_ineligible:{ALICE}")
+    assert "quorum_not_met" in result.reasons
+
+
+def test_G13_only_confirmed_pairs_count_toward_the_quorum() -> None:
+    w = World()
+    w.add(A, "P1", votes=(vote(ALICE, "qa"), vote(BOB, "dev")))
+    quorum = (Quorum(role="qa", count=1), Quorum(role="dev", count=1))
+    refused(w.decide(quorum=quorum, recheck=lambda who, _r, _g: who == ALICE), "quorum_not_met")
+
+
+# --- pass 1 review: pins ----------------------------------------------------------------
+
+
+def test_G13_an_empty_base_range_on_a_moved_base_is_unknown_unless_complete() -> None:
+    w, _ = approved_world()
+    refused(
+        w.decide(merge_base=B2, base_range=BaseRange(B1, B2, frozenset())), "base_range_unknown"
+    )
+    assert w.decide(merge_base=B2, base_range=BaseRange(B1, B2, frozenset(), complete=True)).carried
+
+
+def test_G13_an_empty_complete_range_still_refuses_for_other_commits() -> None:
+    w, _ = approved_world()
+    rng = BaseRange(B2, B2, frozenset(), complete=True)
+    refused(w.decide(merge_base=B2, base_range=rng), "base_range_unknown")
+
+
+def test_G13_a_base_range_complete_flag_is_a_bool() -> None:
+    with pytest.raises(TypeError, match="complete"):
+        BaseRange(B1, B2, frozenset(), complete="yes")  # type: ignore[arg-type]
+
+
+def test_G13_a_base_move_in_a_chain_is_measured_from_the_human_decision() -> None:
+    w = World()
+    r1 = w.add(A, "P1", merge_base=B1)
+    w.add(A, "P1", carried_from=r1, merge_base=B2)
+    refused(w.decide(merge_base=B2, base_range=None), "base_range_unknown")
+
+
+def test_G13_a_carry_from_a_retest_origin_refuses() -> None:
+    w = World()
+    r1 = w.add(X.RETEST, "P1")
+    w.add(A, "P1", carried_from=r1)
+    refused(w.decide(), "non_approved_close_since:1:RETEST")
+
+
+def test_G13_history_of_another_gate_type_is_refused() -> None:
+    w, _ = approved_world()
+    other = dataclasses.replace(w.history[0].gate, type=GateType.QA)
+    refused(
+        w.decide(history=[dataclasses.replace(w.history[0], gate=other)]), "inconsistent_history"
+    )
+
+
+def test_G13_dot_segments_in_a_path_are_normalised() -> None:
+    w, _ = approved_world()
+    result = w.decide(
+        merge_base=B2,
+        patch_files=frozenset({"src/./app.py"}),
+        base_range=BaseRange(B1, B2, frozenset({"src/app.py"})),
+    )
+    refused(result, "base_range_touches_patch")
+    assert w.decide(
+        merge_base=B2,
+        patch_files=frozenset({"src/./app.py"}),
+        base_range=BaseRange(B1, B2, frozenset({"src/other.py"})),
+    ).carried
+
+
+def test_G13_a_person_counts_once_in_their_first_role() -> None:
+    w = World()
+    w.add(A, "P1", votes=(vote(ALICE, "qa"), vote(ALICE, "dev")))
+    assert w.decide(quorum=(Quorum(role="qa", count=1),)).carried
+    refused(w.decide(quorum=(Quorum(role="dev", count=1),)), "quorum_not_met")
+
+
+def test_G13_an_empty_quorum_is_never_met() -> None:
+    w, _ = approved_world()
+    refused(w.decide(quorum=()), "quorum_not_met")
+
+
+def test_G13_invalidated_by_close_ignores_another_run() -> None:
+    w, r1 = approved_world()
+    foreign = dataclasses.replace(w.history[0].gate, run_id=RunId.new(), id=GateId.new())
+    history = (w.history[0], dataclasses.replace(w.history[0], gate=foreign))
+    closing = Gate(GateId.new(), w.run_id, NAME, GateType.REVIEW, 2, subject("a" * 40), X.REJECTED)
+    assert invalidated_by_close(history, closing) == (r1.id,)
+
+
+def test_G13_invalidated_by_patch_filters_by_gate_name_and_run() -> None:
+    w, r1 = approved_world()
+    other_name = dataclasses.replace(w.history[0].gate, name="qa", id=GateId.new())
+    other_run = dataclasses.replace(w.history[0].gate, run_id=RunId.new(), id=GateId.new())
+    history = (
+        w.history[0],
+        dataclasses.replace(w.history[0], gate=other_name),
+        dataclasses.replace(w.history[0], gate=other_run),
+    )
+    assert invalidated_by_patch(history, "P2", gate=r1) == (r1.id,)

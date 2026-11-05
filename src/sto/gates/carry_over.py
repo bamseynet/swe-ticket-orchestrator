@@ -20,11 +20,16 @@ at once, since the rest would rest on it.
    and leaves earlier rounds ``APPROVED``, so the walk reads the instances themselves.
    Waived approvals never carry (a waiver is recorded per criterion, with a reason, and is not
    extended silently).
-2. Its ``patch_id`` equals the current one, and so does that of every instance since the decision.
-   P1, P2, P1 asks again (``patch_changed``).
+2. Its ``patch_id`` equals the current one, and so does that of every instance since the decision
+   (``patch_changed``), and that of every subject the *run* has had since (``patch_ids_since``,
+   required, ``patch_changed_since``): a push that never reached a round of this gate still counts,
+   so P1, P2, P1 asks again whether or not P2 opened a round. No ids at all is
+   ``patch_history_unknown``.
 3. Every approver it cites passes the **approver port** (``ApproverRecheck``), which D3-05's
-   ``sod.evaluate`` fills: eligible now and when the gate opened, and separation of duties against
-   the current commits (``approver_ineligible:<actor>``). The answer must be exactly ``True``.
+   ``sod.evaluate`` fills, asked per ``(actor, role)`` with the role they voted as: they still hold
+   that role, were eligible when the gate opened, and separation of duties holds against the
+   current commits (``approver_ineligible:<actor>``). The answer must be exactly ``True``, and
+   only confirmed pairs count toward the quorum again.
    The port is asked only when every other condition holds, so a refusal costs no lookups. A port
    that raises propagates: it is a fault, never a verdict.
 4. The ticket revision is unchanged (``ticket_revision_changed``).
@@ -32,20 +37,29 @@ at once, since the rest would rest on it.
 6. The base range changed no file in the patch (``base_range_touches_patch:<path>``). The range
    runs from the merge base the *human* decision was made on (the origin of a chain of
    carry-overs) to the current one, and is refused when it is for other commits or missing while
-   the base moved (``base_range_unknown``). A patch with no known files refuses
+   the base moved (``base_range_unknown``), and so is an empty range on a moved base unless its
+   producer marks it ``complete`` (an empty list is also what a failed read looks like). A patch
+   with no known files refuses
    (``patch_files_unknown``). Paths are compared after NFC and case folding, and a path that
    contains or is contained by another counts as touched, so a file that became a directory, or
    the reverse, and a case-insensitive checkout do not slip through.
 
+The history must be exactly rounds 1 to ``gate.round - 1`` of this run, gate name and type, or it
+is ``inconsistent_history``: a missing round could hide a close.
+
 A carried instance has no votes of its own. It names the instance it carried from
-(``GateInstance.carried_from``) and the walk follows that to the original human decision, whose
-votes are the ones cited. A broken chain (missing, cyclic, pointing forward) refuses
-(``broken_chain``).
+(``GateInstance.carried_from``), which must be the round immediately before it, and the walk
+follows that to the original human decision, whose votes are the ones cited. A broken chain
+(missing, cyclic, skipping a round) refuses (``broken_chain``).
+
+A retest (or any close) on a *different* gate does not block carry-over here: PLAN's "never
+crosses a QA retest" is read as the retest of this gate's own line, which is what the walk sees.
 
 Invalidation. :func:`invalidated_by_close` lists the earlier approved rounds a non-approved close
 voids (PLAN 4.3 rule 3), and :func:`invalidated_by_patch` those approved on another patch (a patch
-change invalidates permanently). They agree with the gate service's ``_earlier_approvals`` and with
-the reducer, which drops a gate's approvals on any non-approved close.
+change invalidates permanently). Carry-over does not depend on either being called. They agree
+with the gate service's ``_earlier_approvals`` and with the reducer, which drops a gate's
+approvals on any non-approved close.
 
 Not here: opening or closing the gate (``GateService``), the audit entry, reading commits and
 diffs (``git diff --name-only`` for the patch and for the base range), or the eligibility lookup
@@ -149,23 +163,32 @@ def _paths(label: str, paths: Collection[str]) -> frozenset[str]:
 @dataclass(frozen=True)
 class BaseRange:
     """The files the base changed between two merge bases (``git diff --name-only -z`` with
-    renames turned off, so both sides of a rename appear)."""
+    renames turned off, so both sides of a rename appear).
+
+    ``complete`` is the producer's statement that the list is whole: the output ended in its
+    final NUL and nothing was dropped. An empty list on a moved base is believed only when it is
+    set, because an empty list is also what a truncated or failed read looks like."""
 
     from_base: str
     to_base: str
     files: frozenset[str]
+    complete: bool = False  # the caller vouches the list is whole (see the module docstring)
 
     def __post_init__(self) -> None:
+        if type(self.complete) is not bool:
+            raise TypeError("base range complete must be a bool")
         _nonblank("base range from_base", self.from_base)
         _nonblank("base range to_base", self.to_base)
         object.__setattr__(self, "files", _paths("base range path", self.files))
 
 
 class ApproverRecheck(Protocol):
-    """The approver port (D3-05 fills it with ``sod.evaluate`` and the current mapping): may
-    ``actor`` (``issuer|subject``) still decide ``gate``, the re-entered round? ``True`` or no."""
+    """The approver port (D3-05 fills it with ``sod.evaluate`` and the current mapping): does
+    ``actor`` (``issuer|subject``) still hold ``role``, the quorum role they voted as, and may they
+    still decide ``gate``, the re-entered round, as far as separation of duties goes? ``True`` or
+    no. Only a confirmed ``(actor, role)`` pair counts toward the quorum."""
 
-    def __call__(self, actor: str, gate: Gate, /) -> bool: ...
+    def __call__(self, actor: str, role: str, gate: Gate, /) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -210,6 +233,10 @@ def _related(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
     return a[:n] == b[:n]
 
 
+def _actors(votes: Sequence[Vote]) -> frozenset[str]:
+    return frozenset(v.actor for v in votes)
+
+
 def _quorum_met(votes: Sequence[Vote], quorum: Sequence[Quorum] | None) -> bool:
     """Distinct people per role. A person who voted more than once counts once, in the role of
     their first vote."""
@@ -237,18 +264,24 @@ def evaluate_carry_over(
     merge_base: str,
     patch_files: Collection[str],
     base_range: BaseRange | None,
+    patch_ids_since: Sequence[str],
     recheck: ApproverRecheck,
 ) -> CarryOverDecision:
     """May the re-entered ``gate`` (open, round ``plan.round``) close approved by carry-over?
 
     ``history`` is every earlier instance of this gate in the run. ``quorum`` is the gate's
     current quorum (``None`` means one approval), ``merge_base`` the commit the current diff is
-    against and ``patch_files`` the paths the patch touches. See the module docstring.
+    against and ``patch_files`` the paths the patch touches. ``patch_ids_since`` is the patch id of
+    every subject the **run** has had since the human decision, whichever gate it was for (required;
+    a push that no round of this gate saw still shows here). See the module docstring.
     """
     if not isinstance(gate, Gate) or not isinstance(plan, RoundPlan):
         raise TypeError("gate must be a Gate and plan a RoundPlan")
     _nonblank("merge_base", merge_base)
     files = _paths("patch file path", patch_files)
+    if isinstance(patch_ids_since, str) or not isinstance(patch_ids_since, Sequence):
+        raise TypeError("patch_ids_since must be a sequence of patch ids")
+    seen_patches = tuple(_nonblank("patch id", p) for p in patch_ids_since)
     if base_range is not None and not isinstance(base_range, BaseRange):
         raise TypeError("base_range must be a BaseRange or None")
     if carry_over != "patch_id":
@@ -271,7 +304,9 @@ def evaluate_carry_over(
         rounds.add(g.round)
         by_id[g.id] = inst
     if not by_id:
-        return _refuse("no_previous_instance")
+        return _refuse("no_previous_instance" if gate.round == 1 else "inconsistent_history")
+    if rounds != set(range(1, gate.round)):
+        return _refuse("inconsistent_history")  # a missing round hides what closed in it
     latest = max(by_id.values(), key=lambda i: i.gate.round)
     if plan.previous_gate_id != latest.gate.id or gate.round != latest.gate.round + 1:
         return _refuse("not_most_recent")
@@ -283,7 +318,7 @@ def evaluate_carry_over(
     seen = {latest.gate.id}
     while origin.carried_from is not None:
         nxt = by_id.get(origin.carried_from)
-        if nxt is None or nxt.gate.id in seen or nxt.gate.round >= origin.gate.round:
+        if nxt is None or nxt.gate.id in seen or nxt.gate.round != origin.gate.round - 1:
             return _refuse("broken_chain")
         seen.add(nxt.gate.id)
         origin = nxt
@@ -304,6 +339,10 @@ def evaluate_carry_over(
     subject = gate.subject
     if any(i.gate.subject.patch_id != subject.patch_id for i in span):
         reasons.append("patch_changed")
+    if not seen_patches:
+        reasons.append("patch_history_unknown")
+    elif any(p != origin.gate.subject.patch_id for p in seen_patches):
+        reasons.append("patch_changed_since")
     if any(i.gate.subject.ticket_revision != subject.ticket_revision for i in span):
         reasons.append("ticket_revision_changed")
     if any(i.gate.subject.attention_digest != subject.attention_digest for i in span):
@@ -319,6 +358,8 @@ def evaluate_carry_over(
     elif (base_range.from_base, base_range.to_base) != (origin.merge_base, merge_base):
         reasons.append("base_range_unknown")
     else:
+        if moved and not base_range.files and not base_range.complete:
+            reasons.append("base_range_unknown")
         patch_keys = [_key(f) for f in files]
         reasons.extend(
             f"base_range_touches_patch:{path}"
@@ -327,11 +368,21 @@ def evaluate_carry_over(
         )
 
     # --- 3: the approvers, last: it is a lookup, so ask only when the rest allows ---
-    approvers = tuple(dict.fromkeys(v.actor for v in origin.votes))
+    # One (actor, role) pair per person, the role of their first vote: the port confirms that role,
+    # and only confirmed pairs count toward the quorum again.
+    pairs: dict[str, str] = {}
+    for v in origin.votes:
+        pairs.setdefault(v.actor, v.role)
+    approvers = tuple(pairs)
     if not reasons:
+        confirmed = [
+            Vote(who, role) for who, role in pairs.items() if recheck(who, role, gate) is True
+        ]
         reasons.extend(
-            f"approver_ineligible:{who}" for who in approvers if recheck(who, gate) is not True
+            f"approver_ineligible:{who}" for who in approvers if who not in _actors(confirmed)
         )
+        if not _quorum_met(confirmed, quorum):
+            reasons.append("quorum_not_met")
     if reasons:
         return _refuse(*reasons)
     return CarryOverDecision(
@@ -366,13 +417,23 @@ def invalidated_by_close(history: Sequence[GateInstance], closing: Gate) -> tupl
     return tuple(g.id for g in sorted(earlier, key=lambda g: g.round))
 
 
-def invalidated_by_patch(history: Sequence[GateInstance], patch_id: str) -> tuple[GateId, ...]:
-    """The ``APPROVED`` rounds approved on a patch other than ``patch_id``: a patch change voids
-    an approval for good, so a return to the old patch revives nothing."""
+def invalidated_by_patch(
+    history: Sequence[GateInstance], patch_id: str, *, gate: Gate
+) -> tuple[GateId, ...]:
+    """The ``APPROVED`` rounds of ``gate``'s name and run that were approved on a patch other than
+    ``patch_id``: a patch change voids an approval for good.
+
+    Carry-over does not depend on anyone calling this. A push that no round of the gate saw leaves
+    the stored row ``APPROVED``, so :func:`evaluate_carry_over` takes the run's ``patch_ids_since``
+    and refuses on any difference (``patch_changed_since``). Calling this just keeps the stored
+    status honest.
+    """
     _nonblank("patch_id", patch_id)
     stale = [
         i.gate
         for i in history
-        if i.gate.status is GateStatus.APPROVED and i.gate.subject.patch_id != patch_id
+        if (i.gate.name, i.gate.run_id) == (gate.name, gate.run_id)
+        and i.gate.status is GateStatus.APPROVED
+        and i.gate.subject.patch_id != patch_id
     ]
     return tuple(g.id for g in sorted(stale, key=lambda g: g.round))
