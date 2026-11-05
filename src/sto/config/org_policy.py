@@ -260,6 +260,11 @@ def allowed_carry_over(policy: OrgPolicy, team: str) -> frozenset[str] | None:
 # --- V17 -----------------------------------------------------------------------------------
 
 _SHIPPING_EFFECTS = frozenset({"pr.merge", "release.trigger"})
+# Effects that must list a required gate that precedes them in ``requires_gates``.
+# ``branch.promote`` releases the approved SHA to the branch that holds QA secrets (PLAN T18),
+# so it may not run before the gate decides, when the gate precedes it. It is not a way to
+# finish a run, so the success search ignores it.
+_LISTING_EFFECTS = _SHIPPING_EFFECTS | {"branch.promote"}
 
 # Where a path is, for a QA gate that follows a merge.
 _NOT_SHIPPED = 0  # nothing merged yet
@@ -368,7 +373,7 @@ def _shipping_effects_after(
     Every edge is followed. An effect is let through if it lists the gate, or if it is a release
     after a merge that listed the gate and succeeded on this path, or, for an exempt QA gate, if
     the search with the approval removed already reaches it (it has checked what follows)."""
-    before = _reachable_without(wf, gate_id) if qa_exempt else set()
+    before = _reachable_without(wf, gate_id)
     first = dict(_targets(gate.next)).get("approved")
     seen: set[tuple[str, bool]] = set()
     queue: deque[tuple[str, bool]] = deque([(first, False)] if first else [])
@@ -383,10 +388,13 @@ def _shipping_effects_after(
         if isinstance(stage, TerminalStage):
             continue
         lists = False
-        if isinstance(stage, EffectStage) and stage.effect in _SHIPPING_EFFECTS:
+        if isinstance(stage, EffectStage) and stage.effect in _LISTING_EFFECTS:
             lists = gate_id in (stage.requires_gates or ())
             after_listed_merge = stage.effect == "release.trigger" and merged
-            if not (lists or (qa_exempt and sid in before) or after_listed_merge):
+            # A promote the run reaches without this gate is not preceded by it, so it need not
+            # list it (a QA gate comes after the promote that releases QA's secrets)
+            skips_gate = sid in before and (qa_exempt or stage.effect == "branch.promote")
+            if not (lists or skips_gate or after_listed_merge):
                 found.add(sid)
         for outcome, target in _targets(stage.next):
             listed_merge = (
