@@ -6,15 +6,18 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Path
+from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 
+from sto.api.auth import actor_key
 from sto.api.routers.runs import (
     NOT_FOUND,
     ApiError,
     ErrorResponse,
     RuntimeDep,
     _busy,
+    authorization_of,
+    may_stop_run,
     parse_run_id,
 )
 from sto.api.runtime import DeliveryFailedError, RunNotFoundError, StoreConflictError
@@ -35,7 +38,7 @@ log = logging.getLogger("sto.api")
 router = APIRouter(tags=["gates"])
 
 _RETRY = {"Retry-After": "1"}
-ACTOR = "dev"  # the dev token has one identity
+DEV_ACTOR = "dev"  # the dev token has one identity; with real sign-in the actor is the caller
 
 
 class GateOut(BaseModel):
@@ -147,7 +150,10 @@ async def decide(
     round: Annotated[int, Path(ge=1, le=1000)],
     body: DecisionIn,
     rt: RuntimeDep,
+    request: Request,
 ) -> Any:
+    auth = authorization_of(request)
+    actor = actor_key(auth.identity) if auth else DEV_ACTOR
     if body.kind is not DecisionKind.APPROVE and not body.comment.strip():
         raise ApiError(422, "comment_required", f"a {body.kind.value} decision needs a comment")
     if not body.kind.is_negative and not body.subject_digest.strip():
@@ -160,7 +166,7 @@ async def decide(
             name,
             round,
             body.kind,
-            actor=ACTOR,
+            actor=actor,
             surface=Surface.UI,
             subject_digest=body.subject_digest,
             comment=body.comment,
@@ -185,7 +191,12 @@ async def decide(
             "closed_by": e.closed_by,
         }
         try:
-            stop_offered = await rt.can_stop(parse_run_id(run_id))
+            rid = parse_run_id(run_id)
+            # offered only to a caller the cancel route will let through, and only if there is
+            # still something to stop
+            stop_offered = await rt.can_stop(rid) and await may_stop_run(
+                request, rt, rid, offer=True
+            )
         except Exception as stop_error:  # the 409 is true whether or not we can say who can stop
             log.warning("could not tell whether run %s can be stopped: %r", run_id, stop_error)
             stop_offered = False

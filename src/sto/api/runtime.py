@@ -42,6 +42,7 @@ from sto.domain import (
     DecisionKind,
     Effect,
     Gate,
+    GateStatus,
     GateType,
     PermanentError,
     Run,
@@ -247,6 +248,16 @@ class _TaggedDriver(LocalDriver):
 # --- the runtime --------------------------------------------------------------------------------
 
 
+GateRoles = Callable[[Gate], frozenset[str] | None]
+
+
+def default_gate_roles(gate: Gate) -> frozenset[str] | None:
+    """Who may decide a gate until its snapshotted ``eligible_roles`` are stored (D3-08a): the
+    template defaults (PLAN 9.3: ``reviewer`` for review, ``qa`` for QA). Any other gate names
+    nobody, so a Stop through it fails closed."""
+    return {GateType.REVIEW: frozenset({"reviewer"}), GateType.QA: frozenset({"qa"})}.get(gate.type)
+
+
 class Runtime:
     def __init__(
         self,
@@ -259,6 +270,7 @@ class Runtime:
         merges: MergeFactory,
         live: LiveSubject,
         workflow: Workflow = LINEAR_V0,
+        gate_roles: GateRoles = default_gate_roles,
         clock: Callable[[], float] = time.time,
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
         owner: str = "api",
@@ -272,6 +284,7 @@ class Runtime:
         load_handlers()  # before anything stored is decoded (the driver needs the registries)
         self.store, self.scope, self._wf = store, scope, workflow
         self._gates = gates
+        self._gate_roles = gate_roles
         self._api_sleep, self._backoff = api_sleep, backoff
         self._cooldown, self._mono = cooldown, mono
         self._wake: dict[RunId, asyncio.Event] = {}
@@ -565,12 +578,12 @@ class Runtime:
 
     # --- runs ---------------------------------------------------------------------------------
 
-    async def create_run(self, ticket: str | None) -> Run:
+    async def create_run(self, ticket: str | None, started_by: str | None = None) -> Run:
+        """``started_by``: the starter's actor key (``issuer|subject``), None for the dev token."""
         run = Run(id=RunId.new(), team=self.scope.team)
+        data = {"ticket": ticket, "started_by": started_by}
         await self._store(
-            lambda: self.store.put(
-                self.scope, Key(API_INDEX, str(run.id)), {"ticket": ticket}, when=Absent()
-            )
+            lambda: self.store.put(self.scope, Key(API_INDEX, str(run.id)), data, when=Absent())
         )
         try:
             await self.driver.start(run)
@@ -632,6 +645,56 @@ class Runtime:
         everything = await self._store(self.driver.timeline, run_id)
         return [e for e in everything if e["seq"] > after][:limit]
 
+    async def started_by(self, run_id: RunId) -> str | None:
+        """Who started the run (actor key), or None if unknown or started with the dev token."""
+        await self._astate(run_id)  # 404 for an unknown run
+        item = await self._store(self.store.get, self.scope, Key(API_INDEX, str(run_id)))
+        found = item.data.get("started_by") if item else None
+        return found if isinstance(found, str) else None
+
+    async def stop_gate_roles(self, run_id: RunId) -> frozenset[str]:
+        """The roles that may Stop the run through a gate (PLAN 9.3: "open or just-approved").
+
+        Those of every gate that is open, and of the one gate that is *just approved*: it holds
+        the run's most recent approval (still in ``RunState.approvals``, which the engine empties
+        or trims when changes are requested), its record is APPROVED in its latest round (a later
+        round that expired or was rejected ends it), and the run has not started a later stage:
+        its stage is still that gate's, or an effect that waits on it (``pr.merge`` holding after
+        approval). This is the late reject, where the 409 offers Stop (PLAN 4.3 rule 5). Reads
+        without driving the run.
+        """
+        state = await self._astate(run_id)
+        latest: dict[str, Gate] = {}
+        for gate in await self._read_gates(run_id):
+            if gate.name not in latest or gate.round > latest[gate.name].round:
+                latest[gate.name] = gate
+        counted = [g for g in latest.values() if g.is_open]
+        last = state.approvals[-1] if state.approvals else None
+        approved = latest.get(last.gate) if last else None
+        if (
+            last is not None
+            and approved is not None
+            and approved.status is GateStatus.APPROVED
+            and approved.round == last.round
+            and self._waiting_on(state.run.stage, approved.name)
+        ):
+            counted.append(approved)
+        roles: set[str] = set()
+        for gate in counted:
+            roles |= self._gate_roles(gate) or frozenset()
+        return frozenset(roles)
+
+    def _waiting_on(self, stage: str | None, gate: str) -> bool:
+        """Is the run still at ``gate``, or at an effect that requires it?"""
+        if stage is None:
+            return False
+        if stage == gate:
+            return True
+        return any(
+            n.name == stage and n.kind == "effect" and gate in n.requires_gates
+            for n in self._wf.nodes
+        )
+
     async def can_stop(self, run_id: RunId) -> bool:
         """Is there anything left to stop? (A finished or already stopping run offers no Stop.)"""
         try:
@@ -657,6 +720,10 @@ class Runtime:
     async def gates(self, run_id: RunId) -> list[Gate]:
         await self._astate(run_id)
         await self._ensure_driven(run_id)
+        return await self._read_gates(run_id)
+
+    async def _read_gates(self, run_id: RunId) -> list[Gate]:
+        """The run's gates from the store, without driving the run."""
 
         def read() -> list[Gate]:
             found: list[Gate] = []
@@ -782,6 +849,8 @@ def _closed_event(gate: Gate, decision: DecisionRecord) -> GateClosed:
 
 
 __all__ = [
+    "GateRoles",
+    "default_gate_roles",
     "API_INDEX",
     "CancelRequested",
     "DeliveryFailedError",

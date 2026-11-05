@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
+from sto.api.auth import Authorization, Authorized, actor_key, may_stop, stop_flags
 from sto.api.runtime import (
     BadCursorError,
     RunFinishedError,
@@ -128,9 +129,10 @@ class EventPage(BaseModel):
     summary="Start a run",
     description="Accepted: the run is queued and driven in the background.",
 )
-async def create_run(body: NewRun, rt: RuntimeDep) -> dict[str, Any]:
+async def create_run(body: NewRun, rt: RuntimeDep, request: Request) -> dict[str, Any]:
+    auth = authorization_of(request)
     try:
-        run = await rt.create_run(body.ticket)
+        run = await rt.create_run(body.ticket, actor_key(auth.identity) if auth else None)
     except StoreConflictError as e:
         raise _busy(e) from e
     # The run is durable: answer from what was written, not from a read that could fail.
@@ -222,9 +224,11 @@ async def events(
     summary="Stop a run",
     description="Accepted: the Stop is applied in the background, ahead of any waiting backoff.",
 )
-async def cancel(run_id: str, rt: RuntimeDep) -> dict[str, Any]:
+async def cancel(run_id: str, rt: RuntimeDep, request: Request) -> dict[str, Any]:
     rid = parse_run_id(run_id)
     try:
+        if not await may_stop_run(request, rt, rid, offer=False):
+            raise ApiError(403, "forbidden", "this request is not allowed")
         await rt.cancel(rid)
     except RunNotFoundError as e:
         raise ApiError(404, "run_not_found", str(e)) from e
@@ -233,6 +237,39 @@ async def cancel(run_id: str, rt: RuntimeDep) -> dict[str, Any]:
     except StoreConflictError as e:
         raise _busy(e) from e
     return {"id": str(rid), "accepted": True}
+
+
+def authorization_of(request: Request) -> Authorized | None:
+    """What the authorization middleware decided; None under the local dev token."""
+    auth = getattr(request.state, "auth", None)
+    return auth if isinstance(auth, Authorized) else None
+
+
+async def may_stop_run(request: Request, rt: Runtime, run_id: RunId, *, offer: bool) -> bool:
+    """The conditions behind the cancel route's "own" and stop-at-gate grants (D3-22): the caller
+    started the run, or holds a role that may decide a gate the run may still be stopped at.
+    Raises ``RunNotFoundError`` for an unknown run.
+
+    On the cancel route (``offer=False``) the flags are the ones the middleware set from the
+    table in force. From another route (``offer=True``: the 409's Stop link) they are looked up in
+    the installed table's cancel rule, so the link is offered exactly when cancel would admit.
+    """
+    auth = authorization_of(request)
+    if auth is None:  # the dev token has one identity, which may do anything
+        return True
+    if offer:
+        installed = getattr(request.app.state, "authorization", None)
+        flags = stop_flags(installed, auth) if isinstance(installed, Authorization) else None
+    else:
+        flags = (auth.own_only, auth.gate_only)
+    if flags is None:
+        return False
+    return may_stop(
+        auth,
+        flags,
+        started_by=await rt.started_by(run_id) if flags[0] else None,
+        gate_roles=await rt.stop_gate_roles(run_id) if flags[1] else frozenset(),
+    )
 
 
 def _busy(e: Exception) -> ApiError:
