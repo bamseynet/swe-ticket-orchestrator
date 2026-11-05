@@ -21,6 +21,16 @@ signature or malformed headers (counted), ``503`` the store or queue failed, so 
   vendor's retry would be dropped as a duplicate and the nudge lost. If even that delete fails
   the 503 still goes out and ``webhook.release_failed`` is counted; the reconciler sweeps open
   runs, so a lost nudge is late, not missing.
+* **Size.** The queue carries at most ``SQS_MESSAGE_LIMIT`` bytes of text but the edge accepts
+  far more (GitHub deliveries reach 25 MB), so a nudge that does not fit would fail on every retry.
+  The wire form is pinned here: ``serialise_nudge`` is the one text form every queue adapter must
+  use (JSON, body base64-encoded, never JSON-escaped text). A body is carried only when it is at
+  most ``max_body_bytes`` AND the serialised nudge, body included, fits ``NUDGE_BUDGET_BYTES``;
+  otherwise it is verified on its full raw body like any other, then queued with ``body=b""``,
+  ``body_omitted=True`` and its ``body_size``, and the consumer re-reads state (it must anyway).
+  Headers get ``HEADER_BUDGET_BYTES``: past it only the routing headers are kept, and if even
+  those do not fit the delivery is refused as malformed (400, counted) before it claims anything.
+  The delivery stays claimed after an omission, so it is one nudge, accepted with a 202.
 * **A rejected delivery claims nothing**, so guessing a delivery ID cannot block the real one.
 * **Deadline.** The work is one verify, one conditional write and one enqueue; the store and queue
   adapters carry the timeouts, so a hung dependency becomes a 503 inside the vendor's deadline
@@ -29,10 +39,12 @@ signature or malformed headers (counted), ``503`` the store or queue failed, so 
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -52,9 +64,22 @@ ACCEPTED = 202
 DUPLICATE = 200
 UNAUTHORIZED = 401
 UNAVAILABLE = 503
+MALFORMED = 400
 
 SEEN_SK = "SEEN"
 MAX_DELIVERY_ID_CHARS = 512
+SQS_MESSAGE_LIMIT = 256 * 1024
+# The most a serialised nudge may take: well under the queue limit.
+NUDGE_BUDGET_BYTES = 240 * 1024
+# The most the serialised headers may take. Past it only routing headers are kept.
+HEADER_BUDGET_BYTES = 16 * 1024
+MAX_EVENT_CHARS = 256
+# Base64 of the ceiling (218,456) + the header budget + the event + the rest of the envelope
+# (delivery ID, surface, flags) stays under NUDGE_BUDGET_BYTES; a test pins that.
+MAX_BODY_BYTES_CEILING = 160 * 1024
+DEFAULT_MAX_BODY_BYTES = 128 * 1024
+# Headers kept when the full set does not fit the budget (plus the configured event header).
+DEFAULT_ROUTING_HEADERS = frozenset({"content-type"})
 # Never queued: the nudge and its dead-letter queue are read by more people and tools than the
 # vendor's endpoint is. A verifier adds the vendor's own secret headers via ``secret_headers``.
 CREDENTIAL_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
@@ -95,7 +120,14 @@ class WebhookVerifier(Protocol):
 
 @dataclass(frozen=True)
 class Nudge:
-    """What is queued: that something changed. Never the truth. ``reread`` is always True."""
+    """What is queued: that something changed. Never the truth. ``reread`` is always True.
+
+    ``body`` is the raw delivery only when it fit under the ingest's size limit. Otherwise it is
+    empty and ``body_omitted`` is True; ``body_size`` is the delivery's real size either way.
+    ``event`` is the vendor's event name from the configured event header, if any. It is an
+    UNAUTHENTICATED routing hint, never a fact: GitHub does not sign ``X-GitHub-Event``, so a
+    consumer may use it to pick a queue or a re-read, and must never act on it.
+    """
 
     surface: str
     delivery_id: str
@@ -103,10 +135,45 @@ class Nudge:
     headers: Mapping[str, str]
     received_at: float
     reread: bool = True
+    body_omitted: bool = False
+    body_size: int | None = None
+    event: str | None = None
 
     def __post_init__(self) -> None:
         if self.reread is not True:
             raise ValueError("a webhook delivery is a nudge: consumers must re-read state")
+        if self.body_omitted:
+            if self.body:
+                raise ValueError("a nudge that omits its body must carry no body")
+            if self.body_size is None or isinstance(self.body_size, bool) or self.body_size <= 0:
+                raise ValueError("a nudge that omits its body must say its positive body_size")
+        elif self.body_size is None:
+            object.__setattr__(self, "body_size", len(self.body))
+        elif self.body_size != len(self.body):
+            raise ValueError("body_size must match a carried body")
+
+
+def serialise_nudge(nudge: Nudge) -> str:
+    """The queue's text form of a nudge. EVERY queue adapter must use this and nothing else.
+
+    ASCII JSON with sorted keys; the body is base64 (``body_b64``), never JSON-escaped text, so
+    the size is a function of the body length alone. ``NUDGE_BUDGET_BYTES`` is measured on this.
+    """
+    return json.dumps(
+        {
+            "surface": nudge.surface,
+            "delivery_id": nudge.delivery_id,
+            "headers": dict(nudge.headers),
+            "received_at": nudge.received_at,
+            "reread": nudge.reread,
+            "event": nudge.event,
+            "body_omitted": nudge.body_omitted,
+            "body_size": nudge.body_size,
+            "body_b64": base64.b64encode(nudge.body).decode("ascii"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class NudgeQueue(Protocol):
@@ -155,9 +222,22 @@ class WebhookIngest:
         metrics: Metrics,
         *,
         clock: Callable[[], float] = time.time,
+        max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        event_header: str | None = None,
+        routing_headers: Iterable[str] = (),
     ) -> None:
         if not surface or surface != surface.strip() or "#" in surface:
             raise ValueError("surface must be a non-empty name without '#' or surrounding space")
+        if (
+            not isinstance(max_body_bytes, int)
+            or isinstance(max_body_bytes, bool)
+            or not 0 < max_body_bytes <= MAX_BODY_BYTES_CEILING
+        ):
+            raise ValueError(
+                f"max_body_bytes must be an int of 1 to {MAX_BODY_BYTES_CEILING} bytes, "
+                f"well below the queue limit of {SQS_MESSAGE_LIMIT} bytes"
+            )
+        self._max_body = max_body_bytes
         window = verifier.replay_window
         if verifier.signed_timestamp and window is None:
             raise ValueError("a vendor with a signed timestamp must declare its replay_window")
@@ -167,6 +247,14 @@ class WebhookIngest:
             raise ValueError("replay_window must be positive")
         self._window = window
         self._secret_headers = CREDENTIAL_HEADERS | verifier.secret_headers
+        self._event_header = event_header.strip().lower() if event_header else None
+        if self._event_header in self._secret_headers:
+            raise ValueError("event_header must not be a credential or secret header")
+        self._routing = (
+            DEFAULT_ROUTING_HEADERS
+            | {h.strip().lower() for h in routing_headers}
+            | ({self._event_header} if self._event_header else set())
+        )
         self._surface = surface
         self._verifier = verifier
         self._store = store
@@ -203,6 +291,11 @@ class WebhookIngest:
             return IngestResponse(UNAUTHORIZED, "invalid delivery id")
 
         now = self._clock()
+        safe = {k: v for k, v in norm.items() if k not in self._secret_headers}
+        nudge = self._build(delivery_id, raw_body, safe, now)
+        if nudge is None:
+            self._metrics.incr("webhook.rejected", surface=surface, reason="headers_too_large")
+            return IngestResponse(MALFORMED, "headers too large")
         key = Key(f"HOOK#{surface}#{delivery_id}", SEEN_SK)
         record: dict[str, object] = {"surface": surface, "seen_at": now}
         if self._window is not None:
@@ -224,8 +317,6 @@ class WebhookIngest:
             self._metrics.incr("webhook.store_failed", surface=surface)
             return IngestResponse(UNAVAILABLE, "try again")
 
-        safe = {k: v for k, v in norm.items() if k not in self._secret_headers}
-        nudge = Nudge(surface, delivery_id, raw_body, safe, now)
         try:
             self._queue.enqueue(nudge)
         except Exception:
@@ -233,8 +324,43 @@ class WebhookIngest:
             self._metrics.incr("webhook.enqueue_failed", surface=surface)
             self._release(key)
             return IngestResponse(UNAVAILABLE, "try again")
+        if nudge.body_omitted:
+            self._metrics.incr("webhook.body_omitted", surface=surface)
         self._metrics.incr("webhook.accepted", surface=surface)
         return IngestResponse(ACCEPTED, "accepted")
+
+    def _build(
+        self, delivery_id: str, raw_body: bytes, safe: dict[str, str], now: float
+    ) -> Nudge | None:
+        """The nudge to queue, or None if even its routing headers do not fit the budget."""
+        headers = safe
+        if len(json.dumps(headers)) > HEADER_BUDGET_BYTES:
+            headers = {k: v for k, v in safe.items() if k in self._routing}
+            self._metrics.incr("webhook.headers_trimmed", surface=self._surface)
+            if len(json.dumps(headers)) > HEADER_BUDGET_BYTES:
+                return None
+        event = safe.get(self._event_header) if self._event_header else None
+        if event is not None and len(event) > MAX_EVENT_CHARS:
+            event = None
+        size = len(raw_body)
+
+        def make(body: bytes, omitted: bool) -> Nudge:
+            return Nudge(
+                self._surface,
+                delivery_id,
+                body,
+                headers,
+                now,
+                body_omitted=omitted,
+                body_size=size,
+                event=event or None,
+            )
+
+        if size <= self._max_body:
+            carried = make(raw_body, False)
+            if len(serialise_nudge(carried)) <= NUDGE_BUDGET_BYTES:
+                return carried
+        return make(b"", True)
 
     def _release(self, key: Key) -> None:
         try:
