@@ -23,7 +23,7 @@ test module has imported it, and imports nothing from ``sto`` itself (else cover
 Its hooks fail the
 run if a subclass collected no test (under ``-m`` too), if a suite test was replaced, if an
 in-process subclass carries a marker that deselects or skips it, and if a suite test is skipped
-or xfailed by anything but ``pending_controls``. A subclass must be named ``Test*`` and may define
+or xfailed at all. A subclass must be named ``Test*`` and may define
 only ``port``, ``registry`` and Python's own class attributes (an allow-list, in itself and in any
 mixin): no helper, hook, fixture, mark or ``test_*`` method. The checks run at class creation AND
 again at collection, over every real subclass of ``AdapterConformance`` (so a registry edit or a
@@ -31,9 +31,9 @@ swallowed ``__init_subclass__`` does not hide one).
 
 Known limits, deliberate routes the suite does not stop:
 
-* Forging the private waiver token, and setting ``__module__`` plus ``setattr`` into
+* Setting ``__module__`` plus ``setattr`` into
   ``contract.test_suite`` to pass as a reference adapter.
-* The port, vendor and waiver checks trust ``target.adapter``: a target can name a different real
+* The port and vendor checks trust ``target.adapter``: a target can name a different real
   class under ``sto.`` (the class must be really defined there, and match the declared vendor's
   module path, but the suite cannot tell it from the class the test means to exercise).
 * Header names are matched case-sensitively (fails closed).
@@ -96,15 +96,18 @@ suite can catch it; ``HarnessError`` marks a broken harness, as opposed to an ad
 contract.
 
 This section covers **Receipt-returning, keyed writes** only (comment, check, message). The SCM
-section (``MergeHandle``, ``UpdateResult``, keyless ``move_ref``, ``dequeue``, update-branch)
-belongs to D4-19. A delivery's result is whatever the port returns (nudges, or a ``Notifier``'s
+port runs all of it, through the keyed write an SCM adapter makes (a PR comment). The SCM-only
+calls (``MergeHandle``, ``UpdateResult``, keyless ``move_ref``, ``dequeue``, update-branch) are
+tested with their adapters (D4-12, D4-21) against the fake GitHub's PR routes (D4-19), not here.
+A delivery's result is whatever the port returns (nudges, or a ``Notifier``'s
 ``DecisionRequest | None``); a target maps it to an ``Outcome``. The suite invents no nudge.
 
 Not testable black-box: constant-time comparison (T4). D4-04 owns it as a static check.
 
-A test needing a control the target lacks FAILS with ``MissingControl``; it is never skipped.
-``pending_controls`` lets a FAKE (an adapter class really defined under ``sto.adapters.fake``)
-lack the one waivable control, with a reason; it cannot be used on anything else.
+A test needing a control the target lacks FAILS with ``MissingControl``; it is never skipped, and
+there is no waiver. (D4-01 had ``pending_controls`` for a fake that lacked a plain 403 and 404, but
+it only accepted an adapter under ``sto.adapters.fake``, and those are refused as targets, so no
+server fake could use it. D4-19 retired it: the fake GitHub has every control.)
 """
 
 from __future__ import annotations
@@ -227,11 +230,6 @@ class Control(StrEnum):
     RATE_LIMIT = "rate_limit"
     AUTH = "auth"
     HTTP_ERRORS = "http_errors"  # a plain 403 and 404 from the server
-
-
-# The only control a fake may lack. Everything else is a hole an attacker or a crash walks through.
-WAIVABLE = frozenset({Control.HTTP_ERRORS})
-SECURITY_CONTROLS = frozenset(Control) - WAIVABLE
 
 
 class CrashPoint(StrEnum):
@@ -655,10 +653,9 @@ def is_auth_error(exc: BaseException) -> bool:
     return isinstance(exc, PermanentError) and not isinstance(exc, PORT_ERRORS)
 
 
-# --- known gaps (fakes only) ----------------------------------------------------------------
+# --- the suite's own tests ------------------------------------------------------------------
 
 _SUITE_TESTS: dict[str, Callable[..., None]] = {}
-_WAIVER = object()
 
 
 def covers(
@@ -673,46 +670,6 @@ def covers(
         return fn
 
     return tag
-
-
-def pending_controls(*missing: Control, reason: str) -> Callable[[type[Any]], type[Any]]:
-    """Class decorator for a FAKE that lacks a waivable control. Each test needing one becomes a
-    strict xfail on ``MissingControl``.
-
-    Refused without a reason and for any non-waivable control. When the test RUNS, it fails unless
-    the target is the default ``fake`` and the adapter under test is a class really defined under
-    ``sto.adapters.fake`` (dot boundary, loaded module, source location), whatever it is called.
-    """
-    if not reason.strip():
-        raise ValueError("pending_controls needs a reason")
-    banned = sorted(set(missing) - WAIVABLE)
-    if banned:
-        raise ValueError(f"pending_controls cannot waive security controls: {', '.join(banned)}")
-    gone = frozenset(missing)
-
-    def apply(cls: type[Any]) -> type[Any]:
-        for attr in dir(cls):
-            fn = getattr(cls, attr)
-            if attr not in _SUITE_TESTS or not getattr(fn, "_needs", frozenset()) & gone:
-                continue
-            mark = pytest.mark.xfail(strict=True, raises=MissingControl, reason=reason)
-
-            def guarded(*a: Any, _fn: Callable[..., None] = fn, **k: Any) -> None:
-                target = a[1] if len(a) > 1 else k.get("target")
-                adapter = getattr(target, "adapter", None)
-                if getattr(target, "selected", None) != DEFAULT_TARGET or adapter is None:
-                    pytest.fail("pending_controls is only for the fake target")
-                if not is_fake(type(adapter)):
-                    pytest.fail(f"pending_controls is only for a fake under {FAKE_MODULE}")
-                _fn(*a, **k)
-
-            own = functools.wraps(fn)(guarded)  # a copy: marking `fn` would mark every class
-            own.__dict__.pop("pytestmark", None)
-            own._waiver = _WAIVER  # type: ignore[attr-defined]
-            setattr(cls, attr, mark(own))
-        return cls
-
-    return apply
 
 
 def retrying[T](call: Callable[[], T], attempts: int = RETRIES) -> T:
@@ -731,7 +688,7 @@ def retrying[T](call: Callable[[], T], attempts: int = RETRIES) -> T:
 SUBCLASSES: list[type] = []
 # Everything a subclass (or a mixin of one) may define: the port, the registry, and the
 # machinery Python adds to every class. Any other name (a helper, a hook, a fixture, a mark) could
-# change what the suite does, so it is refused. The suite's own tests may only be None or a waiver.
+# change what the suite does, so it is refused. The suite's own tests may only be None.
 _ALLOWED = frozenset(
     {
         "port",
@@ -763,8 +720,7 @@ def applicable(port: Port) -> list[str]:
 
 def check_class(cls: type) -> list[str]:
     """Why ``cls`` is not a faithful conformance subclass, looking through its whole MRO (mixins
-    too). A test may be absent (``None``: the port does not require it) or the waiver copy that
-    ``pending_controls`` made; nothing else."""
+    too). A test may be absent (``None``: the port does not require it); nothing else."""
     problems = []
     if not cls.__name__.startswith("Test"):
         problems.append(f"{cls.__name__} must be named Test*: pytest collects none of its tests")
@@ -773,11 +729,7 @@ def check_class(cls: type) -> list[str]:
             continue
         for name, value in vars(klass).items():
             if name in _SUITE_TESTS:
-                genuine = _SUITE_TESTS[name]
-                waived = getattr(value, "_waiver", None) is _WAIVER and (
-                    getattr(value, "__wrapped__", None) is genuine
-                )
-                if value is not None and not waived:
+                if value is not None:
                     problems.append(f"{cls.__name__} ({klass.__name__}) overrides {name}")
             elif name not in _ALLOWED:
                 problems.append(f"{cls.__name__} ({klass.__name__}) defines {name!r}")
@@ -853,12 +805,10 @@ def check_collection(items: Iterable[Any], args: Iterable[str]) -> list[str]:
         for name, item in found.items():
             genuine = _SUITE_TESTS.get(name)
             fn = item.function
-            waived = getattr(fn, "_waiver", None) is _WAIVER and fn.__wrapped__ is genuine
-            if genuine is not None and fn is not genuine and not waived:
+            if genuine is not None and fn is not genuine:
                 problems.append(f"{cls.__name__}.{name} is not the suite's own test")
             if "fake" in getattr(cls, "registry", {}):
                 marks = {m.name for m in item.iter_markers()} & ESCAPE_MARKERS
-                marks -= {"xfail"} if waived else set()
                 if marks:
                     problems.append(f"{cls.__name__}.{name} carries {sorted(marks)}")
     for cls in _all_subclasses(AdapterConformance):
@@ -886,12 +836,10 @@ def check_collection(items: Iterable[Any], args: Iterable[str]) -> list[str]:
 
 
 def enforce_outcome(item: Any, report: Any) -> None:
-    """Turn a skip or xfail of a suite test into a failure, unless ``pending_controls`` made it."""
+    """Turn a skip or xfail of a suite test into a failure."""
     cls = getattr(item, "cls", None)
     name = getattr(item, "originalname", "")
     if cls not in SUBCLASSES or name not in _SUITE_TESTS:
-        return
-    if getattr(item.function, "_waiver", None) is _WAIVER:
         return
     if report.outcome == "skipped" or hasattr(report, "wasxfail"):
         report.outcome = "failed"

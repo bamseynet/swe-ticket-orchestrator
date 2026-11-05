@@ -33,10 +33,8 @@ from contract.suite import (  # noqa: E402
     MAX_REPLAY_WINDOW,
     PAGE_SIZE,
     PORT_SECTIONS,
-    SECURITY_CONTROLS,
     SHAPE_RETRY_AFTER,
     SUBCLASSES,
-    WAIVABLE,
     AdapterConformance,
     AuthRefresh,
     Capabilities,
@@ -59,7 +57,6 @@ from contract.suite import (  # noqa: E402
     is_auth_error,
     is_fake,
     is_reference,
-    pending_controls,
     resolve,
     run_suite,
     validate_target,
@@ -2529,7 +2526,6 @@ def test_vendor_capabilities_are_owned_by_the_suite() -> None:
 
 
 def test_no_vendor_removes_signature_dedupe_auth_or_idempotency() -> None:
-    assert not {Control.SIGNATURE, Control.DUPLICATE, Control.AUTH, Control.CRASH} & WAIVABLE
     assert set(Capabilities.__dataclass_fields__) == {
         "signed_timestamp",
         "rate_shapes",
@@ -2626,99 +2622,24 @@ def test_the_fixture_records_the_target_that_ran() -> None:
     assert probe.user_properties == [("conformance_target", "fake")]
 
 
-# --- pending_controls: fake-only by the adapter that runs, pinned --------------------------------
+# --- no waiver: a missing control fails (D4-19 retired ``pending_controls``) ----------------------
 
 
-def _probe() -> type[Any]:
-    class TestProbe(AdapterConformance):
-        port = Port.TICKET_SOURCE
-        registry: ClassVar[Mapping[str, Callable[[], Target]]] = {"fake": reference}
+def test_the_suite_has_no_way_to_waive_a_control() -> None:
+    """``pending_controls`` only accepted an adapter under ``sto.adapters.fake``, which are
+    refused as targets, so no server fake could use it. A missing control is a failure for every
+    target, and no control is waivable."""
+    import contract.suite as suite
 
-    SUBCLASSES.remove(TestProbe)
-    return pending_controls(Control.HTTP_ERRORS, reason="the fake has no 403 or 404")(TestProbe)
-
-
-WAIVED = (
-    "test_a_plain_403_on_a_read_is_a_permission_error",
-    "test_a_404_on_a_read_is_an_unknown_object_not_a_credential_error",
-    "test_a_plain_403_at_any_step_of_a_write_is_a_permission_error",
-    "test_a_404_at_any_step_of_a_write_is_an_unknown_object",
-)
+    for gone in ("pending_controls", "WAIVABLE", "SECURITY_CONTROLS", "_WAIVER"):
+        assert not hasattr(suite, gone), gone
+    assert not [n for n in vars(suite) if "waiv" in n.lower()]
 
 
-class FakeBacked(Target):
-    """A target whose adapter really is a fake from ``sto.adapters.fake``, with no HTTP errors."""
-
-    name = "fake-backed"
-    vendor = Vendor.STUB
-    controls: ClassVar[frozenset[Control]] = frozenset()
-
-    def __init__(self, adapter: object, selected: str = "fake") -> None:
-        self.adapter = adapter
-        self.selected = selected
-
-
-def test_pending_controls_marks_strict_xfail_on_missing_control_only() -> None:
-    probe = _probe()
-    for name in WAIVED:
-        marks = probe.__dict__[name].pytestmark
-        xfails = [m for m in marks if m.name == "xfail"]
-        assert len(xfails) == 1, "must be an xfail, not a skip"
-        assert xfails[0].kwargs["strict"] is True
-        assert xfails[0].kwargs["raises"] is MissingControl
-        assert xfails[0].kwargs["reason"] == "the fake has no 403 or 404"
-        assert not [m for m in marks if m.name == "skip"]
-    assert "test_a_new_key_is_a_new_write" not in probe.__dict__
-
-
-def test_pending_controls_does_not_mark_the_shared_base_tests() -> None:
-    _probe()
-    for name in WAIVED:
-        assert not hasattr(getattr(AdapterConformance, name), "pytestmark")
-
-
-@pytest.mark.parametrize("control", sorted(SECURITY_CONTROLS))
-def test_pending_controls_refuses_every_non_waivable_control(control: Control) -> None:
-    with pytest.raises(ValueError, match="security"):
-        pending_controls(control, reason="because")
-
-
-def test_pending_controls_refuses_a_class_with_every_control() -> None:
-    with pytest.raises(ValueError, match="security"):
-        pending_controls(*Control, reason="all of them")
-
-
-def test_only_one_control_can_be_waived_at_all() -> None:
-    assert {Control.HTTP_ERRORS} == WAIVABLE
-
-
-@pytest.mark.parametrize("reason", ["", "   "])
-def test_pending_controls_needs_a_reason(reason: str) -> None:
-    with pytest.raises(ValueError, match="reason"):
-        pending_controls(Control.HTTP_ERRORS, reason=reason)
-
-
-def test_a_waiver_is_allowed_for_an_adapter_really_defined_as_a_fake() -> None:
-    probe = _probe()
-    target = FakeBacked(FakeTicketSource(SpyWriter()))
-    with pytest.raises(MissingControl):  # past the guard, into the test: the xfail path
-        probe().__getattribute__(WAIVED[0])(target)
-
-
-def test_a_waiver_fails_for_the_adapter_that_runs_when_it_is_not_a_fake() -> None:
-    """The running adapter is checked, not a class named when the waiver was written."""
-    probe = _probe()
-    target = FakeBacked(Bad403IsNotFound(Stub()))
-    with pytest.raises(pytest.fail.Exception, match="only for a fake"):
-        probe().__getattribute__(WAIVED[0])(target)
-
-
-@pytest.mark.parametrize("name", ["live", "staging"])
-def test_a_waiver_fails_when_the_target_is_not_the_fake(name: str) -> None:
-    probe = _probe()
-    target = FakeBacked(FakeTicketSource(SpyWriter()), selected=name)
-    with pytest.raises(pytest.fail.Exception, match="only for the fake"):
-        probe().__getattribute__(WAIVED[0])(target)
+def test_a_missing_control_is_a_failure_for_every_control() -> None:
+    for control in Control:
+        with pytest.raises(MissingControl, match=control.value):
+            Target().require(control)
 
 
 def test_is_fake_needs_a_dot_boundary_a_loaded_module_and_the_source_location() -> None:
@@ -2941,19 +2862,6 @@ def test_check_collection_flags_an_in_process_class_carrying_an_escape_marker(ma
     assert any(mark in p for p in problems), problems
 
 
-def test_check_collection_allows_the_xfail_pending_controls_made() -> None:
-    probe = _probe()
-    name = WAIVED[0]
-    item = types.SimpleNamespace(
-        cls=TestReferenceAdapter,
-        originalname=name,
-        function=probe.__dict__[name],
-        iter_markers=lambda: iter([types.SimpleNamespace(name="xfail")]),
-    )
-    problems = check_collection([item], [f"{__file__}::TestReferenceAdapter::{name}"])
-    assert not [p for p in problems if "xfail" in p], problems
-
-
 def test_enforce_outcome_turns_a_skip_or_an_xfail_into_a_failure() -> None:
     item = _item(TestReferenceAdapter, "test_a_new_key_is_a_new_write")
     skipped = types.SimpleNamespace(outcome="skipped", longrepr=None)
@@ -2966,15 +2874,6 @@ def test_enforce_outcome_turns_a_skip_or_an_xfail_into_a_failure() -> None:
     passed = types.SimpleNamespace(outcome="passed", longrepr=None)
     enforce_outcome(item, passed)
     assert passed.outcome == "passed"
-
-
-def test_enforce_outcome_allows_the_xfail_pending_controls_makes() -> None:
-    probe = _probe()
-    fn = probe.__dict__[WAIVED[0]]
-    item = types.SimpleNamespace(cls=TestReferenceAdapter, originalname=WAIVED[0], function=fn)
-    report = types.SimpleNamespace(outcome="skipped", longrepr=None, wasxfail="x")
-    enforce_outcome(item, report)
-    assert report.outcome == "skipped"
 
 
 def test_the_collection_guard_runs_before_deselection_and_is_a_plugin_for_every_session() -> None:
