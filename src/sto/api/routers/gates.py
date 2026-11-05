@@ -23,12 +23,15 @@ from sto.api.routers.runs import (
 from sto.api.runtime import DeliveryFailedError, RunNotFoundError, StoreConflictError
 from sto.domain import DecisionKind, Gate, Surface, TransientError
 from sto.gates.service import (
+    CommentRequiredError,
     DecisionNotAllowedError,
+    DuplicateVoteError,
     GateClosedError,
     GateConflictError,
     GateError,
     GateNotFoundError,
     GateRoundLimitError,
+    QuorumConfigError,
     StaleRoundError,
     StaleSubjectError,
 )
@@ -110,7 +113,10 @@ _REFUSALS: list[tuple[type[GateError], int]] = [
     (StaleSubjectError, 409),
     (StaleRoundError, 409),
     (GateConflictError, 409),
+    (DuplicateVoteError, 409),  # the person already holds a vote: the state conflicts
     (DecisionNotAllowedError, 422),
+    (CommentRequiredError, 422),  # the request is incomplete
+    (QuorumConfigError, 422),  # a gate whose quorum was refused cannot be decided as asked
     (GateRoundLimitError, 422),
 ]
 
@@ -219,7 +225,8 @@ async def decide(
         log.error("deciding gate %s of run %s hit corrupt data: %r", name, run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
     except ConditionFailedError as e:
-        # The gate service ran out of retries on a gate that is still open (D3-06 reworks this).
+        # A hook's op (an audit op, D3-19) lost a race on a gate that is still open: contention,
+        # retryable. The service's own retries run out as GateContentionError (below).
         raise ApiError(
             503, "gate_contention", "the gate kept changing; try again", headers=_RETRY
         ) from e

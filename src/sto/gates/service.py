@@ -11,9 +11,27 @@
 * An approval carries the subject digest the person saw and is refused if the subject has moved;
   a negative decision is exempt, so nothing can delay a veto (ADR-0005 #1, #2).
 
-v0 is single-approver: the first valid decision closes the gate. Hooks add ops to the
-transaction (and can refuse); they do not change who may close or when. Quorum (D3-06) replaces
-the close path in ``decide`` itself, with its own tests.
+Quorum and veto (D3-06) are the close path of ``decide``. A :class:`DecisionPolicy` supplies the
+gate's quorum (a list of ``(role, count)``), each person's roles and any separation-of-duties
+refusals; without a policy a gate is the v0 single-approver gate (one approval from anyone).
+
+* The quorum is read when the gate opens and frozen beside it (``QUO#name#round``). Duplicate
+  roles, a count below 1 or a blank role are refused then (:class:`QuorumConfigError`), so one
+  role cannot count twice. The ``Gate`` record itself is unchanged.
+* One person (the actor string) has one vote per gate round, whatever the surface. A sub-quorum
+  approval commits a vote record (``VOTE#name#round#<hash of actor>``) and an audit entry and
+  leaves the gate open. A person holding several roles fills one slot; slots are assigned by
+  matching, so the order of votes does not matter.
+* A vote counts only while its subject digest is the gate's current one (a moved subject drops
+  earlier votes; the person may vote again) and while its voter is still eligible at the close.
+* Any negative decision closes the gate whatever the votes, is exempt from the digest match and
+  from the quorum roles (not from the policy's refusals), and needs a comment. An approval
+  needs none.
+* All decisions of a run serialise on the audit chain head (``RUN#r/CHAIN``, see ``AuditWriter``),
+  and a vote also ``Check``s the gate's version, so a vote cannot slip in beside a close.
+* Hooks run when a decision closes the gate, not for a vote that leaves it open.
+* Exhausted retries raise :class:`GateContentionError` (transient), never the store's
+  ``ConditionFailedError``.
 
 Rounds of one gate are ordered: a new round opens only after every lower round is closed, a
 round with a newer sibling can no longer be decided, and a non-approved close voids only
@@ -23,8 +41,11 @@ them all always fits in one transaction (ADR-0017: 100 operations).
 
 from __future__ import annotations
 
+import hashlib
 import time
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from sto.domain import (
     Decision,
@@ -61,6 +82,8 @@ from sto.store.ports import (
     AUDIT,
     MAX_TRANSACTION_OPS,
     Absent,
+    Check,
+    Condition,
     ConditionFailedError,
     Item,
     Key,
@@ -130,6 +153,24 @@ class StaleRoundError(GateError):
     code = "stale_round"
 
 
+class CommentRequiredError(GateError):
+    """A request for changes, a reject or a retest without a (non-blank) comment."""
+
+    code = "comment_required"
+
+
+class DuplicateVoteError(GateError):
+    """This person already has a vote for the current subject of the gate round."""
+
+    code = "already_voted"
+
+
+class QuorumConfigError(GateError):
+    """A quorum that cannot be enforced: a repeated or blank role, or a count below 1."""
+
+    code = "quorum_invalid"
+
+
 class GateContentionError(TransientError):
     """The gate kept changing under this call (or the store kept conflicting) until the retries
     ran out. Nothing was written. Retry the call."""
@@ -154,9 +195,41 @@ def gate_key(run_id: RunId, name: str, round: int) -> Key:
 
 
 @dataclass(frozen=True)
+class QuorumRule:
+    """``count`` distinct people holding ``role``. Anything with ``role`` and ``count`` (the config
+    schema's ``Quorum``) is accepted where a rule is expected."""
+
+    role: str
+    count: int
+
+
+class DecisionPolicy(Protocol):
+    """What the service cannot know itself: the gate's quorum, who holds which role, and who is
+    barred (separation of duties, D3-05). It is read at each attempt and must not write."""
+
+    def quorum(self, scope: Scope, gate: Gate) -> Sequence[QuorumRule]:
+        """Read once, when the gate opens. Empty means one approval from any eligible person."""
+        ...
+
+    def roles(self, scope: Scope, gate: Gate, actor: str) -> Collection[str]:
+        """The roles ``actor`` can vote in on this gate."""
+        ...
+
+    def refusals(self, scope: Scope, gate: Gate, actor: str, *, negative: bool) -> Sequence[str]:
+        """Reasons ``actor`` may not decide now; empty means eligible."""
+        ...
+
+
+@dataclass(frozen=True)
 class Decided:
+    """``gate`` is the gate as left by this decision: still open for a vote below quorum."""
+
     gate: Gate
     decision: Decision
+
+    @property
+    def closed(self) -> bool:
+        return not self.gate.is_open
 
 
 class GateService:
@@ -166,7 +239,9 @@ class GateService:
         *,
         hooks: GateHooks | None = None,
         audit: AuditWriter | None = None,
+        policy: DecisionPolicy | None = None,
     ) -> None:
+        self._policy = policy
         self._store = store
         self._reader = ReadOnly(store)
         self._hooks = hooks if hooks is not None else GateHooks()
@@ -205,6 +280,7 @@ class GateService:
                         f"round {other.round} is still open"
                     )
             gate = Gate(GateId.new(), cmd.run_id, cmd.name, cmd.type, cmd.round, cmd.subject)
+            rules = _checked_quorum(self._policy.quorum(scope, gate) if self._policy else ())
             entry = AuditEntry(
                 cmd.run_id,
                 "gate.opened",
@@ -222,6 +298,8 @@ class GateService:
                 Put(key, to_wire(gate), Absent()),
                 *self._audit.ops(self._reader, scope, entry),
             ]
+            if rules:
+                own.append(Put(_quorum_key(gate), {"rules": rules}, Absent()))
             hook_ops = self._hooks.open_ops(OpenContext(self._reader, scope, gate))
             ops = _within_cap([*own, *hook_ops])
             try:
@@ -234,9 +312,9 @@ class GateService:
                 _backoff(attempt)
             else:
                 return gate
-        if last is not None:
-            raise last
-        raise GateContentionError(f"gate {cmd.name!r} round {cmd.round} kept changing; try again")
+        raise GateContentionError(
+            f"gate {cmd.name!r} round {cmd.round} kept changing; try again"
+        ) from last
 
     # --- decide -----------------------------------------------------------------------------
 
@@ -258,6 +336,8 @@ class GateService:
         kind = DecisionKind(kind)
         if kind not in _CLOSES_AS:
             raise DecisionNotAllowedError(f"{kind.value} is not available yet")
+        if kind is not DecisionKind.APPROVE and not comment.strip():
+            raise CommentRequiredError(f"a {kind.value} decision needs a comment")
         key = gate_key(run_id, gate, round)
         decision_id = DecisionId.new()
         last: Exception | None = None
@@ -282,9 +362,35 @@ class GateService:
                 raise StaleRoundError(
                     f"gate {gate!r} round {round} was superseded by a newer round"
                 )
+            self._refuse_if_barred(scope, current, actor, kind)
+            counted = [decision.id]
+            if kind is DecisionKind.APPROVE:
+                # A vote's count is only as fresh as the chain head the audit entry will be
+                # conditioned on. Read the head BEFORE counting and compare it after the audit ops
+                # are built (they read it again): equal means no decision committed in between, so
+                # the count is the count this transaction commits against. Heads only move
+                # forward. A close needs no such check: it already counted a quorum, anything that
+                # lands in between is a veto or another close, and both move the gate's version.
+                head = self._head_version(scope, run_id)
+                tally = self._tally(scope, current, decision)
+                if not tally.closes:
+                    own = self._vote_ops(scope, item, current, decision, tally)
+                    if self._head_version(scope, run_id) != head:
+                        continue  # a decision committed while we counted: count again
+                    try:
+                        self._store.transact(scope, _within_cap(own))
+                    except ConditionFailedError as err:
+                        last = err  # a close or a vote raced us: re-read and count again
+                    except TransactionConflictError as err:
+                        last = err
+                        _backoff(attempt)
+                    else:
+                        return Decided(current, decision)
+                    continue
+                counted = tally.counted
             closed = current.advance(_CLOSES_AS[kind], closed_by=actor)
             invalidated = self._earlier_approvals(scope, current, kind)
-            own = self._close_ops(scope, item, closed, decision, invalidated)
+            own = self._close_ops(scope, item, closed, decision, invalidated, counted)
             # The audit chain head was read inside _close_ops. Confirm the set of approvals to
             # void is still the same now: any later change to a round also moves the head.
             if [g.round for _, g in self._earlier_approvals(scope, current, kind)] != [
@@ -305,11 +411,111 @@ class GateService:
                 _backoff(attempt)
             else:
                 return Decided(closed, decision)
-        if last is not None:
-            raise last
-        raise GateContentionError(f"gate {gate!r} round {round} kept changing; try again")
+        raise GateContentionError(f"gate {gate!r} round {round} kept changing; try again") from last
 
     # --- internals --------------------------------------------------------------------------
+
+    # --- quorum -----------------------------------------------------------------------------
+
+    def _refuse_if_barred(self, scope: Scope, gate: Gate, actor: str, kind: DecisionKind) -> None:
+        if self._policy is None:
+            return
+        reasons = self._policy.refusals(scope, gate, actor, negative=kind.is_negative)
+        if reasons:
+            raise DecisionNotAllowedError(
+                f"{actor} may not {kind.value} gate {gate.name!r} round {gate.round}: "
+                + ", ".join(reasons)
+            )
+
+    def _head_version(self, scope: Scope, run_id: RunId) -> int | None:
+        head = self._store.get(scope, Key(run_pk(run_id), CHAIN_SK))
+        return None if head is None else head.version
+
+    def _rules(self, scope: Scope, gate: Gate) -> list[QuorumRule]:
+        item = self._store.get(scope, _quorum_key(gate))
+        if item is None:
+            return []  # opened without a quorum: one approval from any eligible person
+        return [QuorumRule(r["role"], r["count"]) for r in item.data["rules"]]
+
+    def _votes(self, scope: Scope, gate: Gate) -> list[tuple[Item, Decision]]:
+        found: list[tuple[Item, Decision]] = []
+        cursor: str | None = None
+        while True:
+            page = self._store.query(
+                scope, run_pk(gate.run_id), sk_prefix=_vote_prefix(gate), cursor=cursor
+            )
+            found += [(i, from_wire(Decision, i.data["decision"])) for i in page.items]
+            cursor = page.cursor
+            if cursor is None:
+                return found
+
+    def _tally(self, scope: Scope, gate: Gate, decision: Decision) -> _Tally:
+        """Count this approval with the earlier votes that still stand: bound to the gate's
+        current subject, by a person who is still eligible (PLAN 4.1). Nothing is written."""
+        rules = self._rules(scope, gate)
+        if not rules:
+            return _Tally(True, [decision.id], None, None)
+        policy = self._policy
+        if policy is None:
+            raise QuorumConfigError("the gate has a quorum but the service has no policy")
+        digest, actor = gate.subject.digest(), decision.actor
+        stale: Item | None = None
+        voters: list[tuple[str, frozenset[str]]] = []
+        counted: list[DecisionId] = []
+        for vote_item, vote in self._votes(scope, gate):
+            if vote.actor == actor:
+                if vote.subject_digest == digest:
+                    raise DuplicateVoteError(
+                        f"{actor} already approved gate {gate.name!r} round {gate.round}"
+                    )
+                stale = vote_item  # a vote for a subject that moved: replaced, never counted
+            elif vote.subject_digest == digest and not policy.refusals(
+                scope, gate, vote.actor, negative=False
+            ):
+                voters.append((vote.actor, frozenset(policy.roles(scope, gate, vote.actor))))
+                counted.append(vote.id)
+        wanted = {r.role for r in rules}
+        mine = frozenset(policy.roles(scope, gate, actor)) & wanted
+        if not mine:
+            raise DecisionNotAllowedError(
+                f"{actor} holds none of the roles gate {gate.name!r} needs: {sorted(wanted)}"
+            )
+        voters.append((actor, mine))
+        slots = [r.role for r in rules for _ in range(r.count)]
+        met = _fills(slots, [roles for _, roles in voters])
+        return _Tally(met, [*counted, decision.id], stale, len(voters))
+
+    def _vote_ops(
+        self, scope: Scope, item: Item, gate: Gate, decision: Decision, tally: _Tally
+    ) -> list[Op]:
+        when: Condition = Absent() if tally.stale is None else VersionIs(tally.stale.version)
+        entry = AuditEntry(
+            gate.run_id,
+            "gate.voted",
+            decision.actor,
+            {
+                "gate": gate.name,
+                "round": gate.round,
+                "gate_id": str(gate.id),
+                "decision": decision.kind.value,
+                "decision_id": str(decision.id),
+                "surface": decision.surface.value,
+                "subject_digest": decision.subject_digest,
+                "comment": decision.comment,
+                "votes": tally.votes,
+            },
+            _now_ms(),
+        )
+        return [
+            # The vote is only valid while the gate is still the one that was read.
+            Check(item.key, VersionIs(item.version)),
+            Put(
+                _vote_key(gate, decision.actor),
+                {"actor": decision.actor, "decision": to_wire(decision)},
+                when,
+            ),
+            *self._audit.ops(self._reader, scope, entry),
+        ]
 
     def _rounds(self, scope: Scope, run_id: RunId, name: str) -> list[tuple[Item, Gate]]:
         page = self._store.query(scope, run_pk(run_id), sk_prefix=f"GATE#{name}#")
@@ -336,6 +542,7 @@ class GateService:
         closed: Gate,
         decision: Decision,
         invalidated: list[tuple[Item, Gate]],
+        counted: list[DecisionId],
     ) -> list[Op]:
         pk = run_pk(closed.run_id)
         outbox = {
@@ -346,6 +553,7 @@ class GateService:
             "status": closed.status.value,
             "decision": decision.kind.value,
             "decision_id": str(decision.id),
+            "decision_ids": [str(d) for d in counted],
             "actor": decision.actor,
             "subject": to_wire(closed.subject) if decision.kind is DecisionKind.APPROVE else None,
         }
@@ -363,6 +571,7 @@ class GateService:
                 "status": closed.status.value,
                 "subject_digest": decision.subject_digest,
                 "comment": decision.comment,
+                "decision_ids": [str(d) for d in counted],
                 "invalidated_rounds": [g.round for _, g in invalidated],
             },
             _now_ms(),
@@ -387,6 +596,64 @@ class GateService:
                 )
             )
         return ops
+
+
+@dataclass(frozen=True)
+class _Tally:
+    closes: bool
+    # the approvals that stand: earlier votes in the store's order of VOTE# keys (a hash of the
+    # voter, so NOT time order), then this decision last. Consumers must not read order as time.
+    counted: list[DecisionId]
+    stale: Item | None  # this person's earlier vote for a subject that has moved
+    votes: int | None  # people who now hold a vote, this one included
+
+
+def _quorum_key(gate: Gate) -> Key:
+    return Key(run_pk(gate.run_id), f"QUO#{gate.name}#{gate.round}")
+
+
+def _vote_prefix(gate: Gate) -> str:
+    return f"VOTE#{gate.name}#{gate.round}#"
+
+
+def _vote_key(gate: Gate, actor: str) -> Key:
+    # hashed: an actor is ``issuer|subject`` and may hold characters a sort key should not
+    return Key(run_pk(gate.run_id), _vote_prefix(gate) + hashlib.sha256(actor.encode()).hexdigest())
+
+
+def _checked_quorum(rules: Sequence[QuorumRule]) -> list[dict[str, object]]:
+    """The wire form of a quorum, or :class:`QuorumConfigError`: one entry per role, a real role
+    name and a count of at least 1, so a role cannot count twice."""
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for rule in rules:
+        role, count = rule.role, rule.count
+        if not isinstance(role, str) or not role.strip():
+            raise QuorumConfigError("a quorum role must be a non-blank name")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise QuorumConfigError(f"quorum role {role!r} needs a count of at least 1")
+        if role in seen:
+            raise QuorumConfigError(f"quorum role {role!r} is listed twice")
+        seen.add(role)
+        out.append({"role": role, "count": count})
+    return out
+
+
+def _fills(slots: list[str], voters: list[frozenset[str]]) -> bool:
+    """True if every slot (a role, once per head needed) can get its own voter holding that role.
+    Augmenting-path matching, so a voter with two roles takes whichever one is left."""
+    owner: dict[int, int] = {}  # voter -> slot
+
+    def place(slot: int, seen: set[int]) -> bool:
+        for v, roles in enumerate(voters):
+            if slots[slot] in roles and v not in seen:
+                seen.add(v)
+                if v not in owner or place(owner[v], seen):
+                    owner[v] = slot
+                    return True
+        return False
+
+    return all(place(s, set()) for s in range(len(slots)))
 
 
 def verify_audit_chain(store: Store | ReadOnly, scope: Scope, run_id: RunId) -> int:

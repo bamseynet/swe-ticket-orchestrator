@@ -783,6 +783,8 @@ class Runtime:
                 # Whatever is queued for this run must not wait for a drive that died.
                 await self._ensure_driven(run_id)
                 raise
+            if not decided.closed:
+                return decided  # a vote below quorum: the gate is still open, the run hears nothing
             event = _closed_event(decided.gate, decided.decision)
             try:
                 await self.submit(run_id, event)
