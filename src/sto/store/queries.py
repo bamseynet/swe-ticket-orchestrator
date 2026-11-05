@@ -17,6 +17,15 @@ index      pk                           sk                           use
 
 Timestamps are ISO 8601 strings in UTC, so text order is time order.
 
+**Index sort keys are unique by construction.** Where entries of one index partition can share a
+timestamp (``gsi1``-``gsi4``), the sort key is ``<stamp>#<item pk>#<item sk>`` (the stamp has no
+``#``). DynamoDB does not document the order of equal sort keys, and a page that resumes from an
+``ExclusiveStartKey`` inside such a tie could skip entries; with distinct keys there is no tie.
+``gsi5`` is ``<kind>#<id>``, already one per ORG item.
+
+**A Put replaces the item, attributes included.** An item that is rewritten must be written with
+its ``*_attrs`` again, or it leaves the indexes (which is what closing a gate does on purpose).
+
 Reads of a GSI are eventually consistent on DynamoDB, so a result says "look here", not "decide
 from this": a caller that acts on a gate or run re-reads the item with ``get``.
 
@@ -24,7 +33,11 @@ from this": a caller that acts on a gate or run re-reads the item with ``get``.
 of its own, ``TICKET#<source>#<ref>`` / ``ACTIVE``, created with ``Absent()`` in the same
 transaction as the run. Of any number of concurrent starts exactly one commits; the others get
 ``ActiveRunExistsError`` and write nothing. Ending a run releases the claim with
-``release_ticket_op`` in the transaction that moves it to a terminal status.
+``release_ticket_ops`` in the transaction that moves it to a terminal status. A release succeeds
+whether the claim is held by this run or missing (a run that never had one can still end), and is
+refused when another run holds it. If a run ended without releasing, the next ``start_run`` takes
+the claim over, in one transaction: a ``Check`` that the holder's run is still in the terminal
+status that was read, a versioned overwrite of the claim, and the new run.
 """
 
 from __future__ import annotations
@@ -42,6 +55,7 @@ from sto.domain.states import RunStatus
 from .ports import (
     PLATFORM,
     Absent,
+    Check,
     ConditionFailedError,
     Delete,
     FieldEquals,
@@ -52,6 +66,7 @@ from .ports import (
     Page,
     Put,
     TeamScope,
+    VersionIs,
     encode_index_cursor,
 )
 
@@ -98,17 +113,24 @@ def ttl_attrs(expires_at: datetime) -> dict[str, str | int]:
     return {"ttl": int(expires_at.timestamp())}
 
 
-def gate_queue_attrs(role: str, opened_at: str) -> dict[str, str | int]:
-    """Index entry of an OPEN gate that ``role`` can decide. Leave it out when the gate closes."""
+def _unique_sk(label: str, stamp: str, key: Key) -> str:
+    """``<stamp>#<pk>#<sk>``: sorts by time, and no two items of one index share it."""
+    return f"{_part(label, stamp)}#{key.pk}#{key.sk}"
+
+
+def gate_queue_attrs(role: str, opened_at: str, key: Key) -> dict[str, str | int]:
+    """Index entry of an OPEN gate item ``key`` that ``role`` can decide. Leave it out when the
+    gate closes."""
     return {
         "gsi1pk": f"GATE#OPEN#{_part('role', role)}",
-        "gsi1sk": _stamp("opened_at", opened_at),
+        "gsi1sk": _unique_sk("opened_at", opened_at, key),
     }
 
 
 def run_attrs(
     status: RunStatus,
     updated_at: str,
+    key: Key,
     *,
     ticket: tuple[str, str] | None = None,
     pr: tuple[str, int] | None = None,
@@ -116,32 +138,33 @@ def run_attrs(
     """Index entries of a run's META item: the run list by status always, the ticket lookup while
     the run is active (a terminal run leaves it, so the lookup finds active runs only), and the PR
     lookup when it has a PR."""
-    stamp = _stamp("updated_at", updated_at)
     attrs: dict[str, str | int] = {
         "gsi2pk": f"RUNS#{_part('status', RunStatus(status).value)}",
-        "gsi2sk": stamp,
+        "gsi2sk": _unique_sk("updated_at", updated_at, key),
     }
     if ticket is not None and not RunStatus(status).is_terminal:
-        attrs |= ticket_attrs(*ticket, updated_at=stamp)
+        attrs |= ticket_attrs(*ticket, updated_at, key)
     if pr is not None:
-        attrs |= pr_attrs(pr[0], pr[1], stamp)
+        attrs |= pr_attrs(pr[0], pr[1], updated_at, key)
     return attrs
 
 
-def ticket_attrs(source: str, ref: str, *, updated_at: str = "-") -> dict[str, str | int]:
-    return {
-        "gsi3pk": f"TICKET#{_part('source', source)}#{_stamp('ref', ref)}",
-        "gsi3sk": _stamp("updated_at", updated_at),
-    }
+def _ticket_pk(source: str, ref: str) -> str:
+    return f"TICKET#{_part('source', source)}#{_stamp('ref', ref)}"
 
 
-def pr_attrs(repo: str, number: int, updated_at: str) -> dict[str, str | int]:
+def ticket_attrs(source: str, ref: str, updated_at: str, key: Key) -> dict[str, str | int]:
+    return {"gsi3pk": _ticket_pk(source, ref), "gsi3sk": _unique_sk("updated_at", updated_at, key)}
+
+
+def _pr_pk(repo: str, number: int) -> str:
     if type(number) is not int or number < 1:
         raise ValueError("a PR number is an int of at least 1")
-    return {
-        "gsi4pk": f"PR#{_part('repo', repo)}#{number}",
-        "gsi4sk": _stamp("updated_at", updated_at),
-    }
+    return f"PR#{_part('repo', repo)}#{number}"
+
+
+def pr_attrs(repo: str, number: int, updated_at: str, key: Key) -> dict[str, str | int]:
+    return {"gsi4pk": _pr_pk(repo, number), "gsi4sk": _unique_sk("updated_at", updated_at, key)}
 
 
 def resource_attrs(team: str, kind: str, resource_id: str) -> dict[str, str | int]:
@@ -236,9 +259,7 @@ def list_runs(
 
 def runs_for_ticket(store: IndexedStore, scope: TeamScope, source: str, ref: str) -> Page:
     """The active run(s) of a ticket: at most one, since ``start_run`` claims the ticket."""
-    return store.query_index(
-        scope, TICKET_LOOKUP, f"TICKET#{_part('source', source)}#{_stamp('ref', ref)}"
-    )
+    return store.query_index(scope, TICKET_LOOKUP, _ticket_pk(source, ref))
 
 
 def runs_for_pr(
@@ -251,8 +272,7 @@ def runs_for_pr(
     cursor: str | None = None,
 ) -> Page:
     """Items carrying a PR's index entry, to route a webhook."""
-    pk = pr_attrs(repo, number, "-")["gsi4pk"]
-    return store.query_index(scope, PR_LOOKUP, str(pk), limit=limit, cursor=cursor)
+    return store.query_index(scope, PR_LOOKUP, _pr_pk(repo, number), limit=limit, cursor=cursor)
 
 
 def resources_of_team(
@@ -268,13 +288,48 @@ def resources_of_team(
 
 
 def _claim_key(source: str, ref: str) -> Key:
-    return Key(f"TICKET#{_part('source', source)}#{_stamp('ref', ref)}", CLAIM_SK)
+    return Key(_ticket_pk(source, ref), CLAIM_SK)
 
 
-def release_ticket_op(source: str, ref: str, *, run_id: str) -> Delete:
-    """Release a ticket's claim, only if ``run_id`` holds it. Put it in the transaction that moves
-    the run to a terminal status."""
-    return Delete(_claim_key(source, ref), when=FieldEquals("run_id", _part("run_id", run_id)))
+class ClaimHeldByAnotherRunError(PermanentError):
+    """A run tried to release a ticket claim that another run holds."""
+
+    def __init__(self, source: str, ref: str, holder: str | None) -> None:
+        self.source, self.ref, self.holder = source, ref, holder
+        super().__init__(f"ticket {source}:{ref} is claimed by another run ({holder})")
+
+
+def release_ticket_ops(
+    store: IndexedStore, scope: TeamScope, source: str, ref: str, *, run_id: str
+) -> list[Op]:
+    """Operations that release ``run_id``'s claim on a ticket; add them to the transaction that
+    moves the run to a terminal status. They commit only if the claim is still as read:
+
+    * held by this run: a ``Delete`` guarded by the claim's version;
+    * missing (the run never had one, or it was released): a ``Check`` that it is still absent,
+      so a run without a claim can still end;
+    * held by another run: ``ClaimHeldByAnotherRunError``, and nothing is released.
+    """
+    claim = _claim_key(source, ref)
+    held = store.get(scope, claim)
+    if held is None:
+        return [Check(claim, Absent())]
+    holder = held.data.get("run_id")
+    if holder != _part("run_id", run_id):
+        raise ClaimHeldByAnotherRunError(source, ref, None if holder is None else str(holder))
+    return [Delete(claim, when=VersionIs(held.version))]
+
+
+_TERMINAL = frozenset(s.value for s in RunStatus if s.is_terminal)
+
+
+def _claim_data(run_id: str, updated_at: str, run_key: Key) -> dict[str, Any]:
+    return {
+        "run_id": _part("run_id", run_id),
+        "since": _stamp("updated_at", updated_at),
+        "run_pk": run_key.pk,
+        "run_sk": run_key.sk,
+    }
 
 
 def start_run(
@@ -292,28 +347,70 @@ def start_run(
 ) -> None:
     """Create a run and claim its ticket in one transaction. Raises ``ActiveRunExistsError`` if
     the ticket has an active run, and writes nothing. Other errors (for example the run item
-    already existing) are ``ConditionFailedError`` as usual."""
+    already existing) are ``ConditionFailedError`` as usual.
+
+    If the claim is held by a run whose item shows a terminal status (``data["status"]``), that
+    run ended without releasing: the claim is taken over in the same transaction, guarded by the
+    claim's version and by that run still having the status that was read (terminal statuses
+    never change). A holder whose run item is missing or not terminal is never displaced."""
     source, ref = ticket
     claim = _claim_key(source, ref)
-    ops: list[Op] = [
-        Put(claim, {"run_id": _part("run_id", run_id), "since": _stamp("updated_at", updated_at)},
-            when=Absent()),
+    mine = _claim_data(run_id, updated_at, run_key)
+    new_run = [
         Put(
             run_key,
             run_data,
             when=Absent(),
-            attrs=run_attrs(status, updated_at, ticket=ticket, pr=pr),
+            attrs=run_attrs(status, updated_at, run_key, ticket=ticket, pr=pr),
         ),
         *extra_ops,
-    ]  # fmt: skip
+    ]
     try:
-        store.transact(scope, ops)
+        store.transact(scope, [Put(claim, mine, when=Absent()), *new_run])
+        return
     except ConditionFailedError as exc:
-        if 0 in exc.failed:
-            held = store.get(scope, claim)
-            holder = None if held is None else str(held.data.get("run_id"))
-            raise ActiveRunExistsError(source, ref, holder) from exc
+        if 0 not in exc.failed:
+            raise
+    held = store.get(scope, claim)
+    ended = _ended_holder(store, scope, held)
+    if held is None or ended is None:
+        raise ActiveRunExistsError(
+            source, ref, None if held is None else str(held.data.get("run_id"))
+        )
+    holder_key, holder_status = ended
+    try:
+        store.transact(
+            scope,
+            [
+                Put(claim, mine, when=VersionIs(held.version)),
+                Check(holder_key, FieldEquals("status", holder_status)),
+                *new_run,
+            ],
+        )
+    except ConditionFailedError as exc:
+        if exc.failed and min(exc.failed) <= 1:  # the claim or the holder moved: someone else won
+            now = store.get(scope, claim)
+            raise ActiveRunExistsError(
+                source, ref, None if now is None else str(now.data.get("run_id"))
+            ) from exc
         raise
+
+
+def _ended_holder(
+    store: IndexedStore, scope: TeamScope, claim: Item | None
+) -> tuple[Key, str] | None:
+    """The claim holder's run key and terminal status, or ``None`` if it cannot be shown to have
+    ended."""
+    if claim is None:
+        return None
+    pk, sk = claim.data.get("run_pk"), claim.data.get("run_sk")
+    if not isinstance(pk, str) or not isinstance(sk, str) or not pk or not sk:
+        return None
+    run = store.get(scope, Key(pk, sk))
+    status = None if run is None else run.data.get("status")
+    if isinstance(status, str) and status in _TERMINAL:
+        return Key(pk, sk), status
+    return None
 
 
 # --- merged cursor of my_approvals -------------------------------------------------------------

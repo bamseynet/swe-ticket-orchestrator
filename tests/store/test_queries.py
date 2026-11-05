@@ -9,6 +9,9 @@ of these paths, top-level attributes, TTL.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import sqlite3
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -18,17 +21,24 @@ import pytest
 from store_contract import A, B
 from test_dynamodb import AUDIT_TABLE, MAIN_TABLE, Env, env  # noqa: F401  (env is a fixture)
 
-from sto.domain.errors import PermanentError
 from sto.domain.states import RunStatus
 from sto.store import queries
 from sto.store.memory import MemoryStore
 from sto.store.ports import (
     AUDIT,
+    MAX_ITEM_BYTES,
     PLATFORM,
     Absent,
+    Check,
+    ConditionFailedError,
+    Exists,
     IndexedStore,
     Key,
     Put,
+    TeamScope,
+    attrs_size,
+    encode_index_cursor,
+    validate_ops,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -249,6 +259,55 @@ class IndexContract:
             store.transact(A, [Put(RUN1, {}, when=Absent(), attrs={"gsi2pk": "R", "gsi2sk": "b"})])
         assert [i.attrs["gsi2sk"] for i in store.query_index(A, "gsi2", "R").items] == ["a"]
 
+    def test_promoted_attributes_count_towards_the_item_size_on_every_store(
+        self, store: IndexedStore
+    ) -> None:
+        attrs: dict[str, str | int] = {}
+        for i in range(1, 6):
+            attrs[f"gsi{i}pk"] = "P" * 2000
+            attrs[f"gsi{i}sk"] = "S" * 1000
+        # JSON plus keys is just under the limit; the 15 KB of attributes (and the team prefix on
+        # five index keys) push it over, and the port says so, not DynamoDB.
+        data = {"x": "y" * (400 * 1024 - 2000)}
+        with pytest.raises(ValueError, match="item is"):
+            store.transact(A, [Put(RUN1, data, attrs=attrs)])
+        with pytest.raises(ValueError, match="item is"):
+            store.transact(A, [Put(Key("RUN#2", "META"), data, attrs=attrs, scope=None)])
+        assert store.get(A, RUN1) is None
+        assert store.get(A, Key("RUN#2", "META")) is None
+
+    def test_delete_then_put_again_with_the_same_index_keys(self, store: IndexedStore) -> None:
+        attrs = {"gsi2pk": "R", "gsi2sk": "t"}
+        store.transact(A, [Put(RUN1, {"n": 1}, attrs=attrs)])
+        store.delete(A, RUN1)
+        assert store.query_index(A, "gsi2", "R").items == ()
+        store.transact(A, [Put(RUN1, {"n": 2}, attrs=attrs)])
+        (item,) = store.query_index(A, "gsi2", "R").items
+        assert item.data == {"n": 2}
+        assert item.version == 1
+        store.delete(A, RUN1)
+        assert store.query_index(A, "gsi2", "R").items == ()
+
+    def test_ttl_is_epoch_seconds_and_a_millisecond_value_is_refused(
+        self, store: IndexedStore
+    ) -> None:
+        top = 10**11 - 1
+        store.transact(A, [Put(RUN1, {}, attrs={"ttl": top})])
+        assert store.get(A, RUN1).attrs == {"ttl": top}  # type: ignore[union-attr]
+        for bad in (10**11, 1_893_456_000_000, 10**13):
+            with pytest.raises(ValueError, match="milliseconds"):
+                Put(RUN1, {}, attrs={"ttl": bad})
+
+    def test_a_forged_cursor_with_an_empty_sort_key_is_refused(self, store: IndexedStore) -> None:
+        store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R", "gsi2sk": "t"})])
+        for last in (("", "RUN#1", "META"), ("t", "RUN#1", "")):
+            cursor = encode_index_cursor("TEAM#team-a", "gsi2", "R", "", False, last)
+            with pytest.raises(ValueError, match="cursor"):
+                store.query_index(A, "gsi2", "R", cursor=cursor)
+        # An empty item pk is the team root, and is fine.
+        ok = encode_index_cursor("TEAM#team-a", "gsi2", "R", "", False, ("t", "", "META"))
+        assert [i.key for i in store.query_index(A, "gsi2", "R", cursor=ok).items] == [RUN1]
+
 
 class HelperContract:
     """``sto.store.queries`` on any store."""
@@ -258,7 +317,7 @@ class HelperContract:
             store,
             A,
             Key(f"RUN#{n}", "META"),
-            {"id": n},
+            {"id": n, "status": "QUEUED"},
             run_id=f"r{n}",
             status=RunStatus.QUEUED,
             updated_at=f"2024-01-0{n}",
@@ -310,12 +369,135 @@ class HelperContract:
         self, store: IndexedStore
     ) -> None:
         self.start(store, 1)
-        with pytest.raises(PermanentError):
-            store.transact(A, [queries.release_ticket_op("jira", "T-1", run_id="someone-else")])
+        with pytest.raises(queries.ClaimHeldByAnotherRunError) as err:
+            queries.release_ticket_ops(store, A, "jira", "T-1", run_id="someone-else")
+        assert err.value.holder == "r1"
         with pytest.raises(queries.ActiveRunExistsError):
             self.start(store, 2)
-        store.transact(A, [queries.release_ticket_op("jira", "T-1", run_id="r1")])
+        store.transact(A, queries.release_ticket_ops(store, A, "jira", "T-1", run_id="r1"))
         self.start(store, 2)
+
+    def test_a_run_without_a_claim_can_still_reach_a_terminal_status(
+        self, store: IndexedStore
+    ) -> None:
+        k = Key("RUN#1", "META")
+        store.transact(
+            A, [Put(k, {"status": "QUEUED"}, attrs=queries.run_attrs(RunStatus.QUEUED, "t", k))]
+        )
+        ops = queries.release_ticket_ops(store, A, "jira", "T-404", run_id="r1")
+        store.transact(
+            A,
+            [
+                Put(
+                    k,
+                    {"status": "DONE"},
+                    attrs=queries.run_attrs(RunStatus.DONE, "t2", k, ticket=("jira", "T-404")),
+                ),
+                *ops,
+            ],
+        )
+        assert store.get(A, k).data == {"status": "DONE"}  # type: ignore[union-attr]
+
+    def test_a_release_planned_on_an_absent_claim_fails_if_the_claim_appears_first(
+        self, store: IndexedStore
+    ) -> None:
+        ops = queries.release_ticket_ops(store, A, "jira", "T-1", run_id="r1")  # absent: a Check
+        self.start(store, 2)  # another run claims the ticket before the release commits
+        with pytest.raises(ConditionFailedError):
+            store.transact(A, [Put(Key("RUN#1", "META"), {}), *ops])
+        assert store.get(A, Key("RUN#1", "META")) is None
+        assert queries.runs_for_ticket(store, A, "jira", "T-1").items != ()
+
+    def test_a_release_planned_for_one_holder_cannot_delete_a_newer_claim(
+        self, store: IndexedStore
+    ) -> None:
+        self.start(store, 1)
+        ops = queries.release_ticket_ops(store, A, "jira", "T-1", run_id="r1")  # a versioned Delete
+        self.end_without_releasing(store, 1, RunStatus.DONE)
+        self.start(store, 2)  # takes the claim over before r1's release commits
+        with pytest.raises(ConditionFailedError):
+            store.transact(A, [Put(Key("RUN#7", "META"), {}), *ops])
+        claim = store.get(A, Key("TICKET#jira#T-1", "ACTIVE"))
+        assert claim is not None
+        assert claim.data["run_id"] == "r2"
+        assert store.get(A, Key("RUN#7", "META")) is None
+
+    def end_without_releasing(self, store: IndexedStore, n: int, status: RunStatus) -> None:
+        k = Key(f"RUN#{n}", "META")
+        store.transact(
+            A,
+            [Put(k, {"id": n, "status": status.value}, attrs=queries.run_attrs(status, "t9", k))],
+        )
+
+    def test_a_claim_held_by_a_finished_run_is_taken_over_in_one_transaction(
+        self, store: IndexedStore
+    ) -> None:
+        self.start(store, 1)
+        self.end_without_releasing(store, 1, RunStatus.DONE)
+        self.start(store, 2)  # the holder is terminal, so this takes the claim
+        claim = store.get(A, Key("TICKET#jira#T-1", "ACTIVE"))
+        assert claim is not None
+        assert claim.data["run_id"] == "r2"
+        assert claim.version == 2
+        assert [i.key.pk for i in queries.runs_for_ticket(store, A, "jira", "T-1").items] == [
+            "RUN#2"
+        ]
+        with pytest.raises(queries.ClaimHeldByAnotherRunError):  # the old run cannot release it
+            queries.release_ticket_ops(store, A, "jira", "T-1", run_id="r1")
+        with pytest.raises(queries.ActiveRunExistsError):  # and r2 is a live holder now
+            self.start(store, 3)
+
+    def test_a_claim_held_by_a_live_or_missing_run_is_never_taken_over(
+        self, store: IndexedStore
+    ) -> None:
+        self.start(store, 1)  # QUEUED
+        self.end_without_releasing(store, 1, RunStatus.RUNNING)
+        with pytest.raises(queries.ActiveRunExistsError) as err:
+            self.start(store, 2)
+        assert err.value.run_id == "r1"
+        store.delete(A, Key("RUN#1", "META"))  # holder's run item is gone: cannot show it ended
+        with pytest.raises(queries.ActiveRunExistsError):
+            self.start(store, 2)
+        assert store.get(A, Key("RUN#2", "META")) is None
+
+    def test_a_failed_takeover_writes_nothing(self, store: IndexedStore) -> None:
+        self.start(store, 1)
+        self.end_without_releasing(store, 1, RunStatus.DONE)
+        self.start(store, 2)
+        self.end_without_releasing(store, 2, RunStatus.DONE)
+        # A start that takes the claim over but fails on another operation changes nothing.
+        with pytest.raises(ConditionFailedError):
+            queries.start_run(
+                store, A, Key("RUN#3", "META"), {}, run_id="r3", status=RunStatus.QUEUED,
+                updated_at="t", ticket=("jira", "T-1"),
+                extra_ops=[Check(Key("NOPE", "1"), Exists())],
+            )  # fmt: skip
+        assert store.get(A, Key("RUN#3", "META")) is None
+        claim = store.get(A, Key("TICKET#jira#T-1", "ACTIVE"))
+        assert claim is not None
+        assert claim.data["run_id"] == "r2"
+
+    def test_racing_takeovers_have_exactly_one_winner(self, store: IndexedStore) -> None:
+        self.start(store, 1)
+        self.end_without_releasing(store, 1, RunStatus.DONE)
+        wins: list[int] = []
+        barrier = threading.Barrier(8)
+
+        def go(n: int) -> None:
+            barrier.wait()
+            with contextlib.suppress(queries.ActiveRunExistsError):
+                self.start(store, n)
+                wins.append(n)
+
+        threads = [threading.Thread(target=go, args=(n,)) for n in range(2, 10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(wins) == 1
+        claim = store.get(A, Key("TICKET#jira#T-1", "ACTIVE"))
+        assert claim is not None
+        assert claim.data["run_id"] == f"r{wins[0]}"
 
     def test_a_terminal_run_leaves_the_ticket_index_but_stays_in_the_run_list(
         self, store: IndexedStore
@@ -327,9 +509,11 @@ class HelperContract:
                 Put(
                     Key("RUN#1", "META"),
                     {"id": 1},
-                    attrs=queries.run_attrs(RunStatus.DONE, "2024-02-01", ticket=("jira", "T-1")),
+                    attrs=queries.run_attrs(
+                        RunStatus.DONE, "2024-02-01", Key("RUN#1", "META"), ticket=("jira", "T-1")
+                    ),
                 ),
-                queries.release_ticket_op("jira", "T-1", run_id="r1"),
+                *queries.release_ticket_ops(store, A, "jira", "T-1", run_id="r1"),
             ],
         )
         assert queries.runs_for_ticket(store, A, "jira", "T-1").items == ()
@@ -354,7 +538,9 @@ class HelperContract:
         assert queries.list_runs(store, B, RunStatus.QUEUED).items == ()
 
     def test_pr_lookup(self, store: IndexedStore) -> None:
-        store.transact(A, [Put(RUN1, {}, attrs=queries.pr_attrs("org/repo", 7, "2024-01-01"))])
+        store.transact(
+            A, [Put(RUN1, {}, attrs=queries.pr_attrs("org/repo", 7, "2024-01-01", RUN1))]
+        )
         assert [i.key for i in queries.runs_for_pr(store, A, "org/repo", 7).items] == [RUN1]
         assert queries.runs_for_pr(store, A, "org/repo", 8).items == ()
         assert queries.runs_for_pr(store, B, "org/repo", 7).items == ()
@@ -364,47 +550,44 @@ class HelperContract:
                  ("dev", "2024-01-04"), ("ops", "2024-01-02"), ("qa", "2024-01-06"),
                  ("dev", "2024-01-07")]  # fmt: skip
         for n, (role, at) in enumerate(gates):
+            k = Key(f"RUN#{n}", "GATE#g#1")
             store.transact(
                 A,
-                [Put(Key(f"RUN#{n}", "GATE#g#1"), {}, attrs=queries.gate_queue_attrs(role, at))],
+                [Put(k, {}, attrs=queries.gate_queue_attrs(role, at, k))],
             )
         everything = [i.key.pk for i in queries.my_approvals(store, A, ["qa", "dev"]).items]
         assert everything == ["RUN#1", "RUN#2", "RUN#3", "RUN#0", "RUN#5", "RUN#6"]  # no ops
         for size in (1, 2, 4):
             seen: list[str] = []
             cursor = None
-            while True:
+            for _ in range(len(everything) + 2):  # a cursor that does not advance fails here
                 page = queries.my_approvals(store, A, ["dev", "qa"], limit=size, cursor=cursor)
                 assert len(page.items) <= size
                 seen += [i.key.pk for i in page.items]
                 cursor = page.cursor
                 if cursor is None:
                     break
+            else:
+                pytest.fail(f"my_approvals did not finish in {len(everything) + 2} pages")
             assert seen == everything
         assert queries.my_approvals(store, A, []).items == ()
         assert queries.my_approvals(store, B, ["qa"]).items == ()
 
     def test_my_approvals_drops_a_gate_once_it_closes(self, store: IndexedStore) -> None:
         k = Key("RUN#1", "GATE#g#1")
-        store.transact(A, [Put(k, {}, attrs=queries.gate_queue_attrs("qa", "2024-01-01"))])
+        store.transact(A, [Put(k, {}, attrs=queries.gate_queue_attrs("qa", "2024-01-01", k))])
         assert len(queries.my_approvals(store, A, ["qa"]).items) == 1
         store.transact(A, [Put(k, {"status": "APPROVED"})])
         assert queries.my_approvals(store, A, ["qa"]).items == ()
 
     def test_my_approvals_rejects_a_cursor_for_other_roles(self, store: IndexedStore) -> None:
         for n in range(3):
-            store.transact(
-                A,
-                [
-                    Put(
-                        Key(f"RUN#{n}", "GATE#g#1"),
-                        {},
-                        attrs=queries.gate_queue_attrs("qa", f"t{n}"),
-                    )
-                ],
-            )
+            k = Key(f"RUN#{n}", "GATE#g#1")
+            store.transact(A, [Put(k, {}, attrs=queries.gate_queue_attrs("qa", f"t{n}", k))])
         cursor = queries.my_approvals(store, A, ["qa"], limit=1).cursor
         assert cursor is not None
+        with pytest.raises(ValueError, match="cursor"):  # replayed by another team
+            queries.my_approvals(store, B, ["qa"], limit=1, cursor=cursor)
         with pytest.raises(ValueError, match="cursor"):
             queries.my_approvals(store, A, ["dev"], limit=1, cursor=cursor)
         with pytest.raises(ValueError, match="cursor"):
@@ -429,17 +612,46 @@ class HelperContract:
             "RESOURCE#repo#b"
         ]
 
+    def test_entries_with_one_stamp_have_distinct_sort_keys_and_page_with_limit_one(
+        self, store: IndexedStore
+    ) -> None:
+        keys_ = [Key(f"RUN#{n}", "GATE#g#1") for n in range(5)]
+        for k in keys_:
+            store.transact(A, [Put(k, {}, attrs=queries.gate_queue_attrs("qa", "same", k))])
+        sks = [store.get(A, k).attrs["gsi1sk"] for k in keys_]  # type: ignore[union-attr]
+        assert len(set(sks)) == 5
+        seen: list[str] = []
+        cursor = None
+        for _ in range(7):
+            page = queries.my_approvals(store, A, ["qa"], limit=1, cursor=cursor)
+            seen += [i.key.pk for i in page.items]
+            cursor = page.cursor
+            if cursor is None:
+                break
+        else:
+            pytest.fail("did not finish")
+        assert seen == [f"RUN#{n}" for n in range(5)]
+        # The same holds for the other indexes that can tie.
+        r = [Key(f"RUN#{n}", "META") for n in range(3)]
+        made = [
+            queries.run_attrs(RunStatus.QUEUED, "t", k, ticket=("s", "r"), pr=("o/r", 1)) for k in r
+        ]
+        for name in ("gsi2sk", "gsi3sk", "gsi4sk"):
+            assert len({m[name] for m in made}) == 3
+
     def test_key_parts_that_would_collide_are_refused(self, store: IndexedStore) -> None:
         with pytest.raises(ValueError, match="must"):
-            queries.ticket_attrs("a#b", "c")
+            queries.ticket_attrs("a#b", "c", "t", RUN1)
         with pytest.raises(ValueError, match="must"):
-            queries.gate_queue_attrs("a#b", "t")
+            queries.gate_queue_attrs("a#b", "t", RUN1)
         with pytest.raises(ValueError, match="must"):
-            queries.pr_attrs("a#b", 1, "t")
+            queries.pr_attrs("a#b", 1, "t", RUN1)
         with pytest.raises(ValueError, match="must"):
-            queries.gate_queue_attrs("", "t")
+            queries.gate_queue_attrs("", "t", RUN1)
         with pytest.raises(ValueError, match="PR number"):
-            queries.pr_attrs("r", 0, "t")
+            queries.pr_attrs("r", 0, "t", RUN1)
+        with pytest.raises(ValueError, match="must"):  # a stamp with '#' would blur the key
+            queries.gate_queue_attrs("qa", "a#b", RUN1)
 
     def test_ttl_helper_gives_epoch_seconds(self, store: IndexedStore) -> None:
         from datetime import UTC, datetime
@@ -498,11 +710,80 @@ class TestSqliteMigration:
             s.close()
 
 
+class TestSqliteSchemaVersion:
+    def test_a_new_file_records_the_schema_version(self, tmp_path: Path) -> None:
+        SqliteStore(tmp_path / "n.db").close()
+        assert sqlite3.connect(tmp_path / "n.db").execute("PRAGMA user_version").fetchone() == (1,)
+
+    def test_an_old_file_is_migrated_and_marked(self, tmp_path: Path) -> None:
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE items (partition TEXT NOT NULL, tbl TEXT NOT NULL, pk BLOB NOT NULL,"
+            " sk BLOB NOT NULL, data TEXT NOT NULL, version INTEGER NOT NULL,"
+            " PRIMARY KEY (partition, tbl, pk, sk)) WITHOUT ROWID"
+        )
+        conn.commit()
+        conn.close()
+        SqliteStore(path).close()
+        assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone() == (1,)
+
+    def test_a_file_from_newer_code_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / "new.db"
+        SqliteStore(path).close()
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA user_version=99")
+        conn.close()
+        with pytest.raises(RuntimeError, match="schema version 99"):
+            SqliteStore(path)
+
+    def test_delete_leaves_no_index_row_behind(self, tmp_path: Path) -> None:
+        path = tmp_path / "d.db"
+        s = SqliteStore(path)
+        attrs = {"gsi2pk": "R", "gsi2sk": "t"}
+        s.transact(A, [Put(RUN1, {}, attrs=attrs)])
+        s.delete(A, RUN1)
+        rows = sqlite3.connect(path).execute("SELECT count(*) FROM item_index").fetchone()
+        assert rows == (0,)
+        s.transact(A, [Put(RUN1, {}, attrs=attrs)])
+        s.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R", "gsi2sk": "u"})])
+        rows = sqlite3.connect(path).execute("SELECT count(*) FROM item_index").fetchone()
+        assert rows == (1,)
+        s.close()
+
+
+class TestSizeAccountingInThePort:
+    """The attributes, and the team prefix the store puts on index keys, are counted."""
+
+    def test_the_team_prefix_counts_and_the_limit_is_exact(self) -> None:
+        scope = TeamScope("team-a")
+        attrs: dict[str, str | int] = {
+            "gsi1pk": "P" * 2000,
+            "gsi1sk": "S",
+            "gsi2pk": "Q",
+            "gsi2sk": "S",
+        }
+        base = len(json.dumps({"x": ""}, separators=(",", ":"))) + len("RUN#1") + len("META")
+        fixed = base + attrs_size(attrs)  # no team prefix yet
+        prefix = len("TEAM#team-a#") * 2  # two index pks
+        data_len = MAX_ITEM_BYTES - fixed  # fills the limit exactly without the prefix
+        Put(RUN1, {"x": "y" * data_len}, attrs=attrs)  # constructing it is fine
+        with pytest.raises(ValueError, match="item is"):
+            validate_ops(scope, [Put(RUN1, {"x": "y" * data_len}, attrs=attrs)])
+        # Leaving room for exactly the prefix is accepted; one byte more is not.
+        validate_ops(scope, [Put(RUN1, {"x": "y" * (data_len - prefix)}, attrs=attrs)])
+        with pytest.raises(ValueError, match="item is"):
+            validate_ops(scope, [Put(RUN1, {"x": "y" * (data_len - prefix + 1)}, attrs=attrs)])
+        # Without attributes the same data is fine, so it is the attributes that count.
+        validate_ops(scope, [Put(RUN1, {"x": "y" * data_len})])
+
+
 class TestDynamoIndexes:
     """What a DynamoDB table does that the other stores do not."""
 
     def test_no_scan_on_any_indexed_path(self, env: Env) -> None:  # noqa: F811
         store = env.store
+        g, r2 = Key("RUN#1", "GATE#g#1"), Key("RUN#2", "META")
         queries.start_run(
             store, A, RUN1, {}, run_id="r1", status=RunStatus.QUEUED, updated_at="2024-01-01",
             ticket=("jira", "T-1"),
@@ -510,8 +791,8 @@ class TestDynamoIndexes:
         store.transact(
             A,
             [
-                Put(Key("RUN#1", "GATE#g#1"), {}, attrs=queries.gate_queue_attrs("qa", "t")),
-                Put(Key("RUN#2", "META"), {}, attrs=queries.pr_attrs("o/r", 3, "t")),
+                Put(g, {}, attrs=queries.gate_queue_attrs("qa", "t", g)),
+                Put(r2, {}, attrs=queries.pr_attrs("o/r", 3, "t", r2)),
                 Put(
                     Key("ORG", "RESOURCE#repo#x"),
                     {},
@@ -589,6 +870,25 @@ class TestDynamoIndexes:
     def test_the_audit_table_takes_no_promoted_attributes(self, env: Env) -> None:  # noqa: F811
         with pytest.raises(ValueError, match="audit"):
             Put(Key("RUN#1", "1", AUDIT), {}, when=Absent(), attrs={"gsi1pk": "a", "gsi1sk": "b"})
+
+    def test_create_tables_refuses_an_existing_table_without_the_indexes(self, env: Env) -> None:  # noqa: F811
+        inner = env.client.inner
+        inner.create_table(
+            TableName="plain",
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        from sto.store.dynamodb import create_tables
+
+        with pytest.raises(RuntimeError, match="without the indexes"):
+            create_tables(inner, main_table="plain", audit_table="plain-audit")
 
     def test_create_tables_can_run_twice(self, env: Env) -> None:  # noqa: F811
         from sto.store.dynamodb import create_tables

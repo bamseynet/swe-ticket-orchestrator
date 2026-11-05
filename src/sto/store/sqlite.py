@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS items (
     PRIMARY KEY (partition, tbl, pk, sk)
 ) WITHOUT ROWID
 """
+# PRAGMA user_version: 0 is a file from before D3-10 (or a new one), 1 has the ``attrs`` column and
+# the ``item_index`` table. A file with a higher number was made by newer code: refuse it.
+_SCHEMA_VERSION = 1
 _ATTRS_COLUMN = "ALTER TABLE items ADD COLUMN attrs TEXT NOT NULL DEFAULT '{}'"
 _INDEX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS item_index (
@@ -134,6 +137,12 @@ class SqliteStore:
                 if str(mode).lower() != "wal":
                     raise RuntimeError(f"cannot use WAL journaling here (got {mode!r})")
                 self._conn.execute(_SCHEMA)
+                found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                if found > _SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"store file has schema version {found}; this code knows up to "
+                        f"{_SCHEMA_VERSION}"
+                    )
                 columns = {r[1] for r in self._conn.execute("PRAGMA table_info(items)")}
                 if "attrs" not in columns:
                     try:
@@ -142,6 +151,8 @@ class SqliteStore:
                         if "duplicate column" not in str(exc):  # another opener added it first
                             raise
                 self._conn.execute(_INDEX_SCHEMA)
+                if found < _SCHEMA_VERSION:
+                    self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
                 return
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc) or time.monotonic() >= deadline:

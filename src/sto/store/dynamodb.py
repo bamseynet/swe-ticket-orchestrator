@@ -111,6 +111,7 @@ from .ports import (
     TransactionConflictError,
     TransactionOutcomeUnknownError,
     VersionIs,
+    attrs_size,
     check_index_args,
     check_query_args,
     decode_cursor,
@@ -618,7 +619,7 @@ class DynamoDbStore:
         match p:
             case Prepared(op=Put(when=when), data=data) if data is not None:
                 size = estimate_item_bytes(data, pk=key["pk"]["S"], sk=p.addr.sk)
-                size += sum(len(n) + len(str(v)) + 1 for n, v in p.attrs.items())
+                size += attrs_size(p.attrs, p.addr.partition)
                 if size > MAX_ITEM_BYTES:
                     raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
                 if p.addr.table == AUDIT:
@@ -729,7 +730,8 @@ def _index_item(raw: Mapping[str, Any], partition: str) -> Item:
 def create_tables(client: DynamoDBClient, *, main_table: str, audit_table: str) -> None:
     """Create the two tables if they are missing (on-demand billing, ``pk``/``sk`` strings), the
     main one with its five GSIs and TTL on ``ttl``. For tests and local setups; the real tables,
-    with indexes, TTL and backups, come from CDK."""
+    with indexes, TTL and backups, come from CDK. A main table that already exists is not
+    altered: if it lacks one of the five indexes this raises ``RuntimeError``."""
     index_keys = [f"{i}{part}" for i in INDEXES for part in ("pk", "sk")]
     for name in (main_table, audit_table):
         definitions = [{"AttributeName": a, "AttributeType": "S"} for a in ("pk", "sk")]
@@ -762,6 +764,19 @@ def create_tables(client: DynamoDBClient, *, main_table: str, audit_table: str) 
             if exc.response.get("Error", {}).get("Code") != "ResourceInUseException":
                 raise
         client.get_waiter("table_exists").wait(TableName=name)
+    # A table that already exists is left alone, so one made before D3-10 would silently lack
+    # the indexes and every ``query_index`` would fail later. Say so now instead.
+    have = {
+        g["IndexName"]
+        for g in client.describe_table(TableName=main_table)["Table"].get(
+            "GlobalSecondaryIndexes", []
+        )
+    }
+    if missing := sorted(set(INDEXES) - have):
+        raise RuntimeError(
+            f"table {main_table!r} exists without the indexes {missing}; "
+            "create_tables does not change an existing table: recreate it or add them"
+        )
     try:
         client.update_time_to_live(
             TableName=main_table,

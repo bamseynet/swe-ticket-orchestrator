@@ -58,6 +58,9 @@ _MAX_DEPTH = 32
 # DynamoDB's smallest non-zero magnitude (1E-130). Memory and SQLite could hold less, so every
 # store refuses it: a run that works locally must not fail in production.
 _MIN_NUMBER = 1e-130
+# ``ttl`` is epoch *seconds*. A millisecond value (about 1.7e12 today) would be read as a date
+# thousands of years away, so the item would never expire: refuse anything from year 5138 on.
+_MAX_TTL = 10**11
 
 # The team's own bare partition (PLAN 11: Team META and switches, CONFIG, WF#, BUD#, SLOT#, CONN#,
 # IMAGE# live under exactly ``TEAM#<t>``). ``Key(TEAM_ROOT, "META")`` addresses it, so every caller
@@ -318,6 +321,10 @@ def decode_index_cursor(
             and parts[0] == "idx"
             and isinstance(parts[5], bool)
             and all(isinstance(p, str) for p in (*parts[1:5], *parts[6:]))
+            # DynamoDB refuses an empty key, so no store ever made a cursor with one: a forged
+            # one is refused here, the same on every store, rather than by the server.
+            and bool(parts[6])
+            and bool(parts[8])
         )
     except (TypeError, ValueError, binascii.Error, RecursionError):
         raise ValueError("invalid cursor") from None
@@ -383,7 +390,8 @@ def canonical_data(data: object) -> dict[str, Any]:
 def canonical_attrs(attrs: object) -> dict[str, str | int]:
     """The one stored form of promoted attributes (a fresh dict), or ``ValueError``/``TypeError``.
     Only the five GSIs' keys and ``ttl`` are allowed; an index's two keys come together, as
-    non-empty text within the key size limits; ``ttl`` is an integer of seconds, zero or more."""
+    non-empty text within the key size limits; ``ttl`` is an integer of epoch seconds, from 0
+    up to (not including) 10**11."""
     if attrs is None:
         return {}
     if not isinstance(attrs, Mapping):
@@ -395,8 +403,10 @@ def canonical_attrs(attrs: object) -> dict[str, str | int]:
         if name == TTL_ATTR:
             if type(value) is not int:
                 raise TypeError("ttl must be an int of epoch seconds")
-            if not 0 <= value < _MAX_NUMBER:
-                raise ValueError("ttl is out of range")
+            if not 0 <= value < _MAX_TTL:
+                raise ValueError(
+                    f"ttl is out of range: epoch seconds below {_MAX_TTL} (is it milliseconds?)"
+                )
         else:
             limit = MAX_PK_BYTES if name.endswith("pk") else MAX_SK_BYTES
             _check_part(name, value, limit)
@@ -415,9 +425,20 @@ def _utf8_ok(name: str, text: str) -> None:
         raise ValueError(f"attribute {name} must be valid UTF-8 text") from None
 
 
-def _item_size(key: Key, data: dict[str, Any]) -> int:
+def attrs_size(attrs: Mapping[str, str | int], partition: str = "PLATFORM") -> int:
+    """Bytes the promoted attributes take in the stored item: name, value and one byte of
+    overhead each. An index partition key counts with the ``TEAM#<team>#`` prefix the store adds
+    (``partition`` is the item's: ``TEAM#<team>`` or ``PLATFORM``)."""
+    total = 0
+    for name, value in attrs.items():
+        text = index_pk(partition, str(value)) if name.endswith("pk") else str(value)
+        total += len(name) + len(text.encode("utf-8", "surrogatepass")) + 1
+    return total
+
+
+def _item_size(key: Key, data: dict[str, Any], attrs_bytes: int = 0) -> int:
     size = len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    size += len(key.pk.encode()) + len(key.sk.encode())
+    size += len(key.pk.encode()) + len(key.sk.encode()) + attrs_bytes
     if size > MAX_ITEM_BYTES:
         raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
     return size
@@ -485,7 +506,12 @@ def _check_condition(condition: object, *, required: bool) -> None:
 
 @dataclass(frozen=True)
 class Put:
-    """Create or replace an item. Bumps its version."""
+    """Create or replace an item. Bumps its version.
+
+    **A Put replaces the whole item, promoted attributes included.** Leave ``attrs`` out (or leave
+    an index's keys out) and the item drops out of that index: a writer that updates an indexed
+    item must pass the same ``attrs`` again, with the changed parts changed.
+    """
 
     key: Key
     data: dict[str, Any]
@@ -504,7 +530,9 @@ class Put:
             raise ValueError("the audit table has no indexes or ttl: attrs are not allowed there")
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "attrs", attrs)
-        object.__setattr__(self, "size", _item_size(self.key, data))
+        # The team prefix of the index keys is not known yet (it comes from the scope), so this
+        # is a lower bound; ``validate_ops`` counts the prefix and refuses what it pushes over.
+        object.__setattr__(self, "size", _item_size(self.key, data, attrs_size(attrs)))
 
 
 @dataclass(frozen=True)
@@ -578,10 +606,10 @@ def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Prepared, ...]:
         attrs: dict[str, str | int] = {}
         if isinstance(op, Put):
             data = canonical_data(op.data)
-            total += _item_size(op.key, data)
             attrs = canonical_attrs(op.attrs)
             for name in (n for n in attrs if n.endswith("pk")):
                 checked_index_pk(addr.partition, str(attrs[name]))
+            total += _item_size(op.key, data, attrs_size(attrs, addr.partition))
         prepared.append(Prepared(op, addr, data, attrs))
     if total > MAX_TRANSACTION_BYTES:
         raise ValueError(f"transaction is {total} bytes; the limit is {MAX_TRANSACTION_BYTES}")
