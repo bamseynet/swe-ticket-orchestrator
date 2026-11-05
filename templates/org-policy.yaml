@@ -1,0 +1,34 @@
+# The bundled example OrgPolicy. Every bundled template validates against it (D2-05).
+# It is synthetic: replace the roles, teams and ceilings with your organisation's own.
+#
+# decision_surfaces names all four gate types. A type missing here permits no surface at all
+# (V10), so `pre_push` and `custom` are listed even though only some templates use them.
+apiVersion: sto/v1
+kind: OrgPolicy
+floors:
+  single_human_allowed: false
+  requester_excluded_from: [review, pre_push]
+  mandatory_gate_roles: { pre_push: [reviewer], review: [reviewer], qa: [qa, reviewer] }
+  decision_surfaces:
+    pre_push: [ui]
+    review: [ui, slack, github]
+    qa: [ui, slack]
+    custom: [ui]
+  waive_allowed: false
+  hold_after_approval_min: 10m
+  require_up_to_date: true
+  identity_max_age: 8h
+ceilings:
+  max_steps_per_run: 200
+  max_run_age: 90d
+  max_loop: 5
+  max_stage_duration: 30d
+  max_run_usd: 50
+route_orders: { risk: [low, medium, high] }
+teams:
+  ledger:
+    required_gates:
+      - { id: security_gate, role: security_officer }
+      - { id: change_gate, role: change_manager, when: { field: risk, value: high } }
+    min_quorum: { review: 2 }
+    allowed_carry_over: [none]

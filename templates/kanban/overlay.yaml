@@ -1,0 +1,44 @@
+# Kanban, trunk-based, QA on staging after merge (PLAN 7.7). Extends standard@1.
+# Replace intake and repo with your own before publishing.
+apiVersion: sto/v1
+kind: WorkflowOverlay
+metadata: { name: platform-kanban, team: platform }
+extends: standard@1
+intake: { source: github, project: example/platform, label: agent-ready }
+repo: { name: example/platform, base: main, sandbox_image: go1 }
+limits:
+  loops: { release_stale: 2 }
+  max_steps_per_run: 100
+  max_run_age: 30d
+definition_of_done: null
+stages:
+  refine: null
+  plan: null
+  promote: null
+  qa_env: null
+  post_merge: null
+  triage: { model_tier: fast, next: { ready: implement } }
+  implement: { next: { blocked: await_implementer } }   # trust_route and pre_push_gate still apply
+  await_implementer:
+    kind: wait
+    wait_for: human_answer
+    timeout: 7d
+    next: { resumed: { to: implement, loop: info }, timeout: closed }
+  ci: { timeout: 45m }
+  llm_review: { reviewers: [correctness_reviewer, security_reviewer], required: [correctness_reviewer] }
+  review_gate:
+    gate: { timeouts: { remind_after: 4h, escalate_after: 1d } }
+    next: { approved: mark_ready }
+  mark_ready: { requires_gates: [review_gate] }
+  merge: { requires_gates: [review_gate], next: { done: qa_auto } }
+  qa_auto: { required: [staging-smoke], timeout: 1h }
+  qa_gate:
+    gate: { eligible_roles: [qa, reviewer], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
+    next: { approved: release, rejected: revert_pr }
+  release:
+    kind: effect
+    effect: release.trigger
+    with: { workflow: deploy-prod.yml, sha_input: release_sha }
+    requires_gates: [qa_gate]
+    next: { done: ticket_done, stale: { to: qa_auto, loop: release_stale } }
+  ticket_done: { requires_gates: [qa_gate] }
