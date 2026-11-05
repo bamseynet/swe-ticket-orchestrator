@@ -570,9 +570,7 @@ def hook_write(store: MemoryStore, run: RunId, n: int, *, action: str = "x.did")
     store.transact(HOOK_TEAM, ops)
 
 
-def test_record_with_audit_commits_record_and_entry_together() -> (
-    None
-):
+def test_record_with_audit_commits_record_and_entry_together() -> None:
     store, run = MemoryStore(), RunId.new()
     hook_write(store, run, 1)
     hook_write(store, run, 2)
