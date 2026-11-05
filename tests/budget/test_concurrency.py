@@ -5,6 +5,7 @@ injected and the interleavings of racing acquirers enumerated, not sampled."""
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from functools import partial
 from pathlib import Path
@@ -13,28 +14,38 @@ from typing import Any
 import pytest
 
 from sto.budget.concurrency import (
+    MAX_ID_BYTES,
     MAX_LIMIT,
+    MAX_TEAM_BYTES,
     ORG_KEY,
     TEAM_KEY,
     ConcurrencyLeases,
     ConcurrencyLimits,
     Denied,
+    Done,
+    Failed,
     Lease,
+    LeaseContentionError,
     admit_queued,
     run_bounded,
 )
 from sto.store.memory import MemoryStore
 from sto.store.ports import (
     PLATFORM,
+    Absent,
     Condition,
     ConditionFailedError,
     Item,
     Key,
     Op,
     Page,
+    Put,
     Scope,
     Store,
     TeamScope,
+    TransactionConflictError,
+    TransactionOutcomeUnknownError,
+    VersionIs,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -322,26 +333,25 @@ def test_writes_use_conditional_transactions_only(store: Store, clock: FakeClock
 def test_queued_runs_start_in_order_when_a_slot_frees(store: Store, clock: FakeClock) -> None:
     leases = make(store, clock)
     lim = ConcurrencyLimits(team=2, org=9)
-    queue = ["q1", "q2", "q3"]
-    started, waiting = admit_queued(leases, "a", queue, lim)
-    assert [lease.run_id for lease in started] == ["q1", "q2"]
-    assert waiting == ["q3"]  # stays queued, not failed
-    again, waiting = admit_queued(leases, "a", waiting, lim)
-    assert again == []
-    assert waiting == ["q3"]
-    leases.release(started[0])
-    started3, waiting = admit_queued(leases, "a", waiting, lim)
-    assert [lease.run_id for lease in started3] == ["q3"]
-    assert waiting == []
+    first = admit_queued(leases, "a", ["q1", "q2", "q3"], lim)
+    assert [lease.run_id for lease in first.started] == ["q1", "q2"]
+    assert first.waiting == ["q3"]  # stays queued, not failed
+    again = admit_queued(leases, "a", first.waiting, lim)
+    assert again.started == []
+    assert again.waiting == ["q3"]
+    leases.release(first.started[0])
+    third = admit_queued(leases, "a", again.waiting, lim)
+    assert [lease.run_id for lease in third.started] == ["q3"]
+    assert third.waiting == []
 
 
 def test_admit_queued_does_not_skip_the_head_of_the_queue(store: Store, clock: FakeClock) -> None:
     leases = make(store, clock)
     # org is full, so nothing from any later entry may jump ahead of the first denied one
     lease_of(leases.acquire("z", "other", ConcurrencyLimits(5, 1)))
-    started, waiting = admit_queued(leases, "a", ["q1", "q2"], ConcurrencyLimits(5, 1))
-    assert started == []
-    assert waiting == ["q1", "q2"]
+    got = admit_queued(leases, "a", ["q1", "q2"], ConcurrencyLimits(5, 1))
+    assert got.started == []
+    assert got.waiting == ["q1", "q2"]
 
 
 def test_run_bounded_never_exceeds_the_bound() -> None:
@@ -362,7 +372,7 @@ def test_run_bounded_never_exceeds_the_bound() -> None:
 
     results = run_bounded(range(8), work, max_concurrency=3)
     assert peak == 3
-    assert results == [i * 2 for i in range(8)]
+    assert results == [Done(i * 2) for i in range(8)]
 
 
 def test_run_bounded_one_failure_does_not_stop_the_rest() -> None:
@@ -372,9 +382,10 @@ def test_run_bounded_one_failure_does_not_stop_the_rest() -> None:
         return item
 
     results = run_bounded([0, 1, 2], work, max_concurrency=2)
-    assert results[0] == 0
-    assert results[2] == 2
-    assert isinstance(results[1], RuntimeError)
+    assert results[0] == Done(0)
+    assert results[2] == Done(2)
+    assert isinstance(results[1], Failed)
+    assert isinstance(results[1].error, RuntimeError)
 
 
 def test_run_bounded_rejects_a_bad_bound() -> None:
@@ -653,3 +664,288 @@ def test_rows_are_where_the_spec_says(store: Store, clock: FakeClock) -> None:
     make(store, clock).acquire("a", "r1", ConcurrencyLimits(1, 1))
     assert store.get(TeamScope("a"), Key("TEAM", "CONC")) is not None
     assert store.get(PLATFORM, Key("ORG", "CONC")) is not None
+
+
+# --- transient conflicts (DynamoDB cancels concurrent writes to the one ORG row) ---------------
+
+
+class Flaky:
+    """Fails the first ``n`` transactions with ``error``; with ``land`` the write is applied
+    first, so the caller cannot tell from the exception that it landed."""
+
+    def __init__(
+        self,
+        inner: Store,
+        n: int = 1,
+        error: type[Exception] = TransactionConflictError,
+        land: bool = False,
+    ) -> None:
+        self.inner, self.n, self.error, self.land = inner, n, error, land
+
+    def get(self, scope: Scope, key: Key) -> Item | None:
+        return self.inner.get(scope, key)
+
+    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
+        if self.n > 0:
+            self.n -= 1
+            if self.land:
+                self.inner.transact(scope, ops)
+            raise self.error("TransactionConflict")
+        self.inner.transact(scope, ops)
+
+
+class Sleeps:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def flaky_leases(inner: Any, clock: FakeClock, sleeps: Sleeps, **kw: Any) -> ConcurrencyLeases:
+    return make(inner, clock, sleep=sleeps, rng=lambda: 0.5, **kw)
+
+
+def test_acquire_retries_a_transaction_conflict_with_backoff(
+    store: Store, clock: FakeClock
+) -> None:
+    sleeps = Sleeps()
+    leases = flaky_leases(Flaky(store, 2), clock, sleeps)
+    lease_of(leases.acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    assert len(sleeps.calls) == 2
+    assert all(0 < d <= 1.0 for d in sleeps.calls)
+    assert sleeps.calls[1] > sleeps.calls[0]  # backs off
+    assert make(store, clock).active("a") == 1
+
+
+def test_extend_retries_a_transaction_conflict(store: Store, clock: FakeClock) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    clock.now += 10
+    sleeps = Sleeps()
+    got = flaky_leases(Flaky(store), clock, sleeps).extend(lease)
+    assert got is not None
+    assert got.expires_at == clock.now + TTL
+    assert len(sleeps.calls) == 1
+
+
+def test_release_retries_a_transaction_conflict(store: Store, clock: FakeClock) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    sleeps = Sleeps()
+    assert flaky_leases(Flaky(store), clock, sleeps).release(lease) is True
+    assert make(store, clock).active("a") == 0
+
+
+def test_conflicts_that_never_clear_fail_closed(store: Store, clock: FakeClock) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+
+    def mk() -> ConcurrencyLeases:
+        return flaky_leases(Flaky(store, 99), clock, Sleeps(), max_attempts=3)
+
+    assert mk().acquire("a", "r2", ConcurrencyLimits(2, 2)) == Denied("contended")
+    assert mk().extend(lease) is None  # documented: None can mean "could not confirm"
+    with pytest.raises(LeaseContentionError):
+        mk().release(lease)
+    assert make(store, clock).active("a") == 1  # nothing was over-admitted or lost
+
+
+def test_release_whose_write_landed_but_outcome_was_unknown_reports_true(
+    store: Store, clock: FakeClock
+) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    flaky = Flaky(store, error=TransactionOutcomeUnknownError, land=True)
+    assert flaky_leases(flaky, clock, Sleeps()).release(lease) is True
+    assert make(store, clock).active("a") == 0
+
+
+def test_release_unknown_outcome_that_did_not_land_still_frees(
+    store: Store, clock: FakeClock
+) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    flaky = Flaky(store, error=TransactionOutcomeUnknownError, land=False)
+    assert flaky_leases(flaky, clock, Sleeps()).release(lease) is True
+    assert make(store, clock).active("a") == 0
+
+
+def test_a_second_release_after_an_unknown_outcome_is_false(store: Store, clock: FakeClock) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    flaky = Flaky(store, error=TransactionOutcomeUnknownError, land=True)
+    leases = flaky_leases(flaky, clock, Sleeps())
+    assert leases.release(lease) is True
+    assert leases.release(lease) is False
+
+
+def test_acquire_whose_write_landed_but_outcome_was_unknown_takes_one_slot(
+    store: Store, clock: FakeClock
+) -> None:
+    flaky = Flaky(store, error=TransactionOutcomeUnknownError, land=True)
+    lease = lease_of(
+        flaky_leases(flaky, clock, Sleeps()).acquire("a", "r1", ConcurrencyLimits(1, 1))
+    )
+    assert make(store, clock).active("a") == 1
+    assert make(store, clock).release(lease) is True
+
+
+def test_release_that_loses_a_condition_race_retries_and_really_frees(
+    store: Store, clock: FakeClock
+) -> None:
+    lease = lease_of(make(store, clock).acquire("a", "r1", ConcurrencyLimits(2, 2)))
+    flaky = Flaky(store, error=ConditionFailedError)
+    flaky.error = lambda _m: ConditionFailedError([0])  # type: ignore[assignment]
+    assert flaky_leases(flaky, clock, Sleeps()).release(lease) is True
+    assert make(store, clock).active("a") == 0
+
+
+# --- half-held rows (one level lost) ----------------------------------------------------------
+
+
+def plant(store: Store, scope: Scope, key: Key, run_key: str, token: str, exp: float) -> None:
+    item = store.get(scope, key)
+    holders = dict(item.data["holders"]) if item else {}
+    holders[run_key] = {"token": token, "exp": exp}
+    when: Condition = VersionIs(item.version) if item else Absent()
+    store.transact(scope, [Put(key, {"holders": holders}, when=when)])
+
+
+def test_half_held_run_reacquires_at_both_levels(store: Store, clock: FakeClock) -> None:
+    plant(store, TeamScope("a"), TEAM_KEY, "r1", "old", clock.now + 50)  # org entry lost
+    leases = make(store, clock)
+    got = lease_of(leases.acquire("a", "r1", ConcurrencyLimits(1, 1)))
+    assert got.token != "old"
+    assert leases.active_org() == 1
+    assert leases.active("a") == 1
+
+
+def test_org_only_leftover_of_the_same_run_is_cleaned_on_reacquire(
+    store: Store, clock: FakeClock
+) -> None:
+    plant(store, PLATFORM, ORG_KEY, "a#r1", "old", clock.now + 50)  # team entry lost
+    leases = make(store, clock)
+    lease_of(
+        leases.acquire("a", "r1", ConcurrencyLimits(1, 1))
+    )  # org=1: the leftover must not count
+    item = store.get(PLATFORM, ORG_KEY)
+    assert item is not None
+    assert list(item.data["holders"]) == ["a#r1"]
+    assert item.data["holders"]["a#r1"]["token"] != "old"
+
+
+def test_half_held_extend_is_refused(store: Store, clock: FakeClock) -> None:
+    plant(store, TeamScope("a"), TEAM_KEY, "r1", "old", clock.now + 50)
+    assert make(store, clock).extend(Lease("a", "r1", "old", clock.now + 50)) is None
+
+
+def test_extend_with_a_matching_team_token_but_other_org_token_is_refused(
+    store: Store, clock: FakeClock
+) -> None:
+    plant(store, TeamScope("a"), TEAM_KEY, "r1", "tok", clock.now + 50)
+    plant(store, PLATFORM, ORG_KEY, "a#r1", "other", clock.now + 50)
+    assert make(store, clock).extend(Lease("a", "r1", "tok", clock.now + 50)) is None
+
+
+def test_half_held_release_frees_the_entry_that_is_ours(store: Store, clock: FakeClock) -> None:
+    plant(store, TeamScope("a"), TEAM_KEY, "r1", "old", clock.now + 50)
+    leases = make(store, clock)
+    assert leases.release(Lease("a", "r1", "old", clock.now + 50)) is True
+    assert leases.active("a") == 0
+
+
+def test_extend_moves_the_org_expiry_too(store: Store, clock: FakeClock) -> None:
+    leases = make(store, clock)
+    lim = ConcurrencyLimits(team=5, org=1)
+    lease = lease_of(leases.acquire("a", "r1", lim))
+    clock.now += TTL - 1
+    assert leases.extend(lease) is not None
+    clock.now += 5  # past the first expiry, inside the extended one
+    assert leases.active_org() == 1
+    assert leases.acquire("b", "r2", lim) == Denied("org_limit")
+
+
+# --- input bounds and construction ------------------------------------------------------------
+
+
+def test_long_identities_are_refused(store: Store, clock: FakeClock) -> None:
+    leases = make(store, clock)
+    with pytest.raises(ValueError, match="at most"):
+        leases.acquire("a", "r" * (MAX_ID_BYTES + 1), ConcurrencyLimits(1, 1))
+    with pytest.raises(ValueError, match="at most"):
+        leases.acquire("t" * (MAX_TEAM_BYTES + 1), "r1", ConcurrencyLimits(1, 1))
+    lease_of(leases.acquire("t" * MAX_TEAM_BYTES, "r" * MAX_ID_BYTES, ConcurrencyLimits(1, 1)))
+
+
+def test_multibyte_identities_are_bounded_in_bytes(store: Store, clock: FakeClock) -> None:
+    with pytest.raises(ValueError, match="at most"):
+        make(store, clock).acquire("a", "é" * MAX_ID_BYTES, ConcurrencyLimits(1, 1))
+
+
+def test_the_org_row_fits_the_item_limit_at_the_cap_with_the_longest_ids() -> None:
+    from sto.store.dynamodb import estimate_item_bytes
+
+    holders = {
+        f"{'t' * MAX_TEAM_BYTES}#{str(i).rjust(MAX_ID_BYTES, 'r')}": {
+            "token": "f" * 32,
+            "exp": 1762380000.123456,
+        }
+        for i in range(MAX_LIMIT)
+    }
+    assert estimate_item_bytes({"holders": holders}, pk="ORG", sk="CONC") < 400 * 1024
+
+
+@pytest.mark.parametrize("ttl", [float("inf"), float("nan"), 0.0, -1.0])
+def test_ttl_must_be_finite_and_positive(store: Store, ttl: float) -> None:
+    with pytest.raises(ValueError, match="ttl_s"):
+        ConcurrencyLeases(store, ttl_s=ttl)
+
+
+# --- queue: duplicates and runs that already hold a slot --------------------------------------
+
+
+def test_admit_queued_dedupes_a_repeated_entry(store: Store, clock: FakeClock) -> None:
+    leases = make(store, clock)
+    got = admit_queued(leases, "a", ["r1", "r1", "r2"], ConcurrencyLimits(5, 5))
+    assert [lease.run_id for lease in got.started] == ["r1", "r2"]
+    assert got.already_held == []
+    assert leases.active("a") == 2
+
+
+def test_admit_queued_flags_a_run_that_already_holds_a_slot(store: Store, clock: FakeClock) -> None:
+    leases = make(store, clock)
+    lim = ConcurrencyLimits(5, 5)
+    running = lease_of(leases.acquire("a", "r1", lim))
+    got = admit_queued(leases, "a", ["r1", "r2"], lim)
+    assert got.already_held == [
+        running
+    ]  # not reported as started: the caller must not drive it again
+    assert [lease.run_id for lease in got.started] == ["r2"]
+
+
+def test_a_duplicate_of_a_waiting_run_waits_once(store: Store, clock: FakeClock) -> None:
+    leases = make(store, clock)
+    got = admit_queued(leases, "a", ["r1", "r2", "r2", "r3"], ConcurrencyLimits(1, 5))
+    assert got.waiting == ["r2", "r3"]
+
+
+# --- run_bounded ------------------------------------------------------------------------------
+
+
+def test_run_bounded_does_not_start_queued_items_after_a_base_exception() -> None:
+    ran: list[int] = []
+    lock = threading.Lock()
+
+    def fn(i: int) -> int:
+        if i == 0:
+            raise KeyboardInterrupt
+        time.sleep(0.02)
+        with lock:
+            ran.append(i)
+        return i
+
+    with pytest.raises(KeyboardInterrupt):
+        run_bounded(range(50), fn, max_concurrency=1)
+    assert len(ran) < 10  # the queued rest was cancelled, not drained
+
+
+def test_run_bounded_a_returned_exception_is_not_a_raised_one() -> None:
+    returned = ValueError("a value")
+    out = run_bounded([1], lambda _x: returned, max_concurrency=1)
+    assert out == [Done(returned)]
+    assert not isinstance(out[0], Failed)
