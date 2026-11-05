@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
 from sto.api.auth import DOCS, Authorization, install_authorization
-from sto.api.routers import gates, runs
+from sto.api.routers import attribution, gates, runs
 from sto.api.routers.runs import ApiError, ErrorResponse
 from sto.api.runtime import Runtime, scm_merge_factory
 from sto.domain import RunId, StepKey, Subject
@@ -189,6 +189,7 @@ def create_app(
     }
     app.include_router(runs.router, dependencies=protected, responses=shared)
     app.include_router(gates.router, dependencies=protected, responses=shared)
+    app.include_router(attribution.router, dependencies=protected, responses=shared)
     if authorization is not None:
         install_authorization(app, authorization)
     return app

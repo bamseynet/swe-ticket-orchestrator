@@ -206,6 +206,11 @@ ROUTES: dict[tuple[str, str], RouteRule] = {
     ),
     ("GET", "/runs/{run_id}/gates"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs/{run_id}/gates/{name}/{round}/decisions"): RouteRule(Permission.DECIDE_GATE),
+    # D3-19: only team and org admins attribute a commit or resolve a SoD term (PLAN 9.3);
+    # anyone who can view the run may read what blocks it and who can clear it.
+    ("GET", "/runs/{run_id}/sod-blocks"): RouteRule(Permission.VIEW_RUNS),
+    ("POST", "/runs/{run_id}/commits/{sha}:attribute"): RouteRule(Permission.ATTRIBUTE_COMMIT),
+    ("POST", "/runs/{run_id}/sod-terms:resolve"): RouteRule(Permission.ATTRIBUTE_COMMIT),
 }
 
 PUBLIC: frozenset[tuple[str, str]] = frozenset({("GET", "/healthz")})
@@ -294,28 +299,49 @@ class RouteTableError(ValueError):
 
 
 _PARAM = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+_SUFFIXED = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}(:[A-Za-z][A-Za-z0-9-]*)")
 
 
 def _segments(template: str) -> list[str]:
-    """The segments of a template. A parameter must be a whole segment (``/runs/{run_id}``): a
-    partial one (``/f/{name}.json``, ``/g/{a}-{b}``) or a converter (``{p:path}``) is refused, so
-    "segment is a parameter" is the only wildcard the overlap check has to know."""
+    """The segments of a template. A parameter must be a whole segment (``/runs/{run_id}``),
+    optionally followed by a literal colon suffix (``/commits/{sha}:attribute``, the custom-method
+    style of the API): any other partial one (``/f/{name}.json``, ``/g/{a}-{b}``) or a converter
+    (``{p:path}``) is refused, so the overlap check only has to compare those two shapes."""
     segments = template.split("/")[1:]
     ok = template.startswith("/") and all(
-        _PARAM.fullmatch(seg) or ("{" not in seg and "}" not in seg) for seg in segments
+        _PARAM.fullmatch(seg) or _SUFFIXED.fullmatch(seg) or ("{" not in seg and "}" not in seg)
+        for seg in segments
     )
     if not ok:
         raise RouteTableError(
-            f"unsupported path template {template!r} (whole-segment parameters only)"
+            f"unsupported path template {template!r} (whole-segment parameters only, "
+            "optionally with a ':name' suffix)"
         )
     return segments
 
 
+def _shape(segment: str) -> tuple[bool, str]:
+    """``(has a parameter, literal suffix)``: ``{id}`` is (True, ''), ``{id}:go`` (True, ':go')
+    and ``plain`` (False, 'plain')."""
+    found = _SUFFIXED.fullmatch(segment)
+    if found:
+        return True, found.group(1)
+    return (True, "") if _PARAM.fullmatch(segment) else (False, segment)
+
+
+def _segments_overlap(a: str, b: str) -> bool:
+    """Could one non-empty segment value match both templates' segments?"""
+    (pa, sa), (pb, sb) = _shape(a), _shape(b)
+    if not pa and not pb:
+        return sa == sb
+    if pa and pb:
+        return sa.endswith(sb) or sb.endswith(sa)
+    literal, suffix = (sb, sa) if pa else (sa, sb)
+    return literal.endswith(suffix) and len(literal) > len(suffix)
+
+
 def _overlap(a: list[str], b: list[str]) -> bool:
-    return len(a) == len(b) and all(
-        x == y or _PARAM.fullmatch(x) is not None or _PARAM.fullmatch(y) is not None
-        for x, y in zip(a, b, strict=True)
-    )
+    return len(a) == len(b) and all(_segments_overlap(x, y) for x, y in zip(a, b, strict=True))
 
 
 def check_table(*tables: Iterable[tuple[str, str]]) -> None:

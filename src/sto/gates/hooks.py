@@ -171,6 +171,29 @@ class ChainedAuditWriter:
         ]
 
 
+def record_with_audit(
+    reader: Reader,
+    scope: Scope,
+    run_id: RunId,
+    *,
+    action: str,
+    actor: str,
+    data: dict[str, Any],
+    at: int,
+    writes: Sequence[Op],
+) -> list[Op]:
+    """``writes`` plus the chained audit entry for them, as one list of ops for one transaction.
+
+    For a change that is not a gate open or decision (D3-19: a commit attributed, a term
+    resolved) and so has no ``GateService`` path, without letting the caller touch the audit
+    seam: it passes the facts, this builds the entry with :class:`ChainedAuditWriter` (redaction,
+    hash chain and head included). A stale chain head fails the transaction; the caller re-reads
+    and tries again. ``at`` is epoch milliseconds.
+    """
+    entry = AuditEntry(run_id, action, actor, data, at)
+    return [*writes, *ChainedAuditWriter().ops(reader, scope, entry)]
+
+
 # --- hooks ------------------------------------------------------------------------------------
 
 
