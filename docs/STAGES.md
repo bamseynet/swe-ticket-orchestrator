@@ -347,9 +347,9 @@ Property tests pass over all templates, with crash injection.
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
-| 6 | D2-09, D2-23, D2-25 | D2-29, D2-30 |
-| 7 | D2-14, D2-15, D2-19, D2-28 | D2-31 |
-| 8 | D2-20 | - |
+| 6 | D2-09, D2-23, D2-25, D2-36, D2-37, D2-38 | D2-29, D2-30, D2-32, D2-33 |
+| 7 | D2-14, D2-15, D2-19, D2-28 | D2-31, D2-34 |
+| 8 | D2-20, D2-35 | D2-39, D2-40 |
 
 #### D2-01: Workflow schema
 Typed models for the whole schema in PLAN.md section 7.2, generating a JSON Schema for editors.
@@ -536,6 +536,51 @@ Found in review of D2-09. `gates/carry_over.py` decides whether a re-entered gat
 **AC:** each gate round persists its `merge_base` and `carried_from`; the patch history passed to carry-over is every head the run has had since the origin decision (each push and each PR synchronize, with a computed `patch_id`; a head whose `patch_id` cannot be computed refuses), anchored to that decision; the full history of the gate name comes from the store, unfiltered; the approver check calls `sod.evaluate` per voted role with fresh identity and membership and passes only when allowed and not blocked; file lists come from `git diff --name-only -z --no-renames` with the trailing NUL required, surrogateescape decoding, and `complete` set only after a full read, measured from the merge base of the subject head; the carried close is a conditional write (gate still open, same subject, nothing new since the read), emitted only by the engine under a service identity with the `Citation` in audit, and a service approval without a citation is refused by the reducer and guard 2; `carry_over` is read from the pinned workflow and checked against the org's `allowed_carry_over`. G13 end-to-end tests on the local driver: P1, P2, P1 with P2 never reaching the gate asks again.
 **Deps:** D2-09, D2-26, D2-30, D3-06. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/handlers/carry.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_carry.py`.
 
+#### D2-32: Stop closes open gates
+Found in review of D2-11. A Stop or Cancel ends the run but leaves its gates open, and a linear v0 run whose merge lands after `on_cancel_completed` is merged without anyone noticing.
+**AC:** `GateService.cancel_open` closes every open gate of the run with an audited close (PLAN 4.9), and the runtime calls it when a Stop or Cancel completes; a decision on a closed gate is refused; a linear v0 run whose merge lands after `on_cancel_completed` opens an incident instead of finishing quietly.
+**Deps:** D2-11, D3-06. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `src/sto/engine/reducer.py`, `src/sto/api/runtime.py`, `tests/gates/test_service.py`, `tests/engine/test_reducer.py`.
+
+#### D2-33: Definition of done at gate entry
+Found in review of D2-16. `dod.refusal` is not called by anything, so no gate or stage exit is held by the definition of done.
+**AC:** entering a gate calls `dod.refusal(wf.definition_of_done, name, facts)`; the stage handlers and the reducer consume an event that carries the AC, coverage, findings and check facts; a refusal blocks the run with the `dod` reason and the failed entries; the driver contract for `required_checks` (who reports which check, and when a missing check is a failure) is declared in the driver port and tested on the local driver.
+**Deps:** D2-16, D2-26. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/handlers/stages.py`, `src/sto/engine/handlers/dod.py`, `src/sto/engine/drivers/ports.py`, `tests/engine/test_dod.py`.
+
+#### D2-34: The blocked loop edge is in RunState
+Found in review of D2-25. A grant for a blocked loop has to re-derive which edge was blocked, so it can name the wrong one after the workflow or the counts change.
+**AC:** the reducer records the blocked loop edge in `RunState` when it blocks a loop, and `grants.py` reads it for `LoopGranted`, `_route_target` and `grant_refusal` instead of deriving it; a run saved before the field existed still loads.
+**Deps:** D2-25. **Size:** M. **Run:** serial. **Files:** `src/sto/domain/models.py`, `src/sto/engine/reducer.py`, `src/sto/engine/handlers/grants.py`, `tests/engine/test_grants.py`, `tests/engine/test_reducer.py`.
+
+#### D2-35: Route policy and grant executors
+Found in review of D2-25. `RoutePolicy` has no production implementation, `FLOOR_TRACKING` still lists D2-25 against `floors.route_to_gate_allowed`, and nothing executes `BarFromRound` or `AddToAttention`.
+**AC:** a `RoutePolicy` adapter reads the floor from `OrgPolicyStore`; `FLOOR_TRACKING` in `org_policy.py` drops D2-25; the local driver executes `BarFromRound` (an SoD `AdminAction`) and `AddToAttention` in the order `grants.py` emits them, and a route-to-gate on the local driver bars the actor and lists the item end to end.
+**Deps:** D2-25, D2-34. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/org_policy.py`, `src/sto/engine/drivers/local.py`, `tests/config/test_policy.py`, `tests/engine/test_local_driver.py`.
+
+#### D2-36: A stage with no handler is not retryable
+Found in review of D2-29. `stage_unhandled` blocks a run, but `NOT_RETRYABLE_WHY` has no entry for it, so Retry gives no reason.
+**AC:** `NOT_RETRYABLE_WHY` gains `stage_unhandled` with a reason that says the workflow needs a handler for the stage, and a Retry on such a block is refused with it.
+**Deps:** D2-29. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
+
+#### D2-37: Publish refuses overlapping selectors
+Found in review of D2-17. `intake.check_publish` refuses overlapping selectors (V12), but `publish.py` does not call it, so V12 is not enforced at publish.
+**AC:** `Publisher.publish` calls `intake.check_publish` against the team's other published workflows and refuses a selector that overlaps (V12) before anything is stored.
+**Deps:** D2-17, D2-07. **Size:** S. **Run:** parallel. **Files:** `src/sto/config/publish.py`, `tests/config/test_publish.py`.
+
+#### D2-38: Reuse hardening
+Found in review of D2-21. A panel prior that lists a participant twice passes the set comparison, and a prompt change does not change `stage_digest`, so an old result is reused against a new prompt.
+**AC:** a panel prior with duplicate participants is refused (a tuple length check, not `frozenset`); `stage_digest` binds each profile's manifest outcomes and prompt version, so a prompt or outcome change invalidates reuse.
+**Deps:** D2-21. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/reuse.py`, `tests/engine/test_reuse.py`.
+
+#### D2-39: Return to the first invalid gate in production
+Found in review of D2-28. The driver emits `EffectFailed(gate_invalid)`, so `regate.py` never runs in production. A late `max_steps_exceeded` block leaves the approvals in an unstated state, and `_holds` fails on a gate with no head.
+**AC:** the driver emits `EffectDisposed` instead of `EffectFailed(gate_invalid)`, so the run returns to the first invalid gate end to end on the local driver; the `failures.py` docstring says so; a late `max_steps_exceeded` block either leaves approvals and the subject untouched or documents and tests that it drops them; `_holds` treats a `None` head as not holding.
+**Deps:** D2-28. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/engine/handlers/regate.py`, `src/sto/engine/handlers/failures.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_regate.py`, `tests/engine/test_local_driver.py`.
+
+#### D2-40: Stop watch in production
+Found in review of D2-11. `StopWatch` exists but nothing schedules it, and its merge probe can claim merges the orchestrator never made.
+**AC:** a scheduler calls `StopWatch.sweep` and `StopWatch.recheck`; the SCM port's `find_merge` reports only merges the orchestrator made (matched by idempotency key or actor), and its contract states that the request timeout is below the effect lease (D4-06); the `sto-scm` client pool is one shared, sized pool (or per-request client timeouts) instead of one per executor, with production `close()` callers; a Stop confirms or annotates the effect record from the `find_merge` receipt; blocked effects on ended runs appear in an operator view.
+**Deps:** D2-11, D4-06. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `src/sto/api/runtime.py`, `src/sto/api/routers/runs.py`, `tests/engine/test_cancel.py`, `tests/engine/test_local_driver.py`, `tests/adapters/test_fake.py`.
+
 ## D3: Identity and complete gates
 
 **Goal:** real identities, roles and every gate rule in PLAN.md section 4.
@@ -549,10 +594,12 @@ Found in review of D2-09. `gates/carry_over.py` decides whether a re-entered gat
 |---|---|---|
 | 1 | D3-01, D3-08 | D3-09 |
 | 2 | D3-02, D3-10 | - |
-| 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
+| 3 | D3-05, D3-14, D3-18 | D3-03, D3-04 |
 | 4 | D3-15, D3-19 | D3-06 |
-| 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | D3-08b |
+| 5 | D3-11, D3-12, D3-13, D3-16 | D3-08b, D3-17 |
 | 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22, D3-23, D3-24 |
+| 7 | - | D3-25, D3-27, D3-28 |
+| 8 | - | D3-26 |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -575,8 +622,8 @@ A shared suite tries every route as every role from another team.
 #### D3-04: Account linking
 Linking proves control of a Slack, GitHub or **Jira** account through that vendor's OAuth flow, while signed in to SSO.
 Email matching alone is refused, links expire, and an unlinked account can never decide.
-**AC:** replayed and expired link tokens are refused; a Jira account ID resolves to an SSO identity; unlink works and is audited.
-**Deps:** D3-02. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/linking.py`, `src/sto/api/routers/links.py`, `tests/identity/test_linking.py`.
+**AC:** replayed and expired link tokens are refused; a Jira account ID resolves to an SSO identity; unlink works and is audited. The routes are declared in `ROUTES` (`GET /links`, `POST /links/{vendor}:start`, `POST /links/{vendor}:complete`, `DELETE /links/{vendor}/{account_id}`) and the app includes the links router.
+**Deps:** D3-02. **Size:** M. **Run:** serial. **Files:** `src/sto/identity/linking.py`, `src/sto/api/routers/links.py`, `src/sto/api/auth.py` (the four `ROUTES` lines), `src/sto/api/app.py` (include the links router and pass `session_of`), `tests/identity/test_linking.py`.
 
 #### D3-05: Separation of duties
 Evaluate SoD at decision time from push receipts, with the floors from PLAN.md section 9.4, including two distinct humans, a frozen `author` union and an intake-derived `requester`. Unresolvable terms fail closed.
@@ -665,8 +712,8 @@ This plugs into the D1-06 hook points.
 #### D3-17: Write conflicts and concurrency
 A write conflict while a gate is open retries instead of returning a false `409`, on every store, with 50 concurrent decisions.
 Runs on DynamoDB Local in CI, because the fast stores may not model `TransactionConflict`.
-**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3, G5 and G6 also pass in the integration job. Retry paths handle `TransactionOutcomeUnknownError`: a decision whose write landed must not return a 409 for the person's own vote, and `LocalDriver.submit` must not queue an event twice. Reconcile by re-reading. Stop being offered on a 409 survives a read conflict from `can_stop`.
-**Deps:** D3-06, D3-09. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/retry.py`, `tests/integration/test_gate_concurrency.py`.
+**AC:** G5 with 50 concurrent decisions; sub-quorum approvals all commit; only a truly closed gate returns `409`; G3 and G5 also pass in the integration job. Retry paths handle `TransactionOutcomeUnknownError`: a decision whose write landed must not return a 409 for the person's own vote. Reconcile by re-reading. The rest moved to D3-28.
+**Deps:** D3-06, D3-09. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/retry.py`, `src/sto/gates/service.py` (retry and backoff in the decision and `open_gate` contention loops), `tests/gates/test_service.py`, `tests/integration/test_gate_concurrency.py`.
 
 #### D3-18: First org admin
 A deployment parameter names one bootstrap IdP group, because mappings are data and something must write the first one.
@@ -708,6 +755,26 @@ Found in review of D3-06. The gate service takes a `DecisionPolicy`, but the app
 **AC:** the app and runtime build the gate service with a policy that applies `sod.evaluate` and the workflow gate's quorum; a gate opened from a workflow with a quorum writes its quorum record; a sub-quorum vote never advances the run; an ineligible or SoD-excluded person is refused through the API, by the shared tenancy suite; a quorum the validator would refuse never reaches `open_gate`.
 **Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_gate_policy.py`.
 
+#### D3-25: One production gate-service builder
+Found in review of D3-24. The app and the runtime can each build `GateService`, and a service built without a `DecisionPolicy` is the v0 single-approver gate, so a missed builder silently drops separation of duties.
+**AC:** the app and the runtime build `GateService` through one builder that always supplies a `DecisionPolicy`; `GateService` refuses a decision when its policy is `None` (the v0 path is explicit in tests only); a test fails if production code constructs `GateService` another way.
+**Deps:** D3-24. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/service.py`, `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_gate_policy.py`, `tests/gates/test_service.py`.
+
+#### D3-26: Moving-subject atomicity
+Found in review of D3-13. The moving-subject check runs before the decision transaction, so a ticket edit between `check_decision` and `decide` still lets the vote land, and `refuse_closed_ticket` is not registered.
+**AC:** `gates/service.py` has a pre-decision guard seam that runs for every vote and close and lets `moving.py` add `Check(MOVE#state, VersionIs)` to the decide transaction, which closes the `check_decision`/`decide` race; `moving.refuse_closed_ticket` is registered through `GateHooks.on_open` in the shared builder; a race test on the memory and SQLite stores shows a vote after a ticket move never lands.
+**Deps:** D3-13, D3-25. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `src/sto/gates/moving.py`, `src/sto/api/app.py`, `tests/gates/test_moving.py`, `tests/gates/test_service.py`.
+
+#### D3-27: Link sessions come from token claims
+Found in review of D3-04. `make_router(links, session_of=...)` needs the SSO session, but `Authorized` carries no session identifier, so link tokens cannot be bound to the real session.
+**AC:** `Authorized` carries the SSO session identifier from the token claims, the app passes it as `session_of`, and a link token started in one session is refused in another; a token with no session claim is refused for linking.
+**Deps:** D3-04, D3-22. **Size:** S. **Run:** serial. **Files:** `src/sto/api/auth.py`, `src/sto/api/app.py`, `tests/api/test_tenancy.py`.
+
+#### D3-28: Concurrency ACs split from D3-17
+Found in review of D3-17. `LocalDriver._commit` retries `TransactionOutcomeUnknownError` blind, because it subclasses `TransactionConflictError`, so a transaction that landed can queue its event twice. The gates router sets `stop_offered` to False on any exception from `can_stop`, hiding Stop after a read conflict.
+**AC:** `LocalDriver.submit` does not queue an event twice when a transaction's outcome is unknown but it landed: `_commit` reconciles by event id first, then retries; the gates router offers Stop after a `can_stop` read conflict by retrying the read, and sets `stop_offered` False only when the read answers no; G6 runs in the integration job.
+**Deps:** D3-17, D2-11. **Size:** S. **Run:** serial. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/api/routers/gates.py`, `tests/engine/test_local_driver.py`, `tests/integration/test_gate_concurrency.py`.
+
 ## D4: GitHub, live
 
 **Goal:** a real PR is opened, gated and merged by the orchestrator on a live throwaway repo.
@@ -733,6 +800,8 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 | 9 | D4-26, D4-28, D4-29, D4-30 | - |
 | 10 | - | D4-15 |
 | 11 | - | D4-23 |
+| 12 | - | D4-31 |
+| 13 | D4-32 | - |
 
 #### D4-01: Conformance suite
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
@@ -908,6 +977,16 @@ Found in review of D4-29. `github.py` builds `WebhookIngest` without `event_head
 **Deps:** D4-04, D4-29. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
 
 ---
+
+#### D4-31: Moving-subject reasons and loop cap
+Found in review of D3-13. `outside_merge`, `ticket_edit_unconfirmed` and `external_commit_unroutable` are not registered blocked reasons. The reducer treats an undeclared `external_commit` cap as 0 while `moving.py` documents 3, and a `LoopGranted` cannot lift an `external_commit` `loop_exhausted` block.
+**AC:** the three reasons are registered in `BLOCKED_REASONS`; the `external_commit` loop cap has one default, used by the reducer and `moving.py`; `grants._spent_edges` lets `LoopGranted` lift an `external_commit` `loop_exhausted` block; tests cover each.
+**Deps:** D3-13, D2-25. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/moving.py`, `src/sto/engine/reducer.py`, `src/sto/engine/handlers/grants.py`, `tests/gates/test_moving.py`, `tests/engine/test_grants.py`.
+
+#### D4-32: Moving-subject reactions commit atomically
+Found in review of D3-13. The driver applies `apply_reaction` ops and the reducer transition separately, so a lost version race drops the CANCEL or RETURN.
+**AC:** the driver commits the `apply_reaction` ops and the reducer transition in one transaction, and a lost version race retries both; parity tests for `apply_reaction` run on DynamoDB Local in the integration job.
+**Deps:** D3-13, D4-31. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/drivers/local.py`, `tests/engine/test_local_driver.py`, `tests/integration/test_moving_dynamodb.py`.
 
 ## D5: Agents
 
@@ -1469,7 +1548,7 @@ calls, as counted at the stub. A local trace shows a whole run.
 | Wave | Parallel | Serial, one at a time |
 |---|---|---|
 | 1 | D10-01, D10-05, D10-08, D10-09, D10-10, D10-12 | - |
-| 2 | D10-02, D10-13 | - |
+| 2 | D10-02, D10-13 | D10-15 |
 | 3 | D10-03, D10-11, D10-14 | - |
 | 4 | D10-04, D10-06 | - |
 | 5 | D10-07 | - |
@@ -1559,6 +1638,11 @@ A looping `workspace.exec` costs no tokens, so token budgets alone do not bound 
 **Deps:** D10-02, D5-07. **Size:** S. **Run:** parallel. **Files:** `src/sto/budget/compute.py`, `tests/budget/test_compute.py`.
 
 ---
+
+#### D10-15: Concurrency leases in dispatch
+Found in review of D10-05. `budget/concurrency.py` has no caller, so nothing limits concurrent runs and startup redelivery is sequential.
+**AC:** dispatch acquires a lease before it starts a run, the drive loop heartbeats and extends it, and a terminal run releases it; `run_bounded` replaces sequential startup redelivery; a run over the limit waits and starts when a lease frees; a crashed holder's lease expires.
+**Deps:** D10-05. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/drivers/local.py`, `src/sto/api/runtime.py`, `tests/engine/test_local_driver.py`.
 
 ## D11: AWS infrastructure, offline
 
