@@ -416,7 +416,7 @@ Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, an
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
 Carried from D1-03: the local driver retries a persistent `TransientError` with capped backoff but no limit on total time, so cap it, and classify permanent errors that arrive as transient.
 **AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited. A head that moves during the QA step blocks the run; today it wedges with `RunWedgedError` and no merge. A run whose drive gave up is re-driven in the background, not only when someone next asks about it.
-**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`, `src/sto/engine/handlers/stages.py` (`head_moved` block), `tests/engine/test_reducer_v1.py`, `src/sto/engine/drivers/local.py` (backoff cap, re-drive hook), `tests/engine/test_local_driver.py`.
+**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`, `src/sto/engine/handlers/stages.py` (`head_moved` block), `tests/engine/test_reducer_v1.py`, `src/sto/engine/drivers/local.py` (backoff cap, re-drive hook), `tests/engine/test_local_driver.py`, `src/sto/engine/handlers/core.py` (`EffectFailed.reason`).
 
 #### D2-11: Cancel v1
 Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert. To tell that a merge landed, add a read-only `find_merge(pr)` to `ScmProvider` and the fake, since D1-07's `reconcile` only dequeues. D4-06 implements it for GitHub.
@@ -673,7 +673,7 @@ It works once, and is then disabled and audited.
 `POST /runs/{id}/commits/{sha}:attribute` and `POST /runs/{id}/sod-terms:resolve` let a team admin attribute an unknown commit, clear a false exclusion, or resolve an unknown requester or author, which unblocks the gate.
 Without them, one stray commit or a Jira automation adding a label would leave a run stuck forever.
 **AC:** the gate reports the block and who can clear it; the actor becomes ineligible for that round; a person cannot clear their own exclusion; it is audited.
-**Deps:** D3-05, D3-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/api/routers/attribution.py`, `tests/api/test_attribution.py`.
+**Deps:** D3-05, D3-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/api/routers/attribution.py`, `tests/api/test_attribution.py`, `src/sto/api/auth.py` (the routes' `ROUTES` entries), `src/sto/api/app.py` (the router include), `src/sto/gates/hooks.py` (an audit append the router calls, since routers may not write audit directly).
 
 #### D3-20: Eligibility extension
 An org admin can extend eligibility on an open gate when its approvers have left or are away, through `POST /gates/{id}:extend-eligibility`. Otherwise "then and now" could deadlock a gate, with Stop the only exit.
