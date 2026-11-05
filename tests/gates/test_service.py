@@ -43,6 +43,7 @@ from sto.gates.hooks import (
 )
 from sto.gates.service import (
     MAX_ROUNDS_PER_GATE,
+    CommentRequiredError,
     DecisionNotAllowedError,
     GateClosedError,
     GateConflictError,
@@ -449,7 +450,7 @@ def test_waive_is_not_available_in_v0(svc: GateService) -> None:
 
 def test_negative_decision_needs_a_comment(store: Store, svc: GateService) -> None:
     gate = svc.open_gate(TEAM, open_cmd())
-    with pytest.raises(ValueError, match="comment"):
+    with pytest.raises(CommentRequiredError, match="comment"):  # D3-06: a refusal, not a ValueError
         decide(svc, DecisionKind.REJECT, gate=gate, comment="  ")
     assert gate_of(store).is_open
     assert ledger(store) == []
@@ -887,7 +888,7 @@ def test_failed_audit_append_aborts_the_decision(store: Store) -> None:
     # Occupy the next audit slot (without moving the chain head), so this decision's audit
     # Put(Absent) can never succeed, however often the service retries.
     store.transact(TEAM, [Put(Key(audit_pk(RUN), f"{2:012d}", AUDIT), {"x": 1}, Absent())])
-    with pytest.raises(ConditionFailedError):
+    with pytest.raises(GateContentionError):  # D3-06: contention is not a ConditionFailedError
         decide(service, DecisionKind.APPROVE, gate=gate)
     assert gate_of(store).is_open
     assert ledger(store) == []
