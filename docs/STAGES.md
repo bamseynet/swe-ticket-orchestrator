@@ -507,7 +507,7 @@ Both are engine actions, so they are limited to what the graph allows. A patch b
 #### D2-26: Run the graph reducer everywhere
 Found in review of D2-06. Reducer v1 runs any validated workflow, but `api/runtime.py` and the local driver still default to `LINEAR_V0`, so the hard-coded path is not yet replaced, and no driver can execute `OpenRevert`.
 **AC:** the runtime and the local driver run every workflow through the graph reducer by default, with `LINEAR_V0` expressed as its graph twin; an `OpenRevert` executor opens the revert idempotently per `(run, merge_sha)`; the gate suite runs against v1 and passes unchanged.
-**Deps:** D2-06. **Size:** M. **Run:** serial. **Files:** `src/sto/api/runtime.py`, `src/sto/drivers/local.py`, `tests/drivers/test_local_v1.py`.
+**Deps:** D2-06. **Size:** M. **Run:** serial. **Files:** `src/sto/api/runtime.py`, `src/sto/engine/drivers/local.py`, `tests/engine/test_local_v1.py`.
 
 #### D2-27: PLAN examples agree with the bundled templates
 Found in review of D2-05. PLAN's OrgPolicy example refuses PLAN's own workflows: it names no `pre_push` or `custom` surface, its 60-day run age is below the regulated workflow's 90, and its 14-day stage limit is below four `expire_after` values. PLAN 7.7's Kanban QA gate has no quorum, so QA can pass with no QA person.
@@ -707,7 +707,7 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 #### D4-01: Conformance suite
 Shared adapter conformance suite, run against whichever server a setting selects: in-process fake or real API.
 It is written once, and every adapter in every later stage runs it.
-**AC:** suite covers signature rejection, duplicates, out-of-order delivery, crash-after-write, rate limits and auth failure; it runs in process with no Docker; a trivial fake adapter passes it; T6 covered. A target declares typed capabilities that select a different mandatory test and never remove a control; required sections come from the port it implements; a subclass cannot skip or override a suite test; `pending_controls` works only for adapters under `sto.adapters.fake`.
+**AC:** suite covers signature rejection, duplicates, out-of-order delivery, crash-after-write, rate limits and auth failure; it runs in process with no Docker; a trivial fake adapter passes it; T6 covered. A target declares typed capabilities that select a different mandatory test and never remove a control; required sections come from the port it implements; a subclass cannot skip or override a suite test; there is no waiver: `pending_controls` was retired in D4-19, because it accepted only adapters under `sto.adapters.fake`, which are refused as targets.
 **Deps:** D1-04. **Size:** M. **Run:** serial. **Files:** `tests/contract/__init__.py`, `tests/contract/conftest.py`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-16: Fake GitHub: auth and webhooks
@@ -780,7 +780,7 @@ A switches port is read here, and D10-07 controls it.
 #### D4-12: Base update
 The `pr.update_branch` path from a `stale` merge through `POST /merges`, which returns the SHA. It cannot carry an expected head, so we check the head before, and read back that the first parent equals it.
 A commit from a lost response is recognised only by parents and an unchanged `patch_id`, and carry-over decides on re-approval.
-**AC:** a clean update with `carry_over: patch_id` proceeds with no person asked; with `none` it asks again; conflict goes to the `merge_conflict` loop; a human push between check and merge is detected by the first parent; a crash never classifies our commit as human (G9); a hand-made merge that alters code is not treated as ours.
+**AC:** a clean update with `carry_over: patch_id` proceeds with no person asked; with `none` it asks again; conflict goes to the `merge_conflict` loop; a human push between check and merge is detected by the first parent; a crash never classifies our commit as human (G9); a hand-made merge that alters code is not treated as ours. The shared conformance suite does not cover `update-branch` or `POST /merges`; test them here against D4-19's fake, including the first-parent read-back.
 **Deps:** D4-21. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/base_update.py`, `tests/effects/test_base_update.py`.
 
 #### D4-13: Reconciler
@@ -811,7 +811,7 @@ Anything it cannot prove stays `unknown`, because attestation fails closed. Fork
 Fake pull requests, draft state, async merge with polling and `sha`, base updates through `POST /merges`, commit and ref APIs, and merge queue responses.
 It models the async API as the main path, with the behaviours marked unverified until D4-23.
 **AC:** async merge, a moved head, `enqueued` and conflict are all simulated; the conformance suite's SCM section can target it. It runs the suite's SCM section. Give `pending_controls` a user here, or retire it and correct D4-01's tests, since no merged fake can reach it now.
-**Deps:** D4-16. **Size:** L. **Run:** parallel. **Files:** `tests/fakes/github/pulls/`.
+**Deps:** D4-16. **Size:** L. **Run:** parallel. **Files:** `tests/fakes/github/pulls/`, `tests/contract/suite.py`, `tests/contract/test_suite.py`.
 
 #### D4-20: Fake GitHub: checks, rulesets and dispatch
 Fake check runs, required checks with `neutral` counting as passing, rulesets, reviews and workflow dispatch with run IDs.
@@ -822,13 +822,13 @@ Protection failures give messages the merge guard can explain.
 #### D4-21: Merge request and results
 Request merges through the async API with the approved SHA, poll, read back, and map each result: merged, moved head, conflict, cannot merge, `enqueued`, and protection failure.
 The sync endpoint is not used, because it cannot do merge queues and GitHub no longer recommends it.
-**AC:** each result maps to its defined next step; `gate_invalid` returns to the gate; already merged at that SHA counts as success; an effect stays `ACCEPTED` until read-back.
+**AC:** each result maps to its defined next step; `gate_invalid` returns to the gate; already merged at that SHA counts as success; an effect stays `ACCEPTED` until read-back. The shared conformance suite does not cover `MergeHandle` or the async merge; test them here against D4-19's fake.
 **Deps:** D4-11, D4-19. **Size:** M. **Run:** serial. **Files:** `src/sto/effects/merge_results.py`, `tests/effects/test_merge_results.py`.
 
 #### D4-22: Merge queue
 Enqueue through the async API, wait for the outcome, read back, and dequeue on Stop, with the group's result counting as the tested tree.
 Queues need an organization-owned repo, so the live part waits for one. D13-07 models the benefit.
-**AC:** a queue failure returns to CI; Stop dequeues with the expected head; `enqueued` never reads as merged; live test is tagged and skipped on the personal account.
+**AC:** a queue failure returns to CI; Stop dequeues with the expected head; `enqueued` never reads as merged; live test is tagged and skipped on the personal account. The shared conformance suite does not cover dequeue; test it here against D4-19's fake.
 **Deps:** D4-21. **Size:** M. **Run:** parallel. **Files:** `src/sto/effects/merge_queue.py`, `tests/effects/test_merge_queue.py`.
 
 #### D4-23: Live merge behaviour
@@ -937,7 +937,7 @@ It matches the AgentCore command model, so tests stay meaningful.
 #### D5-07: Patch flow
 Workspace tools for agents, snapshot delivery, patch capture, scan, path and size policy, then hand-off to `branch.push` by effect, held in S3 until allowed. The harness checkpoints a patch at each worker turn, and caps commands per step.
 The sandbox never sees an SCM token.
-**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint. `ExecResult` is decoded text and the sandbox has no network, so capture with `git diff --binary | base64` through `exec`, never a raw diff or a presigned PUT. Capture arguments do not trust `.gitattributes` from the sandbox. Decide with D11-12 whether `start` takes a snapshot reference, since bytes hold up to 256 MB in memory. A command that exits normally is never swept, so `setsid daemon &` can outlive it: confirm nothing else is running before capture, using the provider's host-side count. A blocked patch hands kind, path and line back to the agent to correct, so a block does not need a person.
+**AC:** full loop from snapshot to commit on the fake; a denied path or size blocks; the sandbox environment holds no SCM credentials, by assertion; a lost session recovers from the last checkpoint. `ExecResult` is decoded text and the sandbox has no network, so capture with `git diff --binary | base64` through `exec`, never a raw diff or a presigned PUT. Capture arguments do not trust `.gitattributes` from the sandbox. Decide with D11-12 whether `start` takes a snapshot reference, since bytes hold up to 256 MB in memory. A command that exits normally is never swept, so `setsid daemon &` can outlive it: confirm nothing else is running before capture, using the provider's host-side count. A blocked patch hands kind, path and line back to the agent to correct, so a block does not need a person. Test that route-to-gate refuses a D4-27 path-policy block (found in review of D4-27).
 **Deps:** D5-06, D5-05, D4-07, D4-27. **Size:** M. **Run:** parallel. **Files:** `src/sto/workspace/patch.py`, `src/sto/agents/tools/workspace.py`, `tests/workspace/test_patch.py`.
 
 #### D5-08: Triage, refine and plan profiles
@@ -1953,7 +1953,7 @@ Examples are tested, so they cannot rot. A human trial comes at the pilot, becau
 #### D13-11: GitOps for workflows
 Sync workflow YAML from a repo path, so a PR changes a workflow, with validation as a check run.
 Publishing still pins versions, and audits who merged.
-**AC:** an invalid workflow fails the PR's check; floors cannot be weakened this way; the merge author appears in audit.
+**AC:** an invalid workflow fails the PR's check; floors cannot be weakened this way; the merge author appears in audit. The configured sync path is appended to D4-27's path deny list, so an agent's patch cannot change a workflow.
 **Deps:** D2-07, D4-08. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/gitops.py`, `tests/config/test_gitops.py`.
 
 #### D13-12: Complete CLI
