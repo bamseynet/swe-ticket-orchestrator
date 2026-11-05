@@ -836,6 +836,8 @@ floors:
   public_repo_intake: false          # public repos need explicit opt-in
   ci_without_secrets_waived_for: []  # repos exempt from the floor in T18
   route_to_gate_allowed: false
+ceilings: { max_steps_per_run: 200, max_run_age: 60d, max_loop: 5, max_stage_duration: 14d, max_run_usd: 50 }   # V9, all optional
+route_orders: { risk: [low, medium, high] }   # the org's ranking, lowest to highest; a route's order must agree (V9), and every `when` below needs its value here
 teams:                               # per team or tag, enforced at publish, on migrate and live
   ledger:
     required_gates:

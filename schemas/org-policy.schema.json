@@ -1,5 +1,39 @@
 {
   "$defs": {
+    "Ceilings": {
+      "additionalProperties": false,
+      "description": "Upper bounds a workflow's and a team's own numbers may not pass (V9). Each is optional;\nthe platform caps hold when one is unset.",
+      "properties": {
+        "max_loop": {
+          "minimum": 1,
+          "title": "Max Loop",
+          "type": "integer"
+        },
+        "max_run_age": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Max Run Age",
+          "type": "string"
+        },
+        "max_run_usd": {
+          "exclusiveMinimum": 0,
+          "title": "Max Run Usd",
+          "type": "number"
+        },
+        "max_stage_duration": {
+          "pattern": "^[1-9][0-9]*[smhdw]$",
+          "title": "Max Stage Duration",
+          "type": "string"
+        },
+        "max_steps_per_run": {
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Max Steps Per Run",
+          "type": "integer"
+        }
+      },
+      "title": "Ceilings",
+      "type": "object"
+    },
     "Floors": {
       "additionalProperties": false,
       "properties": {
@@ -235,6 +269,9 @@
       "title": "Apiversion",
       "type": "string"
     },
+    "ceilings": {
+      "$ref": "#/$defs/Ceilings"
+    },
     "floors": {
       "$ref": "#/$defs/Floors"
     },
@@ -242,6 +279,29 @@
       "const": "OrgPolicy",
       "title": "Kind",
       "type": "string"
+    },
+    "route_orders": {
+      "additionalProperties": {
+        "items": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "propertyNames": {
+        "enum": [
+          "risk",
+          "issue_type",
+          "priority",
+          "component",
+          "label",
+          "repo_ci_trust"
+        ]
+      },
+      "title": "Route Orders",
+      "type": "object"
     },
     "teams": {
       "additionalProperties": false,

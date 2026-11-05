@@ -804,6 +804,19 @@ class Floors(_Strict):
     ci_without_secrets_waived_for: Seq[Text] = ()
     route_to_gate_allowed: bool = False
 
+    @field_validator("decision_surfaces")
+    @classmethod
+    def _github_only_on_review(
+        cls, v: Mapping[str, tuple[str, ...]]
+    ) -> Mapping[str, tuple[str, ...]]:
+        # PLAN 7.3 V10: a GitHub review binds only a commit, so only a review gate may take one
+        for gate, surfaces in v.items():
+            if gate != "review" and "github" in surfaces:
+                raise ValueError(
+                    f"{gate}: github is only for review gates; remove it from this list"
+                )
+        return v
+
     @field_validator("mandatory_gate_roles")
     @classmethod
     def _every_mandatory_gate_has_roles_and_never_developer(
@@ -837,11 +850,55 @@ class TeamPolicy(_Strict):
     allowed_carry_over: Annotated[Seq[CarryOver], Field(min_length=1)] | None = None
 
 
+class Ceilings(_Strict):
+    """Upper bounds a workflow's and a team's own numbers may not pass (V9). Each is optional;
+    the platform caps hold when one is unset."""
+
+    max_steps_per_run: Annotated[int, Field(ge=1, le=PLATFORM_MAX_STEPS)] | None = None
+    max_run_age: RunAge | None = None
+    max_loop: Annotated[int, Field(ge=1)] | None = None  # most visits any named loop may allow
+    max_stage_duration: Duration | None = None  # any wait, checks or gate timeout
+    max_run_usd: Money | None = None  # the most a team's ``budgets.run_usd`` may be
+
+
+def _distinct(value: Sequence[str]) -> Sequence[str]:
+    seen: set[str] = set()
+    for item in value:
+        if item in seen:
+            raise ValueError(f"{item!r} is ranked twice; list each value once")
+        seen.add(item)
+    return value
+
+
 class OrgPolicy(_Strict):
     apiVersion: Literal["sto/v1"]
     kind: Literal["OrgPolicy"]
     floors: Floors
+    ceilings: Ceilings = Field(default_factory=Ceilings)
+    # The org owns the ranking of a ticket field's values, lowest to highest. A route's own
+    # ``order`` must agree with it (V9), so a team cannot rank a value down to skip a gate.
+    route_orders: FMap[
+        RouteField, Annotated[Seq[Text], Field(min_length=1), AfterValidator(_distinct)]
+    ] = Field(default_factory=lambda: FrozenMap())
     teams: FMap[TeamName, TeamPolicy] = Field(default_factory=lambda: FrozenMap())
+
+    @model_validator(mode="after")
+    def _a_when_gate_needs_the_orgs_ranking(self) -> OrgPolicy:
+        # Without the org's own ranking of the field, a team ranks the value last and skips the
+        # gate, and nothing else says the ranking was ever the org's.
+        for team, policy in self.teams.items():
+            for gate in policy.required_gates:
+                when = gate.when
+                if when is None:
+                    continue
+                ranked = self.route_orders.get(when.field, ())
+                if when.value not in ranked:
+                    raise ValueError(
+                        f"teams.{team}: required gate {gate.id} applies when {when.field} is "
+                        f"{when.value}, so route_orders.{when.field} must rank {when.value}; "
+                        f"add it, lowest to highest"
+                    )
+        return self
 
 
 Document = Workflow | WorkflowOverlay | TeamConfig | OrgPolicy

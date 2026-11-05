@@ -38,15 +38,20 @@ What counts as getting round a required gate, with its approval removed:
   release clears that), and the run then opened a revert (``pr.open_revert``). A rejection that
   ends in ``rejected`` or ``expired`` is fine. Once merged, a wait timeout is ignored only when
   it goes straight to a ``closed`` terminal (as V6 ignores a timeout that gives up); every other
-  timeout is followed, so waiting cannot reach ``done``, a release or a ticket move. A merge that
-  ends in a terminal with no QA gate on that path is tolerated, as V6 tolerates it.
+  timeout is followed, so waiting cannot reach ``done``, a release or a ticket move. V17 does not
+  judge a merge that ends in a ``rejected`` or ``expired`` terminal with no QA gate on that path:
+  it leaves that to V6, which refuses a ``rejected`` terminal there (PLAN 7.7: a rejected run
+  blocks the release).
 * For an entry without ``when``, every merge or release reachable from the gate's approval lists
   the gate in ``requires_gates``, so the gate cannot approve before there is code (V4 and V5 do
   the rest). The walk follows every edge and never stops at an effect that lists the gate, since
   a later merge (a fix after a stale release or a red post-merge check) is code the approval
-  never saw. Two effects need not list it: for an exempt QA gate, one that the search with the
-  approval removed already reaches (that search has checked what follows it); and a
-  ``release.trigger`` after a ``pr.merge`` that listed the gate and succeeded on that path.
+  never saw. ``branch.promote`` is listed the same way when the gate precedes it, which QA
+  secrets depend on. Three effects need not list it: for an exempt QA gate, one that the search
+  with the approval removed already reaches (that search has checked what follows it); a
+  ``branch.promote`` the run reaches without the gate's approval, since the gate does not precede
+  it (a QA gate comes after the promote that releases QA's secrets); and a ``release.trigger``
+  after a ``pr.merge`` that listed the gate and succeeded on that path.
 * An entry with ``when`` relies on the ratchet of PLAN 4.3 where a route on its field holds the
   gate. Every route on its field must carry an ``order`` that contains the value, and the search
   also runs for every value ranked above it in that order, because a raised ticket must not skip
@@ -260,6 +265,11 @@ def allowed_carry_over(policy: OrgPolicy, team: str) -> frozenset[str] | None:
 # --- V17 -----------------------------------------------------------------------------------
 
 _SHIPPING_EFFECTS = frozenset({"pr.merge", "release.trigger"})
+# Effects that must list a required gate that precedes them in ``requires_gates``.
+# ``branch.promote`` releases the approved SHA to the branch that holds QA secrets (PLAN T18),
+# so it may not run before the gate decides, when the gate precedes it. It is not a way to
+# finish a run, so the success search ignores it.
+_LISTING_EFFECTS = _SHIPPING_EFFECTS | {"branch.promote"}
 
 # Where a path is, for a QA gate that follows a merge.
 _NOT_SHIPPED = 0  # nothing merged yet
@@ -368,7 +378,7 @@ def _shipping_effects_after(
     Every edge is followed. An effect is let through if it lists the gate, or if it is a release
     after a merge that listed the gate and succeeded on this path, or, for an exempt QA gate, if
     the search with the approval removed already reaches it (it has checked what follows)."""
-    before = _reachable_without(wf, gate_id) if qa_exempt else set()
+    before = _reachable_without(wf, gate_id)
     first = dict(_targets(gate.next)).get("approved")
     seen: set[tuple[str, bool]] = set()
     queue: deque[tuple[str, bool]] = deque([(first, False)] if first else [])
@@ -383,10 +393,13 @@ def _shipping_effects_after(
         if isinstance(stage, TerminalStage):
             continue
         lists = False
-        if isinstance(stage, EffectStage) and stage.effect in _SHIPPING_EFFECTS:
+        if isinstance(stage, EffectStage) and stage.effect in _LISTING_EFFECTS:
             lists = gate_id in (stage.requires_gates or ())
             after_listed_merge = stage.effect == "release.trigger" and merged
-            if not (lists or (qa_exempt and sid in before) or after_listed_merge):
+            # A promote the run reaches without this gate is not preceded by it, so it need not
+            # list it (a QA gate comes after the promote that releases QA's secrets)
+            skips_gate = sid in before and (qa_exempt or stage.effect == "branch.promote")
+            if not (lists or skips_gate or after_listed_merge):
                 found.add(sid)
         for outcome, target in _targets(stage.next):
             listed_merge = (
