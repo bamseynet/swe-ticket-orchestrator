@@ -46,9 +46,10 @@ from sto.api.auth import (
 )
 from sto.api.runtime import Runtime, default_gate_roles
 from sto.config.org_policy import ORG_ADMIN, Principal
-from sto.domain import Gate, GateId, GateStatus, GateType, RunId, Subject
+from sto.domain import DecisionId, Gate, GateId, GateStatus, GateType, RunId, Subject
 from sto.effects.core import EffectExecutor
 from sto.engine.commands import OpenGate
+from sto.engine.reducer import Approval
 from sto.gates.service import GateService
 from sto.identity.fake_issuer import FakeIssuer
 from sto.identity.mapping import RoleMapping, ServiceIdentity, UserIdentity
@@ -1029,12 +1030,62 @@ def approve(world: World, run_id: RunId, name: str = "g") -> None:
     assert r.status_code == 202, r.text
 
 
-def test_a_just_approved_gate_still_lets_its_role_stop_the_run(world: World) -> None:
+def engine_state(
+    world: World, monkeypatch: pytest.MonkeyPatch, stage: str | None, *approved: str
+) -> None:
+    """Show every run at ``stage`` holding approvals of ``approved`` (round 1, oldest first), the
+    way the engine leaves them; the unstarted runs of this world have neither."""
+    real = world.runtime._astate
+
+    async def shown(rid: RunId) -> Any:
+        state = await real(rid)
+        approvals = tuple(Approval(g, 1, DecisionId.new(), "d") for g in approved)
+        return replace(state, run=replace(state.run, stage=stage), approvals=approvals)
+
+    monkeypatch.setattr(world.runtime, "_astate", shown)
+
+
+def open_named(world: World, run_id: RunId, name: str, kind: GateType, rnd: int = 1) -> str:
+    """Open gate ``name`` (a subject of its own) and return the digest an approval must send."""
+    subject = Subject(
+        head_sha=f"{len(name):040d}",
+        patch_id=f"p-{name}-{rnd}",
+        ticket_revision="r1",
+        evidence_digest="e1",
+        attention_digest="t1",
+    )
+    world.runtime._gates.open_gate(world.scope, OpenGate(run_id, name, kind, rnd, subject))
+    return subject.digest()
+
+
+def decide_as(
+    world: World, run_id: RunId, name: str, digest: str, role: str = "team_admin", rnd: int = 1
+) -> httpx.Response:
+    return post(
+        world.app(),
+        f"/runs/{run_id}/gates/{name}/{rnd}/decisions",
+        world.user(ALPHA, role),
+        {"kind": "approve", "subject_digest": digest},
+    )
+
+
+def stoppable_by(world: World, run_id: RunId, *roles: str) -> dict[str, bool]:
+    app = world.app()
+    return {
+        r: send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, r)).status_code == 202
+        for r in roles
+    }
+
+
+def test_a_just_approved_gate_still_lets_its_role_stop_the_run(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """PLAN 9.3 and 4.3 rule 5: eligible for an open or just-approved gate. The late reject gets
     a 409 with a Stop link, and the link works (the JWT path agrees with the dev-token case)."""
     app = world.app()
     run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
     approve(world, run_id)
+    engine_state(world, monkeypatch, "g", "g")  # the decision is in; the run is still at g
     reviewer = world.user(ALPHA, "reviewer")
     late = decide_twice(world, run_id, reviewer)
     assert (late.status_code, code(late)) == (409, "gate_closed")
@@ -1046,33 +1097,60 @@ def test_a_just_approved_gate_still_lets_its_role_stop_the_run(world: World) -> 
     refused(send(app, "POST", f"/runs/{other}/cancel", world.user(ALPHA, "qa")), 403, "forbidden")
 
 
-def test_once_the_run_has_moved_past_the_gate_its_role_can_no_longer_stop(
+def test_an_approved_gate_with_the_run_on_a_later_stage_no_longer_lets_its_role_stop(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app = world.app()
+    """The run started the stage after the gate, or the approval is gone: no window."""
     run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
     approve(world, run_id)
-    subject = Subject(
-        head_sha="c" * 40,
-        patch_id="p3",
-        ticket_revision="r1",
-        evidence_digest="e1",
-        attention_digest="t1",
+    for stage in ("qa", "implement", "merge", "unknown-stage", None):
+        engine_state(world, monkeypatch, stage, "g")
+        assert stoppable_by(world, run_id, "reviewer") == {"reviewer": False}, stage
+    engine_state(world, monkeypatch, "g")  # at g, but the engine holds no approval of it
+    assert stoppable_by(world, run_id, "reviewer") == {"reviewer": False}
+
+
+def test_only_the_most_recent_approval_can_be_just_approved(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review_gate approved, then qa_gate approved: at merge only qa_gate's role may Stop, though
+    both records say APPROVED (it was 202 for the reviewer at merge before)."""
+    run_id = seed_run(world, started_by=None)
+    approve_digest = open_named(world, run_id, "review_gate", GateType.REVIEW)
+    assert decide_as(world, run_id, "review_gate", approve_digest).status_code == 202
+    qa_digest = open_named(world, run_id, "qa_gate", GateType.QA)
+    assert decide_as(world, run_id, "qa_gate", qa_digest).status_code == 202
+    both = ("review_gate", "qa_gate")
+    for stage in ("qa_gate", "merge"):  # at the gate itself, or at the effect that waits on it
+        engine_state(world, monkeypatch, stage, *both)
+        assert stoppable_by(world, run_id, "reviewer", "qa") == {"reviewer": False, "qa": True}
+        run_id = seed_run(world, started_by=None)  # a Stop is final: a fresh run for the next
+        approve_digest = open_named(world, run_id, "review_gate", GateType.REVIEW)
+        decide_as(world, run_id, "review_gate", approve_digest)
+        qa_digest = open_named(world, run_id, "qa_gate", GateType.QA)
+        decide_as(world, run_id, "qa_gate", qa_digest)
+    engine_state(world, monkeypatch, "implement", *both)  # a long stage after both approvals
+    assert stoppable_by(world, run_id, "reviewer", "qa") == {"reviewer": False, "qa": False}
+
+
+def test_after_changes_are_requested_the_old_approval_gives_no_stop(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """qa_gate asks for changes: the engine drops every approval and sends the run back to
+    implement, but review_gate's record stays APPROVED."""
+    run_id = seed_run(world, started_by=None)
+    approved = open_named(world, run_id, "review_gate", GateType.REVIEW)
+    assert decide_as(world, run_id, "review_gate", approved).status_code == 202
+    open_named(world, run_id, "qa_gate", GateType.QA)
+    changes = post(
+        world.app(),
+        f"/runs/{run_id}/gates/qa_gate/1/decisions",
+        world.user(ALPHA, "qa"),
+        {"kind": "request_changes", "comment": "again"},
     )
-    world.runtime._gates.open_gate(world.scope, OpenGate(run_id, "qa", GateType.QA, 1, subject))
-    real = world.runtime._astate
-
-    async def at_qa(rid: RunId) -> Any:
-        state = await real(rid)
-        return replace(state, run=replace(state.run, stage="qa"))
-
-    monkeypatch.setattr(world.runtime, "_astate", at_qa)
-    reviewer = world.user(ALPHA, "reviewer")
-    refused(send(app, "POST", f"/runs/{run_id}/cancel", reviewer), 403, "forbidden")
-    refused(decide_twice(world, run_id, reviewer), 409, "gate_closed")  # no stop link
-    assert "stop" not in decide_twice(world, run_id, reviewer).json()["error"]
-    # the role of the gate the run is at now still can
-    assert send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "qa")).status_code == 202
+    assert changes.status_code == 202, changes.text
+    engine_state(world, monkeypatch, "implement")  # no approvals left
+    assert stoppable_by(world, run_id, "reviewer", "qa") == {"reviewer": False, "qa": False}
 
 
 def test_an_unknown_run_is_404_for_a_holder_the_middleware_admitted(world: World) -> None:
@@ -1124,8 +1202,11 @@ def decide_twice(world: World, run_id: RunId, token: str) -> httpx.Response:
     )
 
 
-def test_the_409_stop_link_is_offered_only_to_roles_that_can_use_it(world: World) -> None:
+def test_the_409_stop_link_is_offered_only_to_roles_that_can_use_it(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = world.app()
+    engine_state(world, monkeypatch, "g", "g")
     owner_actor = actor_of(ALPHA, "developer")
     run_id = seed_run(world, started_by=owner_actor, gate=GateType.REVIEW)
     first = post(
@@ -1326,14 +1407,17 @@ def test_may_stop_honours_exactly_the_flags_it_is_given(
 def test_only_the_latest_round_of_a_gate_counts_for_a_stop(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round 1 approved, round 2 rejected. The gate service voids the approval when round 2
-    closes, so this shape is fed in directly: defence in depth, the run is not at an approved
-    gate and its role cannot Stop through round 1."""
+    """Round 1 approved, round 2 EXPIRED. The timer closes a round EXPIRED without voiding the
+    earlier approval (gates/timers.py ``_expire_ops``), so the approval is still in the engine's
+    state, and the latest round alone must decide: the run is not at an approved gate."""
     app = world.app()
     run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
     approve(world, run_id)
+    engine_state(world, monkeypatch, "g", "g")
     (first,) = asyncio.run(world.runtime.gates(run_id))
-    second = replace(first, id=GateId.new(), round=2, status=GateStatus.REJECTED, closed_by="x")
+    second = replace(
+        first, id=GateId.new(), round=2, status=GateStatus.EXPIRED, closed_by="system:timer"
+    )
 
     async def both(rid: RunId) -> list[Gate]:
         return [first, second]
@@ -1351,3 +1435,49 @@ def test_only_the_latest_round_of_a_gate_counts_for_a_stop(
 
 async def _only(gate: Gate) -> list[Gate]:
     return [gate]
+
+
+def test_an_org_admin_with_no_team_role_is_offered_the_stop_link(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 409 offer and the cancel decision agree for an org-level admin."""
+    app = world.app()
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"), gate=GateType.REVIEW)
+    approve(world, run_id)
+    engine_state(world, monkeypatch, "g", "g")
+    org = world.token("root-user", ["org-admins"])
+    late = post(
+        app, f"/runs/{run_id}/gates/g/1/decisions", org, {"kind": "reject", "comment": "no"}
+    )
+    assert (late.status_code, code(late)) == (409, "gate_closed")
+    assert late.json()["error"]["stop"] == {"method": "POST", "href": f"/runs/{run_id}/cancel"}
+    assert send(app, "POST", f"/runs/{run_id}/cancel", org).status_code == 202
+
+
+def test_may_stop_counts_only_roles_that_hold_the_stop_at_gate_grant() -> None:
+    """A developer is eligible to decide a gate (say a team made it so) but holds no
+    stop-at-gate grant, so the gate's roles do not let them Stop a run that is not theirs."""
+    user = UserIdentity("u", ISS, frozenset({(ALPHA, "developer")}))
+    auth = Authorized(user, TeamScope(ALPHA))
+    assert not may_stop(
+        auth, (True, True), started_by=f"{ISS}|other", gate_roles=frozenset({"developer"})
+    )
+    assert may_stop(auth, (True, True), started_by=f"{ISS}|u", gate_roles=frozenset())  # owner
+
+
+def test_an_approval_of_another_round_than_the_latest_record_gives_no_stop(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine holds round 1's approval but the newest record is round 2 (approved, not yet
+    delivered to the run): fail closed until the engine's state agrees with the record."""
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    approve(world, run_id)
+    engine_state(world, monkeypatch, "g", "g")
+    (first,) = asyncio.run(world.runtime.gates(run_id))
+    second = replace(first, id=GateId.new(), round=2)  # APPROVED, like round 1
+
+    async def both(rid: RunId) -> list[Gate]:
+        return [first, second]
+
+    monkeypatch.setattr(world.runtime, "_read_gates", both)
+    assert stoppable_by(world, run_id, "reviewer") == {"reviewer": False}

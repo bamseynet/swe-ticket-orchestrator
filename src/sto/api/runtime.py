@@ -655,22 +655,45 @@ class Runtime:
     async def stop_gate_roles(self, run_id: RunId) -> frozenset[str]:
         """The roles that may Stop the run through a gate (PLAN 9.3: "open or just-approved").
 
-        Those of every gate that is open, and of a gate that closed APPROVED in its latest round
-        while the run has not moved past it: the run's stage does not name another of its gates
-        (PLAN 4.3 rule 5, the late reject, where the 409 offers Stop). Reads without driving.
+        Those of every gate that is open, and of the one gate that is *just approved*: it holds
+        the run's most recent approval (still in ``RunState.approvals``, which the engine empties
+        or trims when changes are requested), its record is APPROVED in its latest round (a later
+        round that expired or was rejected ends it), and the run has not started a later stage:
+        its stage is still that gate's, or an effect that waits on it (``pr.merge`` holding after
+        approval). This is the late reject, where the 409 offers Stop (PLAN 4.3 rule 5). Reads
+        without driving the run.
         """
-        stage = (await self._astate(run_id)).run.stage
+        state = await self._astate(run_id)
         latest: dict[str, Gate] = {}
         for gate in await self._read_gates(run_id):
             if gate.name not in latest or gate.round > latest[gate.name].round:
                 latest[gate.name] = gate
+        counted = [g for g in latest.values() if g.is_open]
+        last = state.approvals[-1] if state.approvals else None
+        approved = latest.get(last.gate) if last else None
+        if (
+            last is not None
+            and approved is not None
+            and approved.status is GateStatus.APPROVED
+            and approved.round == last.round
+            and self._waiting_on(state.run.stage, approved.name)
+        ):
+            counted.append(approved)
         roles: set[str] = set()
-        for gate in latest.values():
-            moved_on = stage in latest and stage != gate.name
-            just_approved = gate.status is GateStatus.APPROVED and not moved_on
-            if gate.is_open or just_approved:
-                roles |= self._gate_roles(gate) or frozenset()
+        for gate in counted:
+            roles |= self._gate_roles(gate) or frozenset()
         return frozenset(roles)
+
+    def _waiting_on(self, stage: str | None, gate: str) -> bool:
+        """Is the run still at ``gate``, or at an effect that requires it?"""
+        if stage is None:
+            return False
+        if stage == gate:
+            return True
+        return any(
+            n.name == stage and n.kind == "effect" and gate in n.requires_gates
+            for n in self._wf.nodes
+        )
 
     async def can_stop(self, run_id: RunId) -> bool:
         """Is there anything left to stop? (A finished or already stopping run offers no Stop.)"""
