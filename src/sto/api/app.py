@@ -34,15 +34,21 @@ from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
 from sto.api.auth import DOCS, Authorization, install_authorization
 from sto.api.routers import attribution, gates, runs
+from sto.api.routers.attribution import read_records
+from sto.api.routers.gates import DEV_ACTOR
 from sto.api.routers.runs import ApiError, ErrorResponse
-from sto.api.runtime import Runtime, scm_merge_factory
+from sto.api.runtime import API_INDEX, Runtime, default_gate_roles, scm_merge_factory
+from sto.config.schema import Floors
 from sto.domain import RunId, StepKey, Subject
 from sto.effects.core import EffectExecutor
 from sto.engine.commands import RunEffect, RunStep
 from sto.engine.drivers.ports import Done, Outcome
 from sto.engine.handlers.core import StepSucceeded
+from sto.engine.reducer import LINEAR_V0
+from sto.gates.policy import GatePolicy, LinearGates, StoreRecords
 from sto.gates.service import GateService
-from sto.store.ports import TeamScope
+from sto.identity.mapping import ServiceIdentity, UserIdentity
+from sto.store.ports import Key, Scope, Store, TeamScope
 from sto.store.sqlite import SqliteStore
 
 log = logging.getLogger("sto.api")
@@ -241,6 +247,60 @@ def land_pending(scm: FakeScm, landed: int) -> int:
     return landed
 
 
+class DevDirectory:
+    """The local stack's one person: the dev token's actor holds the roles of the linear v0 gates
+    and is linked. Anyone else is unknown, so every other actor is refused."""
+
+    ISSUER = "local"
+
+    def __init__(self, team: str) -> None:
+        self._me = UserIdentity(
+            subject=DEV_ACTOR,
+            issuer=self.ISSUER,
+            memberships=frozenset({(team, "reviewer"), (team, "qa")}),
+        )
+
+    @property
+    def actor(self) -> str:
+        return f"{self._me.issuer}|{self._me.subject}"
+
+    def who(self, scope: Scope, actor: str) -> UserIdentity | ServiceIdentity | None:
+        return self._me if actor == DEV_ACTOR else None
+
+    def linked(self, scope: Scope, actor: str) -> bool:
+        return actor == DEV_ACTOR
+
+
+# One developer plays every part on the local stack, so the floors that need two people are off.
+# The committer floor, which needs no one else, stays on. Real floors come from org policy.
+LOCAL_FLOORS = Floors.model_construct(single_human_allowed=True, requester_excluded_from=())
+
+
+def gate_policy(
+    store: Store, directory: DevDirectory, *, floors: Floors = LOCAL_FLOORS
+) -> GatePolicy:
+    """The policy of the gate service: the gate's config, the person, the run's records and the
+    floors, so a decision is refused when separation of duties bars it (D3-24)."""
+
+    def requester_of(scope: Scope, run_id: RunId) -> str | None:
+        item = store.get(scope, Key(API_INDEX, str(run_id)))
+        found = item.data.get("started_by") if item else None
+        return found if isinstance(found, str) else None
+
+    return GatePolicy(
+        rules=LinearGates(LINEAR_V0, default_gate_roles),
+        directory=directory,
+        records=StoreRecords(
+            store,
+            read=read_records,
+            requester_of=requester_of,
+            snapshot=lambda scope, gate: frozenset({directory.actor}),
+        ),
+        floors=floors,
+        actor_key=lambda who: DEV_ACTOR,  # the dev token's one actor string is "dev"
+    )
+
+
 def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
     """The app ``make dev`` serves. Refuses outside local mode before it opens anything."""
     env = os.environ if env is None else env
@@ -283,7 +343,7 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
     runtime = Runtime(
         store,
         scope,
-        gates=GateService(store),
+        gates=GateService(store, policy=gate_policy(store, DevDirectory(scope.team))),
         effects=EffectExecutor(store, scope),
         steps=SimulatedSteps(subject_for),
         merges=scm_merge_factory(scm, store, scope, lambda run_id: pr, MergeMethod.SQUASH),
