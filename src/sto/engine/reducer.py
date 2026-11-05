@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -229,6 +230,9 @@ class HandlerRegistry:
 
 HANDLERS = HandlerRegistry()
 GRAPH_HANDLERS = HandlerRegistry()
+# The registry ``next`` is running a handler from, so a stage kind can refuse an entry whose leaving
+# events this registry cannot handle (it would park the run for good). Set only inside ``next``.
+ACTIVE_REGISTRY: ContextVar[HandlerRegistry | None] = ContextVar("active_registry", default=None)
 
 
 def handles(
@@ -298,4 +302,8 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     version = workflow_version(workflow)
     if state.run.workflow_version not in (None, version):
         raise WorkflowMismatchError(f"run is on {state.run.workflow_version!r}, not {version!r}")
-    return handler(state, event, workflow)
+    token = ACTIVE_REGISTRY.set(chosen)
+    try:
+        return handler(state, event, workflow)
+    finally:
+        ACTIVE_REGISTRY.reset(token)

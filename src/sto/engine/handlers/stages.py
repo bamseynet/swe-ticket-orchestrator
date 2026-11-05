@@ -12,7 +12,10 @@ instead of raising, because a refused event is dropped by the driver and the run
   exhausted, so a workflow the validator never saw cannot loop free.
 * ``max_steps_exceeded``: the entry would exceed ``limits.max_steps_per_run``.
 * ``stage_unsupported``: ``route`` stages arrive in D2-23. They are not skipped. (``wait`` and
-  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``.)
+  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``. A registry that lacks the
+  handlers a kind needs to leave its stage cannot enter it either: that would park the run.)
+* ``checks_timed_out`` and ``checks_unresolved`` (``waits.py``): a checks stage timed out
+  (PLAN 6.2, WAITING_EXTERNAL to BLOCKED), or its ``team_default`` resolved to no checks.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
   ``RunState.routed_gates``, PLAN 4.3 rule 2) has no live approval.
 * ``subject_missing``: a gate or an effect with no live subject (of the right shape) to plan
@@ -85,6 +88,7 @@ from sto.engine.handlers.core import (
     StepSucceeded,
 )
 from sto.engine.reducer import (
+    ACTIVE_REGISTRY,
     Approval,
     MalformedEventError,
     Merge,
@@ -183,7 +187,10 @@ def _out(what: str) -> OutOfOrderEventError:
 
 
 def _with(rs: RunState, run: Run, **changes: object) -> RunState:
-    """New state with the run's version bumped: one accepted event, one version."""
+    """New state with the run's version bumped: one accepted event, one version.
+
+    The one exception is a snapshot that decides nothing (pending check results): it returns the
+    state as it was."""
     bumped = dataclasses.replace(run, version=run.version + 1)
     return dataclasses.replace(rs, run=bumped, **changes)  # type: ignore[arg-type]
 
@@ -211,10 +218,13 @@ class StageEntry:
     """How a stage kind defined in another handler module is entered (D2-13 wait and checks).
 
     ``refuse`` runs with the other entry checks, before any counter moves, and returns a blocked
-    reason or ``None``. ``enter`` runs once the visit is counted and returns the transition."""
+    reason or ``None``. ``enter`` runs once the visit is counted and returns the transition.
+    ``leaves`` are the event types that end the stage: a registry without all of them cannot enter
+    it, because nothing could ever take the run out again."""
 
     refuse: Callable[[RunState, Any], str | None]
     enter: Callable[[RunState, Run, str, Any, int], Transition]
+    leaves: tuple[type, ...] = ()
 
 
 STAGE_ENTRY: dict[type, StageEntry] = {}
@@ -230,6 +240,13 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     stage = wf.stages[name]
     entry = STAGE_ENTRY.get(type(stage))
     if entry is None and not isinstance(stage, _SUPPORTED):
+        return _block(rs, "stage_unsupported")
+    registry = ACTIVE_REGISTRY.get()
+    if (
+        entry is not None
+        and registry is not None
+        and any(registry.get(t) is None for t in entry.leaves)
+    ):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
         return _block(rs, "loop_exhausted")
@@ -538,3 +555,8 @@ def on_cancel_completed(rs: RunState, event: CancelCompleted, wf: Graph) -> Tran
     if rs.run.status is not RunStatus.CANCELLING:
         raise _out(f"cancel completed while run is {rs.run.status.value}")
     return _end(rs, wf, RunStatus.CANCELLED)
+
+
+# Last, so the wait and checks stage kinds are always entered, whichever module is imported first.
+# ``waits`` imports the names above, which exist by now.
+import sto.engine.handlers.waits  # noqa: E402,F401

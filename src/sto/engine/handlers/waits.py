@@ -8,8 +8,10 @@ command carries the timeout in seconds and the timer (D2-12) reports ``StageTime
 Three events end or advance the wait, all tied to the stage's own visit:
 
 * ``WaitResumed``: an answer or a ready environment. A wait follows ``resumed``.
-* ``StageTimedOut``: a wait follows ``timeout``. A checks stage has no timeout edge, and a timeout
-  is never green, so it follows ``red``.
+* ``StageTimedOut``: a wait follows ``timeout``. A checks stage has only green and red, and a
+  timeout is neither, so it BLOCKS ``checks_timed_out`` (PLAN 6.2: WAITING_EXTERNAL to BLOCKED)
+  instead of spending a fix loop on an outage. A ``team_default`` that never resolved blocks
+  ``checks_unresolved``.
 * ``CheckResults``: a snapshot of the results for the head SHA (the driver reads them from the
   SCM port). Any required check ``failed`` is ``red``; every required check ``passed`` is
   ``green``. Anything else, ``pending`` or not yet reported, is a wait and not a failure: the
@@ -39,11 +41,17 @@ from sto.domain import BLOCKED_REASONS, COMMANDS, EVENTS, Run, RunId, RunStatus
 from sto.engine.handlers.stages import STAGE_ENTRY, StageEntry, _block, _goto, _out, _target, _with
 from sto.engine.reducer import MalformedEventError, RunState, Transition, handles_graph
 
-_STATUSES = frozenset({"passed", "failed", "pending"})
+_PASSING = frozenset({"passed", "neutral"})  # neutral counts as passing (PLAN, [S59])
+_STATUSES = _PASSING | {"failed", "pending"}
 
 
 @BLOCKED_REASONS.register("checks_unresolved")
 class ChecksUnresolved:
+    pass
+
+
+@BLOCKED_REASONS.register("checks_timed_out")
+class ChecksTimedOut:
     pass
 
 
@@ -84,6 +92,9 @@ class CheckResult:
 @EVENTS.register("wait.resumed")
 @dataclass(frozen=True)
 class WaitResumed:
+    """An answer arrived or the environment is ready. It carries no responder: who answered is
+    authenticated before the event is built, and the reducer takes it as given."""
+
     run_id: RunId
     stage: str
     visit: int
@@ -92,14 +103,29 @@ class WaitResumed:
 @EVENTS.register("stage.timed_out")
 @dataclass(frozen=True)
 class StageTimedOut:
+    """The stage's timeout passed. ``team_required`` is, for a ``team_default`` checks stage, the
+    list the driver resolved (empty if it never did); it picks the blocked reason."""
+
     run_id: RunId
     stage: str
     visit: int
+    team_required: tuple[str, ...] = ()
 
 
 @EVENTS.register("check.results")
 @dataclass(frozen=True)
 class CheckResults:
+    """A snapshot of check results for ``sha``. The driver's contract:
+
+    * one entry per check name, the latest run only (re-runs would repeat a name, and the reducer
+      refuses a name reported with two statuses);
+    * statuses are ``passed``, ``failed``, ``pending`` or ``neutral`` (counts as passing); the
+      driver maps GitHub's other conclusions, ``skipped`` included, before sending;
+    * ``team_required`` (used only for ``team_default``) is the resolved list and must be the
+      same on every snapshot of a visit. RunState has no field to pin the first list, so the
+      reducer reads it fresh on each event: a shorter later list could turn green on fewer checks.
+    """
+
     run_id: RunId
     stage: str
     visit: int
@@ -146,8 +172,8 @@ def _enter(rs: RunState, run: Run, name: str, stage: object, count: int) -> Tran
     return Transition(_with(rs, run.advance(status), visit=count, attempt=1, round=0), (cmd,))
 
 
-STAGE_ENTRY[WaitStage] = StageEntry(_refuse, _enter)
-STAGE_ENTRY[ChecksStage] = StageEntry(_refuse, _enter)
+STAGE_ENTRY[WaitStage] = StageEntry(_refuse, _enter, (WaitResumed, StageTimedOut))
+STAGE_ENTRY[ChecksStage] = StageEntry(_refuse, _enter, (CheckResults, StageTimedOut))
 
 
 # --- the live position ---------------------------------------------------------------------
@@ -187,8 +213,13 @@ def on_wait_resumed(rs: RunState, event: WaitResumed, wf: Graph) -> Transition:
 @handles_graph(StageTimedOut)
 def on_stage_timed_out(rs: RunState, event: StageTimedOut, wf: Graph) -> Transition:
     stage = _waiting(rs, wf, event.stage, event.visit)
-    # A timeout never passes a check: with no timeout edge of its own, checks follow ``red``.
-    return _leave(rs, wf, stage, "timeout" if isinstance(stage, WaitStage) else "red")
+    if isinstance(stage, WaitStage):
+        return _leave(rs, wf, stage, "timeout")
+    # Checks have only green and red (PLAN 7.2), and a timeout is neither: the run BLOCKS (PLAN 6.2)
+    # rather than spend a fix loop on an outage.
+    if stage.required == "team_default" and not event.team_required:
+        return _block(rs, "checks_unresolved")
+    return _block(rs, "checks_timed_out")
 
 
 @handles_graph(CheckResults)
@@ -211,6 +242,6 @@ def on_check_results(rs: RunState, event: CheckResults, wf: Graph) -> Transition
     states = [seen.get(name, "pending") for name in required]
     if "failed" in states:
         return _leave(rs, wf, stage, "red")
-    if all(s == "passed" for s in states):
+    if all(s in _PASSING for s in states):
         return _leave(rs, wf, stage, "green")
     return Transition(rs)  # pending is a wait: nothing moves and nothing is spent

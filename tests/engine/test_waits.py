@@ -9,6 +9,9 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -16,7 +19,7 @@ import pytest
 import yaml
 
 from sto.config.manifest import load_manifest
-from sto.config.schema import OrgPolicy, load_document
+from sto.config.schema import ChecksStage, OrgPolicy, WaitStage, load_document
 from sto.config.schema import Workflow as Graph
 from sto.config.validate_structure import validate_structure
 from sto.domain import (
@@ -33,7 +36,7 @@ from sto.domain import (
 )
 from sto.engine.commands import RunStep
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, RunStarted
-from sto.engine.handlers.stages import StageReported
+from sto.engine.handlers.stages import STAGE_ENTRY, StageReported
 from sto.engine.handlers.waits import (
     AwaitChecks,
     AwaitWait,
@@ -43,6 +46,8 @@ from sto.engine.handlers.waits import (
     WaitResumed,
 )
 from sto.engine.reducer import (
+    GRAPH_HANDLERS,
+    HandlerRegistry,
     MalformedEventError,
     OutOfOrderEventError,
     RunState,
@@ -331,11 +336,24 @@ def test_an_unknown_status_or_a_contradicting_pair_is_malformed() -> None:
         next(rs, results(rs, ("unit", "passed"), ("unit", "failed")), W)
 
 
-def test_a_checks_timeout_is_not_green_and_follows_the_red_edge() -> None:
+def test_a_checks_timeout_blocks_instead_of_spending_a_fix_loop() -> None:
     rs = at_ci()
     t = next(rs, StageTimedOut(RID, "ci", 1), W)
-    assert (t.state.run.status, t.state.run.stage) == (RunStatus.RUNNING, "implement")
-    assert t.state.loop_count("fix") == 1
+    assert (t.state.run.status, t.state.run.blocked_reason) == (
+        RunStatus.BLOCKED,
+        "checks_timed_out",
+    )
+    assert t.state.run.stage == "ci"  # it stays where it waited
+    assert (t.state.loops, t.state.steps, t.commands) == (rs.loops, rs.steps, ())
+
+
+def test_a_team_default_that_never_resolved_before_the_timeout_blocks_as_unresolved() -> None:
+    w = wf(team_default)
+    rs = at_ci(w)
+    t = next(rs, StageTimedOut(RID, "ci", 1), w)
+    assert t.state.run.blocked_reason == "checks_unresolved"
+    resolved = next(rs, StageTimedOut(RID, "ci", 1, team_required=("unit",)), w)
+    assert resolved.state.run.blocked_reason == "checks_timed_out"
 
 
 def test_a_timeout_after_the_checks_decided_changes_nothing() -> None:
@@ -426,7 +444,8 @@ def test_events_commands_and_reasons_are_registered_and_survive_the_wire() -> No
         assert EVENTS.get(name) is not None
     for name in ("await_wait", "await_checks"):
         assert COMMANDS.get(name) is not None
-    assert BLOCKED_REASONS.get("checks_unresolved") is not None
+    for reason in ("checks_unresolved", "checks_timed_out"):
+        assert BLOCKED_REASONS.get(reason) is not None
     ev = CheckResults(RID, "ci", 1, SHA, (CheckResult("unit", "passed"),), ("unit",))
     cmd = AwaitChecks(RID, "ci", 1, "ci", SHA, ("unit",), False, 60)
     assert from_wire(CheckResults, to_wire(ev)) == ev
@@ -476,3 +495,96 @@ def test_a_workflow_missing_the_edge_an_event_needs_is_malformed_not_a_crash() -
     rs = report(started(w), "blocked", w=w)
     with pytest.raises(MalformedEventError):
         next(rs, StageTimedOut(RID, "ask", 1), w)
+
+
+# --- review pass 1 ---------------------------------------------------------------------------
+
+
+def test_the_stage_entries_are_exactly_wait_and_checks_whatever_the_import_order() -> None:
+    assert set(STAGE_ENTRY) == {WaitStage, ChecksStage}
+
+
+@pytest.mark.parametrize(
+    "first",
+    ["sto.engine.handlers.stages", "sto.engine.handlers.waits"],
+)
+def test_a_fresh_interpreter_has_both_entries_whichever_module_it_imports_first(
+    first: str,
+) -> None:
+    code = (
+        f"import {first}\n"
+        "from sto.engine.handlers.stages import STAGE_ENTRY\n"
+        "print(sorted(k.__name__ for k in STAGE_ENTRY))"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "['ChecksStage', 'WaitStage']"
+
+
+def test_a_registry_without_the_wait_handlers_blocks_instead_of_parking_the_run() -> None:
+    partial = HandlerRegistry()
+    for event_type in (RunStarted, StageReported):
+        handler = GRAPH_HANDLERS.get(event_type)
+        assert handler is not None
+        partial.register(event_type, handler)
+    rs = next(RunState(Run(id=RID, team="t")), RunStarted(RID), W, graph_registry=partial).state
+    key = StepKey(RID, "implement", 1, 1)
+    t = next(rs, StageReported(key, "blocked"), W, graph_registry=partial)
+    assert (t.state.run.status, t.state.run.blocked_reason) == (
+        RunStatus.BLOCKED,
+        "stage_unsupported",
+    )
+    assert t.state.run.stage == "implement"
+    assert t.commands == ()
+
+
+def test_the_default_registry_can_enter_both_kinds() -> None:
+    assert at_ask().run.stage == "ask"
+    assert at_ci().run.stage == "ci"
+
+
+def test_a_second_visit_of_a_wait_plans_visit_two_and_only_visit_two_is_live() -> None:
+    resumed = next(at_ask(), WaitResumed(RID, "ask", 1), W).state
+    t = next(resumed, StageReported(StepKey(RID, "implement", 2, 1), "blocked"), W)
+    assert t.commands == (AwaitWait(RID, "ask", 2, "human_answer", 2 * 86400),)
+    with pytest.raises(OutOfOrderEventError):
+        next(t.state, StageTimedOut(RID, "ask", 1), W)
+    assert next(t.state, StageTimedOut(RID, "ask", 2), W).state.run.stage == "closed"
+
+
+def test_a_second_visit_of_checks_plans_visit_two_and_only_visit_two_is_live() -> None:
+    rs = at_ci()
+    red = next(rs, results(rs, ("unit", "failed"), ("lint", "passed")), W).state
+    t = next(red, StageReported(StepKey(RID, "implement", 2, 1), "ready", subj(SHA2)), W)
+    cmd = t.commands[0]
+    assert isinstance(cmd, AwaitChecks)
+    assert (cmd.visit, cmd.sha) == (2, SHA2)
+    with pytest.raises(OutOfOrderEventError):
+        next(t.state, StageTimedOut(RID, "ci", 1), W)
+    assert next(t.state, StageTimedOut(RID, "ci", 2), W).state.run.blocked_reason == (
+        "checks_timed_out"
+    )
+
+
+def test_a_neutral_result_counts_as_passing() -> None:
+    rs = at_ci()
+    t = next(rs, results(rs, ("unit", "passed"), ("lint", "neutral")), W)
+    assert t.state.run.status is RunStatus.DONE
+
+
+def test_skipped_is_for_the_driver_to_map_and_the_reducer_refuses_it() -> None:
+    rs = at_ci()
+    with pytest.raises(MalformedEventError):
+        next(rs, results(rs, ("unit", "passed"), ("lint", "skipped")), W)
+
+
+def test_the_refusal_order_puts_the_step_limit_before_the_missing_subject() -> None:
+    rs = dataclasses.replace(started(), steps=W.limits.max_steps_per_run)
+    t = next(rs, StageReported(StepKey(RID, "implement", 1, 1), "ready"), W)
+    assert (t.state.run.status, t.state.run.blocked_reason) == (
+        RunStatus.BLOCKED,
+        "max_steps_exceeded",
+    )
