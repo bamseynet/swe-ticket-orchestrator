@@ -19,6 +19,11 @@ write anything; a team admin only for their own team, and cannot take over or re
 is mapped to another team. Admin self-service rules (an admin who changed a mapping is ineligible
 for the affected gate rounds) belong to D3-05 and D3-16, not here.
 
+An issuer containing ``|`` is refused at construction: actors are ``issuer|subject`` and separation
+of duties compares them exactly, so a ``|`` in an issuer could make two identities share a key.
+Bootstrap and other callers use the public helpers :func:`check_text`, :func:`map_key`,
+:meth:`RoleMapping.check_idp` and :meth:`RoleMapping.has_any_mapping`, never private names.
+
 ``idp`` means the token issuer, compared exactly. Under ADR-0008 every upstream IdP federated into
 the Cognito pool shares one ``iss``, so ``idp`` is the broker, group IDs from different upstream
 IdPs share one namespace, and a disable is keyed by the pool ``sub``. Provider separation comes
@@ -71,13 +76,16 @@ __all__ = [
     "ServiceIdentity",
     "UserDisabledError",
     "UserIdentity",
+    "check_text",
     "is_service_token",
+    "map_key",
 ]
 
 BUILTIN_ROLES = ("developer", "reviewer", "qa", "team_admin", "auditor")
 TEAM_ADMIN = "team_admin"
 MAX_NAME_BYTES = 400  # "DISABLED#<idp>#<subject>" stays under the 1024-byte sort key
 _ROLE = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
+_BAD_ISSUER_CHARS = frozenset("#|")  # "#" splits keys; "|" splits the issuer|subject actor key
 _ORG_PK = "ORG"
 _MAP = "MAP#"
 _DISABLED = "DISABLED#"
@@ -137,7 +145,7 @@ def _too_long(value: str) -> bool:
     return len(value.encode("utf-8", "surrogatepass")) > MAX_NAME_BYTES
 
 
-def _check_text(label: str, value: object) -> str:
+def check_text(label: str, value: object) -> str:
     if not isinstance(value, str) or not value:
         raise InvalidMappingError(f"{label} must be a non-empty string")
     if _too_long(value):
@@ -158,7 +166,7 @@ def _check_team(team: object) -> str:
         raise InvalidMappingError(f"bad team: {exc}") from exc
 
 
-def _map_key(idp: str, group: str) -> Key:
+def map_key(idp: str, group: str) -> Key:
     return Key(_ORG_PK, f"{_MAP}{idp}#{group}")
 
 
@@ -185,10 +193,19 @@ class RoleMapping:
         if not self._issuers:
             raise ValueError("at least one issuer is required")
         for issuer in self._issuers:
-            if not isinstance(issuer, str) or not issuer or "#" in issuer or _too_long(issuer):
-                raise ValueError("issuers must be short non-empty strings without '#'")
+            if (
+                not isinstance(issuer, str)
+                or not issuer
+                or _BAD_ISSUER_CHARS.intersection(issuer)
+                or _too_long(issuer)
+            ):
+                raise ValueError("issuers must be short non-empty strings without '#' or '|'")
 
-    def _check_idp(self, idp: object) -> str:
+    def has_any_mapping(self) -> bool:
+        """True if any mapping item is stored, however it was written."""
+        return bool(self._store.query(PLATFORM, _ORG_PK, sk_prefix=_MAP, limit=1).items)
+
+    def check_idp(self, idp: object) -> str:
         """``idp`` is a configured issuer, exactly as :meth:`resolve` compares it."""
         if not isinstance(idp, str) or idp not in self._issuers:
             raise InvalidMappingError("idp is not a configured issuer")
@@ -221,15 +238,13 @@ class RoleMapping:
 
     def mapping(self, idp: str, group: str) -> tuple[str | None, str] | None:
         """The stored ``(team, role)`` for a group, or ``None``."""
-        item = self._store.get(
-            PLATFORM, _map_key(self._check_idp(idp), _check_text("group", group))
-        )
+        item = self._store.get(PLATFORM, map_key(self.check_idp(idp), check_text("group", group)))
         return _parse(item.data) if item else None
 
     def set_mapping(
         self, who: Principal, *, idp: str, group: str, team: str | None, role: str
     ) -> None:
-        idp, group = self._check_idp(idp), _check_text("group", group)
+        idp, group = self.check_idp(idp), check_text("group", group)
         if team is None:
             if role != ORG_ADMIN:
                 raise InvalidMappingError("an org-level mapping can only carry org_admin")
@@ -244,18 +259,18 @@ class RoleMapping:
         when = self._guard_existing(who, idp, group)
         self._store.put(
             PLATFORM,
-            _map_key(idp, group),
+            map_key(idp, group),
             {"team": team, "role": role, "by": who.actor, "at": self._clock()},
             when=when,
         )
 
     def remove_mapping(self, who: Principal, *, idp: str, group: str, team: str | None) -> None:
-        idp, group = self._check_idp(idp), _check_text("group", group)
+        idp, group = self.check_idp(idp), check_text("group", group)
         team = None if team is None else _check_team(team)
         if not _may_admin(who, team):
             raise PermissionDeniedError(f"{who.actor} may not unmap groups for {team or 'the org'}")
         when = self._guard_existing(who, idp, group, team=team)
-        self._store.delete(PLATFORM, _map_key(idp, group), when=when)
+        self._store.delete(PLATFORM, map_key(idp, group), when=when)
 
     def _guard_existing(
         self,
@@ -269,7 +284,7 @@ class RoleMapping:
         write must carry: absent, or the version read here (so a racing write makes it fail).
 
         With ``team`` given (a removal) the stored team must equal it."""
-        item = self._store.get(PLATFORM, _map_key(idp, group))
+        item = self._store.get(PLATFORM, map_key(idp, group))
         if item is None:
             return Absent()
         current = _parse(item.data)
@@ -287,14 +302,14 @@ class RoleMapping:
     def disable_user(self, who: Principal, *, idp: str, subject: str) -> None:
         if not who.is_org_admin:
             raise PermissionDeniedError(f"{who.actor} may not disable users: it needs {ORG_ADMIN}")
-        key = _disabled_key(self._check_idp(idp), _check_text("subject", subject))
+        key = _disabled_key(self.check_idp(idp), check_text("subject", subject))
         self._store.put(PLATFORM, key, {"by": who.actor, "at": self._clock()})
 
     def enable_user(self, who: Principal, *, idp: str, subject: str) -> None:
         if not who.is_org_admin:
             raise PermissionDeniedError(f"{who.actor} may not enable users: it needs {ORG_ADMIN}")
         self._store.delete(
-            PLATFORM, _disabled_key(self._check_idp(idp), _check_text("subject", subject))
+            PLATFORM, _disabled_key(self.check_idp(idp), check_text("subject", subject))
         )
 
     # --- resolution -------------------------------------------------------------------------
@@ -318,7 +333,7 @@ class RoleMapping:
         for group in dict.fromkeys(token.groups):
             if _too_long(group):
                 continue  # writes refuse such a group, so it cannot have a mapping
-            item = self._store.get(PLATFORM, _map_key(token.issuer, group))
+            item = self._store.get(PLATFORM, map_key(token.issuer, group))
             parsed = _parse(item.data) if item else None
             if parsed is None:
                 continue

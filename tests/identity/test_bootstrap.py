@@ -388,3 +388,24 @@ def test_misconfigured_idp_is_refused() -> None:
             group=BOOT,
             audit=lambda e: None,
         )
+
+
+def test_bootstrap_imports_no_private_name_from_mapping() -> None:
+    """The bootstrap uses RoleMapping's public helpers, not its private ones or key layout."""
+    import ast
+    import pathlib
+
+    import sto.identity.bootstrap as mod
+
+    tree = ast.parse(pathlib.Path(mod.__file__).read_text())
+    private = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "sto.identity.mapping"
+        for alias in node.names
+        if alias.name.startswith("_")
+    ]
+    assert private == []
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert not {a for a in attrs if a.startswith("_check") or a == "_map_key"}
+    assert "MAP#" not in pathlib.Path(mod.__file__).read_text().split('"""', 2)[2]
