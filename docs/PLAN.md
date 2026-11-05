@@ -1537,7 +1537,9 @@ class Notifier(Protocol):
     def parse_action(self, raw: RawWebhook) -> DecisionRequest | None: ...
 
 class WebhookVerifier(Protocol):
-    def verify(self, headers: Mapping[str, str], raw_body: bytes) -> VerifiedDelivery: ...
+    replay_window: float | None      # seconds; None when the vendor signs no timestamp
+    secret_headers: frozenset[str]   # never copied into a nudge
+    def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str: ...  # the delivery ID
 ```
 
 **Webhooks are nudges, not facts.** A verified delivery says that something changed. The adapter then
