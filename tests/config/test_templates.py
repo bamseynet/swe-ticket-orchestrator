@@ -237,28 +237,37 @@ def test_the_kanban_readme_shows_the_qa_quorum_an_org_requiring_qa_gate_needs() 
     assert "lets QA pass with no QA person" in " ".join(text.split())
 
 
-def test_the_kanban_overlay_needs_that_quorum_for_an_org_requiring_qa_gate_with_role_qa() -> None:
+def test_plan_7_7_and_the_kanban_overlay_carry_the_qa_quorum() -> None:
+    quorum = [{"role": "qa", "count": 1}]
+    plan = yaml.safe_load(PLAN_BLOCKS["platform-kanban"])
+    assert plan["stages"]["qa_gate"]["gate"]["quorum"] == quorum
+    shipped = yaml.safe_load(_read(template_file("kanban")))
+    assert shipped["stages"]["qa_gate"]["gate"]["quorum"] == quorum
+
+
+def test_the_kanban_overlay_satisfies_an_org_requiring_qa_gate_with_role_qa() -> None:
     wf = flattened("kanban")
     qa_gate = wf.stages["qa_gate"]
     assert isinstance(qa_gate, GateStage)
     assert qa_gate.gate.eligible_roles == ("qa", "reviewer")
-    without = check_org_required_gates(wf, _qa_org(), team="platform")
-    assert any("qa_gate" in i.path for i in without), "the PLAN overlay has no qa quorum"
-
-    patched = copy.deepcopy(yaml.safe_load(_read(template_file("kanban"))))
-    patched["stages"]["qa_gate"]["gate"]["quorum"] = [{"role": "qa", "count": 1}]
-    ov = load_document(yaml.safe_dump(patched))
-    assert isinstance(ov, WorkflowOverlay)
-    with_quorum = flatten(template(), ov, template_ref=TEMPLATE_REF).workflow
-    got = check_org_required_gates(with_quorum, _qa_org(), team="platform")
+    assert [(q.role, q.count) for q in qa_gate.gate.quorum or ()] == [("qa", 1)]
+    got = check_org_required_gates(wf, _qa_org(), team="platform")
     assert got == [], messages(got)
     assert (
-        validate_structure(
-            with_quorum, manifest=MANIFEST, policy=_qa_org(), sandbox_images=SANDBOX_IMAGES
-        )
+        validate_structure(wf, manifest=MANIFEST, policy=_qa_org(), sandbox_images=SANDBOX_IMAGES)
         == []
     )
-    assert check_gate_dominance(with_quorum, MANIFEST) == []
+    assert check_gate_dominance(wf, MANIFEST) == []
+
+
+def test_without_the_quorum_a_reviewer_alone_could_decide_the_qa_gate() -> None:
+    patched = copy.deepcopy(yaml.safe_load(_read(template_file("kanban"))))
+    del patched["stages"]["qa_gate"]["gate"]["quorum"]
+    ov = load_document(yaml.safe_dump(patched))
+    assert isinstance(ov, WorkflowOverlay)
+    wf = flatten(template(), ov, template_ref=TEMPLATE_REF).workflow
+    got = check_org_required_gates(wf, _qa_org(), team="platform")
+    assert any("qa_gate" in i.path for i in got)
 
 
 # --- the bundled policy against PLAN's own OrgPolicy example -------------------------------------
@@ -276,48 +285,20 @@ def _plan_policy_text() -> str:
     return next(b for b in blocks if "kind: OrgPolicy" in b and ": string" not in b)
 
 
-# every difference between PLAN 7.2's OrgPolicy example and templates/org-policy.yaml, and why
-_POLICY_DIFFERENCES = {
-    ("floors", "decision_surfaces", "pre_push"): "the standard template's pre_push_gate uses ui; "
-    "PLAN's example names no pre_push surface, so (V10) it permits none",
-    ("floors", "decision_surfaces", "custom"): "the regulated overlay's security_gate and "
-    "change_gate are custom gates; PLAN's example names no custom surface",
-    ("floors", "waive_allowed"): "PLAN's example allows waive; no bundled template uses it and "
-    "PLAN 7.8 says the regulated org forbids it, so the bundled policy is the safer false",
-    ("ceilings", "max_run_age"): "the regulated overlay's max_run_age is 90d, above PLAN's 60d "
-    "ceiling (V9)",
-    ("ceilings", "max_stage_duration"): "the regulated overlay's expire_after values are 20d, "
-    "20d, 20d and 15d, above PLAN's 14d ceiling (V9)",
-}
-
-
-def test_the_bundled_policy_differs_from_plans_example_only_where_plans_own_workflows_need_it() -> (
-    None
-):
-    """PLAN's OrgPolicy example cannot validate PLAN's own workflows, so the bundled policy
-    differs from it in exactly ``_POLICY_DIFFERENCES``, each for the reason given there. Both
-    are loaded through ``load_document``, so defaults are filled in on both sides and a key
-    PLAN spells out at its default does not count as a difference."""
+def test_plans_org_policy_example_is_the_bundled_policy() -> None:
+    """No exceptions: PLAN 7.2's OrgPolicy example loads through ``load_document`` and equals
+    ``templates/org-policy.yaml`` once defaults are filled in on both sides."""
     plan = load_document(_plan_policy_text())
     assert isinstance(plan, OrgPolicy)
-    a = _leaves(plan.model_dump(mode="json"))
-    b = _leaves(policy().model_dump(mode="json"))
-    differing = {k for k in a.keys() | b.keys() if a.get(k, "<absent>") != b.get(k, "<absent>")}
-    assert differing == set(_POLICY_DIFFERENCES)
+    assert plan.model_dump(mode="json") == policy().model_dump(mode="json")
 
 
-def test_plans_own_policy_refuses_the_workflows_that_need_those_differences() -> None:
+@pytest.mark.parametrize("name", BUNDLED)
+def test_plans_org_policy_example_validates_each_of_plans_workflows(name: str) -> None:
     plan = load_document(_plan_policy_text())
     assert isinstance(plan, OrgPolicy)
-    found: dict[str, str] = {}
-    for name in BUNDLED:
-        wf = flattened(name)
-        for i in validate_structure(
-            wf, manifest=MANIFEST, policy=plan, sandbox_images=SANDBOX_IMAGES
-        ):
-            found.setdefault(name, "")
-            found[name] += f"\n{i.path}: {i.message}"
-    assert "pre_push_gate" in found["standard"]  # no pre_push surface
-    assert "custom" in found["regulated"] or "security_gate" in found["regulated"]
-    assert "max_run_age" in found["regulated"]  # 90d over the 60d ceiling
-    assert "expire_after" in found["regulated"]  # over the 14d max_stage_duration
+    wf = flattened(name)
+    got = validate_structure(wf, manifest=MANIFEST, policy=plan, sandbox_images=SANDBOX_IMAGES)
+    assert got == [], messages(got)
+    got = check_org_required_gates(wf, plan, team=wf.metadata.team)
+    assert got == [], messages(got)

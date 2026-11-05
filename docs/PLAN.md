@@ -827,8 +827,8 @@ floors:
   single_human_allowed: false        # true lets one person pass both mandatory gates (Q5)
   requester_excluded_from: [review, pre_push]
   mandatory_gate_roles: { pre_push: [reviewer], review: [reviewer], qa: [qa, reviewer] }    # never developer
-  decision_surfaces: { review: [ui, slack, github], qa: [ui, slack] }
-  waive_allowed: true
+  decision_surfaces: { pre_push: [ui], review: [ui, slack, github], qa: [ui, slack], custom: [ui] }   # a gate type not named here permits no surface (V10)
+  waive_allowed: false
   hold_after_approval_min: 10m
   require_up_to_date: true
   require_up_to_date_waived_for: []  # repos
@@ -836,7 +836,7 @@ floors:
   public_repo_intake: false          # public repos need explicit opt-in
   ci_without_secrets_waived_for: []  # repos exempt from the floor in T18
   route_to_gate_allowed: false
-ceilings: { max_steps_per_run: 200, max_run_age: 60d, max_loop: 5, max_stage_duration: 14d, max_run_usd: 50 }   # V9, all optional
+ceilings: { max_steps_per_run: 200, max_run_age: 90d, max_loop: 5, max_stage_duration: 30d, max_run_usd: 50 }   # V9, all optional
 route_orders: { risk: [low, medium, high] }   # the org's ranking, lowest to highest; a route's order must agree (V9), and every `when` below needs its value here
 teams:                               # per team or tag, enforced at publish, on migrate and live
   ledger:
@@ -1132,7 +1132,7 @@ stages:
   merge: { requires_gates: [review_gate], next: { done: qa_auto } }
   qa_auto: { required: [staging-smoke], timeout: 1h }
   qa_gate:
-    gate: { eligible_roles: [qa, reviewer], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
+    gate: { eligible_roles: [qa, reviewer], quorum: [{ role: qa, count: 1 }], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
     next: { approved: release, rejected: revert_pr }
   release:
     kind: effect

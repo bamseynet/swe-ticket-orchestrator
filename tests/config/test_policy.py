@@ -1411,9 +1411,15 @@ def test_the_kanban_example_meets_a_requirement_on_its_review_gate() -> None:
     assert _check(_load_wf(_kanban(["qa", "reviewer"])), review) == []
 
 
-def test_the_kanban_qa_gate_as_written_is_refused_only_for_the_extra_role() -> None:
-    # eligible_roles [qa, reviewer] with no quorum: a reviewer alone could pass the QA gate
-    issues = _check(_load_wf(_kanban(["qa", "reviewer"])), _team_policy("ledger", QA))
+def test_the_kanban_qa_gate_as_written_meets_a_requirement_for_role_qa() -> None:
+    # D2-27: the quorum [{role: qa, count: 1}] means a reviewer alone cannot pass the QA gate
+    assert _check(_load_wf(_kanban(["qa", "reviewer"])), _team_policy("ledger", QA)) == []
+
+
+def test_the_kanban_qa_gate_without_its_quorum_is_refused_only_for_the_extra_role() -> None:
+    doc = _kanban(["qa", "reviewer"])
+    del doc["stages"]["qa_gate"]["gate"]["quorum"]
+    issues = _check(_load_wf(doc), _team_policy("ledger", QA))
     assert _paths(issues) == ["stages.qa_gate.gate.eligible_roles"]
 
 
