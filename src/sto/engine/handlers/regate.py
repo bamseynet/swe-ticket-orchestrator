@@ -12,23 +12,36 @@ sends it where it sent ``EffectFailed`` for a voided effect (see the PR for the 
 the final approval has a new ``ticket_revision``; the live subject is the one recorded before).
 It names no gate. Which gate is first is decided here from recorded state:
 
-* the candidates are the gates the effect needs, exactly as its claim checks them: its
-  ``requires_gates``, plus every routed gate (PLAN 4.3 rule 2);
-* a candidate holds when it has an approval whose subject digest equals the current subject's and
-  whose ``head_sha`` is the current head, so an approval is tied to a head SHA and never reused on
-  code or a ticket it did not see;
-* "first" is workflow order: a stage's depth is its fewest edges from ``start``. The earliest
-  invalid gate wins. If two invalid gates are equally deep, or one cannot be placed (it is not a
-  gate of this workflow, or unreachable), the order is unknown and the run BLOCKS
-  ``regate_unresolved``. So does a refusal nothing explains (every approval holds). It fails
-  closed.
+* The candidates are the gates the effect needs, exactly as its claim checks them: its
+  ``requires_gates``, plus every routed gate (PLAN 4.3 rule 2).
+* A candidate is judged as the claim (``effects/core.py``, ``_approval``) judges it. That check
+  reads the store, so this is a pure mirror of it, not a call: a gate holds when it has an
+  approval at the current head (``head_sha``). Only the head is compared across gates, because
+  gates see different evidence and a ticket edit between two gates is shown to the next one
+  (PLAN 4.3). The claim's other void, a live subject that moved since the effect was planned,
+  invalidates the gates that approved the subject the run last recorded: their approval is of
+  what was edited. A gate that approved an earlier subject at the same head is not made invalid
+  by an edit it was never asked about. If the subject has not moved and every gate holds, nothing
+  explains the refusal.
+* The subject may change, but the head may not. A new head BLOCKS ``head_moved``: it has to go
+  through the agent stages and the review panel (``StageReported``) like any other new code, and
+  a return straight to a gate would approve a head nobody reviewed. So only ticket or attention
+  changes return.
+* "First" is decided by the graph, and fails closed. An invalid gate is first only if it lies on
+  every path from ``start`` to every other invalid gate (it dominates them). Fewest edges is not
+  enough: the order a run visited gates in need not be the order of their depth. If no invalid
+  gate dominates the rest (a tie, a branch), or one is not a reachable gate of this workflow, or
+  none is invalid, the order is unknown and the run BLOCKS ``regate_unresolved``.
 
 Returning goes through the existing gate path: ``stages._goto`` onto the gate stage with no loop,
-so the gate's visit count is its next round (``round + 1``), ``OpenGate`` is emitted for it (the
-gate service links it to the last round with ``plan_round``, D2-08, and decides carry-over,
-D2-09), a step is counted against ``max_steps_per_run`` and no loop counter moves. The old round
-is never reopened. The approvals that do not hold are dropped, so the gates that follow ask
-again (a new head changes the digest, so it drops them all, as ``stages._report`` does).
+so the gate's visit count is its next round (``round + 1``) and ``OpenGate`` is emitted for it.
+The gate service links it to the last round with ``plan_round`` (D2-08), and the reopened gate
+may close without a person through D2-09 carry-over, as for any re-entered gate. An old round is
+never reopened. A step is counted against ``max_steps_per_run`` and no loop counter moves, so the
+only bound on repeated returns is that step limit (accepted): each return and the stages after it
+spend steps, and the run BLOCKS ``max_steps_exceeded`` when they are spent. The approvals of the
+needed gates that do not hold are dropped, so the gates that follow ask again; the ones that
+hold, and every approval of a gate the effect does not need, are kept as they were.
 
 Every other ``reason`` (a permanent failure, an unknown outcome, a plain void) BLOCKS with the
 reason ``EffectFailed`` gives it. Like every graph handler this is pure and deterministic, reads
@@ -99,26 +112,29 @@ class EffectDisposed:
             raise TypeError("subject must be a Subject or None")
 
 
-def _depths(wf: Graph) -> dict[str, int]:
-    """Fewest edges from ``start`` to each reachable stage."""
-    depth = {wf.start: 0}
+def _reachable(wf: Graph, avoiding: str | None = None) -> set[str]:
+    """The stages reachable from ``start`` without passing through ``avoiding``."""
+    if wf.start == avoiding:
+        return set()
+    seen = {wf.start}
     queue = deque([wf.start])
     while queue:
-        name = queue.popleft()
-        edges = getattr(wf.stages.get(name), "next", None) or {}
+        edges = getattr(wf.stages.get(queue.popleft()), "next", None) or {}
         for edge in edges.values():
             to, _ = _target(edge)
-            if to in wf.stages and to not in depth:
-                depth[to] = depth[name] + 1
+            if to in wf.stages and to != avoiding and to not in seen:
+                seen.add(to)
                 queue.append(to)
-    return depth
+    return seen
 
 
-def _holds(approval: Approval | None, subject: Subject) -> bool:
+def _holds(approval: Approval | None, subject: Subject, edited: str | None) -> bool:
+    """Does the gate's approval hold, as the effect claim sees it? It must be at the current head,
+    and must not be of the subject (digest ``edited``) that has since moved."""
     return (
         approval is not None
-        and approval.subject_digest == subject.digest()
         and approval.head_sha == subject.head_sha
+        and approval.subject_digest != edited
     )
 
 
@@ -128,19 +144,18 @@ def _needed(rs: RunState, stage: EffectStage) -> tuple[str, ...]:
     return (*gates, *(g for g in rs.routed_gates if gates and g not in gates))
 
 
-def _first_invalid(
-    wf: Graph, needed: tuple[str, ...], approvals: dict[str, Approval], subject: Subject
-) -> str | None:
-    invalid = [g for g in dict.fromkeys(needed) if not _holds(approvals.get(g), subject)]
-    if not invalid:
+def _first(wf: Graph, invalid: list[str]) -> str | None:
+    """The invalid gate that lies on every path from ``start`` to each other one, if any."""
+    anywhere = _reachable(wf)
+    if not invalid or any(
+        g not in anywhere or not isinstance(wf.stages.get(g), GateStage) for g in invalid
+    ):
         return None
-    depth = _depths(wf)
-    if any(g not in depth or not isinstance(wf.stages.get(g), GateStage) for g in invalid):
-        return None
-    ranked = sorted(depth[g] for g in invalid)
-    if len(ranked) > 1 and ranked[0] == ranked[1]:
-        return None  # the workflow does not say which comes first
-    return min(invalid, key=lambda g: depth[g])
+    for g in invalid:
+        past = _reachable(wf, avoiding=g)
+        if not any(h in past for h in invalid if h != g):
+            return g
+    return None
 
 
 @handles_graph(EffectDisposed)
@@ -153,18 +168,20 @@ def on_effect_disposed(rs: RunState, event: EffectDisposed, wf: Graph) -> Transi
         )
     if event.reason != GATE_INVALID:
         return _block(rs, REGATE_BLOCK[event.reason])
-    subject = event.subject if event.subject is not None else rs.subject
-    if subject is None:
+    live = rs.subject
+    if live is None:
         return _block(rs, "subject_missing")
-    if rs.merges and subject.head_sha not in {m.head_sha for m in rs.merges}:
-        return _block(rs, "head_moved")  # merged code cannot change
-    approvals = rs.approvals
-    by_gate = {a.gate: a for a in approvals}
-    first = _first_invalid(wf, _needed(rs, stage), by_gate, subject)
+    subject = event.subject if event.subject is not None else live
+    if subject.head_sha != live.head_sha:
+        return _block(rs, "head_moved")  # new code goes through the panel, not straight to a gate
+    edited = live.digest() if subject.digest() != live.digest() else None
+    needed = _needed(rs, stage)
+    by_gate = {a.gate: a for a in rs.approvals}
+    invalid = [g for g in dict.fromkeys(needed) if not _holds(by_gate.get(g), subject, edited)]
+    first = _first(wf, invalid)
     if first is None:
         return _block(rs, "regate_unresolved")
-    needed = set(_needed(rs, stage))
-    kept = tuple(a for a in approvals if a.gate not in needed or _holds(a, subject))
+    kept = tuple(a for a in rs.approvals if a.gate not in invalid)
     return _goto(dataclasses.replace(rs, subject=subject, approvals=kept), wf, first)
 
 

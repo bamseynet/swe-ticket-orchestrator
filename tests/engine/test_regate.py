@@ -137,8 +137,7 @@ def test_first_means_workflow_order_not_requires_gates_order_or_approval_order()
 
 def test_a_gate_whose_approval_still_holds_is_not_reopened() -> None:
     rs = at_merge2()
-    now = edited()
-    keep = dataclasses.replace(rs.approvals[0], subject_digest=now.digest())
+    keep = dataclasses.replace(rs.approvals[0], subject_digest="older")
     only_sec_stale = dataclasses.replace(rs, approvals=(keep, rs.approvals[1]))
     t = regate(only_sec_stale)
     assert status(t.state) == (RunStatus.WAITING_HUMAN, "sec_gate")
@@ -147,26 +146,23 @@ def test_a_gate_whose_approval_still_holds_is_not_reopened() -> None:
 
 def test_a_missing_approval_is_an_approval_that_does_not_hold() -> None:
     rs = at_merge2()
-    now = edited()
-    held = dataclasses.replace(rs.approvals[0], subject_digest=now.digest())
+    held = dataclasses.replace(rs.approvals[0], subject_digest="older")
     t = regate(dataclasses.replace(rs, approvals=(held,)))  # sec_gate has none
     assert t.state.run.stage == "sec_gate"
 
 
 def test_an_approval_of_another_head_does_not_hold_even_with_the_right_digest() -> None:
     rs = at_merge2()
-    now = edited()
     a0, a1 = rs.approvals
-    held = dataclasses.replace(a0, subject_digest=now.digest(), head_sha=now.head_sha)
-    wrong = dataclasses.replace(a1, subject_digest=now.digest(), head_sha="elsewhere")
+    held = dataclasses.replace(a0, subject_digest="older", head_sha=S1.head_sha)
+    wrong = dataclasses.replace(a1, subject_digest="older", head_sha="elsewhere")
     t = regate(dataclasses.replace(rs, approvals=(held, wrong)))
     assert t.state.run.stage == "sec_gate"
 
 
 def test_a_routed_gate_is_judged_too() -> None:
     rs = at_merge2()
-    now = edited()
-    both = tuple(dataclasses.replace(a, subject_digest=now.digest()) for a in rs.approvals)
+    both = tuple(dataclasses.replace(a, subject_digest="older") for a in rs.approvals)
     routed = dataclasses.replace(rs, approvals=both, routed_gates=("qa_gate",))
     t = regate(routed)
     assert status(t.state) == (RunStatus.WAITING_HUMAN, "qa_gate")
@@ -177,11 +173,15 @@ def test_the_gate_is_found_from_state_alone_the_event_names_none() -> None:
     assert names == {"run_id", "effect", "visit", "reason", "subject", "run_version"}
 
 
-def test_a_new_head_voids_every_approval_so_the_first_gate_is_the_first() -> None:
+def test_a_new_head_blocks_so_the_panel_is_not_skipped() -> None:
     rs = at_merge2()
-    t = regate(rs, subject=_fx.subj("def", "e2"))
-    assert t.state.run.stage == "review_gate"
-    assert t.state.approvals == ()
+    t = regate(rs, subject=_fx.subj("def", "e1"))
+    assert status(t.state) == (RunStatus.BLOCKED, "merge")
+    assert t.state.run.blocked_reason == "head_moved"
+    assert t.commands == ()
+    assert t.state.subject == S1
+    assert t.state.approvals == rs.approvals
+    assert t.state.steps == rs.steps
 
 
 def test_the_effect_stage_is_left_with_an_unchanged_visit_and_the_gate_gets_a_new_round() -> None:
@@ -363,10 +363,10 @@ def test_merged_code_cannot_change_so_another_head_blocks() -> None:
     assert t.state.approvals == rs.approvals
 
 
-def test_a_subject_of_the_wrong_shape_for_the_gate_blocks_instead_of_raising() -> None:
+def test_a_subject_of_the_wrong_shape_blocks_instead_of_raising() -> None:
     rs = at_merge2()
-    t = regate(rs, subject=PRE)
-    assert t.state.run.blocked_reason == "subject_missing"
+    t = regate(rs, subject=PRE)  # no head at all: not the live head
+    assert t.state.run.blocked_reason == "head_moved"
     assert t.commands == ()
     assert t.state.steps == rs.steps
 
@@ -509,8 +509,7 @@ def _running_at(rs: RunState, stage: str, **over: Any) -> RunState:
 
 def test_a_routed_stage_that_is_not_a_gate_cannot_be_the_first_invalid_one() -> None:
     rs = at_merge2()
-    now = edited()
-    both = tuple(dataclasses.replace(a, subject_digest=now.digest()) for a in rs.approvals)
+    both = tuple(dataclasses.replace(a, subject_digest="older") for a in rs.approvals)
     t = regate(dataclasses.replace(rs, approvals=both, routed_gates=("merge",)))
     assert t.state.run.blocked_reason == "regate_unresolved"
     assert t.commands == ()
@@ -525,8 +524,7 @@ def test_an_invalid_gate_the_start_cannot_reach_blocks() -> None:
 
     w = _fx.wf(orphan, valid=False)
     rs = at_merge2()
-    now = edited()
-    both = tuple(dataclasses.replace(a, subject_digest=now.digest()) for a in rs.approvals)
+    both = tuple(dataclasses.replace(a, subject_digest="older") for a in rs.approvals)
     t = next(dataclasses.replace(rs, approvals=both, routed_gates=("lonely",)), void(rs), w)
     assert t.state.run.blocked_reason == "regate_unresolved"
 
@@ -549,3 +547,145 @@ def test_workflow_order_holds_when_requires_gates_is_already_in_that_order() -> 
     rs = at_merge2()
     t = next(rs, void(rs), w)
     assert t.state.run.stage == "review_gate"
+
+
+# --- which gate is first: dominance, not depth ----------------------------------------------
+
+
+def _branch(d: dict[str, Any]) -> None:
+    """The run can reach extra_gate (via fixer) before qa_gate, though qa_gate is shallower."""
+    st = d["stages"]
+    st["review_gate"]["next"]["approved"] = "qa_agent"
+    st["qa_agent"]["next"] = {"pass": "qa_gate", "fail": "fixer", "inconclusive": "qa_gate"}
+    st["fixer"] = {
+        "kind": "agent",
+        "agent": "implementer",
+        "next": {"ready": "extra_gate", "blocked": "closed"},
+    }
+    st["extra_gate"] = _fx._gate(
+        "review",
+        ["reviewer"],
+        {
+            "approved": "qa_gate",
+            "changes_requested": {"to": "implement", "loop": "review_loop"},
+            "rejected": "rejected_end",
+        },
+    )
+    st["qa_gate"]["next"]["approved"] = "merge"
+    st["merge"]["requires_gates"] = ["extra_gate", "qa_gate"]
+    st["merge"]["next"]["done"] = "done"
+
+
+def test_gates_on_different_branches_have_no_first_so_the_run_blocks() -> None:
+    w = _fx.wf(_branch)
+    rs = _running_at(
+        at_merge2(),
+        "merge",
+        approvals=(
+            Approval("extra_gate", 1, did(), S1.digest(), S1.head_sha),
+            Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha),
+        ),
+    )
+    t = next(rs, void(rs), w)
+    assert t.state.run.blocked_reason == "regate_unresolved"
+    assert t.commands == ()
+
+
+def test_a_lone_invalid_gate_on_a_branching_workflow_is_first() -> None:
+    w = _fx.wf(_branch)
+    rs = _running_at(
+        at_merge2(),
+        "merge",
+        approvals=(Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha),),
+    )
+    # extra_gate has no approval; qa_gate is edited. Neither dominates the other: block.
+    assert next(rs, void(rs), w).state.run.blocked_reason == "regate_unresolved"
+    # only extra_gate invalid: it is the only candidate, so it is first
+    held = dataclasses.replace(rs.approvals[0], subject_digest="older")
+    one = dataclasses.replace(
+        rs, approvals=(held, Approval("extra_gate", 1, did(), "x", "elsewhere"))
+    )
+    assert next(one, void(one), w).state.run.stage == "extra_gate"
+
+
+def test_a_three_way_tie_blocks() -> None:
+    def three(d: dict[str, Any]) -> None:
+        st = d["stages"]
+        for g in ("g1", "g2", "g3"):
+            st[g] = _fx._gate(
+                "review", ["reviewer"], {"approved": "merge", "rejected": "rejected_end"}
+            )
+        st["implement"]["next"] = {"ready": "g1", "blocked": "g2", "other": "g3"}
+        st["merge"]["requires_gates"] = ["g1", "g2", "g3"]
+
+    w = _fx.wf(three, valid=False)
+    rs = _running_at(
+        at_merge2(),
+        "merge",
+        approvals=tuple(
+            Approval(g, 1, did(), S1.digest(), S1.head_sha) for g in ("g1", "g2", "g3")
+        ),
+    )
+    t = next(rs, void(rs), w)
+    assert t.state.run.blocked_reason == "regate_unresolved"
+
+
+def test_a_chain_of_three_returns_to_the_head_of_the_chain() -> None:
+    def chain(d: dict[str, Any]) -> None:
+        st = d["stages"]
+        st["review_gate"]["next"]["approved"] = "g2"
+        st["g2"] = _fx._gate("review", ["reviewer"], {"approved": "g3", "rejected": "rejected_end"})
+        st["g3"] = _fx._gate(
+            "review", ["reviewer"], {"approved": "merge", "rejected": "rejected_end"}
+        )
+        st["merge"]["requires_gates"] = ["g3", "g2", "review_gate"]
+
+    w = _fx.wf(chain, valid=False)
+    rs = _running_at(
+        at_merge2(),
+        "merge",
+        approvals=tuple(
+            Approval(g, 1, did(), S1.digest(), S1.head_sha) for g in ("g3", "g2", "review_gate")
+        ),
+    )
+    assert next(rs, void(rs), w).state.run.stage == "review_gate"
+
+
+# --- judged as the effect claim judges ------------------------------------------------------
+
+
+def test_gates_that_saw_different_evidence_at_one_head_hold_when_the_subject_has_not_moved() -> (
+    None
+):
+    rs = at_merge2()
+    other = dataclasses.replace(rs.approvals[0], subject_digest="what review_gate saw")
+    differing = dataclasses.replace(rs, approvals=(other, rs.approvals[1]))
+    t = regate(differing, subject=None)  # the claim compares only the head, so nothing is invalid
+    assert t.state.run.blocked_reason == "regate_unresolved"
+
+
+def test_an_edit_does_not_invalidate_a_gate_that_approved_an_earlier_subject() -> None:
+    rs = at_merge2()
+    earlier = dataclasses.replace(rs.approvals[0], subject_digest="an earlier ticket")
+    t = regate(dataclasses.replace(rs, approvals=(earlier, rs.approvals[1])))
+    assert t.state.run.stage == "sec_gate"  # only the gate that approved the edited subject
+
+
+# --- what is kept and what is dropped -------------------------------------------------------
+
+
+def test_the_return_drops_exactly_the_needed_approvals_that_do_not_hold() -> None:
+    rs = at_merge2()
+    held = dataclasses.replace(rs.approvals[0], subject_digest="older")
+    stale = rs.approvals[1]
+    unrelated = Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha)  # not needed by merge
+    pre = Approval("pre_gate", 1, did(), PRE.digest(), None)
+    t = regate(dataclasses.replace(rs, approvals=(held, stale, unrelated, pre)))
+    assert t.state.run.stage == "sec_gate"
+    assert t.state.approvals == (held, unrelated, pre)
+
+
+def test_when_the_first_gate_is_reopened_both_stale_approvals_go() -> None:
+    rs = at_merge2()
+    t = regate(rs)
+    assert t.state.approvals == ()
