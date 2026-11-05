@@ -6,44 +6,53 @@ comes from two tables in this module, so the tests can generate their cases from
 
 * :data:`MATRIX` is PLAN.md section 9.3: a :class:`Permission` per row, and for each the roles
   that may do it outright (``anyone``) or only on a run of their own (``own``).
-* :data:`ROUTES` maps ``(METHOD, path template)`` to a :class:`RouteRule` (its permission, and
-  whether a service identity may call it). :data:`PUBLIC` lists the routes that need no token.
+* :data:`ROUTES` maps ``(METHOD, path template)`` to a :class:`RouteRule` (its permissions, and
+  whether a service identity may call it). Websockets use the method ``WEBSOCKET``.
+  :data:`PUBLIC` lists the routes that need no token (``/healthz``); :data:`DOCS` the interactive
+  documentation, public only in local mode (``create_app`` disables it otherwise).
 
-**A route with no entry fails closed.** A request for a route that is in neither table is refused
-with ``403 no_permission_declared`` before any token is read, and :func:`undeclared_routes` lists
-the app's routes that are in neither (from the top-level routes and the OpenAPI paths, so a route
-hidden from the schema inside an included router is only caught by the runtime refusal) so a test
-fails when a route is added without a permission.
+**A route with no entry fails closed.** A request (or websocket) for a route that is in neither
+table is refused (``403 no_permission_declared``; a websocket is closed with code 1008) before
+any token is read. :func:`undeclared_routes` walks the app's router tree (included routers,
+mounts, websocket routes, hidden routes) and lists what is in neither table, so a test fails when
+a route is added without a permission. A route type it does not understand is listed as
+``("UNKNOWN", type)``, so it fails too.
 
-Per request, in this order: match the request against the declared path templates (this module
-does its own matching, so it does not depend on how FastAPI nests included routers; a path that
-matches no declared or public template, whether a missing path, a wrong method or a route nobody
-declared, is refused the same way, so the middleware cannot be used to list routes); let a public
-route through; read the bearer token (``401``
-``unauthorized`` for a missing, malformed, expired or otherwise invalid one, and the reason is
-never sent back); resolve the identity from the store *now* (D3-02: a changed mapping or a
-disable applies at once; ``403`` ``no_access`` or ``user_disabled``); then
+Templates are matched by this module, not the router, so no pair of declared templates may
+overlap for one method (``/org/{name}`` and ``/org/summary``): the router serves whichever was
+registered first and the two could disagree on the permission. :class:`Authorization` refuses
+such a table, and a template with a converter (``{p:path}``), when it is built.
+
+Per request, in this order: match the request against the declared templates (a path that
+matches none, whether a missing path, a wrong method or a route nobody declared, is refused the
+same way, so the middleware cannot be used to list routes); let a public route through; read the
+bearer token (``401 unauthorized`` for a missing, malformed, expired or otherwise invalid one,
+and the reason is never sent back); resolve the identity from the store *now* (D3-02: a changed
+mapping or a disable applies at once; ``403`` ``no_access`` or ``user_disabled``); then
 
 * a **service identity** is refused (``403 service_not_permitted``) unless the route declares
   ``service=True``; where it does, the scope is ``PLATFORM``, never a team's, and the handler
   must not read team data. No v0 route declares it.
 * a **user** needs a role in the request's team (``team_of``; the v0 app serves one team, the
-  runtime's) that the matrix grants for the route's permission. Roles are the user's in *that*
-  team only, so they never add up across teams. ``org_admin`` is org-level and holds that role in
-  every team (the matrix's column). Anything else is ``403 forbidden``, the same answer for
-  another team's user and for a role the matrix does not grant, so it does not say which.
+  runtime's) that the matrix grants for one of the route's permissions. Roles are the user's in
+  *that* team only, so they never add up across teams. ``org_admin`` is org-level and holds that
+  role in every team (the matrix's column). Anything else is ``403 forbidden``, the same answer
+  for another team's user and for a role the matrix does not grant, so it does not say which.
+
+**Conditional grants fail closed.** Two kinds of grant depend on something only a handler can
+see. An "own" grant (a developer cancelling *their own* run) and a ``STOP_AT_GATE`` grant (stop
+a run while eligible for its open gate) admit a request only on a route whose rule declares
+``checks_own`` or ``checks_gate``: a promise that the handler checks it, which the handler
+reads as ``own_only`` and ``gate_only`` on :class:`Authorized`. No route declares either yet
+(the cancel handler checks neither), so those roles are refused there until one does.
 
 Custom gate roles (``security_officer``...) are declared per team (D3-02). They are admitted to
 the rows that gate work needs (view runs, stop at a gate, decide a gate); whether they may decide
 *this* gate is the gate's ``eligible_roles`` and separation of duties (D3-05), not this module.
 
-A handler reads the result from ``request.state.auth`` (:class:`Authorized`): the identity, the
-scope, and ``own_only``, true when the role only qualifies for the user's *own* runs (the
-matrix's "Own"). The middleware cannot know a run's owner, so the handler must apply that.
-
-Not wired into ``create_app`` here (its dev-token check is D1-08 and stays until the real app is
-assembled): :func:`install_authorization` adds the middleware to any app. Unverified until D12:
-the middleware against a real Cognito token and a real group list.
+A handler reads the result from ``request.state.auth`` (:class:`Authorized`).
+``create_app(..., authorization=...)`` installs this middleware in place of the dev token.
+Unverified until D12: the middleware against a real Cognito token and a real group list.
 """
 
 from __future__ import annotations
@@ -52,16 +61,16 @@ import asyncio
 import functools
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
-from starlette.requests import Request
+from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from sto.config.org_policy import ORG_ADMIN
@@ -77,6 +86,7 @@ from sto.store.ports import PLATFORM, PlatformScope, TeamScope
 
 __all__ = [
     "MATRIX",
+    "DOCS",
     "PUBLIC",
     "ROLES",
     "ROUTES",
@@ -85,6 +95,7 @@ __all__ = [
     "Grant",
     "Permission",
     "RouteRule",
+    "RouteTableError",
     "grants",
     "install_authorization",
     "routes_of",
@@ -154,23 +165,39 @@ def grants(permission: Permission, role: str) -> Literal["any", "own"] | None:
 
 @dataclass(frozen=True)
 class RouteRule:
-    permission: Permission
-    service: bool = False  # a service identity may call it (denied unless declared)
+    """What a route needs. A role qualifies through ``permission`` or any of ``also``.
 
+    ``checks_own`` and ``checks_gate`` are promises that the handler applies the condition behind
+    an "own" or a ``STOP_AT_GATE`` grant (see the module docstring); without them those grants
+    do not admit.
+    """
+
+    permission: Permission
+    also: tuple[Permission, ...] = ()
+    service: bool = False  # a service identity may call it (denied unless declared)
+    checks_own: bool = False
+    checks_gate: bool = False
+
+
+WEBSOCKET = "WEBSOCKET"
 
 ROUTES: dict[tuple[str, str], RouteRule] = {
     ("GET", "/runs"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs"): RouteRule(Permission.START_RUN),
     ("GET", "/runs/{run_id}"): RouteRule(Permission.VIEW_RUNS),
     ("GET", "/runs/{run_id}/events"): RouteRule(Permission.VIEW_RUNS),
-    ("POST", "/runs/{run_id}/cancel"): RouteRule(Permission.CANCEL_RUN),
+    # Stop: a run's own owner (own) or someone eligible for its gate (STOP_AT_GATE) may stop it,
+    # and the handler checks neither yet, so only an admin gets through (D3-03 review).
+    ("POST", "/runs/{run_id}/cancel"): RouteRule(
+        Permission.CANCEL_RUN, also=(Permission.STOP_AT_GATE,)
+    ),
     ("GET", "/runs/{run_id}/gates"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs/{run_id}/gates/{name}/{round}/decisions"): RouteRule(Permission.DECIDE_GATE),
 }
 
-PUBLIC: frozenset[tuple[str, str]] = frozenset(
+PUBLIC: frozenset[tuple[str, str]] = frozenset({("GET", "/healthz")})
+DOCS: frozenset[tuple[str, str]] = frozenset(
     {
-        ("GET", "/healthz"),
         ("GET", "/openapi.json"),
         ("GET", "/docs"),
         ("GET", "/docs/oauth2-redirect"),
@@ -181,22 +208,63 @@ PUBLIC: frozenset[tuple[str, str]] = frozenset(
 
 @dataclass(frozen=True)
 class Authorized:
-    """What a handler gets in ``request.state.auth``."""
+    """What a handler gets in ``request.state.auth``.
+
+    ``own_only``: the role qualifies only for the user's own runs, so the handler must check the
+    run is theirs. ``gate_only``: only while eligible for the run's open gate. Both are false
+    when a role holds the permission outright. Set only on a route that declared ``checks_own``
+    or ``checks_gate``.
+    """
 
     identity: UserIdentity | ServiceIdentity
     scope: TeamScope | PlatformScope  # ``PLATFORM`` for a service
     own_only: bool = False
+    gate_only: bool = False
 
 
-TeamOf = Callable[[Request], str | None]
+TeamOf = Callable[[HTTPConnection], str | None]
 
 
-def runtime_team(request: Request) -> str | None:
+def runtime_team(conn: HTTPConnection) -> str | None:
     """The v0 app serves one team: the runtime's."""
-    runtime = getattr(request.app.state, "runtime", None)
+    runtime = getattr(conn.app.state, "runtime", None)
     scope = getattr(runtime, "scope", None)
     team = getattr(scope, "team", None)
     return team if isinstance(team, str) and team else None
+
+
+class RouteTableError(ValueError):
+    """The declared routes cannot be matched safely."""
+
+
+_PARAM = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _segments(template: str) -> list[str]:
+    if (
+        not template.startswith("/")
+        or "{" in _PARAM.sub("", template)
+        or "}" in _PARAM.sub("", template)
+    ):
+        raise RouteTableError(f"unsupported path template {template!r} (no converters)")
+    return template.split("/")[1:]
+
+
+def _overlap(a: list[str], b: list[str]) -> bool:
+    return len(a) == len(b) and all(
+        x == y or _PARAM.fullmatch(x) is not None or _PARAM.fullmatch(y) is not None
+        for x, y in zip(a, b, strict=True)
+    )
+
+
+def check_table(*tables: Iterable[tuple[str, str]]) -> None:
+    """Refuse a malformed template, or two that could match one request, for one method."""
+    keys = [k for t in tables for k in t]
+    parsed = [(m, tpl, _segments(tpl)) for m, tpl in keys]
+    for i, (m1, t1, s1) in enumerate(parsed):
+        for m2, t2, s2 in parsed[i + 1 :]:
+            if m1 == m2 and _overlap(s1, s2):
+                raise RouteTableError(f"{m1} {t1} and {t2} can match the same path")
 
 
 @dataclass(frozen=True)
@@ -207,46 +275,101 @@ class Authorization:
     public: frozenset[tuple[str, str]] = PUBLIC
     team_of: TeamOf = runtime_team
 
+    def __post_init__(self) -> None:
+        check_table(self.routes, self.public)
+
+
+def _walk(routes: Iterable[Any], prefix: str = "") -> Iterator[tuple[str, str]]:
+    """Every ``(method, path template)`` below ``routes``, through included routers and mounts."""
+    for r in routes:
+        if hasattr(r, "effective_candidates"):  # FastAPI's wrapper for an included router
+            yield from _walk(r.effective_candidates(), prefix)
+            yield from _walk(r.effective_low_priority_routes(), prefix)
+            continue
+        original = getattr(r, "original_route", None)  # an included route, with its full path
+        if original is not None:
+            if isinstance(original, Mount):
+                yield ("MOUNT", f"{getattr(r, 'frontend_prefix', '')}{original.path}/*")
+            elif isinstance(original, WebSocketRoute):
+                starlette = getattr(r, "starlette_route", None)
+                yield (WEBSOCKET, getattr(starlette, "path", None) or original.path)
+            elif isinstance(original, APIRoute | Route):
+                yield from ((m, r.path) for m in sorted(r.methods) if m != "HEAD")
+            else:
+                yield ("UNKNOWN", type(original).__name__)
+        elif isinstance(r, Mount):
+            sub = getattr(r.app, "routes", None)
+            if sub is None:
+                yield ("MOUNT", f"{prefix}{r.path}/*")
+            else:
+                yield from _walk(sub, prefix + r.path)
+        elif isinstance(r, WebSocketRoute):
+            yield (WEBSOCKET, prefix + r.path)
+        elif isinstance(r, APIRoute | Route):
+            yield from ((m, prefix + r.path) for m in sorted(r.methods or ()) if m != "HEAD")
+        else:
+            yield ("UNKNOWN", type(r).__name__)
+
 
 def routes_of(app: FastAPI) -> list[tuple[str, str]]:
-    """Every ``(method, path template)`` the app serves: its top-level routes plus the OpenAPI
-    paths (which see through included routers)."""
-    found: set[tuple[str, str]] = set()
-    for r in app.routes:
-        if isinstance(r, APIRoute | Route):
-            found |= {(m, r.path) for m in (r.methods or ()) if m != "HEAD"}
-    app.openapi_schema = None  # never a stale schema: a route may have been added since
-    for path, item in app.openapi().get("paths", {}).items():
-        found |= {(m.upper(), path) for m in item if m.upper() in _HTTP_METHODS}
-    return sorted(found)
+    """Every ``(method, path template)`` the app serves, from its router tree (so including
+    included routers, mounts, websockets and routes hidden from the schema)."""
+    return sorted(set(_walk(app.router.routes)))
 
 
 def undeclared_routes(
     app: FastAPI,
     routes: Mapping[tuple[str, str], RouteRule] = ROUTES,
-    public: frozenset[tuple[str, str]] = PUBLIC,
+    public: frozenset[tuple[str, str]] = PUBLIC | DOCS,
 ) -> list[tuple[str, str]]:
-    """Every ``(method, path)`` of the app that is neither declared nor public."""
+    """Every ``(method, path template)`` of the app that is neither declared nor public."""
     return [k for k in routes_of(app) if k not in routes and k not in public]
-
-
-_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE"})
-_BEARER = re.compile(r"Bearer ([^\s]+)", re.ASCII)
 
 
 @functools.cache
 def _compile(template: str) -> re.Pattern[str]:
     """``/runs/{run_id}`` becomes a pattern with one named, non-empty, slash-free group."""
     out = ""
-    for part in re.split(r"(\{[A-Za-z_][A-Za-z0-9_]*\})", template):
-        out += f"(?P<{part[1:-1]}>[^/]+)" if part.startswith("{") else re.escape(part)
+    for part in re.split(f"({_PARAM.pattern})", template):
+        out += f"(?P<{part[1:-1]}>[^/]+)" if _PARAM.fullmatch(part) else re.escape(part)
     return re.compile(out)
 
 
-def _refuse(status: int, code: str, message: str, *, www: bool = False) -> JSONResponse:
-    headers = {"WWW-Authenticate": "Bearer"} if www else None
-    body = {"error": {"code": code, "message": message}}
-    return JSONResponse(body, status_code=status, headers=headers)
+_BEARER = re.compile(r"(?i:bearer) ([^\s]+)", re.ASCII)
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    status: int
+    code: str
+    message: str
+    www: bool = False
+
+    def response(self) -> JSONResponse:
+        headers = {"WWW-Authenticate": "Bearer"} if self.www else None
+        body = {"error": {"code": self.code, "message": self.message}}
+        return JSONResponse(body, status_code=self.status, headers=headers)
+
+
+_UNDECLARED = _Refusal(403, "no_permission_declared", "this route has no declared permission")
+_FORBIDDEN = _Refusal(403, "forbidden", "this request is not allowed")
+
+
+def _admission(rule: RouteRule, roles: Iterable[str]) -> tuple[bool, bool] | None:
+    """``(own_only, gate_only)`` for the best way in, or ``None`` if no role gets in."""
+    own = gate = False
+    for role in roles:
+        for permission in (rule.permission, *rule.also):
+            how = grants(permission, role)
+            if how is None:
+                continue
+            if permission is Permission.STOP_AT_GATE:  # conditional on the run's gate, always
+                gate = gate or rule.checks_gate
+            elif how == "own":
+                own = own or rule.checks_own
+            else:
+                return (False, False)
+    return (own, gate) if own or gate else None
 
 
 class AuthorizationMiddleware:
@@ -254,74 +377,69 @@ class AuthorizationMiddleware:
         self.app, self.authz = app, authorization
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)  # lifespan
+            return
+        refusal = await self._check(scope)
+        if refusal is None:
             await self.app(scope, receive, send)
-            return
-        response = await self._check(scope)
-        if response is not None:
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
+        elif scope["type"] == "http":
+            await refusal.response()(scope, receive, send)
+        else:
+            await receive()  # the connect message; then refuse it before accepting
+            await send({"type": "websocket.close", "code": 1008, "reason": refusal.code})
 
     def _match(self, scope: Scope) -> tuple[tuple[str, str], dict[str, str]] | None:
         """The declared ``(method, template)`` this request is for, and its path parameters.
-        The most specific template wins (fewest parameters): a fixed path beats a captured one."""
+        Templates never overlap (``check_table``), so at most one matches."""
         path = scope["path"]
         root = scope.get("root_path") or ""
         if root and path.startswith(root):
             path = path[len(root) :]
-        method = scope["method"]
-        best: tuple[int, tuple[str, str], dict[str, str]] | None = None
+        method = WEBSOCKET if scope["type"] == "websocket" else scope["method"]
         for m, template in (*self.authz.routes, *self.authz.public):
-            if m != method:
-                continue
-            found = _compile(template).fullmatch(path)
-            if found is None:
-                continue
-            rank = template.count("{")
-            if best is None or rank < best[0]:
-                best = (rank, (m, template), found.groupdict())
-        return None if best is None else (best[1], best[2])
+            if m == method and (found := _compile(template).fullmatch(path)) is not None:
+                return (m, template), found.groupdict()
+        return None
 
-    async def _check(self, scope: Scope) -> JSONResponse | None:
+    async def _check(self, scope: Scope) -> _Refusal | None:
         matched = self._match(scope)
         if matched is None:
-            return _refuse(403, "no_permission_declared", "this route has no declared permission")
+            return _UNDECLARED
         key, params = matched
         if key in self.authz.public:
             return None
         rule = self.authz.routes[key]
-        request = Request({**scope, "path_params": params})
-        header = request.headers.get("authorization", "")
-        found = _BEARER.fullmatch(header)
+        conn = HTTPConnection({**scope, "path_params": params})
+        found = _BEARER.fullmatch(conn.headers.get("authorization", ""))
         if found is None:
-            return _refuse(401, "unauthorized", "a bearer token is required", www=True)
+            return _Refusal(401, "unauthorized", "a bearer token is required", www=True)
         try:
             token = await asyncio.to_thread(self.authz.validator.validate, found.group(1))
         except InvalidTokenError as e:
             log.info("token refused on %s %s: %s", *key, e.reason)
-            return _refuse(401, "unauthorized", "the token is not valid", www=True)
+            return _Refusal(401, "unauthorized", "the token is not valid", www=True)
         try:
             identity = await asyncio.to_thread(self.authz.mapping.resolve, token)
         except UserDisabledError:
-            return _refuse(403, "user_disabled", "this identity is disabled")
+            return _Refusal(403, "user_disabled", "this identity is disabled")
         except NoAccessError:
-            return _refuse(403, "no_access", "this identity has no access")
+            return _Refusal(403, "no_access", "this identity has no access")
         if isinstance(identity, ServiceIdentity):
             if not rule.service:
-                return _refuse(403, "service_not_permitted", "services may not call this route")
+                return _Refusal(403, "service_not_permitted", "services may not call this route")
             self._set(scope, Authorized(identity, PLATFORM))
             return None
-        team = self.authz.team_of(request)
+        team = self.authz.team_of(conn)
         if team is None:
-            return _refuse(403, "forbidden", "this request is not allowed")
+            return _FORBIDDEN
         roles = set(identity.roles_in(team))
         if (None, ORG_ADMIN) in identity.memberships:
             roles.add(ORG_ADMIN)
-        held = {grants(rule.permission, r) for r in roles} - {None}
-        if not held:
-            return _refuse(403, "forbidden", "this request is not allowed")
-        self._set(scope, Authorized(identity, TeamScope(team), own_only="any" not in held))
+        admitted = _admission(rule, roles)
+        if admitted is None:
+            return _FORBIDDEN
+        self._set(scope, Authorized(identity, TeamScope(team), *admitted))
         return None
 
     @staticmethod
