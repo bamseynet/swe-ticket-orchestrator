@@ -17,12 +17,14 @@ from typing import Any
 import pytest
 
 from sto.domain import (
+    EffectStatus,
     FailureClass,
     PermanentError,
     Run,
     RunStatus,
     StepKey,
     TransientError,
+    effect_key,
 )
 from sto.engine.commands import RunEffect, RunStep
 from sto.engine.handlers.core import EffectFailed, StepFailed
@@ -174,10 +176,13 @@ POLICY = RetryPolicy(max_attempts=3, base_delay=1.0, max_delay=4.0, total_budget
 
 def test_r2_a_persistent_transient_error_is_called_exactly_max_attempts_times() -> None:
     stub, clock = Stub(*[TransientError("t")] * 9), Clock()
-    with pytest.raises(TransientError):
+    with pytest.raises(RetryBudgetExceededError) as e:
         call_with_retry(stub, POLICY, clock=clock, sleep=clock.sleep)
     assert stub.calls == 3
     assert clock.slept == [1.0, 2.0]  # doubling backoff between the three calls
+    assert isinstance(e.value.__cause__, TransientError)
+    # P4: an outer layer must see a permanent error, or it would retry again (a second layer)
+    assert classify(e.value) is FailureClass.PERMANENT
 
 
 def test_a_transient_error_that_then_succeeds_returns() -> None:
@@ -241,7 +246,7 @@ def test_async_retry_matches_sync() -> None:
 
         return await acall_with_retry(call, POLICY, clock=clock, sleep=clock.asleep)
 
-    with pytest.raises(TransientError):
+    with pytest.raises(RetryBudgetExceededError):
         asyncio.run(go())
     assert stub.calls == 3
     assert clock.slept == [1.0, 2.0]
@@ -274,6 +279,7 @@ def retry_event(rs: RunState, **over: Any) -> RetryRequested:
         "stage": rs.run.stage,
         "visit": rs.visit,
         "attempt": rs.attempt,
+        "run_version": rs.run.version,
     }
     return RetryRequested(**{**base, **over})
 
@@ -511,28 +517,60 @@ class FakeStopper:
         self.j.log.append(("stop", stage, visit, attempt))
 
 
+class FakeEffect:
+    def __init__(self, status: EffectStatus) -> None:
+        self.status = status
+
+
 class FakeEffects:
-    def __init__(self, j: Journal) -> None:
+    """Models the executor's rule: ``retry_blocked`` clears a block once, and refuses with
+    ``ValueError`` when nothing is blocked. ``get`` reports the record's status."""
+
+    def __init__(self, j: Journal, key: str | None = None) -> None:
         self.j = j
+        self.blocked = {key} if key else set()
+        self.status = EffectStatus.ATTEMPTING
 
     def retry_blocked(self, run_id: Any, idempotency_key: str) -> object:
         self.j.log.append(("retry_blocked", idempotency_key))
+        if idempotency_key not in self.blocked:
+            raise ValueError("only a blocked effect can be retried")
+        self.blocked.discard(idempotency_key)
+        self.status = EffectStatus.PLANNED
         return object()
+
+    def get(self, run_id: Any, idempotency_key: str) -> Any:
+        return FakeEffect(self.status)
+
+
+def merge_key(rs: RunState) -> str:
+    if rs.subject is None:
+        return "no-effect-here"
+    return effect_key(RID, "merge", rs.count("merge"), "pr.merge", rs.subject.digest())
 
 
 def service(
-    rs: RunState, j: Journal, *, audit_fails: bool = False
+    rs: RunState,
+    j: Journal,
+    *,
+    audit_fails: bool = False,
+    effects: FakeEffects | None = None,
+    submit_fails: int = 0,
 ) -> tuple[RetryService, list[object]]:
     sent: list[object] = []
+    failures = [submit_fails]
 
     async def submit(run_id: Any, event: object) -> None:
         j.log.append(("submit", type(event).__name__))
+        if failures[0] > 0:
+            failures[0] -= 1
+            raise TransientError("store blip")
         sent.append(event)
 
     svc = RetryService(
         audit=FakeAudit(j, audit_fails),
         stopper=FakeStopper(j),
-        effects=FakeEffects(j),
+        effects=effects if effects is not None else FakeEffects(j, merge_key(rs)),
         submit=submit,
         load=lambda run_id: (rs, W),
     )
@@ -560,25 +598,43 @@ def test_a_step_retry_audits_then_stops_the_old_attempt_then_submits() -> None:
 def test_an_effect_retry_clears_the_block_before_the_run_hears_of_it() -> None:
     rs, j = blocked_at_merge(), Journal()
     svc, _ = service(rs, j)
-    asyncio.run(svc.retry(RID, "bob", "scm outage over", effect_key="fx-key"))
+    asyncio.run(svc.retry(RID, "bob", "scm outage over"))
     assert [e[0] for e in j.log] == ["audit", "retry_blocked", "submit"]
-    assert j.log[1] == ("retry_blocked", "fx-key")  # no earlier attempt session to stop
+    assert j.log[1] == ("retry_blocked", merge_key(rs))  # no earlier attempt session to stop
 
 
-def test_an_effect_retry_needs_the_effect_key() -> None:
+def test_p3_the_effect_key_is_derived_from_the_run_not_supplied() -> None:
+    import inspect
+
+    assert "effect_key" not in inspect.signature(RetryService.retry).parameters
     rs, j = blocked_at_merge(), Journal()
-    svc, _ = service(rs, j)
-    with pytest.raises(MalformedEventError, match="effect_key"):
-        asyncio.run(svc.retry(RID, "bob", "scm outage over"))
-    assert j.log == []
+    other = FakeEffects(j, "some-other-effects-key")  # blocked, but not this run's effect
+    svc, sent = service(rs, j, effects=other)
+    with pytest.raises(ValueError, match="only a blocked effect"):
+        asyncio.run(svc.retry(RID, "bob", "x"))  # the other effect was never touched
+    assert other.blocked == {"some-other-effects-key"}
+    assert sent == []
 
 
-def test_a_step_retry_ignores_an_effect_key() -> None:
-    rs, j = blocked_at_step(), Journal()
-    svc, _ = service(rs, j)
-    with pytest.raises(MalformedEventError, match="effect_key"):
-        asyncio.run(svc.retry(RID, "bob", "x", effect_key="fx-key"))
-    assert j.log == []
+def test_p2_a_failed_submit_then_a_second_click_goes_through() -> None:
+    rs, j = blocked_at_merge(), Journal()
+    svc, sent = service(rs, j, submit_fails=1)
+    with pytest.raises(TransientError):
+        asyncio.run(svc.retry(RID, "bob", "scm outage over"))  # cleared, then submit failed
+    assert sent == []
+    ev = asyncio.run(svc.retry(RID, "bob", "scm outage over"))  # the block is already cleared
+    assert sent == [ev]
+    assert [e[0] for e in j.log].count("submit") == 2
+
+
+def test_a_second_click_on_an_effect_that_is_not_cleared_nor_blocked_is_refused() -> None:
+    rs, j = blocked_at_merge(), Journal()
+    fx = FakeEffects(j)  # nothing blocked ...
+    fx.status = EffectStatus.FAILED  # ... and the record is final: a retry would replay it
+    svc, sent = service(rs, j, effects=fx)
+    with pytest.raises(ValueError, match="only a blocked effect"):
+        asyncio.run(svc.retry(RID, "bob", "x"))
+    assert sent == []
 
 
 def test_nothing_happens_when_the_audit_write_fails() -> None:
@@ -717,7 +773,7 @@ Submit = Callable[[Any, object], Awaitable[None]]
 def test_retry_requested_is_registered_and_survives_the_wire() -> None:
     from sto.domain import EVENTS, from_wire, to_wire
 
-    ev = RetryRequested(RID, "alice", "why", "implement", 1, 1)
+    ev = RetryRequested(RID, "alice", "why", "implement", 1, 1, 4)
     assert EVENTS.name_of(RetryRequested) == "retry.requested"
     assert from_wire(RetryRequested, to_wire(ev)) == ev
 
@@ -741,7 +797,7 @@ def test_the_default_policy_is_the_plan_default() -> None:
 def test_policy_edges_that_are_allowed() -> None:
     RetryPolicy(max_attempts=1, base_delay=0, max_delay=0.5, total_budget=0.5)
     stub, clock = Stub(TransientError("t")), Clock()
-    with pytest.raises(TransientError):
+    with pytest.raises(RetryBudgetExceededError):
         call_with_retry(stub, RetryPolicy(max_attempts=1), clock=clock, sleep=clock.sleep)
     assert stub.calls == 1  # one attempt means no retry at all
 
@@ -776,3 +832,119 @@ def test_routed_gates_are_not_required_of_an_ungated_effect() -> None:
     assert isinstance(cmd, RunEffect)
     assert cmd.requires_gates == ()
     assert cmd.decision_ids == ()
+
+
+# --- review pass 1 ---------------------------------------------------------------------------
+
+
+def test_p1_a_replayed_effect_retry_is_refused_after_the_effect_blocks_again() -> None:
+    rs = blocked_at_merge()
+    ev = effect_retry(rs)
+    again = next(rs, ev, W).state
+    reblocked = step(again, EffectFailed(RID, "pr.merge", again.count("merge")))
+    assert reblocked.run.blocked_reason == "effect_failed"
+    # same stage, same visit, same attempt (0): only the run version tells the click apart
+    with pytest.raises(OutOfOrderEventError, match="stale retry"):
+        next(reblocked, ev, W)
+
+
+def test_a_replayed_step_retry_is_refused_by_the_run_version_too() -> None:
+    rs = blocked_at_step()
+    ev = retry_event(rs)
+    with pytest.raises(OutOfOrderEventError, match="run version"):
+        next(rs, dataclasses.replace(ev, run_version=ev.run_version - 1), W)
+
+
+def test_the_effect_retry_command_carries_the_decision_ids_of_the_approvals() -> None:
+    rs = blocked_at_merge()
+    (cmd,) = next(rs, effect_retry(rs), W).commands
+    assert isinstance(cmd, RunEffect)
+    assert cmd.decision_ids == tuple(a.decision_id for a in rs.approvals if a.gate == "review_gate")
+    assert cmd.decision_ids
+    assert cmd.subject_digest == rs.subject.digest()  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("reason", "blocked", "why"),
+    [
+        ("blocked", "effect_failed", None),
+        ("failed", "effect_failed_permanently", "permanent failure"),
+        ("voided", "effect_voided", "voided"),
+        ("gate_invalid", "gate_invalid", "approval no longer holds"),
+    ],
+)
+def test_an_effect_failure_blocks_with_its_own_reason_and_only_a_blocked_one_retries(
+    reason: str, blocked: str, why: str | None
+) -> None:
+    at = at_merge()
+    rs = step(at, EffectFailed(RID, "pr.merge", at.count("merge"), reason))
+    assert rs.run.blocked_reason == blocked
+    if why is None:
+        assert next(rs, effect_retry(rs), W).state.run.status is RunStatus.RUNNING
+        return
+    with pytest.raises(OutOfOrderEventError, match=why):
+        next(rs, effect_retry(rs), W)
+
+
+def test_an_effect_failure_reason_is_validated() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        EffectFailed(RID, "pr.merge", 1, "whatever")
+    assert EffectFailed(RID, "pr.merge", 1).reason == "blocked"  # the default is unchanged
+
+
+def test_the_service_refuses_a_failed_effect_before_writing_anything() -> None:
+    at = at_merge()
+    rs = step(at, EffectFailed(RID, "pr.merge", at.count("merge"), "failed"))
+    j = Journal()
+    svc, sent = service(rs, j)
+    with pytest.raises(OutOfOrderEventError, match="permanent failure"):
+        asyncio.run(svc.retry(RID, "bob", "x"))
+    assert j.log == []
+    assert sent == []
+
+
+def test_the_service_stamps_the_run_version_the_person_saw() -> None:
+    rs, j = blocked_at_step(), Journal()
+    svc, _ = service(rs, j)
+    ev = asyncio.run(svc.retry(RID, "alice", "x"))
+    assert ev.run_version == rs.run.version
+
+
+def test_exactly_at_the_budget_is_still_allowed() -> None:
+    p = RetryPolicy(max_attempts=5, base_delay=5.0, max_delay=5.0, total_budget=10.0)
+    stub, clock = Stub(TransientError("t"), TransientError("t")), Clock()
+    assert call_with_retry(stub, p, clock=clock, sleep=clock.sleep) == "ok"
+    assert clock.now - 1000.0 == 10.0  # slept 5 + 5: the second sleep ends exactly at the budget
+
+
+def test_a_bool_status_is_not_an_http_status() -> None:
+    class Odd(TransientError):
+        status = True  # == 1, but not an int status
+
+    assert classify(Odd("x")) is FailureClass.TRANSIENT
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"attempt": True},
+        {"visit": True},
+        {"run_version": True},
+        {"visit": -1},
+        {"run_version": 1.0},
+        {"actor": 5},
+        {"stage": None},
+    ],
+)
+def test_retry_requested_field_types_are_validated(over: dict[str, Any]) -> None:
+    base: dict[str, Any] = {
+        "run_id": RID,
+        "actor": "a",
+        "reason": "r",
+        "stage": "implement",
+        "visit": 1,
+        "attempt": 1,
+        "run_version": 1,
+    }
+    with pytest.raises(TypeError):
+        RetryRequested(**{**base, **over})

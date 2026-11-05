@@ -58,6 +58,9 @@ class Degraded:
     pass
 
 
+EFFECT_FAILURE_REASONS = ("blocked", "failed", "voided", "gate_invalid")
+
+
 @EVENTS.register("run.started")
 @dataclass(frozen=True)
 class RunStarted:
@@ -126,11 +129,20 @@ class EffectConfirmed:
 @EVENTS.register("effect.failed")
 @dataclass(frozen=True)
 class EffectFailed:
-    """A permanent effect failure: the run BLOCKS (PLAN 6.2). Re-entry on ``gate_invalid`` is D2."""
+    """A permanent effect failure: the run BLOCKS (PLAN 6.2). Re-entry on ``gate_invalid`` is D2.
+
+    ``reason`` (D2-10) says what the effect record is: ``blocked`` (the outcome is unknown and a
+    person decides: only this one can be retried), ``failed`` (a permanent failure), ``voided`` or
+    ``gate_invalid`` (voided because an approval no longer holds)."""
 
     run_id: RunId
     effect: str
     visit: int
+    reason: str = "blocked"
+
+    def __post_init__(self) -> None:
+        if self.reason not in EFFECT_FAILURE_REASONS:
+            raise ValueError(f"effect failure reason must be one of {EFFECT_FAILURE_REASONS}")
 
 
 @EVENTS.register("cancel.requested")

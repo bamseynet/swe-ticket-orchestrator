@@ -71,6 +71,7 @@ from sto.engine.drivers.ports import (
     command_key,
 )
 from sto.engine.handlers.core import EffectConfirmed, EffectFailed, RunStarted
+from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
 from sto.engine.reducer import (
     HandlerRegistry,
     MalformedEventError,
@@ -179,9 +180,13 @@ class LocalDriver:
         registry: HandlerRegistry | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backoff: float = 0.01,
+        retry_budget: float = 600.0,
+        redrive: RetryPolicy | None = None,
     ) -> None:
         if not lease_seconds > 0:
             raise ValueError("lease_seconds must be positive")
+        if not (retry_budget > 0 and retry_budget != float("inf")):
+            raise ValueError("retry_budget must be a positive, finite number of seconds")
         load_handlers()  # before any stored event is decoded (decoding needs the registries)
         self._store, self._scope, self._wf = store, scope, workflow
         self._executor, self._registry = executor, registry
@@ -192,6 +197,32 @@ class LocalDriver:
         self._sleep, self._backoff = sleep, backoff
         self._held: dict[RunId, str] = {}
         self._driving: dict[RunId, asyncio.Future[RunState]] = {}
+        # D2-10: when a command first answered "transient:..." (a persistent transient error must
+        # end, not back off for ever), and the background re-driver for a drive that gave up.
+        self._retry_budget = retry_budget
+        self._retrying: dict[str, float] = {}
+        self._redriver = Redriver(self, redrive, clock=clock, sleep=sleep) if redrive else None
+
+    @property
+    def redriver(self) -> Redriver | None:
+        """The background re-driver, if ``redrive`` was given (see ``resume_all``)."""
+        return self._redriver
+
+    def _within_budget(self, key: str, outcome: StillRunning) -> None:
+        """Cap the total time a command may keep answering ``transient:``. The clock starts at its
+        first such answer (in memory: a restart starts it again) and any other answer clears it.
+        Past the budget this raises ``RetryBudgetExceededError`` (permanent), so a persistent
+        transient error ends the drive instead of backing off for ever; nothing re-drives it."""
+        if not outcome.reason.startswith("transient:"):
+            self._retrying.pop(key, None)
+            return
+        started = self._retrying.setdefault(key, self._clock())
+        if self._clock() - started > self._retry_budget:
+            del self._retrying[key]
+            raise RetryBudgetExceededError(
+                f"command {key!r} kept failing with a transient error for over "
+                f"{self._retry_budget}s"
+            )
 
     # --- storage ------------------------------------------------------------------------------
 
@@ -451,7 +482,11 @@ class LocalDriver:
         if isinstance(outcome, StillRunning | Held):
             if probe:
                 return "worked"  # the probe has had its one call; go on to the StopRun
-            return Waiting(outcome.retry_after) if isinstance(outcome, StillRunning) else outcome
+            if isinstance(outcome, StillRunning):
+                self._within_budget(head["key"], outcome)
+                return Waiting(outcome.retry_after)
+            return outcome
+        self._retrying.pop(head["key"], None)
         wires = tuple(encode(e, "event") for e in outcome.events)
         await self._commit(run_id, lambda r: self._done(r, head["key"], wires))
         return "worked"
@@ -542,6 +577,10 @@ class LocalDriver:
             if isinstance(result, BaseException) and not isinstance(result, Exception):
                 raise result  # cancellation is not a run's failure
             out[run_id] = result
+            if isinstance(result, TransientError) and self._redriver is not None:
+                # The drive gave up (a lease still held, a store blip): drive it again in the
+                # background rather than waiting for someone to ask. A permanent error is not.
+                self._redriver.spawn(run_id)
         return out
 
     # --- one event ----------------------------------------------------------------------------
@@ -665,6 +704,8 @@ class EffectsExecutor:
     def _again(self, key: str, reason: str, *, retrying: bool) -> StillRunning:
         """``StillRunning``. Retries back off (doubling, capped), so attempts do not all go
         within seconds of one blip; plain polls of an accepted effect keep the fixed interval."""
+        if retrying and not reason.startswith("transient:"):
+            reason = f"transient:{reason}"  # the driver caps the total time of these
         n = self._streak.get(key, 0) if retrying else 0
         self._streak[key] = n + 1 if retrying else 0
         return StillRunning(min(self._poll * 2 ** min(n, 6), 60 * self._poll), reason)
@@ -707,9 +748,21 @@ class EffectsExecutor:
             return self._again(key, "moved", retrying=False)
         return self._map(cmd, result, key)
 
+    @staticmethod
+    def _failed(cmd: RunEffect, result: ExecResult) -> EffectFailed:
+        """Say what the record is, because only a blocked effect can be retried (D2-10)."""
+        status = result.effect.status
+        if result.blocked:
+            reason = "blocked"
+        elif status is EffectStatus.VOIDED:
+            reason = "gate_invalid" if result.reason == "gate_invalid" else "voided"
+        else:
+            reason = "failed"
+        return EffectFailed(cmd.run_id, cmd.type, cmd.visit, reason)
+
     def _map(self, cmd: RunEffect, result: ExecResult, key: str) -> Outcome:
         effect = result.effect
-        failed = EffectFailed(cmd.run_id, cmd.type, cmd.visit)
+        failed = self._failed(cmd, result)
         # Blocked means the outcome is unknown and a person must decide. It is reported even on a
         # dead run: the run refuses it, which leaves the only trace of it in the timeline (D2-11
         # decides what a blocked effect on a stopped run shows).

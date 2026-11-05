@@ -65,6 +65,7 @@ from sto.engine.handlers.core import (
     StepFailed,
     StepSucceeded,
 )
+from sto.engine.handlers.failures import RetryBudgetExceededError, RetryPolicy, classify
 from sto.engine.reducer import (
     LINEAR_V0,
     HandlerRegistry,
@@ -2171,6 +2172,170 @@ def test_wire_roundtrip_of_commands() -> None:
     cmds = [RunStep(RID, "implement", 1, 1), _gate_cmd(), Finish(RID, RunStatus.DONE)]
     for c in cmds:
         assert decode(json.loads(json.dumps(encode(c, "command"))), "command") == c
+
+
+# --- D2-10: a total-time cap on transient retries, and the background re-drive ---------------
+
+
+class TickClock(Clock):
+    """A clock that only moves when the driver sleeps."""
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        await asyncio.sleep(0)
+
+
+def transient_forever(key: str, command: object) -> Outcome | None:
+    return (
+        StillRunning(1.0, "transient:ConnectionResetError")
+        if isinstance(command, RunStep)
+        else None
+    )
+
+
+def test_a_persistent_transient_error_ends_as_a_permanent_budget_error(tmp_path: Path) -> None:
+    clock = TickClock()
+    w = Worker(tmp_path / "l", override=transient_forever)
+    d = make(MemoryStore(), w, clock=clock, sleep=clock.sleep, retry_budget=30.0)
+
+    async def go() -> None:
+        await d.start(new_run())
+        await d.run_until_idle(RID)
+
+    with pytest.raises(RetryBudgetExceededError) as e:
+        run(go())
+    assert classify(e.value) is FailureClass.PERMANENT
+    assert 30 <= len(w.calls()) <= 32  # one call a second for the budget, then it stops
+    assert clock.now - 1000.0 <= 32
+
+
+def test_a_poll_that_is_not_a_transient_error_is_not_capped(tmp_path: Path) -> None:
+    clock = TickClock()
+    n = itertools.count()
+
+    def slow(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunStep) and next(n) < 50:
+            return StillRunning(1.0, "in_flight")  # 50s of polling is not a failure
+        return None
+
+    d = make(MemoryStore(), Worker(tmp_path / "l", override=slow), clock=clock, sleep=clock.sleep)
+    d._retry_budget = 30.0
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    assert run(go()).run.status is RunStatus.DONE
+    assert clock.now - 1000.0 >= 50
+
+
+def test_the_budget_starts_again_after_a_call_that_is_not_transient(tmp_path: Path) -> None:
+    clock = TickClock()
+    answers = ["transient:x"] * 20 + ["in_flight"] + ["transient:x"] * 20
+
+    def flaky(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunStep) and answers:
+            return StillRunning(1.0, answers.pop(0))
+        return None
+
+    d = make(MemoryStore(), Worker(tmp_path / "l", override=flaky), clock=clock, sleep=clock.sleep)
+    d._retry_budget = 30.0
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    assert run(go()).run.status is RunStatus.DONE  # 20s, a break, 20s: never 30 in a row
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf")])
+def test_the_retry_budget_must_be_positive_and_finite(bad: float) -> None:
+    with pytest.raises(ValueError, match="retry_budget"):
+        make(MemoryStore(), Worker(Path("/nonexistent/l")), retry_budget=bad)
+
+
+def test_a_drive_that_gave_up_is_driven_again_in_the_background(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), TickClock()
+    a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    policy = RetryPolicy(max_attempts=6, base_delay=4.0, max_delay=4.0, total_budget=100.0)
+    b = make(
+        store,
+        Worker(tmp_path / "b"),
+        owner="b",
+        clock=clock,
+        sleep=clock.sleep,
+        lease_seconds=10,
+        resume_wait=0,
+        redrive=policy,
+    )
+
+    async def go() -> RunState:
+        await a.start(new_run())
+        await a.step(RID)  # a holds the lease, and its driver is gone
+        out = await b.resume_all()
+        assert isinstance(out[RID], LeaseHeldError)  # the drive gave up ...
+        for _ in range(500):  # ... and nobody asks again: the background drive finishes the run
+            if b.state(RID).run.status is RunStatus.DONE:
+                return b.state(RID)
+            await asyncio.sleep(0.01)  # store calls run in threads, so yield for real
+        raise AssertionError("the run was not re-driven in the background")
+
+    assert run(go()).run.status is RunStatus.DONE
+
+
+def test_without_a_redrive_policy_a_given_up_drive_stays_given_up(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    b = make(store, Worker(tmp_path / "b"), owner="b", clock=clock, lease_seconds=10, resume_wait=0)
+
+    async def go() -> None:
+        await a.start(new_run())
+        await a.step(RID)
+        await b.resume_all()
+        await asyncio.sleep(0.3)
+
+    run(go())
+    assert b.redriver is None
+    assert b.state(RID).run.status is not RunStatus.DONE
+
+
+def test_a_permanent_give_up_is_not_driven_again(tmp_path: Path) -> None:
+    clock = TickClock()
+    policy = RetryPolicy(max_attempts=6, base_delay=1.0, max_delay=1.0, total_budget=100.0)
+    w = Worker(tmp_path / "l", override=transient_forever)
+    d = make(MemoryStore(), w, clock=clock, sleep=clock.sleep, retry_budget=5.0, redrive=policy)
+
+    async def go() -> int:
+        await d.start(new_run())
+        out = await d.resume_all()
+        assert isinstance(out[RID], RetryBudgetExceededError)
+        calls = len(w.calls())
+        await asyncio.sleep(0.3)  # long enough for a (wrong) background drive to call again
+        return calls
+
+    calls = run(go())
+    assert len(w.calls()) == calls  # R1: nothing drove it again
+
+
+@pytest.mark.parametrize(
+    ("status", "blocked", "reason", "want"),
+    [
+        (EffectStatus.ATTEMPTING, True, None, "blocked"),
+        (EffectStatus.FAILED, False, "x", "failed"),
+        (EffectStatus.VOIDED, False, "gate_invalid", "gate_invalid"),
+        (EffectStatus.VOIDED, False, "run_not_active", "voided"),
+        (EffectStatus.VOIDED, False, None, "voided"),
+    ],
+)
+def test_the_driver_tells_the_run_what_kind_of_effect_failure_it_is(
+    status: EffectStatus, blocked: bool, reason: str | None, want: str
+) -> None:
+    from types import SimpleNamespace
+
+    cmd = RunEffect(RID, "pr.merge", "merge", 1, SUBJECT, SUBJECT.digest(), (), ())
+    result = SimpleNamespace(effect=SimpleNamespace(status=status), blocked=blocked, reason=reason)
+    failed = EffectsExecutor._failed(cmd, result)  # type: ignore[arg-type]
+    assert failed.reason == want
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["child"]:

@@ -25,10 +25,19 @@ the service and re-driver take their other collaborators the same way:
 * ``Redriver``: a drive that gave up on a transient error is driven again in the background, with
   the same capped backoff. A BLOCKED run is returned as it is and never driven again (R1).
 
-The attempt a Retry starts is numbered past the stage's ``max_attempts``; ``handlers/stages.py``
-compares ``attempt < max_attempts``, so a transient failure of that attempt blocks again at once.
-A person's Retry buys one attempt, not ``max_attempts`` more. (For an effect the executor grants
-``max_attempts`` more, see ``retry_blocked``.)
+One click buys one step attempt: it is numbered past the stage's ``max_attempts``, and
+``handlers/stages.py`` compares ``attempt < max_attempts``, so a transient failure of it blocks
+again at once. One click on an effect buys one executor call, which has its own retry layer
+(``retry_blocked`` allows ``max_attempts`` more). Both match PLAN 6.2.
+
+Only a *blocked* effect (unknown outcome) is retryable. A FAILED or VOIDED effect shows as its own
+block (``effect_failed_permanently``, ``effect_voided``, ``gate_invalid``; ``EffectFailed.reason``)
+and a Retry is refused with the reason in ``NOT_RETRYABLE_WHY``, because the executor would replay
+the record. PLAN 6.3's return to the first invalid gate is a follow-up, not part of this issue.
+
+Notes for callers: the stopper port is filled by D10-06; who may Retry (PLAN's role table) is the
+API route's job; the linear v0 path in ``core.py`` is D2-26's. A ``head_moved`` block on a run with
+an uncovered merge gets its revert only on Cancel, so it must be on the attention list.
 """
 
 from __future__ import annotations
@@ -44,12 +53,15 @@ from sto.config.schema import AgentStage, EffectStage, ReviewPanelStage
 from sto.config.schema import Workflow as Graph
 from sto.domain import (
     EVENTS,
+    Effect,
+    EffectStatus,
     FailureClass,
     PermanentError,
     RunId,
     RunStatus,
     StepKey,
     StoError,
+    effect_key,
 )
 from sto.engine.commands import RunEffect, RunStep
 from sto.engine.handlers.core import StepFailed
@@ -69,6 +81,15 @@ RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 RETRYABLE_BLOCKS = frozenset(
     {"permanent_failure", "attempts_exhausted", "degraded", "effect_failed"}
 )
+
+
+# What a UI shows when a Retry is refused for a block that is not a step or effect failure.
+NOT_RETRYABLE_WHY = {
+    "effect_failed_permanently": "permanent failure: Cancel the run (a retry would re-spend)",
+    "effect_voided": "the effect was voided: Cancel the run",
+    "gate_invalid": "approval no longer holds: it needs a new approval, not a retry",
+    "head_moved": "the merged head changed: Cancel the run (an uncovered merge is reverted then)",
+}
 
 
 class RetryBudgetExceededError(PermanentError):
@@ -149,7 +170,11 @@ class _Loop:
         if classify(exc) is not FailureClass.TRANSIENT:
             raise exc
         if self._calls >= p.max_attempts:
-            raise exc
+            # Not the raw transient error: an outer layer would classify it as retryable and
+            # retry again, which is a second retry layer (R2).
+            raise RetryBudgetExceededError(
+                f"gave up after {self._calls} calls: max_attempts ({p.max_attempts}) is spent"
+            ) from exc
         delay = p.delay(self._calls)
         if (self._clock() - self._start) + delay > p.total_budget:
             raise RetryBudgetExceededError(
@@ -196,7 +221,10 @@ async def acall_with_retry[T](
 class RetryRequested:
     """A person's Retry of a BLOCKED run. ``stage``, ``visit`` and ``attempt`` are the position the
     person saw blocked (``attempt`` is 0 for an effect, which has none), so a late or repeated
-    click is refused. ``actor`` and ``reason`` are the audit record's."""
+    click is refused. ``run_version`` is the run's version the person saw: the position can come
+    back to the same stage, visit and attempt (an effect blocks again at the same visit), so it is
+    the position's identity and a replayed event is refused. ``actor`` and ``reason`` are the
+    audit record's."""
 
     run_id: RunId
     actor: str
@@ -204,6 +232,16 @@ class RetryRequested:
     stage: str
     visit: int
     attempt: int = 0
+    run_version: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("actor", "reason", "stage"):
+            if type(getattr(self, name)) is not str:
+                raise TypeError(f"{name} must be a str")
+        for name in ("visit", "attempt", "run_version"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:  # a bool is not an int here
+                raise TypeError(f"{name} must be a non-negative int")
 
 
 @dataclass(frozen=True)
@@ -222,8 +260,11 @@ def describe_retry(rs: RunState, wf: Graph) -> RetryTarget:
         raise OutOfOrderEventError(f"retry while run is {run.status.value}, not BLOCKED")
     reason = run.blocked_reason or ""
     if reason not in RETRYABLE_BLOCKS:
+        why = NOT_RETRYABLE_WHY.get(reason)
         raise OutOfOrderEventError(
-            f"retry cannot clear a {reason!r} block: it would step past that guard"
+            f"retry cannot clear a {reason!r} block: {why}"
+            if why
+            else f"retry cannot clear a {reason!r} block: it would step past that guard"
         )
     name = run.stage or ""
     stage = wf.stages.get(name)
@@ -270,12 +311,17 @@ def _effect_command(rs: RunState, wf: Graph, target: RetryTarget) -> RunEffect:
 def on_retry_requested(rs: RunState, event: RetryRequested, wf: Graph) -> Transition:
     _check_actor(event.actor, event.reason)
     target = describe_retry(rs, wf)
+    if event.run_version != rs.run.version:
+        raise OutOfOrderEventError(
+            f"stale retry: it was asked at run version {event.run_version}, live is "
+            f"{rs.run.version}"
+        )
     if (event.stage, event.visit, event.attempt) != (target.stage, target.visit, target.attempt):
         raise OutOfOrderEventError(
             f"stale retry for {event.stage!r} visit {event.visit} attempt {event.attempt}; "
             f"blocked at {target.stage!r} visit {target.visit} attempt {target.attempt}"
         )
-    run = dataclasses.replace(rs.run.advance(RunStatus.RUNNING))
+    run = rs.run.advance(RunStatus.RUNNING)
     run = dataclasses.replace(run, version=run.version + 1)
     if target.is_effect:
         cmd = _effect_command(rs, wf, target)
@@ -302,7 +348,11 @@ class AttemptStopper(Protocol):
 
 
 class BlockedEffects(Protocol):
+    """``EffectExecutor``'s two calls this service needs."""
+
     def retry_blocked(self, run_id: RunId, idempotency_key: str) -> object: ...
+
+    def get(self, run_id: RunId, idempotency_key: str) -> Effect: ...
 
 
 class RetryService:
@@ -320,20 +370,22 @@ class RetryService:
         self._audit, self._stopper, self._effects = audit, stopper, effects
         self._submit, self._load = submit, load
 
-    async def retry(
-        self, run_id: RunId, actor: str, reason: str, *, effect_key: str | None = None
-    ) -> RetryRequested:
-        """Retry a blocked run. Order matters: check, audit, stop, clear the block, submit. A
-        failure at any point leaves the run BLOCKED (the audit entry, if written, is a record of
-        the attempt), and the event is only ever sent after the audit entry exists."""
+    async def retry(self, run_id: RunId, actor: str, reason: str) -> RetryRequested:
+        """Retry a blocked run. Order: check, audit, stop (a step) or clear the block (an effect),
+        submit. The event is only ever sent after the audit entry exists. A failure after the block
+        is cleared leaves the run BLOCKED with the effect already cleared, and the next click
+        carries on from there: clearing is idempotent (``_clear``). The effect's key is derived
+        from the run's state, never supplied, so a Retry cannot clear another effect."""
         _check_actor(actor, reason)
         rs, wf = self._load(run_id)
         target = describe_retry(rs, wf)
-        if target.is_effect and not effect_key:
-            raise MalformedEventError("retry of an effect needs its effect_key")
-        if not target.is_effect and effect_key is not None:
-            raise MalformedEventError("effect_key is only for a blocked effect")
-        event = RetryRequested(run_id, actor, reason, target.stage, target.visit, target.attempt)
+        key = None
+        if target.is_effect:
+            cmd = _effect_command(rs, wf, target)  # also proves every approval still holds
+            key = effect_key(run_id, cmd.stage, cmd.visit, cmd.type, cmd.subject_digest)
+        event = RetryRequested(
+            run_id, actor, reason, target.stage, target.visit, target.attempt, rs.run.version
+        )
         self._audit.record(
             run_id,
             "run.retry",
@@ -346,13 +398,24 @@ class RetryService:
                 "blocked_reason": target.blocked_reason,
             },
         )
-        if target.is_effect:
-            assert effect_key is not None
-            self._effects.retry_blocked(run_id, effect_key)
+        if key is not None:
+            self._clear(run_id, key)
         else:
             self._stopper.stop_attempt(run_id, target.stage, target.visit, target.attempt)
         await self._submit(run_id, event)
         return event
+
+    def _clear(self, run_id: RunId, key: str) -> None:
+        """``retry_blocked``, unless an earlier click already did it (the executor then refuses
+        with ``ValueError``): an effect that is PLANNED or RETRYING is cleared, so go on."""
+        try:
+            self._effects.retry_blocked(run_id, key)
+        except ValueError:
+            if self._effects.get(run_id, key).status not in (
+                EffectStatus.PLANNED,
+                EffectStatus.RETRYING,
+            ):
+                raise
 
 
 # --- the background re-drive ---------------------------------------------------------------

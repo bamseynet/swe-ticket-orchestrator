@@ -116,6 +116,12 @@ _DECISION_OUTCOME = {
     DecisionKind.REJECT: "rejected",
     DecisionKind.RETEST: "retest",
 }
+_EFFECT_BLOCK = {
+    "blocked": "effect_failed",
+    "failed": "effect_failed_permanently",
+    "voided": "effect_voided",
+    "gate_invalid": "gate_invalid",
+}
 _REFUSALS = frozenset({"conflict", "stale"})
 _MOVES_HEAD = frozenset({"pr.update_branch"})  # a confirmed effect that leaves a new head SHA
 
@@ -147,6 +153,16 @@ class SubjectMissing:
 
 @BLOCKED_REASONS.register("head_moved")
 class HeadMoved:
+    pass
+
+
+@BLOCKED_REASONS.register("effect_failed_permanently")
+class EffectFailedPermanently:
+    pass
+
+
+@BLOCKED_REASONS.register("effect_voided")
+class EffectVoided:
     pass
 
 
@@ -548,7 +564,9 @@ def on_effect_refused(rs: RunState, event: EffectRefused, wf: Graph) -> Transiti
 @handles_graph(EffectFailed)
 def on_effect_failed(rs: RunState, event: EffectFailed, wf: Graph) -> Transition:
     _effect_stage(rs, wf, event.effect, event.visit)
-    return _block(rs, "effect_failed")
+    # Only a blocked effect (unknown outcome) can be retried (D2-10); FAILED and VOIDED records
+    # would be replayed, so they get their own reasons and a Retry is refused with them.
+    return _block(rs, _EFFECT_BLOCK[event.reason])
 
 
 handles_graph(CancelRequested)(core.on_cancel_requested)  # it never reads the workflow
