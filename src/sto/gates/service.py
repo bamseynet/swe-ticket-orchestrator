@@ -354,6 +354,13 @@ class GateService:
             if item is None:
                 raise GateNotFoundError(f"no gate {gate!r} round {round} for run {run_id}")
             current = from_wire(Gate, item.data)
+            if isinstance(last, TransactionOutcomeUnknownError):
+                # The last write's answer was lost and it may have landed since (even after the
+                # previous attempt's read): our own decision id proves it, so return it rather
+                # than refuse the person's own vote as a duplicate or a closed gate.
+                landed = self._landed(scope, current, actor, kind, decision_id)
+                if landed is not None:
+                    return Decided(current, landed)
             if not current.is_open:
                 raise GateClosedError(current)
             if kind is DecisionKind.RETEST and current.type is not GateType.QA:
@@ -386,15 +393,8 @@ class GateService:
                     if self._head_version(scope, run_id) != head:
                         self._retry.wait(attempt)
                         continue  # a decision committed while we counted: count again
-                    vote_key = _vote_key(current, actor)
                     try:
                         self._store.transact(scope, _within_cap(own))
-                    except TransactionOutcomeUnknownError as err:
-                        # The write may have landed: only our own decision id proves it did.
-                        if self._vote_landed(scope, vote_key, decision):
-                            return Decided(current, decision)
-                        last = err
-                        self._retry.wait(attempt)
                     except ConditionFailedError as err:
                         last = err  # a close or a vote raced us: re-read and count again
                         self._retry.wait(attempt)
@@ -413,6 +413,7 @@ class GateService:
             if [g.round for _, g in self._earlier_approvals(scope, current, kind)] != [
                 g.round for _, g in invalidated
             ]:
+                self._retry.wait(attempt)
                 continue
             hook_ops = self._hooks.decide_ops(
                 DecideContext(self._reader, scope, current, closed, decision)
@@ -420,12 +421,6 @@ class GateService:
             ops = _within_cap([*own, *hook_ops])
             try:
                 self._store.transact(scope, ops)
-            except TransactionOutcomeUnknownError as err:
-                # Reconcile by re-reading: the decision record exists only if our close landed.
-                if self._store.get(scope, _decision_key(closed, decision)) is not None:
-                    return Decided(closed, decision)
-                last = err
-                self._retry.wait(attempt)
             except ConditionFailedError as err:
                 _raise_if_only_hooks(err, len(own))
                 last = err  # re-read: closed now -> gate_closed above; still open -> try again
@@ -451,9 +446,22 @@ class GateService:
                 + ", ".join(reasons)
             )
 
-    def _vote_landed(self, scope: Scope, key: Key, decision: Decision) -> bool:
-        item = self._store.get(scope, key)
-        return item is not None and from_wire(Decision, item.data["decision"]).id == decision.id
+    def _landed(
+        self, scope: Scope, gate: Gate, actor: str, kind: DecisionKind, decision_id: DecisionId
+    ) -> Decision | None:
+        """The decision with this id if it was committed: a close writes ``DEC#...#id``, a vote
+        writes the voter's ``VOTE#`` record. Another id (an older vote by the same person) is not
+        ours."""
+        closed = self._store.get(scope, _decision_key(gate, decision_id))
+        if closed is not None:
+            return from_wire(Decision, closed.data)
+        if kind is DecisionKind.APPROVE:
+            vote = self._store.get(scope, _vote_key(gate, actor))
+            if vote is not None:
+                found = from_wire(Decision, vote.data["decision"])
+                if found.id == decision_id:
+                    return found
+        return None
 
     def _head_version(self, scope: Scope, run_id: RunId) -> int | None:
         head = self._store.get(scope, Key(run_pk(run_id), CHAIN_SK))
@@ -607,7 +615,7 @@ class GateService:
         ops: list[Op] = [
             # The single close: succeeds only if nobody wrote this gate since it was read.
             Put(item.key, to_wire(closed), VersionIs(item.version)),
-            Put(_decision_key(closed, decision), to_wire(decision), Absent()),
+            Put(_decision_key(closed, decision.id), to_wire(decision), Absent()),
             Put(Key(pk, f"OUT#{OutboxId.new()}"), outbox, Absent()),
             *self._audit.ops(self._reader, scope, entry),
         ]
@@ -632,8 +640,8 @@ class _Tally:
     votes: int | None  # people who now hold a vote, this one included
 
 
-def _decision_key(gate: Gate, decision: Decision) -> Key:
-    return Key(run_pk(gate.run_id), f"DEC#{gate.name}#{gate.round}#{decision.id}")
+def _decision_key(gate: Gate, decision_id: DecisionId) -> Key:
+    return Key(run_pk(gate.run_id), f"DEC#{gate.name}#{gate.round}#{decision_id}")
 
 
 def _quorum_key(gate: Gate) -> Key:

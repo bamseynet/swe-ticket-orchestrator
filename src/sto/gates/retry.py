@@ -46,4 +46,6 @@ class Backoff:
         return self.rng() * ceiling
 
     def wait(self, attempt: int) -> None:
-        self.sleep(self.delay(attempt))
+        """Sleep after failed attempt ``attempt``; not after the last one, which has no next try."""
+        if attempt + 1 < self.attempts:
+            self.sleep(self.delay(attempt))
