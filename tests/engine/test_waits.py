@@ -46,8 +46,6 @@ from sto.engine.handlers.waits import (
     WaitResumed,
 )
 from sto.engine.reducer import (
-    GRAPH_HANDLERS,
-    HandlerRegistry,
     MalformedEventError,
     OutOfOrderEventError,
     RunState,
@@ -522,23 +520,6 @@ def test_a_fresh_interpreter_has_both_entries_whichever_module_it_imports_first(
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "['ChecksStage', 'WaitStage']"
-
-
-def test_a_registry_without_the_wait_handlers_blocks_instead_of_parking_the_run() -> None:
-    partial = HandlerRegistry()
-    for event_type in (RunStarted, StageReported):
-        handler = GRAPH_HANDLERS.get(event_type)
-        assert handler is not None
-        partial.register(event_type, handler)
-    rs = next(RunState(Run(id=RID, team="t")), RunStarted(RID), W, graph_registry=partial).state
-    key = StepKey(RID, "implement", 1, 1)
-    t = next(rs, StageReported(key, "blocked"), W, graph_registry=partial)
-    assert (t.state.run.status, t.state.run.blocked_reason) == (
-        RunStatus.BLOCKED,
-        "stage_unsupported",
-    )
-    assert t.state.run.stage == "implement"
-    assert t.commands == ()
 
 
 def test_the_default_registry_can_enter_both_kinds() -> None:

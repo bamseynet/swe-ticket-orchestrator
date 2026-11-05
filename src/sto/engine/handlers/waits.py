@@ -172,8 +172,8 @@ def _enter(rs: RunState, run: Run, name: str, stage: object, count: int) -> Tran
     return Transition(_with(rs, run.advance(status), visit=count, attempt=1, round=0), (cmd,))
 
 
-STAGE_ENTRY[WaitStage] = StageEntry(_refuse, _enter, (WaitResumed, StageTimedOut))
-STAGE_ENTRY[ChecksStage] = StageEntry(_refuse, _enter, (CheckResults, StageTimedOut))
+STAGE_ENTRY[WaitStage] = StageEntry(_refuse, _enter)
+STAGE_ENTRY[ChecksStage] = StageEntry(_refuse, _enter)
 
 
 # --- the live position ---------------------------------------------------------------------

@@ -12,8 +12,8 @@ instead of raising, because a refused event is dropped by the driver and the run
   exhausted, so a workflow the validator never saw cannot loop free.
 * ``max_steps_exceeded``: the entry would exceed ``limits.max_steps_per_run``.
 * ``stage_unsupported``: ``route`` stages arrive in D2-23. They are not skipped. (``wait`` and
-  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``. A registry that lacks the
-  handlers a kind needs to leave its stage cannot enter it either: that would park the run.)
+  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``. A caller's own
+  ``graph_registry=`` must register their handlers: see ``StageEntry``.)
 * ``checks_timed_out`` and ``checks_unresolved`` (``waits.py``): a checks stage timed out
   (PLAN 6.2, WAITING_EXTERNAL to BLOCKED), or its ``team_default`` resolved to no checks.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
@@ -88,7 +88,6 @@ from sto.engine.handlers.core import (
     StepSucceeded,
 )
 from sto.engine.reducer import (
-    ACTIVE_REGISTRY,
     Approval,
     MalformedEventError,
     Merge,
@@ -219,12 +218,14 @@ class StageEntry:
 
     ``refuse`` runs with the other entry checks, before any counter moves, and returns a blocked
     reason or ``None``. ``enter`` runs once the visit is counted and returns the transition.
-    ``leaves`` are the event types that end the stage: a registry without all of them cannot enter
-    it, because nothing could ever take the run out again."""
+
+    A caller that passes its own ``graph_registry=`` to ``next`` must register the wait and checks
+    handlers (``WaitResumed``, ``StageTimedOut``, ``CheckResults``) in it. Entry does not check:
+    the pure handlers cannot see which registry is running, so a registry without them parks the
+    run with nothing able to end the wait. (A reducer-side check is a follow-up.)"""
 
     refuse: Callable[[RunState, Any], str | None]
     enter: Callable[[RunState, Run, str, Any, int], Transition]
-    leaves: tuple[type, ...] = ()
 
 
 STAGE_ENTRY: dict[type, StageEntry] = {}
@@ -240,13 +241,6 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     stage = wf.stages[name]
     entry = STAGE_ENTRY.get(type(stage))
     if entry is None and not isinstance(stage, _SUPPORTED):
-        return _block(rs, "stage_unsupported")
-    registry = ACTIVE_REGISTRY.get()
-    if (
-        entry is not None
-        and registry is not None
-        and any(registry.get(t) is None for t in entry.leaves)
-    ):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
         return _block(rs, "loop_exhausted")
