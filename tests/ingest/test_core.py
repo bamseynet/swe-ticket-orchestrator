@@ -14,7 +14,6 @@ import pytest
 
 from sto.domain.errors import PermanentError, TransientError
 from sto.ingest.core import (
-    DedupePolicy,
     InvalidSignatureError,
     Nudge,
     WebhookIngest,
@@ -22,7 +21,12 @@ from sto.ingest.core import (
     normalise_headers,
 )
 from sto.store.memory import MemoryStore
-from sto.store.ports import PLATFORM, Item, Key
+from sto.store.ports import (
+    PLATFORM,
+    Item,
+    Key,
+    TransactionOutcomeUnknownError,
+)
 
 SECRET = b"synthetic-secret-not-real"
 SIG = "x-signature"
@@ -32,8 +36,11 @@ ID = "x-delivery-id"
 class HmacVerifier:
     """A minimal reference verifier: HMAC-SHA256 of the raw body, constant-time compare."""
 
-    def __init__(self, signed_timestamp: bool = False) -> None:
-        self.signed_timestamp = signed_timestamp
+    secret_headers: frozenset[str] = frozenset()
+
+    def __init__(self, replay_window: float | None = None) -> None:
+        self.replay_window = replay_window
+        self.signed_timestamp = replay_window is not None
         self.seen_headers: list[Mapping[str, str]] = []
         self.seen_bodies: list[bytes] = []
 
@@ -204,6 +211,8 @@ def test_any_permanent_verifier_error_is_a_401_not_a_crash(
 ) -> None:
     class Odd:
         signed_timestamp = False
+        replay_window: float | None = None
+        secret_headers: frozenset[str] = frozenset()
 
         def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
             raise PermanentError("stale timestamp")
@@ -228,6 +237,8 @@ def test_a_verifier_bug_that_is_not_a_store_error_fails_loud_and_the_vendor_retr
 ) -> None:
     class Broken:
         signed_timestamp = False
+        replay_window: float | None = None
+        secret_headers: frozenset[str] = frozenset()
 
         def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
             raise RuntimeError("boom")
@@ -383,9 +394,7 @@ def test_a_store_failure_on_the_dedupe_write_returns_503_and_enqueues_nothing(
 def test_no_signed_timestamp_means_the_dedupe_record_never_expires(
     store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
 ) -> None:
-    make(store, queue, metrics, clock, verifier=HmacVerifier(signed_timestamp=False)).handle(
-        *delivery()
-    )
+    make(store, queue, metrics, clock, verifier=HmacVerifier()).handle(*delivery())
     item = seen_item(store)
     assert item is not None
     assert "ttl" not in item.data
@@ -394,47 +403,42 @@ def test_no_signed_timestamp_means_the_dedupe_record_never_expires(
 def test_a_signed_timestamp_vendor_gets_a_ttl_beyond_the_replay_window(
     store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
 ) -> None:
-    ingest = WebhookIngest(
-        "hub",
-        HmacVerifier(signed_timestamp=True),
-        store,
-        queue,
-        metrics,
-        clock=clock,
-        dedupe=DedupePolicy(replay_window=300.0),
-    )
+    ingest = make(store, queue, metrics, clock, verifier=HmacVerifier(replay_window=300.0))
     ingest.handle(*delivery())
     item = seen_item(store)
     assert item is not None
     assert item.data["ttl"] == int(clock.now + 2 * 300.0)
 
 
-def test_a_signed_timestamp_vendor_must_say_its_replay_window() -> None:
+def test_the_ttl_comes_from_the_verifiers_own_window_and_rounds_up(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    clock.now = 1000.9
+    make(store, queue, metrics, clock, verifier=HmacVerifier(replay_window=0.5)).handle(*delivery())
+    item = seen_item(store)
+    assert item is not None
+    assert item.data["ttl"] == 1002  # ceil(1000.9 + 1.0); never below now + window
+
+
+def test_a_verifier_that_says_signed_timestamp_without_a_window_is_refused() -> None:
+    v = HmacVerifier(replay_window=300.0)
+    v.replay_window = None
     with pytest.raises(ValueError, match="replay_window"):
-        WebhookIngest(
-            "hub",
-            HmacVerifier(signed_timestamp=True),
-            MemoryStore(),
-            Queue(),
-            Metrics(),
-        )
+        WebhookIngest("hub", v, MemoryStore(), Queue(), Metrics())
 
 
-def test_a_replay_window_on_a_vendor_without_a_signed_timestamp_is_refused() -> None:
+def test_a_window_on_a_verifier_without_a_signed_timestamp_is_refused() -> None:
+    v = HmacVerifier()
+    v.replay_window = 300.0
     with pytest.raises(ValueError, match="never expires"):
-        WebhookIngest(
-            "hub",
-            HmacVerifier(signed_timestamp=False),
-            MemoryStore(),
-            Queue(),
-            Metrics(),
-            dedupe=DedupePolicy(replay_window=300.0),
-        )
+        WebhookIngest("hub", v, MemoryStore(), Queue(), Metrics())
 
 
-def test_the_replay_window_must_be_positive() -> None:
+def test_a_non_positive_window_is_refused() -> None:
+    v = HmacVerifier(replay_window=300.0)
+    v.replay_window = 0.0
     with pytest.raises(ValueError, match="positive"):
-        DedupePolicy(replay_window=0.0)
+        WebhookIngest("hub", v, MemoryStore(), Queue(), Metrics())
 
 
 def test_surface_must_be_a_plain_name() -> None:
@@ -453,3 +457,124 @@ def test_a_delivery_id_with_a_hash_cannot_reach_another_surfaces_partition(
     assert other.handle(*delivery(delivery_id="x")).status == 202
     assert seen_item(store, "a", "b#x") is not None
     assert len(queue.items) == 2
+
+
+# --- pass 1 fixes -------------------------------------------------------------------------------
+
+
+class AppliedThenLost(MemoryStore):
+    """The put lands, but the answer is lost."""
+
+    def put(self, *args: object, **kwargs: object) -> None:
+        super().put(*args, **kwargs)  # type: ignore[arg-type]
+        raise TransactionOutcomeUnknownError("answer lost")
+
+
+def test_an_unknown_outcome_on_the_claim_releases_it_so_the_retry_is_enqueued(
+    queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    store = AppliedThenLost()
+    ingest = make(store, queue, metrics, clock)
+    assert ingest.handle(*delivery()).status == 503
+    assert seen_item(store) is None
+    assert metrics.counts == {"webhook.store_failed": 1}
+    store_ok = MemoryStore()
+    assert make(store_ok, queue, metrics, clock).handle(*delivery()).status == 202
+
+
+class IdVerifier(HmacVerifier):
+    def __init__(self, delivery_id: object) -> None:
+        super().__init__()
+        self.delivery_id = delivery_id
+
+    def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
+        return self.delivery_id  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None, 7, b"x", "x" * 513])
+def test_an_unusable_delivery_id_is_rejected_and_claims_nothing(
+    bad: object, store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    ingest = make(store, queue, metrics, clock, verifier=IdVerifier(bad))
+    assert ingest.handle(*delivery()).status == 401
+    assert metrics.tags == [("webhook.rejected", {"surface": "hub", "reason": "delivery_id"})]
+    assert queue.items == []
+    assert store.query(PLATFORM, "HOOK#hub#").items == ()
+
+
+def test_a_transient_verifier_error_is_503_with_a_metric_and_claims_nothing(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    class Flaky(HmacVerifier):
+        def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
+            raise TransientError("jwks fetch failed")
+
+    ingest = make(store, queue, metrics, clock, verifier=Flaky())
+    assert ingest.handle(*delivery()).status == 503
+    assert metrics.counts == {"webhook.verify_failed": 1}
+    assert queue.items == []
+
+
+def test_the_nudge_carries_normalised_headers_without_credentials(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    verifier = HmacVerifier()
+    verifier.secret_headers = frozenset({"x-vendor-token"})
+    ingest = make(store, queue, metrics, clock, verifier=verifier)
+    headers, body = delivery()
+    headers.update(
+        {
+            "Authorization": "Bearer synthetic",
+            "COOKIE": "s=synthetic",
+            "Proxy-Authorization": "Basic synthetic",
+            "X-Vendor-Token": "synthetic",
+            "X-Event": "push",
+        }
+    )
+    assert ingest.handle(headers, body).status == 202
+    assert dict(queue.items[0].headers) == {
+        SIG: sign(body),
+        ID: "d-1",
+        "x-event": "push",
+    }
+
+
+def test_the_dedupe_record_says_when_it_was_seen(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    make(store, queue, metrics, clock).handle(*delivery())
+    item = seen_item(store)
+    assert item is not None
+    assert item.data == {"surface": "hub", "seen_at": clock.now}
+
+
+def test_a_verifier_bug_is_counted_before_it_escapes(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    class Buggy(HmacVerifier):
+        def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
+            raise KeyError("x-signature")
+
+    ingest = make(store, queue, metrics, clock, verifier=Buggy())
+    with pytest.raises(KeyError):
+        ingest.handle(*delivery())
+    assert metrics.counts == {"webhook.verify_error": 1}
+
+
+def test_a_non_string_header_value_is_a_counted_401_not_a_crash(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    headers, body = delivery()
+    headers["X-Extra"] = None  # type: ignore[assignment]
+    ingest = make(store, queue, metrics, clock)
+    assert ingest.handle(headers, body).status == 401
+    assert metrics.tags == [("webhook.rejected", {"surface": "hub", "reason": "headers"})]
+
+
+def test_a_header_conflict_is_counted_as_headers_not_signature(
+    store: MemoryStore, queue: Queue, metrics: Metrics, clock: Clock
+) -> None:
+    headers, body = delivery()
+    headers["x-signature"] = "other"
+    make(store, queue, metrics, clock).handle(headers, body)
+    assert metrics.tags == [("webhook.rejected", {"surface": "hub", "reason": "headers"})]
