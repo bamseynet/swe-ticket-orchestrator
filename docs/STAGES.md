@@ -436,7 +436,7 @@ Timers re-read the gate, so a late or repeated one is harmless.
 `wait` stages for human answers, and `checks` stages that wait for external results with a timeout, as handlers.
 No compute is held while waiting, and `team_default` resolving to no checks blocks with a reason.
 **AC:** duplicates and late results change nothing (R4); a timeout follows its edge; a closed run ignores results; a pending check is a wait, not a failure.
-**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/waits.py`, `tests/engine/test_waits.py`.
+**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/waits.py`, `src/sto/engine/handlers/stages.py` (registration only), `tests/engine/test_waits.py`, `tests/engine/test_reducer_v1.py`.
 
 #### D2-14: Simulator and CLI
 `sto validate` and `sto dry-run` walk a workflow with the fake LLM and print the path taken.
