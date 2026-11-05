@@ -1,0 +1,85 @@
+# Regulated team with extra gates (PLAN 7.8). Extends standard@1.
+# Replace intake and repo with your own before publishing.
+apiVersion: sto/v1
+kind: WorkflowOverlay
+metadata: { name: ledger-regulated, team: ledger }
+extends: standard@1
+intake: { source: jira, project: LED, label: agent-ready, extra_filter: '"Risk" is not EMPTY' }
+repo: { name: example/ledger, base: main, sandbox_image: java21 }
+limits:
+  loops: { info: 2, ci_fix: 2, llm_fix: 2, human_review: 2, security_fix: 2, qa_fix: 2, retest: 1, change_fix: 1, merge_conflict: 1, merge_stale: 2 }
+  max_steps_per_run: 150
+  max_run_age: 90d
+definition_of_done:
+  - { stage: refine, check: ac_present }
+  - { stage: review_gate, check: checks_green }
+  - { stage: review_gate, check: no_findings_above, value: low }
+stages:
+  llm_review:
+    reviewers: [correctness_reviewer, security_reviewer, test_reviewer, compliance_reviewer]
+    required: [correctness_reviewer, security_reviewer, test_reviewer, compliance_reviewer]
+    fail_closed: true
+    block_on: medium
+  review_gate:
+    gate:
+      quorum: [ { role: reviewer, count: 2 } ]
+      decision_surfaces: [ui]
+      separation_of_duties: { not: [author, requester, committer] }
+      carry_over: none
+      timeouts: { expire_after: 20d }
+    next: { approved: security_gate, expired: closed_expired }
+  security_gate:
+    kind: gate
+    gate:
+      type: custom
+      eligible_roles: [security_officer]
+      decisions: [approve, request_changes, reject]
+      decision_surfaces: [ui]
+      separation_of_duties: { not: [author, requester, committer, { approver_of: review_gate }] }
+      carry_over: none
+      timeouts: { remind_after: 2d, escalate_after: 4d, escalate_to: org_admin, expire_after: 20d }
+    next:
+      approved: promote
+      changes_requested: { to: implement, loop: security_fix }
+      rejected: closed_rejected
+      expired: closed_expired
+  promote: { requires_gates: [review_gate, security_gate] }
+  qa_env: { requires_gates: [review_gate, security_gate] }
+  qa_auto: { required: [integration, e2e, performance], timeout: 6h }
+  qa_gate:
+    gate:
+      decision_surfaces: [ui]
+      separation_of_duties: { not: [author, requester, committer, { approver_of: review_gate }, { approver_of: security_gate }] }
+      carry_over: none
+      timeouts: { expire_after: 20d }
+    next: { approved: change_route, expired: closed_expired }
+  change_route:
+    kind: route
+    field: risk
+    order: [low, medium, high]
+    next: { high: change_gate, default: mark_ready }
+  change_gate:
+    kind: gate
+    gate:
+      type: custom
+      eligible_roles: [change_manager]
+      decisions: [approve, request_changes, reject]
+      decision_surfaces: [ui]
+      separation_of_duties: { not: [author, requester, committer] }
+      carry_over: none
+      timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: org_admin, expire_after: 15d }
+    next:
+      approved: mark_ready
+      changes_requested: { to: implement, loop: change_fix }
+      rejected: closed_rejected
+      expired: closed_expired
+  mark_ready: { requires_gates: [review_gate, security_gate, qa_gate] }
+  merge: { with: { method: merge }, requires_gates: [review_gate, security_gate, qa_gate] }
+  post_merge: { timeout: 2h, next: { green: evidence } }
+  evidence:
+    kind: effect
+    effect: ticket.comment
+    with: { template: evidence_pack_link }
+    next: { done: ticket_done }
+  ticket_done: { requires_gates: [review_gate, security_gate, qa_gate] }
+  closed_expired: { kind: terminal, result: expired }

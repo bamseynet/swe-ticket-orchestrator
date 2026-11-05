@@ -51,13 +51,13 @@ select = ["E", "F", "I", "B", "UP", "SIM", "PT"]
 python_version = "3.12"
 strict = true
 files = ["src", "tests"]
-mypy_path = ["src", "tests", "tests/store"]
+mypy_path = ["src", "tests", "tests/store", "tests/config"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
 addopts = ["-p", "hermetic_guard", "-p", "tier_guard", "-p", "contract", "-ra", "--strict-markers", "--strict-config"]
 filterwarnings = ["error"]
-pythonpath = ["src", "tests", "tests/store"]
+pythonpath = ["src", "tests", "tests/store", "tests/config"]
 
 [tool.coverage.run]
 source = ["sto", "tools", "scripts"]

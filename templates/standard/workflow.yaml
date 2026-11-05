@@ -1,0 +1,132 @@
+# The bundled `standard` template (PLAN 7.6). Teams do not edit it: they extend it with an overlay.
+apiVersion: sto/v1
+kind: Workflow
+metadata: { name: standard, team: _template }
+limits:
+  loops: { info: 2, pre_push_fix: 3, ci_fix: 3, llm_fix: 2, human_review: 3, qa_fix: 2, retest: 2, merge_conflict: 2, merge_stale: 3 }
+  max_steps_per_run: 120
+  max_run_age: 60d
+definition_of_done:
+  - { stage: refine, check: ac_present }
+  - { stage: review_gate, check: checks_green }
+start: triage
+stages:
+  triage: { kind: agent, agent: triage, next: { ready: refine, needs_info: await_info, not_actionable: closed } }
+  await_info:
+    kind: wait
+    wait_for: human_answer
+    timeout: 10d
+    next: { resumed: { to: triage, loop: info }, timeout: closed }
+  refine: { kind: agent, agent: refiner, next: { ready: plan, needs_info: await_info } }
+  plan: { kind: agent, agent: planner, model_tier: deep, next: { ready: implement, needs_info: await_info } }
+  implement: { kind: agent, agent: implementer, next: { ready: trust_route, blocked: await_info } }
+  trust_route:                     # re-evaluated on every round, and anything but a current attestation means the gate
+    kind: route
+    field: repo_ci_trust
+    next: { attested: push, default: pre_push_gate }
+  pre_push_gate:                   # the patch is held in S3, and no branch or PR exists yet
+    kind: gate
+    gate:
+      type: pre_push
+      eligible_roles: [reviewer]
+      decisions: [approve, request_changes, reject]
+      decision_surfaces: [ui]
+      carry_over: none
+      timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: team_admin }
+    next:
+      approved: push
+      changes_requested: { to: implement, loop: pre_push_fix }
+      rejected: closed_rejected
+  push: { kind: effect, effect: branch.push, next: { done: open_pr } }
+  open_pr: { kind: effect, effect: pr.ensure_draft, next: { done: ci } }
+  ci:
+    kind: checks
+    source: ci
+    required: team_default
+    timeout: 2h
+    next: { green: llm_review, red: { to: implement, loop: ci_fix } }
+  llm_review:
+    kind: review_panel
+    reviewers: [correctness_reviewer, security_reviewer, test_reviewer]
+    required: [correctness_reviewer, security_reviewer]
+    block_on: high
+    next: { clean: review_gate, findings: { to: implement, loop: llm_fix }, degraded: review_gate }
+  review_gate:
+    kind: gate
+    gate:
+      type: review
+      eligible_roles: [reviewer]
+      decisions: [approve, request_changes, reject]
+      decision_surfaces: [ui, slack]
+      carry_over: patch_id
+      timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: team_admin }
+    next:
+      approved: promote
+      changes_requested: { to: implement, loop: human_review }
+      rejected: closed_rejected
+  promote:                         # moves the approved SHA to sto-approved/<run>, where QA secrets are allowed
+    kind: effect
+    effect: branch.promote
+    requires_gates: [review_gate]
+    next: { done: qa_env }
+  qa_env:
+    kind: effect
+    effect: env.deploy_preview
+    requires_gates: [review_gate]
+    next: { done: qa_auto }
+  qa_auto:
+    kind: checks
+    source: qa_suite
+    required: [integration, e2e]
+    timeout: 3h
+    next: { green: qa_agentic, red: { to: implement, loop: qa_fix } }
+  qa_agentic:
+    kind: agent
+    agent: qa_agent
+    next: { pass: qa_gate, fail: qa_gate, inconclusive: qa_gate }
+  qa_gate:
+    kind: gate
+    gate:
+      type: qa
+      eligible_roles: [qa]
+      decisions: [approve, request_changes, retest, reject]
+      decision_surfaces: [ui, slack]
+      carry_over: patch_id
+      timeouts: { remind_after: 1d, escalate_after: 2d, escalate_to: team_admin }
+    next:
+      approved: mark_ready
+      changes_requested: { to: implement, loop: qa_fix }
+      retest: { to: qa_auto, loop: retest }
+      rejected: closed_rejected
+  mark_ready:
+    kind: effect
+    effect: pr.mark_ready
+    requires_gates: [review_gate, qa_gate]
+    next: { done: merge }
+  merge:
+    kind: effect
+    effect: pr.merge
+    with: { method: squash }
+    requires_gates: [review_gate, qa_gate]
+    next: { done: post_merge, conflict: { to: implement, loop: merge_conflict }, stale: { to: update_branch, loop: merge_stale } }
+  update_branch:
+    kind: effect
+    effect: pr.update_branch
+    next: { done: ci, conflict: { to: implement, loop: merge_conflict } }
+  post_merge:
+    kind: checks
+    source: post_merge
+    required: team_default
+    timeout: 1h
+    next: { green: ticket_done, red: revert_pr }
+  ticket_done:
+    kind: effect
+    effect: ticket.transition
+    with: { to_status_category: done }
+    requires_gates: [review_gate, qa_gate]
+    next: { done: done }
+  revert_pr: { kind: effect, effect: pr.open_revert, next: { done: incident } }
+  done: { kind: terminal, result: done }
+  incident: { kind: terminal, result: done_with_incident }
+  closed: { kind: terminal, result: closed }
+  closed_rejected: { kind: terminal, result: rejected }
