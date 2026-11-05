@@ -11,8 +11,11 @@ instead of raising, because a refused event is dropped by the driver and the run
 * ``loop_exhausted``: the edge's named loop is at its cap (PLAN 6.2); an undeclared loop counts as
   exhausted, so a workflow the validator never saw cannot loop free.
 * ``max_steps_exceeded``: the entry would exceed ``limits.max_steps_per_run``.
-* ``stage_unsupported``: ``wait``, ``checks`` and ``route`` stages arrive in D2-13 and D2-23.
-  They are not skipped.
+* ``stage_unsupported``: ``route`` stages arrive in D2-23. They are not skipped. (``wait`` and
+  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``. A caller's own
+  ``graph_registry=`` must register their handlers: see ``StageEntry``.)
+* ``checks_timed_out`` and ``checks_unresolved`` (``waits.py``): a checks stage timed out
+  (PLAN 6.2, WAITING_EXTERNAL to BLOCKED), or its ``team_default`` resolved to no checks.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
   ``RunState.routed_gates``, PLAN 4.3 rule 2) has no live approval.
 * ``subject_missing``: a gate or an effect with no live subject (of the right shape) to plan
@@ -47,7 +50,9 @@ is Malformed. ``workflow_version`` is the workflow's name until D2-07 pins the d
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from sto.config.schema import (
     AgentStage,
@@ -181,7 +186,10 @@ def _out(what: str) -> OutOfOrderEventError:
 
 
 def _with(rs: RunState, run: Run, **changes: object) -> RunState:
-    """New state with the run's version bumped: one accepted event, one version."""
+    """New state with the run's version bumped: one accepted event, one version.
+
+    The one exception is a snapshot that decides nothing (pending check results): it returns the
+    state as it was."""
     bumped = dataclasses.replace(run, version=run.version + 1)
     return dataclasses.replace(rs, run=bumped, **changes)  # type: ignore[arg-type]
 
@@ -204,6 +212,25 @@ def _inc(pairs: tuple[tuple[str, int], ...], key: str) -> tuple[tuple[str, int],
 _SUPPORTED = (AgentStage, ReviewPanelStage, GateStage, EffectStage, TerminalStage)
 
 
+@dataclass(frozen=True)
+class StageEntry:
+    """How a stage kind defined in another handler module is entered (D2-13 wait and checks).
+
+    ``refuse`` runs with the other entry checks, before any counter moves, and returns a blocked
+    reason or ``None``. ``enter`` runs once the visit is counted and returns the transition.
+
+    A caller that passes its own ``graph_registry=`` to ``next`` must register the wait and checks
+    handlers (``WaitResumed``, ``StageTimedOut``, ``CheckResults``) in it. Entry does not check:
+    the pure handlers cannot see which registry is running, so a registry without them parks the
+    run with nothing able to end the wait. (A reducer-side check is a follow-up.)"""
+
+    refuse: Callable[[RunState, Any], str | None]
+    enter: Callable[[RunState, Run, str, Any, int], Transition]
+
+
+STAGE_ENTRY: dict[type, StageEntry] = {}
+
+
 # --- entering a stage and ending the run ---------------------------------------------------
 
 
@@ -212,7 +239,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
 
     Every refusal is decided before any counter moves, so a BLOCKED run is exactly as it was."""
     stage = wf.stages[name]
-    if not isinstance(stage, _SUPPORTED):
+    entry = STAGE_ENTRY.get(type(stage))
+    if entry is None and not isinstance(stage, _SUPPORTED):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
         return _block(rs, "loop_exhausted")
@@ -223,6 +251,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
                     flagged=stage.result == "done_with_incident")  # fmt: skip
     if rs.steps >= wf.limits.max_steps_per_run:
         return _block(rs, "max_steps_exceeded")
+    if entry is not None and (why := entry.refuse(rs, stage)) is not None:
+        return _block(rs, why)
     approvals: dict[str, Approval] = {}
     needed: tuple[str, ...] = ()
     if isinstance(stage, GateStage) and not _fits(stage, rs.subject):
@@ -244,6 +274,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     )
     count = rs.count(name)
     run = dataclasses.replace(rs.run, stage=name)
+    if entry is not None:
+        return entry.enter(rs, run, name, stage, count)
     if isinstance(stage, GateStage):
         return _open_gate(rs, run, name, stage, count)
     if isinstance(stage, EffectStage):
@@ -517,3 +549,8 @@ def on_cancel_completed(rs: RunState, event: CancelCompleted, wf: Graph) -> Tran
     if rs.run.status is not RunStatus.CANCELLING:
         raise _out(f"cancel completed while run is {rs.run.status.value}")
     return _end(rs, wf, RunStatus.CANCELLED)
+
+
+# Last, so the wait and checks stage kinds are always entered, whichever module is imported first.
+# ``waits`` imports the names above, which exist by now.
+import sto.engine.handlers.waits  # noqa: E402,F401
