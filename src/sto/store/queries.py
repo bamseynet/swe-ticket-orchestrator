@@ -45,12 +45,12 @@ from .ports import (
     ConditionFailedError,
     Delete,
     FieldEquals,
+    IndexedStore,
     Item,
     Key,
     Op,
     Page,
     Put,
-    Store,
     TeamScope,
     encode_index_cursor,
 )
@@ -156,7 +156,7 @@ def resource_attrs(team: str, kind: str, resource_id: str) -> dict[str, str | in
 
 
 def open_gates(
-    store: Store,
+    store: IndexedStore,
     scope: TeamScope,
     role: str,
     *,
@@ -170,7 +170,7 @@ def open_gates(
 
 
 def my_approvals(
-    store: Store,
+    store: IndexedStore,
     scope: TeamScope,
     roles: Sequence[str],
     *,
@@ -216,7 +216,7 @@ def my_approvals(
 
 
 def list_runs(
-    store: Store,
+    store: IndexedStore,
     scope: TeamScope,
     status: RunStatus,
     *,
@@ -234,7 +234,7 @@ def list_runs(
     )
 
 
-def runs_for_ticket(store: Store, scope: TeamScope, source: str, ref: str) -> Page:
+def runs_for_ticket(store: IndexedStore, scope: TeamScope, source: str, ref: str) -> Page:
     """The active run(s) of a ticket: at most one, since ``start_run`` claims the ticket."""
     return store.query_index(
         scope, TICKET_LOOKUP, f"TICKET#{_part('source', source)}#{_stamp('ref', ref)}"
@@ -242,7 +242,7 @@ def runs_for_ticket(store: Store, scope: TeamScope, source: str, ref: str) -> Pa
 
 
 def runs_for_pr(
-    store: Store,
+    store: IndexedStore,
     scope: TeamScope,
     repo: str,
     number: int,
@@ -256,7 +256,7 @@ def runs_for_pr(
 
 
 def resources_of_team(
-    store: Store, team: str, *, limit: int | None = None, cursor: str | None = None
+    store: IndexedStore, team: str, *, limit: int | None = None, cursor: str | None = None
 ) -> Page:
     """The resource bindings an org admin gave one team (ORG items, so the platform scope)."""
     return store.query_index(
@@ -278,7 +278,7 @@ def release_ticket_op(source: str, ref: str, *, run_id: str) -> Delete:
 
 
 def start_run(
-    store: Store,
+    store: IndexedStore,
     scope: TeamScope,
     run_key: Key,
     run_data: dict[str, Any],

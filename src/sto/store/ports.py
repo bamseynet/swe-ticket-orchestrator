@@ -631,6 +631,28 @@ class Store(Protocol):
         throughout."""
         ...
 
+    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
+        """Apply all ``ops`` or none. Raises ``ConditionFailedError`` if any condition fails."""
+        ...
+
+    def put(
+        self,
+        scope: Scope,
+        key: Key,
+        data: Mapping[str, Any],
+        *,
+        when: Condition | None = None,
+    ) -> None: ...
+
+    def delete(self, scope: Scope, key: Key, *, when: Condition | None = None) -> None: ...
+
+
+@runtime_checkable
+class IndexedStore(Store, Protocol):
+    """A ``Store`` that also reads the promoted GSI attributes (D3-10). Memory, SQLite and
+    DynamoDB implement it; a wrapper or fake that only forwards the base calls is still a
+    ``Store``."""
+
     def query_index(
         self,
         scope: Scope,
@@ -648,18 +670,3 @@ class Store(Protocol):
         that stayed put; an item whose index key changes between pages shows up at most once at
         its new place. Never scans. On DynamoDB the read is eventually consistent."""
         ...
-
-    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
-        """Apply all ``ops`` or none. Raises ``ConditionFailedError`` if any condition fails."""
-        ...
-
-    def put(
-        self,
-        scope: Scope,
-        key: Key,
-        data: Mapping[str, Any],
-        *,
-        when: Condition | None = None,
-    ) -> None: ...
-
-    def delete(self, scope: Scope, key: Key, *, when: Condition | None = None) -> None: ...

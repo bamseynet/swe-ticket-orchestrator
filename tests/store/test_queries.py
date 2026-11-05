@@ -26,9 +26,9 @@ from sto.store.ports import (
     AUDIT,
     PLATFORM,
     Absent,
+    IndexedStore,
     Key,
     Put,
-    Store,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -41,7 +41,9 @@ def keys(page: Any) -> list[tuple[str, str]]:
     return [(i.key.pk, i.key.sk) for i in page.items]
 
 
-def walk(store: Store, scope: Any, index: str, pk: str, *, limit: int, **kw: Any) -> list[Any]:
+def walk(
+    store: IndexedStore, scope: Any, index: str, pk: str, *, limit: int, **kw: Any
+) -> list[Any]:
     """Every item of an index query, page by page."""
     out: list[Any] = []
     cursor = None
@@ -56,7 +58,7 @@ def walk(store: Store, scope: Any, index: str, pk: str, *, limit: int, **kw: Any
 
 class IndexContract:
     def test_promoted_attributes_round_trip_and_are_replaced_by_a_rewrite(
-        self, store: Store
+        self, store: IndexedStore
     ) -> None:
         store.put(A, RUN1, {"n": 1}, when=None)
         assert store.get(A, RUN1).attrs == {}  # type: ignore[union-attr]
@@ -69,13 +71,13 @@ class IndexContract:
         assert store.get(A, RUN1).attrs == {}  # type: ignore[union-attr]
         assert store.query_index(A, "gsi2", "RUNS#X").items == ()
 
-    def test_delete_removes_the_index_entry(self, store: Store) -> None:
+    def test_delete_removes_the_index_entry(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R", "gsi2sk": "t"})])
         assert len(store.query_index(A, "gsi2", "R").items) == 1
         store.delete(A, RUN1)
         assert store.query_index(A, "gsi2", "R").items == ()
 
-    def test_a_moved_entry_is_found_under_its_new_key_only(self, store: Store) -> None:
+    def test_a_moved_entry_is_found_under_its_new_key_only(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R#OLD", "gsi2sk": "t"})])
         store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R#NEW", "gsi2sk": "t"})])
         assert store.query_index(A, "gsi2", "R#OLD").items == ()
@@ -83,7 +85,7 @@ class IndexContract:
         assert item.key == RUN1
         assert item.version == 2
 
-    def test_index_order_prefix_and_direction(self, store: Store) -> None:
+    def test_index_order_prefix_and_direction(self, store: IndexedStore) -> None:
         for n, sk in enumerate(["2024-03", "2024-01", "2023-12", "2024-02"]):
             store.transact(
                 A, [Put(Key(f"RUN#{n}", "META"), {"n": n}, attrs={"gsi2pk": "R", "gsi2sk": sk})]
@@ -96,20 +98,22 @@ class IndexContract:
         assert [k[0] for k in keys(pre)] == ["RUN#1", "RUN#3", "RUN#0"]
         assert store.query_index(A, "gsi3", "R").items == ()  # another index is another index
 
-    def test_an_index_query_returns_data_version_and_attrs(self, store: Store) -> None:
+    def test_an_index_query_returns_data_version_and_attrs(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {"a": [1, {"b": 2}]}, attrs={"gsi4pk": "P", "gsi4sk": "s"})])
         (item,) = store.query_index(A, "gsi4", "P").items
         assert item.data == {"a": [1, {"b": 2}]}
         assert item.version == 1
         assert item.attrs == {"gsi4pk": "P", "gsi4sk": "s"}
 
-    def test_the_team_root_partition_can_be_indexed(self, store: Store) -> None:
+    def test_the_team_root_partition_can_be_indexed(self, store: IndexedStore) -> None:
         root = Key("TEAM", "META")
         store.transact(A, [Put(root, {}, attrs={"gsi5pk": "X", "gsi5sk": "s"})])
         (item,) = store.query_index(A, "gsi5", "X").items
         assert item.key == root
 
-    def test_teams_and_the_platform_never_see_each_others_entries(self, store: Store) -> None:
+    def test_teams_and_the_platform_never_see_each_others_entries(
+        self, store: IndexedStore
+    ) -> None:
         store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R", "gsi2sk": "t"})])
         assert store.query_index(B, "gsi2", "R").items == ()
         org = Key("ORG", "RESOURCE#repo#x")
@@ -119,7 +123,9 @@ class IndexContract:
         with pytest.raises(ValueError, match="platform"):
             store.query_index(PLATFORM, "gsi2", "R")  # team data needs a TeamScope
 
-    def test_pagination_covers_everything_once_even_when_sort_keys_tie(self, store: Store) -> None:
+    def test_pagination_covers_everything_once_even_when_sort_keys_tie(
+        self, store: IndexedStore
+    ) -> None:
         for n in range(23):
             store.transact(
                 A,
@@ -133,7 +139,7 @@ class IndexContract:
                 i.key.pk for i in walk(store, A, "gsi2", "R", limit=4, descending=desc)
             ]  # the same order every time
 
-    def test_pagination_survives_writes_between_pages(self, store: Store) -> None:
+    def test_pagination_survives_writes_between_pages(self, store: IndexedStore) -> None:
         for n in range(6):
             store.transact(
                 A,
@@ -158,7 +164,7 @@ class IndexContract:
         # shown; "RUN#0" moved past it and is shown once.
         assert got == ["RUN#2", "RUN#3", "RUN#4", "RUN#5", "RUN#new1", "RUN#0"]
 
-    def test_a_cursor_is_bound_to_its_query(self, store: Store) -> None:
+    def test_a_cursor_is_bound_to_its_query(self, store: IndexedStore) -> None:
         for n in range(3):
             store.transact(
                 A, [Put(Key(f"RUN#{n}", "META"), {}, attrs={"gsi2pk": "R", "gsi2sk": f"t{n}"})]
@@ -181,7 +187,7 @@ class IndexContract:
         with pytest.raises(ValueError, match="cursor"):
             store.query(A, "RUN#0", cursor=cursor)
 
-    def test_bad_index_arguments_are_refused(self, store: Store) -> None:
+    def test_bad_index_arguments_are_refused(self, store: IndexedStore) -> None:
         for bad in ("gsi6", "GSI1", "", "pk", "ttl"):
             with pytest.raises(ValueError, match="index"):
                 store.query_index(A, bad, "R")
@@ -191,7 +197,7 @@ class IndexContract:
             store.query_index(A, "gsi1", "R", limit=0)
 
     def test_bad_promoted_attributes_are_refused_before_anything_is_written(
-        self, store: Store
+        self, store: IndexedStore
     ) -> None:
         bad: list[dict[str, Any]] = [
             {"gsi9pk": "a", "gsi9sk": "b"},  # not an index
@@ -229,13 +235,13 @@ class IndexContract:
             )
         assert store.get(A, RUN1) is None
 
-    def test_a_ttl_is_kept_and_may_be_zero(self, store: Store) -> None:
+    def test_a_ttl_is_kept_and_may_be_zero(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {}, attrs={"ttl": 1_900_000_000})])
         assert store.get(A, RUN1).attrs == {"ttl": 1_900_000_000}  # type: ignore[union-attr]
         store.transact(A, [Put(RUN1, {}, attrs={"ttl": 0})])
         assert store.get(A, RUN1).attrs == {"ttl": 0}  # type: ignore[union-attr]
 
-    def test_a_failed_condition_changes_no_index(self, store: Store) -> None:
+    def test_a_failed_condition_changes_no_index(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {}, attrs={"gsi2pk": "R", "gsi2sk": "a"})])
         from sto.store.ports import ConditionFailedError
 
@@ -247,7 +253,7 @@ class IndexContract:
 class HelperContract:
     """``sto.store.queries`` on any store."""
 
-    def start(self, store: Store, n: int, *, source: str = "jira", ref: str = "T-1") -> None:
+    def start(self, store: IndexedStore, n: int, *, source: str = "jira", ref: str = "T-1") -> None:
         queries.start_run(
             store,
             A,
@@ -260,7 +266,7 @@ class HelperContract:
         )
 
     def test_a_second_active_run_for_a_ticket_is_refused_and_writes_nothing(
-        self, store: Store
+        self, store: IndexedStore
     ) -> None:
         self.start(store, 1)
         with pytest.raises(queries.ActiveRunExistsError) as err:
@@ -274,7 +280,9 @@ class HelperContract:
             updated_at="x", ticket=("jira", "T-1"),
         )  # fmt: skip
 
-    def test_two_threads_racing_for_one_ticket_have_exactly_one_winner(self, store: Store) -> None:
+    def test_two_threads_racing_for_one_ticket_have_exactly_one_winner(
+        self, store: IndexedStore
+    ) -> None:
         wins: list[int] = []
         refused: list[int] = []
         barrier = threading.Barrier(8)
@@ -299,7 +307,7 @@ class HelperContract:
         ]
 
     def test_releasing_the_claim_allows_a_new_run_and_only_the_owner_can_release(
-        self, store: Store
+        self, store: IndexedStore
     ) -> None:
         self.start(store, 1)
         with pytest.raises(PermanentError):
@@ -310,7 +318,7 @@ class HelperContract:
         self.start(store, 2)
 
     def test_a_terminal_run_leaves_the_ticket_index_but_stays_in_the_run_list(
-        self, store: Store
+        self, store: IndexedStore
     ) -> None:
         self.start(store, 1)
         store.transact(
@@ -329,7 +337,9 @@ class HelperContract:
         assert [i.key.pk for i in done.items] == ["RUN#1"]
         assert queries.list_runs(store, A, RunStatus.QUEUED).items == ()
 
-    def test_run_lists_are_newest_first_by_status_and_page_stably(self, store: Store) -> None:
+    def test_run_lists_are_newest_first_by_status_and_page_stably(
+        self, store: IndexedStore
+    ) -> None:
         for n in range(1, 8):
             self.start(store, n, ref=f"T-{n}")
         seen: list[str] = []
@@ -343,13 +353,13 @@ class HelperContract:
         assert seen == [f"RUN#{n}" for n in range(7, 0, -1)]
         assert queries.list_runs(store, B, RunStatus.QUEUED).items == ()
 
-    def test_pr_lookup(self, store: Store) -> None:
+    def test_pr_lookup(self, store: IndexedStore) -> None:
         store.transact(A, [Put(RUN1, {}, attrs=queries.pr_attrs("org/repo", 7, "2024-01-01"))])
         assert [i.key for i in queries.runs_for_pr(store, A, "org/repo", 7).items] == [RUN1]
         assert queries.runs_for_pr(store, A, "org/repo", 8).items == ()
         assert queries.runs_for_pr(store, B, "org/repo", 7).items == ()
 
-    def test_my_approvals_merges_roles_in_order_and_pages_stably(self, store: Store) -> None:
+    def test_my_approvals_merges_roles_in_order_and_pages_stably(self, store: IndexedStore) -> None:
         gates = [("qa", "2024-01-05"), ("dev", "2024-01-01"), ("qa", "2024-01-03"),
                  ("dev", "2024-01-04"), ("ops", "2024-01-02"), ("qa", "2024-01-06"),
                  ("dev", "2024-01-07")]  # fmt: skip
@@ -374,14 +384,14 @@ class HelperContract:
         assert queries.my_approvals(store, A, []).items == ()
         assert queries.my_approvals(store, B, ["qa"]).items == ()
 
-    def test_my_approvals_drops_a_gate_once_it_closes(self, store: Store) -> None:
+    def test_my_approvals_drops_a_gate_once_it_closes(self, store: IndexedStore) -> None:
         k = Key("RUN#1", "GATE#g#1")
         store.transact(A, [Put(k, {}, attrs=queries.gate_queue_attrs("qa", "2024-01-01"))])
         assert len(queries.my_approvals(store, A, ["qa"]).items) == 1
         store.transact(A, [Put(k, {"status": "APPROVED"})])
         assert queries.my_approvals(store, A, ["qa"]).items == ()
 
-    def test_my_approvals_rejects_a_cursor_for_other_roles(self, store: Store) -> None:
+    def test_my_approvals_rejects_a_cursor_for_other_roles(self, store: IndexedStore) -> None:
         for n in range(3):
             store.transact(
                 A,
@@ -400,7 +410,7 @@ class HelperContract:
         with pytest.raises(ValueError, match="cursor"):
             queries.my_approvals(store, A, ["qa"], limit=1, cursor="junk")
 
-    def test_resources_of_a_team(self, store: Store) -> None:
+    def test_resources_of_a_team(self, store: IndexedStore) -> None:
         for kind, rid, team in [("repo", "a", "t1"), ("jira", "P", "t1"), ("repo", "b", "t2")]:
             store.transact(
                 A,
@@ -419,7 +429,7 @@ class HelperContract:
             "RESOURCE#repo#b"
         ]
 
-    def test_key_parts_that_would_collide_are_refused(self, store: Store) -> None:
+    def test_key_parts_that_would_collide_are_refused(self, store: IndexedStore) -> None:
         with pytest.raises(ValueError, match="must"):
             queries.ticket_attrs("a#b", "c")
         with pytest.raises(ValueError, match="must"):
@@ -431,7 +441,7 @@ class HelperContract:
         with pytest.raises(ValueError, match="PR number"):
             queries.pr_attrs("r", 0, "t")
 
-    def test_ttl_helper_gives_epoch_seconds(self, store: Store) -> None:
+    def test_ttl_helper_gives_epoch_seconds(self, store: IndexedStore) -> None:
         from datetime import UTC, datetime
 
         assert queries.ttl_attrs(datetime(2030, 1, 1, tzinfo=UTC)) == {"ttl": 1893456000}
@@ -441,13 +451,13 @@ class HelperContract:
 
 class TestMemoryIndexes(IndexContract, HelperContract):
     @pytest.fixture
-    def store(self) -> Store:
+    def store(self) -> IndexedStore:
         return MemoryStore()
 
 
 class TestSqliteIndexes(IndexContract, HelperContract):
     @pytest.fixture
-    def store(self, tmp_path: Path) -> Iterator[Store]:
+    def store(self, tmp_path: Path) -> Iterator[IndexedStore]:
         s = SqliteStore(tmp_path / "s.db")
         yield s
         s.close()
@@ -455,7 +465,7 @@ class TestSqliteIndexes(IndexContract, HelperContract):
 
 class TestDynamoIndexesOnMoto(IndexContract, HelperContract):
     @pytest.fixture
-    def store(self, env: Env) -> Store:  # noqa: F811
+    def store(self, env: Env) -> IndexedStore:  # noqa: F811
         return env.store
 
 
