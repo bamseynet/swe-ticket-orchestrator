@@ -35,10 +35,12 @@ from sto.api.routers.attribution import blockers, commit_key, read_records
 from sto.config.org_policy import ORG_ADMIN
 from sto.config.schema import Floors
 from sto.domain import Gate, GateId, GateType, RunId, Subject
+from sto.gates.hooks import ReadOnly, record_with_audit
 from sto.gates.service import verify_audit_chain
 from sto.gates.sod import RunFacts, evaluate
 from sto.identity.mapping import UserIdentity
-from sto.store.ports import AUDIT
+from sto.store.memory import MemoryStore
+from sto.store.ports import AUDIT, ConditionFailedError, Key, Put, TeamScope
 
 ATTRIBUTE = ("POST", "/runs/{run_id}/commits/{sha}:attribute")
 RESOLVE = ("POST", "/runs/{run_id}/sod-terms:resolve")
@@ -547,3 +549,51 @@ def test_a_service_identity_never_attributes_even_if_it_reached_the_handler() ->
     with pytest.raises(ApiError) as e:
         _admin(request)
     assert e.value.code == "identity_required"
+
+
+# --- record_with_audit (sto.gates.hooks): the helper the routes audit through -----------------
+
+HOOK_TEAM = TeamScope("t")
+
+
+def hook_write(store: MemoryStore, run: RunId, n: int, *, action: str = "x.did") -> None:
+    ops = record_with_audit(
+        ReadOnly(store),
+        HOOK_TEAM,
+        run,
+        action=action,
+        actor="iss|admin",
+        data={"n": n, "token": "AKIAIOSFODNN7EXAMPLE"},
+        at=1_000 + n,
+        writes=[Put(Key(f"RUN#{run}", f"REC#{n}"), {"n": n})],
+    )
+    store.transact(HOOK_TEAM, ops)
+
+
+def test_record_with_audit_commits_record_and_entry_together() -> (
+    None
+):
+    store, run = MemoryStore(), RunId.new()
+    hook_write(store, run, 1)
+    hook_write(store, run, 2)
+    assert store.get(HOOK_TEAM, Key(f"RUN#{run}", "REC#2")) is not None
+    entries = [i.data for i in store.query(HOOK_TEAM, f"RUN#{run}", table=AUDIT).items]
+    assert [(e["seq"], e["action"], e["actor"], e["at"]) for e in entries] == [
+        (1, "x.did", "iss|admin", 1_001),
+        (2, "x.did", "iss|admin", 1_002),
+    ]
+    assert entries[0]["data"]["n"] == 1
+    assert "AKIA" not in str(entries)  # the writer redacts, as for every entry
+    assert verify_audit_chain(store, HOOK_TEAM, run) == 2
+
+
+def test_record_with_audit_on_a_stale_chain_head_aborts_the_whole_transaction() -> None:
+    store, run = MemoryStore(), RunId.new()
+    hook_write(store, run, 1)
+    stale = record_with_audit(
+        ReadOnly(store), HOOK_TEAM, run, action="a", actor="iss|a", data={}, at=1, writes=[]
+    )
+    hook_write(store, run, 2)  # the head moves
+    with pytest.raises(ConditionFailedError):
+        store.transact(HOOK_TEAM, stale)
+    assert verify_audit_chain(store, HOOK_TEAM, run) == 2  # nothing of the stale call landed
