@@ -1025,7 +1025,17 @@ def test_the_lease_heartbeat_has_its_own_thread_and_survives_a_first_load_error(
                 raise TransientError("store blip on the heartbeat's first load")
         return real_get(scope, key)
 
+    real_transact = w.store.transact
+    renewals: list[str] = []
+
+    def transact(scope: Scope, ops: Sequence[Op]) -> None:
+        name = threading.current_thread().name
+        if state["beat"] and name.startswith("sto-lease"):
+            renewals.append(name)
+        real_transact(scope, ops)
+
     w.store.get = get  # type: ignore[method-assign]
+    w.store.transact = transact  # type: ignore[method-assign]
     w.driver._ttl = 0.3  # noqa: SLF001 - a short lease so the beat fires within the test
     inner = w.driver._executor  # noqa: SLF001
 
@@ -1045,6 +1055,7 @@ def test_the_lease_heartbeat_has_its_own_thread_and_survives_a_first_load_error(
     rs = run(go())
     assert rs.run.status is RunStatus.WAITING_HUMAN  # the slow steps finished: no LeaseLostError
     assert seen, "the heartbeat never used its own thread"
+    assert renewals, "no lease renewal was written from the heartbeat's own thread"
     assert state["fail_once"] is False  # the first load failed and the command still finished
 
 
