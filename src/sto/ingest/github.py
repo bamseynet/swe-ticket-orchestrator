@@ -14,6 +14,10 @@
 * **Order.** Verify, then parse, then claim the delivery, then enqueue. A genuinely signed body that
   cannot be read is refused (``MalformedWebhookError``) before it claims its ID, so GitHub's
   redelivery of a fixed body is not dropped as a duplicate.
+* **Event name.** The queued ``Nudge.event`` is the ``X-GitHub-Event`` header. GitHub does not
+  sign that header, so it is an unauthenticated routing hint: a consumer may use it to pick a
+  queue or a re-read and must never act on it. ``receive`` parses by the same header, and only
+  after the signature check; a delivery with no event name is refused, never guessed.
 * **Events to changes.** ``parse_event`` turns each subscribed event into ``ExternalChange`` values
   that name WHAT changed (repo, PR, SHA, branch, check). It copies no state from the body.
 * **Connection state.** ``installation`` and ``installation_repositories`` events also produce a
@@ -530,6 +534,7 @@ class GitHubWebhooks:
             self._queue,
             self._metrics,
             clock=self._clock,
+            event_header=EVENT_HEADER,
         )
         response = ingest.handle(raw.headers, raw.body)
         if response.status == DUPLICATE:
