@@ -1638,12 +1638,11 @@ def test_a_retry_at_the_limit_that_still_fails_has_told_the_reconciler_first() -
     rig.job.sync()
     theirs = [rig.foreign(f"project = X{i}") for i in range(4)]  # five in all: the limit
     rig.bindings.bind("team-b", "OTH")
-    stub_posts(rig, refusal("The maximum number of webhooks has been reached"))
-    with pytest.raises(WebhookLimitError):
+    stub_posts(rig, refusal("Jira will not take it"))  # even our old filter, in the freed slot
+    with pytest.raises(WebhookRefusedError):
         rig.job.sync()
-    assert rig.ids() == theirs  # ours was freed for the retry, and the retry failed
+    assert rig.ids() == theirs
     assert rig.gaps == [SITE]
-    assert rig.alerts.names() == ["jira.webhook.limit"]
 
 
 # --- review pass 2: a hook a concurrent run registers -------------------------------------------
@@ -1845,3 +1844,204 @@ def test_the_iat_edge_is_90_minutes_with_literal_numbers() -> None:
         else:
             with pytest.raises(InvalidSignatureError):
                 make_verifier(None).verify(bearer_headers(claims), issue_body())
+
+
+# --- review pass 3 ---------------------------------------------------------------------------
+
+
+def refuse_filter(rig: Rig, containing: str) -> None:
+    """POSTs whose filter names ``containing`` are refused as an unknown project; others work."""
+    real = rig.api.call
+
+    def call(method: str, path: str, body: Any = None, params: Any = None) -> ApiReply:
+        if (method, path) == ("POST", "/webhook") and containing in str(body):
+            return ApiReply(200, refusal(f"The value '{containing}' does not exist for 'project'."))
+        return real(method, path, body, params)
+
+    rig.job._api = type("Refusing", (), {"call": staticmethod(call)})()
+
+
+def test_a_refusal_in_the_freed_slot_puts_the_working_hook_back() -> None:
+    """Case Z: at the limit, a bound project that no longer exists is refused. It was never the
+    limit, so our hook is registered again and the alert says refused."""
+    rig = Rig()
+    rig.job.sync()
+    (first,) = rig.ids()
+    for i in range(4):
+        rig.foreign(f"project = F{i}X")
+    rig.bindings.bind("team-b", "GONE")
+    refuse_filter(rig, "GONE")
+    with pytest.raises(WebhookRefusedError) as caught:
+        rig.job.sync()
+    assert not isinstance(caught.value, WebhookLimitError)
+    assert rig.alerts.names() == ["jira.webhook.refused"]
+    ours = rig.job._owned()
+    assert len(ours) == 1
+    assert ours != {first}  # re-registered in the slot freed, with the filter that worked
+    (back,) = (h for h in rig.listed() if h["id"] in ours)
+    assert back["jqlFilter"] == "project in (SYN)"
+    assert rig.gaps == [SITE]  # told when the working hook was deleted
+    with pytest.raises(
+        WebhookRefusedError
+    ):  # the next run finds a working hook, not a vanished one
+        rig.job.sync()
+    assert "jira.webhook.missing" not in rig.alerts.names()
+    assert len(rig.job._owned()) == 1
+
+
+def test_a_working_hook_we_cannot_describe_is_not_re_registered_from_nothing() -> None:
+    rig = Rig()
+    rig.job._restore({"id": 1, "jqlFilter": None, "events": None})  # nothing to put back
+    assert rig.ids() == []
+
+
+def test_four_foreign_hooks_and_our_expired_one_then_a_refusal_is_refused_not_the_limit() -> None:
+    rig = Rig()
+    rig.job.sync()
+    for i in range(4):
+        rig.foreign(f"project = F{i}X")
+    rig.jira.now += 31 * DAY
+    stub_posts(rig, refusal("The JQL query is invalid"))
+    before = len(rig.api.calls)
+    with pytest.raises(WebhookRefusedError) as caught:
+        rig.job.sync()
+    assert not isinstance(caught.value, WebhookLimitError)
+    assert "jira.webhook.refused" in rig.alerts.names()
+    assert "jira.webhook.limit" not in rig.alerts.names()
+    deletes = [c for c in rig.api.calls[before:] if c == ("DELETE", "/webhook")]
+    assert len(deletes) == 1  # the expired one only: no delete-and-retry
+
+
+@pytest.mark.parametrize("stamp", [float("nan"), float("inf"), -float("inf"), 10**400, -(10**400)])
+def test_an_expiry_that_is_not_a_finite_number_is_a_permanent_error(stamp: Any) -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.job._api = Mangled(rig.jira, lambda h: h.update(expirationDate=stamp))
+    with pytest.raises(PermanentError):
+        rig.job.sync()
+    assert len(rig.ids()) == 1  # and no duplicate was registered on the strength of it
+
+
+def test_a_run_that_replaced_our_hook_between_our_record_read_and_listing_is_no_gap() -> None:
+    """Case X: another run (expiry, delete, register) finishes after we read the record."""
+    rig = Rig()
+    rig.job.sync()
+    rig.jira.now += 31 * DAY
+    other = Rig.sharing(rig, {"team-a": "SYN"})
+    other.job._store = rig.store
+    real_owned = rig.job._owned
+    raced = {"done": False}
+
+    def owned_then_race() -> set[int]:
+        held = real_owned()
+        if not raced["done"]:
+            raced["done"] = True
+            other.job.sync()
+        return held
+
+    rig.job._owned = owned_then_race  # type: ignore[method-assign]
+    rig.job.sync()
+    assert rig.alerts.fired == []  # no spurious "missing"
+    assert rig.gaps == []
+    assert len(rig.ids()) == 1  # and no duplicate
+    assert set(rig.ids()) == rig.job._owned()
+
+
+def test_a_run_that_replaced_our_hook_between_listing_and_acting_is_clean() -> None:
+    """Case Y: another run rebinds, registers and deletes after we listed."""
+    rig = Rig()
+    rig.job.sync()
+    rig.jira.now += 11 * DAY
+    other = Rig.sharing(rig, {"team-a": "SYN", "team-b": "OTH"})
+    other.job._store = rig.store
+    rig.bindings.bind("team-b", "OTH")
+    real_list = rig.job._list
+    raced = {"done": False}
+
+    def list_then_race() -> list[dict[str, Any]]:
+        listed = real_list()
+        if not raced["done"]:
+            raced["done"] = True
+            other.job.sync()
+        return listed
+
+    rig.job._list = list_then_race  # type: ignore[method-assign]
+    rig.job.sync()
+    assert rig.alerts.fired == []
+    assert len(rig.ids()) == 1
+    assert set(rig.ids()) == rig.job._owned()
+
+
+def test_a_record_that_changes_on_every_read_is_a_transient_error_not_a_loop() -> None:
+    rig = Rig()
+    rig.job.sync()
+    reads = {"n": 0}
+
+    def churning() -> set[int]:
+        reads["n"] += 1
+        return {reads["n"]}
+
+    rig.job._owned = churning  # type: ignore[method-assign]
+    with pytest.raises(TransientError):
+        rig.job.sync()
+    assert reads["n"] == 4  # two reads per attempt, two attempts
+
+
+def test_a_note_another_run_wrote_while_the_callback_ran_is_not_cleared() -> None:
+    rig = Rig()
+    rig.job.sync()
+    key = Key("ORG", f"JIRAGAP#{SITE}")
+
+    def callback(site: str) -> None:
+        # while we are inside the callback another run acknowledges the note and finds a new gap
+        rig.store.delete(PLATFORM, key)
+        rig.store.put(PLATFORM, key, {"site": SITE, "token": "someone-elses"})
+
+    rig.job._on_gap = callback
+    rig.job._gap_known()
+    assert rig.job._gap_pending()
+    item = rig.store.get(PLATFORM, key)
+    assert item is not None
+    assert item.data["token"] == "someone-elses"
+
+
+def test_the_note_we_wrote_is_cleared_when_the_callback_returns() -> None:
+    rig = Rig()
+    rig.job._gap_known()
+    assert rig.gaps == [SITE]
+    assert not rig.job._gap_pending()
+
+
+def test_each_gap_note_has_its_own_token() -> None:
+    rig = Rig()
+    key = Key("ORG", f"JIRAGAP#{SITE}")
+    tokens = []
+
+    def down(site: str) -> None:
+        raise RuntimeError("reconciler down")
+
+    rig.job._on_gap = down
+    for _ in range(2):
+        rig.job._gap_known()
+        item = rig.store.get(PLATFORM, key)
+        assert item is not None
+        tokens.append(item.data["token"])
+        rig.store.delete(PLATFORM, key)
+    assert tokens[0] != tokens[1]
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        {"jqlFilter": None, "events": ["jira:issue_updated"]},
+        {"jqlFilter": "project = SYN", "events": None},
+        {"jqlFilter": "project = SYN", "events": [1]},
+        {"jqlFilter": 5, "events": []},
+    ],
+)
+def test_a_working_hook_with_an_unusable_description_is_not_registered_again(
+    hook: dict[str, Any],
+) -> None:
+    rig = Rig()
+    rig.job._restore({"id": 1, **hook})
+    assert rig.ids() == []

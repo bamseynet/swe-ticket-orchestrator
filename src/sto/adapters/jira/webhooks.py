@@ -25,6 +25,16 @@
 * **A gap is remembered before anything changes** (``ORG / JIRAGAP#<site>``), the reconciler is told
   at once, and the note is cleared only when its callback returns. A run that then fails (a refused
   or failed registration) cannot lose the gap; the next run tells again until it is acknowledged.
+  The note clears when the reconciler ACKNOWLEDGES (its callback returns), not when a working hook
+  is back, and only that very note (a conditional delete on its token). The reconciler may be told
+  twice in one run (an expiry and then a freed slot, say) or again on a later run; this relies on
+  its sweeps being idempotent.
+* **Refusals.** Only a refusal with no free slot is the limit. If the slot we freed for a retry is
+  refused too, it was never the limit: the filter that worked is registered again, the reconciler
+  has been told, and the error is ``WebhookRefusedError``.
+* **A consistent view.** The record is read, the listing taken, and the record read again; if it
+  changed, both are redone once (then ``TransientError``), so a concurrent run's replacement is
+  never read as a vanished hook.
 * **First versus vanished.** Our record is empty on a first registration and non-empty when Jira
   lost a hook of ours. Unbinding every team deletes our hooks and clears the record.
 """
@@ -33,16 +43,26 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import re
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from sto.domain.errors import PermanentError, TransientError
 from sto.ingest.core import Metrics
 from sto.ingest.jira import SUBSCRIBED_EVENTS
-from sto.store.ports import PLATFORM, Absent, ConditionFailedError, Key, Store, VersionIs
+from sto.store.ports import (
+    PLATFORM,
+    Absent,
+    ConditionFailedError,
+    FieldEquals,
+    Key,
+    Store,
+    VersionIs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -165,8 +185,7 @@ class SiteWebhooks:
         # The record is read BEFORE the listing: a hook a concurrent run registers meanwhile is in
         # the listing but not in our snapshot (left alone), never in our snapshot but missing from
         # the listing (which would read as vanished).
-        owned = self._owned()
-        hooks = self._list()
+        owned, hooks = self._snapshot()
         ours = [h for h in hooks if h["id"] in owned]  # never a hook someone else registered
         expired = [h for h in ours if self._expiry(h) <= now]
         live = [h for h in ours if self._expiry(h) > now]
@@ -201,16 +220,21 @@ class SiteWebhooks:
         registered = 0
         if not keep:
             created = self._try_register(jql, events)
-            at_limit = len(hooks) - len(expired) >= WEBHOOK_LIMIT
-            if isinstance(created, str) and at_limit and stale:
+            if isinstance(created, str):
+                at_limit = len(hooks) - len(expired) >= WEBHOOK_LIMIT
+                if not (at_limit and stale):
+                    self._refused(created, limit=at_limit)
                 # at the limit: free OUR OWN stale hook (never a foreign one) and try once more.
                 # Deleting the one that still works opens a gap: the reconciler hears first.
                 self._gap_known()
+                working = stale[0]
                 deleted += self._delete(stale)
                 stale = []
                 created = self._try_register(jql, events)
-            if isinstance(created, str):
-                self._refused(created, at_limit)
+                if isinstance(created, str):
+                    # a free slot and still refused: it was never the limit. Put back what worked.
+                    self._restore(working)
+                    self._refused(created, limit=False)
             registered = 1
         deleted += self._delete([*stale, *extra])
         return SyncReport(registered, refreshed, deleted, len(expired))
@@ -226,7 +250,13 @@ class SiteWebhooks:
         stamp = hook.get("expirationDate")
         if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
             raise PermanentError("jira webhook has no numeric expirationDate")
-        return float(stamp) / 1000.0
+        try:
+            seconds = float(stamp) / 1000.0
+        except OverflowError as exc:  # 10**400 is an int Python cannot make a float of
+            raise PermanentError("jira webhook expirationDate is out of range") from exc
+        if not math.isfinite(seconds):
+            raise PermanentError("jira webhook expirationDate is not a finite number")
+        return seconds
 
     def _checked(self, reply: ApiReply, what: str, *ok: int) -> Any:
         if reply.status in ok:
@@ -273,13 +303,34 @@ class SiteWebhooks:
             raise PermanentError("jira webhook registration gave neither an ID nor errors")
         return "; ".join(errors)
 
-    def _refused(self, reason: str, at_limit: bool) -> None:
+    def _restore(self, hook: dict[str, Any]) -> None:
+        """Register the filter of a hook we freed a slot from, so a refusal costs nothing."""
+        jql, events = hook.get("jqlFilter"), hook.get("events")
+        if (
+            isinstance(jql, str)
+            and isinstance(events, list)
+            and all(isinstance(e, str) for e in events)
+        ):
+            self._try_register(jql, events)
+
+    def _refused(self, reason: str, *, limit: bool) -> NoReturn:
         self._metrics.incr("webhook.register_refused", surface=self._surface)
-        name = "jira.webhook.limit" if at_limit else "jira.webhook.refused"
+        name = "jira.webhook.limit" if limit else "jira.webhook.refused"
         self._alerts.alert(
             name, f"Jira refused the webhook for site {self._site}: {reason}", site=self._site
         )
-        raise (WebhookLimitError if at_limit else WebhookRefusedError)(reason)
+        raise (WebhookLimitError if limit else WebhookRefusedError)(reason)
+
+    def _snapshot(self) -> tuple[set[int], list[dict[str, Any]]]:
+        """The record and the listing as one consistent view. The record is read BEFORE the
+        listing, and again after: if it changed, a concurrent run replaced or added hooks between
+        the two, so both are read afresh (once). A hook is never judged vanished on a stale read."""
+        for _ in range(2):
+            owned = self._owned()
+            hooks = self._list()
+            if self._owned() == owned:
+                return owned, hooks
+        raise TransientError("jira webhook record kept changing during the listing")
 
     def _delete(self, hooks: list[dict[str, Any]]) -> int:
         if not hooks:
@@ -352,18 +403,25 @@ class SiteWebhooks:
     def _gap_known(self) -> None:
         """Events may have been missed. Remember it BEFORE anything changes, so a run that then
         fails cannot lose it, and tell the reconciler now."""
+        note = {"site": self._site, "at": self._clock(), "token": uuid.uuid4().hex}
         with contextlib.suppress(ConditionFailedError):  # already pending
-            self._store.put(
-                PLATFORM, self._gap_key(), {"site": self._site, "at": self._clock()}, when=Absent()
-            )
+            self._store.put(PLATFORM, self._gap_key(), note, when=Absent())
         self._tell_reconciler()
 
     def _tell_reconciler(self) -> None:
-        """The pending gap stays until the callback returns without raising, then it is cleared."""
+        """The pending gap stays until the callback returns without raising, then it is cleared,
+        but only the very note we saw before calling: a note another run wrote (or found pending)
+        while the callback ran is left for the next run."""
+        before = self._store.get(PLATFORM, self._gap_key())
         try:
             self._on_gap(self._site)
         except Exception:
             log.exception("webhook gap callback failed", extra={"site": self._site})
             self._metrics.incr("webhook.gap_failed", surface=self._surface)
             return
-        self._store.delete(PLATFORM, self._gap_key())
+        if before is None:
+            return
+        with contextlib.suppress(ConditionFailedError):  # a newer note: not ours to clear
+            self._store.delete(
+                PLATFORM, self._gap_key(), when=FieldEquals("token", before.data.get("token"))
+            )
