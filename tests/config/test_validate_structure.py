@@ -931,6 +931,15 @@ def test_v15_auto_approve_on_pr_merge_is_refused() -> None:
     _refused(_stages(change), names="merge", says="auto_approve")
 
 
+@pytest.mark.parametrize("key", ["AUTO_APPROVE", "Auto_Approve", "auto_approve", "approve"])
+def test_v15_the_approval_hint_is_given_whatever_the_case(key: str) -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["merge"]["with"] = {key: True}
+
+    issues = _refused(_stages(change), names="merge", says=key)
+    assert any("requires_gates" in i.message for i in issues), _text(issues)
+
+
 def test_v15_a_with_value_outside_the_enum_is_refused() -> None:
     def change(s: dict[str, Any]) -> None:
         s["merge"]["with"] = {"method": "fast_forward"}
