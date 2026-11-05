@@ -84,6 +84,7 @@ class ExternalChange:
     sha: str | None = None
     branch: str | None = None
     check: str | None = None
+    installation_id: int | None = None  # set for ``INSTALLATION`` (GitHub App installation)
 
 
 @dataclass(frozen=True)
