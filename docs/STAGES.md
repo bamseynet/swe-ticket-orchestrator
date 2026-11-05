@@ -396,7 +396,7 @@ It replaces the hard-coded path, with no behaviour change to the gate suite. `wa
 #### D2-07: Publishing and pinning
 Publishing stores a flattened, immutable version with a manifest digest over workflow, profiles, effects and prompts, and a run pins that digest at start.
 Old manifests stay addressable by hash, so a changed profile cannot strand a run.
-**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too. Publish has a document size limit, because the loader has none. Publish calls V17 with the team of the scope being published to, never a team named in the file.
+**AC:** publish during a run changes nothing for that run; changing a profile's outcomes does not affect a pinned run; `TeamConfig` and `OrgPolicy` changes do apply live. The published hash covers the system prompt and outcomes too. Publish has a document size limit, because the loader has none. Publish calls V17 with the team of the scope being published to, never a team named in the file. Publish runs the structural (D2-03) and gate (D2-04) validators on the flattened result before storing it, and refuses a flatten whose template ref differs from the overlay's `extends`.
 **Deps:** D2-02, D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/publish.py`, `tests/config/test_publish.py`.
 
 #### D2-08: Subject and rounds
@@ -539,7 +539,7 @@ Custom gate roles are declared per team.
 #### D3-03: Authorization middleware
 Middleware turns a verified identity into a `TeamScope` and enforces the permission matrix from PLAN.md section 9.3. Repositories already require the scope from D1-01.
 A shared suite tries every route as every role from another team.
-**AC:** matrix tests are generated from one table; cross-team access is refused on every route; T9 covered; a new route with no declared permission fails a test. An import-boundary test fails if any module outside its own tests imports `sto/identity/fake_issuer.py`.
+**AC:** matrix tests are generated from one table; cross-team access is refused on every route; T9 covered; a new route with no declared permission fails a test. An import-boundary test fails if any module outside its own tests imports `sto/identity/fake_issuer.py`. A service identity is denied on every route unless the route declares a service permission.
 **Deps:** D3-02, D1-08. **Size:** M. **Run:** serial. **Files:** `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
 
 #### D3-04: Account linking
@@ -605,7 +605,7 @@ This is the seam that G6 tests hardest, including a decision committing before t
 #### D3-12: Cognito triggers
 An Inbound federation trigger that rewrites groups on every sign-in, a Pre authentication fallback, a pre token trigger that normalises immutable group IDs, and a configuration guide for Entra ID, Okta and a generic SAML IdP.
 Two traps need fixtures: `{}` is a no-op that keeps every attribute, so no groups needs a non-empty map with an explicit blank, and attributes left out of a non-empty map are dropped.
-**AC:** fixtures for string, list, missing and removed groups, and refresh; the no-groups case returns an explicit blank; attributes to keep are all returned; the guide lists what stays unverified until D12-10.
+**AC:** fixtures for string, list, missing and removed groups, and refresh; the no-groups case returns an explicit blank; attributes to keep are all returned; the guide lists what stays unverified until D12-10. Group IDs reach the token prefixed with their provider name, so two IdPs never share a group namespace; D3-02 maps the prefixed IDs.
 **Deps:** D3-15. **Size:** M. **Run:** parallel. **Files:** `src/sto/identity/cognito_trigger.py`, `tests/identity/test_cognito_trigger.py`, `docs/SSO.md`.
 
 #### D3-13: Moving ticket and PR
@@ -706,7 +706,7 @@ Tokens are narrowed per call, cached under an hour, never logged, and refused fo
 Generic ingest: verify on the raw body, dedupe, enqueue, respond inside the vendor's deadline.
 Consumers treat the delivery as a nudge and re-read state.
 **AC:** bad signatures get 401 with a metric; duplicates are dropped; queue failure returns an error so the vendor retries. This issue owns the `WebhookVerifier` port and the queue failure path, and the port says a delivery ID outside the signature does not stop an attacker, so a decision-shaped delivery must re-read. Header names are normalised. For a vendor with no signed timestamp the dedupe record is the only replay bound, so it does not expire; the TTL on `SEEN` applies only to vendors with signed timestamps (PLAN.md section on the data model).
-**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
+**Deps:** D3-09. **Size:** M. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`, `tests/ingest/__init__.py`.
 
 #### D4-04: GitHub webhooks
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
