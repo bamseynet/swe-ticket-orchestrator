@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from sto.domain import (
 )
 from sto.engine.commands import OpenGate
 from sto.gates.calendar import BusinessCalendar
+from sto.gates.hooks import AuditEntry, ChainedAuditWriter, Reader
 from sto.gates.service import GateClosedError, GateService, verify_audit_chain
 from sto.gates.timers import (
     FireOutcome,
@@ -40,9 +42,26 @@ from sto.gates.timers import (
     schedule_run_age,
 )
 from sto.store.memory import MemoryStore
-from sto.store.ports import Key, TeamScope
+from sto.store.ports import Key, Op, TeamScope
 
 pytestmark = pytest.mark.unit
+
+
+def audit_through_chain(
+    reader: Reader,
+    scope: TeamScope,
+    run_id: RunId,
+    action: str,
+    actor: str,
+    data: dict[str, Any],
+    at_ms: int,
+) -> Sequence[Op]:
+    return ChainedAuditWriter().ops(reader, scope, AuditEntry(run_id, action, actor, data, at_ms))
+
+
+def handler(store: MemoryStore) -> TimerHandler:
+    return TimerHandler(store, audit_ops=audit_through_chain)
+
 
 UTC = dt.UTC
 TEAM = TeamScope("t1")
@@ -221,7 +240,7 @@ class TestFiring:
     def test_a_reminder_notifies_once_however_often_it_fires(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
-        h = TimerHandler(store)
+        h = handler(store)
         t = timer(TimerKind.REMIND)
         assert h.fire(TEAM, t, T0) is FireOutcome.DONE
         assert h.fire(TEAM, t, T0 + dt.timedelta(days=3)) is FireOutcome.DUPLICATE
@@ -235,7 +254,7 @@ class TestFiring:
         t = Timer(
             TEAM.team, RUN, TimerKind.ESCALATE, T0, gate="review", round=1, escalate_to="lead"
         )
-        assert TimerHandler(store).fire(TEAM, t, T0) is FireOutcome.DONE
+        assert handler(store).fire(TEAM, t, T0) is FireOutcome.DONE
         (entry,) = outbox(store)
         assert entry["kind"] == "gate.escalation"
         assert entry["escalate_to"] == "lead"
@@ -245,7 +264,7 @@ class TestFiring:
     def test_expiry_closes_the_gate_expired_and_it_cannot_be_decided_after(self) -> None:
         store = MemoryStore()
         gate = open_gate_with_run(store)
-        assert TimerHandler(store).fire(TEAM, timer(TimerKind.EXPIRE), T0) is FireOutcome.DONE
+        assert handler(store).fire(TEAM, timer(TimerKind.EXPIRE), T0) is FireOutcome.DONE
         assert gate_status(store) is GateStatus.EXPIRED
         (entry,) = outbox(store)
         assert entry["kind"] == "gate.closed"
@@ -279,7 +298,7 @@ class TestFiring:
             subject_digest=gate.subject.digest(),
         )
         before = outbox(store)
-        h = TimerHandler(store)
+        h = handler(store)
         for kind in (TimerKind.REMIND, TimerKind.ESCALATE, TimerKind.EXPIRE):
             assert h.fire(TEAM, timer(kind), T0) is FireOutcome.NOOP
         assert gate_status(store) is GateStatus.APPROVED
@@ -288,7 +307,7 @@ class TestFiring:
     def test_an_early_timer_does_nothing(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
-        h = TimerHandler(store)
+        h = handler(store)
         assert (
             h.fire(TEAM, timer(TimerKind.EXPIRE, T0 + dt.timedelta(hours=1)), T0)
             is FireOutcome.EARLY
@@ -298,7 +317,7 @@ class TestFiring:
 
     def test_a_timer_for_a_missing_gate_or_run_is_a_noop(self) -> None:
         store = MemoryStore()
-        h = TimerHandler(store)
+        h = handler(store)
         assert h.fire(TEAM, timer(TimerKind.REMIND), T0) is FireOutcome.NOOP
         open_gate_with_run(store)
         missing = Timer(TEAM.team, RUN, TimerKind.EXPIRE, T0, gate="review", round=7)
@@ -308,7 +327,7 @@ class TestFiring:
         store = MemoryStore()
         open_gate_with_run(store)
         set_run(store, RunStatus.CLOSED)
-        assert TimerHandler(store).fire(TEAM, timer(TimerKind.EXPIRE), T0) is FireOutcome.NOOP
+        assert handler(store).fire(TEAM, timer(TimerKind.EXPIRE), T0) is FireOutcome.NOOP
         assert gate_status(store) is GateStatus.OPEN
 
     def test_a_timer_of_another_team_is_refused(self) -> None:
@@ -316,7 +335,7 @@ class TestFiring:
         open_gate_with_run(store)
         other = Timer("t2", RUN, TimerKind.EXPIRE, T0, gate="review", round=1)
         with pytest.raises(ValueError, match="team"):
-            TimerHandler(store).fire(TEAM, other, T0)
+            handler(store).fire(TEAM, other, T0)
 
     @pytest.mark.parametrize("round_", [1, 2])
     def test_only_the_timers_round_is_touched(self, round_: int) -> None:
@@ -336,7 +355,7 @@ class TestFiring:
         )
         svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 2, head_subject("2")))
         t = Timer(TEAM.team, RUN, TimerKind.EXPIRE, T0, gate="review", round=round_)
-        TimerHandler(store).fire(TEAM, t, T0)
+        handler(store).fire(TEAM, t, T0)
         assert gate_status(store, 1) is GateStatus.CHANGES_REQUESTED
         assert gate_status(store, 2) is (GateStatus.EXPIRED if round_ == 2 else GateStatus.OPEN)
 
@@ -353,7 +372,7 @@ class TestG12:
     ) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
-        h = TimerHandler(store)
+        h = handler(store)
         for off in offsets:
             for kind in order * 2:  # repeated
                 t = timer(kind, T0 + dt.timedelta(days=off if off < 0 else 0))
@@ -367,7 +386,7 @@ class TestG12:
     def test_no_firing_adds_a_decision_record(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
-        h = TimerHandler(store)
+        h = handler(store)
         for kind in self.ALL:
             h.fire(TEAM, timer(kind), T0 + dt.timedelta(days=500))
         assert list(store.query(TEAM, f"RUN#{RUN}", sk_prefix="DEC#").items) == []
@@ -387,7 +406,7 @@ class TestPause:
     def test_a_reminder_does_nothing_while_the_run_is_paused(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store, RunStatus.BLOCKED)
-        h = TimerHandler(store)
+        h = handler(store)
         for kind in (TimerKind.REMIND, TimerKind.ESCALATE, TimerKind.EXPIRE):
             assert h.fire(TEAM, timer(kind), T0 + dt.timedelta(days=9)) is FireOutcome.PAUSED
         assert gate_status(store) is GateStatus.OPEN
@@ -396,7 +415,7 @@ class TestPause:
     def test_the_same_timer_fires_once_the_run_resumes(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store, RunStatus.BLOCKED)
-        h = TimerHandler(store)
+        h = handler(store)
         t = timer(TimerKind.REMIND)
         assert h.fire(TEAM, t, T0) is FireOutcome.PAUSED
         set_run(store, RunStatus.WAITING_HUMAN)
@@ -465,7 +484,7 @@ class TestMaxRunAge:
         store = MemoryStore()
         open_gate_with_run(store, RunStatus.BLOCKED)
         t = timer(TimerKind.MAX_RUN_AGE)
-        h = TimerHandler(store)
+        h = handler(store)
         assert h.fire(TEAM, t, T0) is FireOutcome.DONE
         assert gate_status(store) is GateStatus.EXPIRED
         assert "run.max_age_exceeded" in kinds(store)
@@ -478,20 +497,20 @@ class TestMaxRunAge:
         timers = LocalTimers(cal())
         schedule_run_age(timers, TEAM.team, RUN, T0, "1d")
         (t,) = timers.due(T0 + dt.timedelta(days=1))
-        assert TimerHandler(store).fire(TEAM, t, T0 + dt.timedelta(days=1)) is FireOutcome.DONE
+        assert handler(store).fire(TEAM, t, T0 + dt.timedelta(days=1)) is FireOutcome.DONE
 
     def test_early_firing_does_nothing(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
         t = timer(TimerKind.MAX_RUN_AGE, T0 + dt.timedelta(days=5))
-        assert TimerHandler(store).fire(TEAM, t, T0) is FireOutcome.EARLY
+        assert handler(store).fire(TEAM, t, T0) is FireOutcome.EARLY
         assert gate_status(store) is GateStatus.OPEN
 
     def test_a_finished_run_ignores_it(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
         set_run(store, RunStatus.DONE)
-        assert TimerHandler(store).fire(TEAM, timer(TimerKind.MAX_RUN_AGE), T0) is FireOutcome.NOOP
+        assert handler(store).fire(TEAM, timer(TimerKind.MAX_RUN_AGE), T0) is FireOutcome.NOOP
 
 
 # --- scheduling -------------------------------------------------------------------------------

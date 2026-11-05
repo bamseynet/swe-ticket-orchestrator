@@ -21,14 +21,15 @@ from __future__ import annotations
 import datetime as dt
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from sto.config.schema import Timeouts, duration_seconds
 from sto.domain import Gate, GateStatus, Run, RunId, RunStatus, from_wire, to_wire
 from sto.gates.calendar import BusinessCalendar
-from sto.gates.hooks import AuditEntry, AuditWriter, ChainedAuditWriter, ReadOnly, run_pk
+from sto.gates.hooks import Reader, ReadOnly, run_pk
 from sto.store.ports import (
     Absent,
     Check,
@@ -208,13 +209,32 @@ def _calendar_of(timers: TimerPort) -> BusinessCalendar:
     return cal
 
 
+class AuditOps(Protocol):
+    """Builds the ops that record a timer's action in the run's audit chain.
+
+    It is injected, not imported: only the gate service and the effect executor may use the audit
+    seam (``tests/audit/test_writer_conformance.py``), so the driver passes in a function that
+    wraps its ``AuditWriter``. The ops go into the same transaction as the change they record."""
+
+    def __call__(
+        self,
+        reader: Reader,
+        scope: TeamScope,
+        run_id: RunId,
+        action: str,
+        actor: str,
+        data: dict[str, Any],
+        at_ms: int,
+    ) -> Sequence[Op]: ...
+
+
 class TimerHandler:
     """Fires one timer against the store. See the module doc for what each kind does."""
 
-    def __init__(self, store: Store, *, audit: AuditWriter | None = None) -> None:
+    def __init__(self, store: Store, *, audit_ops: AuditOps) -> None:
         self._store = store
         self._reader = ReadOnly(store)
-        self._audit: AuditWriter = audit if audit is not None else ChainedAuditWriter()
+        self._audit_ops_for = audit_ops
 
     def fire(self, scope: TeamScope, timer: Timer, now: dt.datetime) -> FireOutcome:
         if timer.team != scope.team:
@@ -349,16 +369,19 @@ class TimerHandler:
     # --- helpers ----------------------------------------------------------------------------
 
     def _audit_ops(
-        self, scope: TeamScope, timer: Timer, action: str, data: dict[str, object], now: dt.datetime
+        self, scope: TeamScope, timer: Timer, action: str, data: dict[str, Any], now: dt.datetime
     ) -> list[Op]:
-        entry = AuditEntry(
-            timer.run_id,
-            action,
-            TIMER_ACTOR,
-            {**data, "timer": timer.id},
-            int(now.timestamp() * 1000),
+        return list(
+            self._audit_ops_for(
+                self._reader,
+                scope,
+                timer.run_id,
+                action,
+                TIMER_ACTOR,
+                {**data, "timer": timer.id},
+                int(now.timestamp() * 1000),
+            )
         )
-        return list(self._audit.ops(self._reader, scope, entry))
 
     def _run(self, scope: TeamScope, run_id: RunId) -> Run | None:
         item = self._store.get(scope, Key(run_pk(run_id), "META"))
