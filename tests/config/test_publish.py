@@ -32,6 +32,7 @@ from sto.config.publish import (
     MAX_PUBLISH_BYTES,
     Pin,
     PinnedMissingError,
+    PublishedUnreadableError,
     Publisher,
     load_pinned,
     manifest_digest,
@@ -42,6 +43,7 @@ from sto.config.team_config import TEAM_ADMIN, TeamConfigStore
 from sto.config.validate_gates import check_gate_dominance
 from sto.config.validate_structure import validate_structure
 from sto.domain.errors import PermanentError
+from sto.engine.intake import OverlappingIntakeError
 from sto.store.memory import MemoryStore
 from sto.store.ports import PLATFORM, Key, Store, TeamScope
 from sto.store.sqlite import SqliteStore
@@ -673,3 +675,113 @@ def test_records_that_hash_correctly_but_no_longer_load_are_corrupt(
     store.put(PLATFORM, Key(f"MANIFEST#{digest}", "META"), man_item.data)
     with pytest.raises(publish.PinnedCorruptError, match="no longer load"):
         load_pinned(store, SCOPE, Pin(pin.team, pin.name, pin.version, digest))
+
+
+# --- V12: overlapping selectors (D2-37) ---------------------------------------------------------
+
+OTHER_NAME = "platform-other"
+
+
+def _renamed(name: str, *, label: str | None = None, issue_types: str | None = None) -> str:
+    text = OVERLAY_TEXT.replace("name: platform-kanban", f"name: {name}")
+    if label is not None:
+        text = text.replace("label: agent-ready", f"label: {label}")
+    if issue_types is not None:
+        text = text.replace("label: ", f"issue_types: {issue_types}, label: ", 1)
+    return text
+
+
+def _wf_names(store: Store, scope: TeamScope = SCOPE) -> list[str]:
+    return sorted(i.key.sk for i in store.query(scope, "TEAM", sk_prefix="WF#").items)
+
+
+def test_publish_refuses_a_selector_that_overlaps_another_published_workflow(
+    publisher: Publisher, store: Store
+) -> None:
+    _publish(publisher)
+    before = _wf_names(store)
+    with pytest.raises(OverlappingIntakeError) as err:
+        _publish(publisher, text=_renamed(OTHER_NAME))
+    assert err.value.workflows == ((SCOPE.team, "platform-kanban"),)
+    assert _wf_names(store) == before  # all-or-nothing: no version, and no manifest item stored
+    assert publisher.latest(SCOPE, OTHER_NAME) is None
+
+
+def test_a_refused_overlap_stores_no_manifest(publisher: Publisher, store: Store) -> None:
+    _publish(publisher)
+    changed = {**PROMPTS, "planner": "a different prompt"}  # a digest nothing else has stored
+    digest = _prepare(_renamed(OTHER_NAME), prompts=changed).digest
+    with pytest.raises(OverlappingIntakeError):
+        _publish(publisher, text=_renamed(OTHER_NAME), prompts=changed)
+    assert store.query(PLATFORM, f"MANIFEST#{digest}").items == ()
+
+
+def test_publish_accepts_a_selector_that_does_not_overlap(publisher: Publisher) -> None:
+    _publish(publisher)
+    other = _publish(publisher, text=_renamed(OTHER_NAME, label="agent-other"))
+    assert other.pin == publisher.latest(SCOPE, OTHER_NAME)
+
+
+def test_disjoint_issue_types_do_not_overlap_but_shared_ones_do(publisher: Publisher) -> None:
+    _publish(publisher, text=_renamed("wf-bug", issue_types="[Bug]"))
+    _publish(publisher, text=_renamed("wf-story", issue_types="[Story]"))
+    with pytest.raises(OverlappingIntakeError):
+        _publish(publisher, text=_renamed("wf-both", issue_types="[Story, Task]"))
+    with pytest.raises(OverlappingIntakeError):  # no issue types means every type
+        _publish(publisher, text=_renamed("wf-any"))
+
+
+def test_republishing_the_same_name_is_not_an_overlap_with_itself(publisher: Publisher) -> None:
+    _publish(publisher)
+    assert _publish(publisher).pin.version == 2
+
+
+def test_only_the_latest_version_of_another_workflow_counts(publisher: Publisher) -> None:
+    _publish(publisher, text=_renamed(OTHER_NAME, label="agent-old"))
+    _publish(publisher, text=_renamed(OTHER_NAME, label="agent-new"))  # v2 moves away from v1
+    _publish(publisher, text=_renamed("platform-reuses-old", label="agent-old"))
+    with pytest.raises(OverlappingIntakeError):
+        _publish(publisher, text=_renamed("platform-takes-new", label="agent-new"))
+
+
+def test_a_republish_is_compared_to_the_others_not_to_its_own_old_version(
+    publisher: Publisher,
+) -> None:
+    _publish(publisher)
+    _publish(publisher, text=_renamed("platform-b", label="agent-b"))
+    with pytest.raises(OverlappingIntakeError):  # platform-kanban still holds agent-ready
+        _publish(publisher, text=_renamed("platform-b", label="agent-ready"))
+    _publish(publisher, text=_renamed("platform-b", label="agent-c"))  # its own old label is free
+
+
+def test_another_teams_workflows_are_not_compared(publisher: Publisher, store: Store) -> None:
+    from sto.store.ports import Absent
+
+    first = _publish(publisher)
+    item = store.get(SCOPE, Key("TEAM", f"WF#{first.pin.name}#1"))
+    assert item is not None
+    # the same selector, held by another team's workflow: V12 is per team
+    store.put(TeamScope("someone-else"), Key("TEAM", "WF#theirs#1"), dict(item.data), when=Absent())
+    assert _publish(publisher).pin.version == 2
+
+
+def test_an_unreadable_published_workflow_fails_closed(publisher: Publisher, store: Store) -> None:
+    from sto.store.ports import Absent
+
+    store.put(SCOPE, Key("TEAM", "WF#broken#1"), {"name": "broken", "version": 1}, when=Absent())
+    with pytest.raises(PublishedUnreadableError, match="broken"):
+        _publish(publisher)
+    assert _wf_names(store) == ["WF#broken#1"]
+
+
+def test_a_store_failure_while_reading_other_workflows_refuses_the_publish(
+    publisher: Publisher, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(store, "query", boom)
+    with pytest.raises(RuntimeError):
+        _publish(publisher)
+    monkeypatch.undo()
+    assert _wf_names(store) == []
