@@ -78,7 +78,6 @@ def test_every_private_name_relied_on_exists_on_the_parent() -> None:
         "_field_list",
         "_add_comment",
         "_comment_body_problem",
-        "_preflight",
         "request",
         "add_status",
         "add_issue",
@@ -301,7 +300,7 @@ def test_unmodelled_agile_parameters_are_refused(jira: FakeJiraWorkflow) -> None
         (f"/board/{board}/sprint", {"bogus": 1}),
         (f"/sprint/{sprint}", {"x": 1}),
         (f"/sprint/{sprint}/issue", {"jql": "key = SYN-1"}),
-        (f"/sprint/{sprint}/issue", {"fields": "summary"}),
+        (f"/sprint/{sprint}/issue", {"validateQuery": "false"}),
         (f"/issue/{key}", {"expand": "names"}),
         (f"/issue/{key}", {"updateHistory": "true"}),
     ]

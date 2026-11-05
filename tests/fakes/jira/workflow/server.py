@@ -48,7 +48,8 @@ Unsourced departures, observed behaviour to prove in D12:
   where unfinished work goes). An issue is in at most one open sprint. The board filter is not
   modelled: any issue can go in any sprint. The sprint list has no ``total`` and is ordered closed,
   active, future, then by ID (reported by the pass-1 reviewer; the spec says nothing).
-* Registered webhook IDs count against the limit of 5 until deleted, expired or not. A second URL
+* Registered webhook IDs count against the limit of 5 until deleted, expired or not, and an
+  expired one stays for 90 days, so it pins the app's single URL for that long. A second URL
   is answered 200 with a per-webhook ``errors`` entry (the response shape is unsourced), as are the
   limit and a bad filter; a bad event name or an unknown key is a 400 (Jira may answer per
   webhook). ``fieldIdsFilter`` and ``issuePropertyKeysFilter`` are refused as not modelled.
@@ -58,8 +59,11 @@ Unsourced departures, observed behaviour to prove in D12:
   ``startAt`` and ``maxResults`` (cap 50, 100 for webhooks).
 * A query parameter that is not modelled is a 400, never ignored: on transitions everything but
   ``expand``, ``transitionId`` and ``includeUnavailableTransitions``; on the Agile operations
-  everything outside the few modelled (board ``name``, ``orderBy``, ``expand``, sprint-issue
-  ``jql``, ``fields``, ``validateQuery``, issue ``expand`` and ``updateHistory`` among them).
+  everything outside the few modelled (refused: board ``name``, ``orderBy``, ``expand``,
+  sprint-issue ``jql`` and ``validateQuery``, issue ``expand`` and ``updateHistory``).
+* ``goal: null`` and an echoed ``id`` (or ``self``) on a sprint update are refused (400). A comment
+  on a transition is accepted whether or not the transition has a screen: unsourced, and less
+  strict than Jira may be; D12 settles it.
 * An unsupported method on a known path is a 404 (Jira probably answers 405).
 * Refused as "not modelled" (400): ``historyMetadata`` and ``properties`` on Transition issue,
   comment ``visibility`` on a transition comment, PUT on a sprint, and sprint fields other than
@@ -555,8 +559,10 @@ class FakeJiraWorkflow(FakeJiraIssues):
             ((verb, value),) = operation.items()
             if verb != "add":
                 return f"Not modelled by the fake Jira: operation '{verb}' on 'comment'"
-            if not isinstance(value, dict) or self._comment_body_problem(value) is not None:
+            if not isinstance(value, dict):
                 return "Comment body is not valid!"
+            if (problem := self._comment_body_problem(value)) is not None:
+                return str(problem.body["errorMessages"][0])  # the parent's own message
             out.append(value)
         return None
 
@@ -684,6 +690,8 @@ class FakeJiraWorkflow(FakeJiraIssues):
         if unknown:
             return _not_modelled(f"{sorted(unknown)} on sprint update")
         for key, value in body.items():
+            if sprint["state"] == "closed" and key in ("startDate", "endDate"):
+                continue  # ignored on a closed sprint, so not worth validating
             if key in ("startDate", "endDate"):
                 good = _date(value)
             else:
@@ -719,24 +727,29 @@ class FakeJiraWorkflow(FakeJiraIssues):
         ]
         return shown
 
+    def _with_fields(self, issue: dict[str, Any], wanted: list[str] | None) -> dict[str, Any]:
+        issue["fields"] = self._select(issue["fields"], wanted)
+        return issue
+
     def _agile_issue(self, ref: str, *, params: Mapping[str, Any], body: Any) -> Response:
         issue = self._visible(ref)
         if issue is None:
             return _err(404, "Issue does not exist or you do not have permission to see it.")
         if (refused := self._only(params, ("fields",), "get issue")) is not None:
             return refused
-        shown = self._agile_issue_body(issue)
-        shown["fields"] = self._select(shown["fields"], self._field_list(params.get("fields")))
-        return Response(200, Headers(), shown)
+        wanted = self._field_list(params.get("fields"))
+        return Response(200, Headers(), self._with_fields(self._agile_issue_body(issue), wanted))
 
     def _sprint_issues(self, raw: str, *, params: Mapping[str, Any], body: Any) -> Response:
         sprint = self._sprint(raw)
         if sprint is None:
             return _err(404, "Sprint does not exist or you do not have permission to view it.")
-        if (refused := self._only(params, ("startAt", "maxResults"), "sprint issues")) is not None:
+        allowed = ("startAt", "maxResults", "fields")
+        if (refused := self._only(params, allowed, "sprint issues")) is not None:
             return refused
+        wanted = self._field_list(params.get("fields"))
         found = [
-            self._agile_issue_body(self._issues[k])
+            self._with_fields(self._agile_issue_body(self._issues[k]), wanted)
             for k, i in self._in_sprint.items()
             if i == sprint["id"] and self._visible(k) is not None
         ]
@@ -855,8 +868,9 @@ class FakeJiraWorkflow(FakeJiraIssues):
 
     def _ids(self, body: Mapping[str, Any]) -> list[int] | None:
         ids = body.get("webhookIds")
-        if (
-            isinstance(ids, list)
+        if (  # v3 spec: ContainerForWebhookIDs has additionalProperties false
+            set(body) == {"webhookIds"}
+            and isinstance(ids, list)
             and ids
             and all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
         ):

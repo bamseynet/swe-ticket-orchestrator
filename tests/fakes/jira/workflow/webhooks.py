@@ -23,6 +23,8 @@ Unsourced departures, to prove in D12:
 * Whether the OAuth token covers the body is unconfirmed (D6-05 must settle it). The fake's JWT
   does NOT: its claims are ``iss``, ``iat`` and ``exp`` only, and a tampered body keeps a valid
   token. A receiver must not read that token as proof of the body.
+* The 30 minute failure clock is kept per recipient URL (``deliver(..., url=)``); the unsourced
+  part is that Jira keeps it per webhook recipient and not, say, per tenant.
 * A retry resends the same bytes and the same token and signature. ``X-Atlassian-Webhook-Retry``
   counts from 1. The wait is a whole number of seconds, chosen from a seeded generator.
 * Delivery order is the order the test gives; ``unordered`` produces a seeded permutation.
@@ -56,6 +58,7 @@ RETRY_MIN, RETRY_MAX = 5 * 60, 15 * 60
 IDENT = "X-Atlassian-Webhook-Identifier"
 RETRY = "X-Atlassian-Webhook-Retry"
 SIGNATURE = "X-Hub-Signature"
+DEFAULT_URL = "https://receiver.example.test/hook"
 _TYPE_NAMES = {"jira:issue_created": "issue_created", "jira:issue_deleted": "issue_deleted"}
 
 
@@ -103,15 +106,18 @@ class FakeJiraWebhooks:
         seed: int = 7,
     ) -> None:
         self.jira, self.admin_secret, self.client_secret = jira, admin_secret, client_secret
-        self._failing_since: float | None = None
+        self._failing_since: dict[str, float] = {}  # per recipient URL
         self._rng = random.Random(seed)
         self._n = 0
 
+    def degraded_for(self, url: str = DEFAULT_URL) -> bool:
+        """No success for 30 minutes to ``url``: one attempt per webhook until one succeeds."""
+        since = self._failing_since.get(url)
+        return since is not None and self.jira.now - since >= SLOW_AFTER
+
     @property
     def degraded(self) -> bool:
-        """No success for 30 minutes: a single attempt per webhook until one succeeds."""
-        since = self._failing_since
-        return since is not None and self.jira.now - since >= SLOW_AFTER
+        return self.degraded_for(DEFAULT_URL)
 
     def _body(self, event: str, key: str, matched: list[int] | None) -> bytes:
         payload: dict[str, Any] = {
@@ -191,11 +197,14 @@ class FakeJiraWebhooks:
             mixed = mixed[1:] + mixed[:1]
         return mixed
 
-    def deliver(self, post: Callable[[RawWebhook], int], raw: RawWebhook) -> DeliveryReport:
+    def deliver(
+        self, post: Callable[[RawWebhook], int], raw: RawWebhook, url: str = DEFAULT_URL
+    ) -> DeliveryReport:
         """Send ``raw`` to ``post`` (which returns the receiver's status, or raises on a timeout
-        or dropped connection) and retry as Jira does, advancing the fake clock between attempts."""
+        or dropped connection) and retry as Jira does, advancing the fake clock between attempts.
+        ``url`` names the recipient: the 30 minute failure clock is kept per recipient."""
         attempts: list[Attempt] = []
-        allowed = 1 if self.degraded else MAX_RESENDS + 1
+        allowed = 1 if self.degraded_for(url) else MAX_RESENDS + 1
         while True:
             n = len(attempts)
             sent = raw if n == 0 else RawWebhook({**raw.headers, RETRY: str(n)}, raw.body)
@@ -205,9 +214,9 @@ class FakeJiraWebhooks:
                 status = None
             attempts.append(Attempt(self.jira.now, status))
             if status is not None and 200 <= status < 300:
-                self._failing_since = None
-            elif self._failing_since is None:
-                self._failing_since = self.jira.now
+                self._failing_since.pop(url, None)
+            else:
+                self._failing_since.setdefault(url, self.jira.now)
             done = status is not None and status not in RETRYABLE and status < 500
             if done or len(attempts) >= allowed:
                 break
