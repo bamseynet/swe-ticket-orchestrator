@@ -19,6 +19,8 @@ from sto.gates.sod import (
     Approval,
     Commit,
     Exclusion,
+    Pusher,
+    Resolution,
     RunFacts,
     SodVerdict,
     evaluate,
@@ -233,9 +235,7 @@ def test_G7_admin_who_attributed_a_commit_is_ineligible() -> None:
 
 
 def test_G7_pusher_from_a_webhook_adds_an_exclusion() -> None:
-    commit = Commit(
-        sha="d" * 40, in_receipts=True, pushers=(Exclusion(actor("bob"), source="webhook"),)
-    )
+    commit = Commit(sha="d" * 40, in_receipts=True, pushers=(Pusher(actor("bob")),))
     refused(check(facts=base_facts(commits=(commit,))), "committer")
 
 
@@ -331,7 +331,8 @@ def test_G7_unresolved_requester_only_matters_when_the_term_applies() -> None:
 
 
 def test_G7_admin_resolving_a_term_makes_that_actor_ineligible_and_lifts_the_block() -> None:
-    facts = base_facts(requester=None, resolutions={"requester": frozenset({actor("rita")})})
+    res = Resolution("requester", frozenset({actor("rita")}), resolved_by=actor("tess"))
+    facts = base_facts(requester=None, resolutions=(res,))
     assert check(user("bob"), facts=facts).allowed
     refused(check(user("rita"), facts=facts), "requester")
 
@@ -404,13 +405,24 @@ def test_T8_admin_who_self_granted_is_ineligible_for_the_affected_round(kind: st
     assert check(user("bob"), facts=facts).allowed
 
 
-def test_T8_admin_action_is_scoped_to_the_gate_and_round_it_affects() -> None:
-    action = AdminAction(actor("tess"), "mapping", gate="review_gate", round=1)
+def test_T8_self_grant_covers_its_round_and_every_later_round_of_the_gate() -> None:
+    # a gate snapshots eligibility at open, so a grant only ever helps a LATER round
+    action = AdminAction(actor("tess"), "mapping", gate="review_gate", round=2)
     facts = base_facts(admin_actions=(action,))
-    refused(check(user("tess"), facts=facts, gate=make_gate(rnd=1)), "admin_self_service")
-    assert check(user("tess"), facts=facts, gate=make_gate(rnd=2)).allowed
-    other = make_gate(GateType.QA, "qa_gate", rnd=1)
+    for rnd in (2, 3, 9):
+        refused(check(user("tess"), facts=facts, gate=make_gate(rnd=rnd)), "admin_self_service")
+    # an earlier round was already open before the action, and another gate is unaffected
+    assert check(user("tess"), facts=facts, gate=make_gate(rnd=1)).allowed
+    other = make_gate(GateType.QA, "qa_gate", rnd=3)
     assert check(user("tess", "qa"), facts=facts, gate=other).allowed
+
+
+def test_T8_eligible_roles_self_grant_covers_later_rounds_too() -> None:
+    action = AdminAction(actor("tess"), "eligible_roles", gate="review_gate", round=1)
+    refused(
+        check(user("tess"), facts=base_facts(admin_actions=(action,)), gate=make_gate(rnd=4)),
+        "admin_self_service",
+    )
 
 
 def test_T8_admin_action_not_scoped_covers_every_gate() -> None:
@@ -445,3 +457,158 @@ def test_reasons_collect_every_cause_not_just_the_first() -> None:
     )
     verdict = check(user("rita"), facts=base_facts(commits=(commit,)))
     assert {"committer", "requester"} <= set(verdict.reasons)
+
+
+def test_G7_extension_covers_exactly_its_round() -> None:
+    action = AdminAction(actor("olga"), "extend_eligibility", gate="review_gate", round=2)
+    facts = base_facts(admin_actions=(action,))
+    refused(check(user("olga"), facts=facts, gate=make_gate(rnd=2)), "admin_self_service")
+    assert check(user("olga"), facts=facts, gate=make_gate(rnd=3)).allowed
+
+
+# --- term resolution ---------------------------------------------------------------------------
+
+
+def test_G7_the_admin_who_resolves_a_term_is_ineligible() -> None:
+    res = Resolution("requester", frozenset({actor("rita")}), resolved_by=actor("tess"))
+    facts = base_facts(requester=None, resolutions=(res,))
+    refused(check(user("tess"), facts=facts), "admin_self_service")
+    assert check(user("bob"), facts=facts).allowed
+
+
+def test_G7_the_resolver_stays_ineligible_in_later_rounds() -> None:
+    res = Resolution("requester", frozenset({actor("rita")}), resolved_by=actor("tess"), round=1)
+    facts = base_facts(requester=None, resolutions=(res,))
+    refused(check(user("tess"), facts=facts, gate=make_gate(rnd=3)), "admin_self_service")
+
+
+def test_G7_a_resolution_naming_nobody_resolves_nothing() -> None:
+    res = Resolution("requester", frozenset(), resolved_by=actor("tess"))
+    facts = base_facts(requester=None, resolutions=(res,))
+    refused(check(user("bob"), facts=facts), "unresolved_term:requester")
+
+
+def test_G7_resolving_the_author_term_excludes_the_named_actor() -> None:
+    res = Resolution("author", frozenset({actor("jo")}), resolved_by=actor("tess"))
+    facts = base_facts(unresolved=frozenset({"author"}), resolutions=(res,))
+    assert check(user("bob"), facts=facts, sod=sod_not("author")).allowed
+    refused(check(user("jo"), facts=facts, sod=sod_not("author")), "author")
+
+
+# --- pushers, store-shaped records, actor format ------------------------------------------------
+
+
+def test_G7_a_pusher_exclusion_cannot_be_cleared() -> None:
+    assert not hasattr(Pusher(actor("bob")), "cleared_by")
+    with pytest.raises(TypeError):
+        Pusher(actor("bob"), cleared_by=actor("tess"))  # type: ignore[call-arg]
+    commit = Commit(sha="d" * 40, in_receipts=True, pushers=(Pusher(actor("bob")),))
+    refused(check(user("bob"), facts=base_facts(commits=(commit,))), "committer")
+
+
+def test_G7_gate_type_read_back_as_a_string_still_enforces_review_and_qa() -> None:
+    qa = make_gate(GateType.QA, "qa_gate")
+    facts = base_facts(approvals=(Approval("review_gate", "review", actor("bob")),))  # type: ignore[arg-type]
+    refused(check(user("bob", "qa"), gate=qa, facts=facts), "review_and_qa")
+
+
+def test_G7_an_unknown_approval_gate_type_is_refused() -> None:
+    with pytest.raises(ValueError, match="GateType"):
+        Approval("g", "nonsense", actor("bob"))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", ["bob", "bob@example.test", "|bob", "https://idp.test|", ""])
+def test_G7_an_actor_not_in_issuer_subject_form_is_refused(bad: str) -> None:
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Commit(sha="d" * 40, in_receipts=False, attributed_to=bad, attributed_by=actor("tess"))
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Commit(sha="d" * 40, in_receipts=False, attributed_to=actor("a"), attributed_by=bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Exclusion(bad, source="co-authored-by")
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Exclusion(actor("a"), source="co-authored-by", cleared_by=bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Pusher(bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Approval("g", GateType.REVIEW, bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        AdminAction(bad, "mapping")
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Resolution("requester", frozenset({bad}), resolved_by=actor("tess"))
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        Resolution("requester", frozenset({actor("a")}), resolved_by=bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        base_facts(requester=bad)
+    with pytest.raises(ValueError, match=r"issuer\|subject"):
+        base_facts(assignees=frozenset({bad}))
+
+
+def test_G7_a_subject_containing_a_bar_is_still_a_valid_actor() -> None:
+    assert Approval("g", GateType.REVIEW, f"{ISS}|auth0|123").actor.endswith("auth0|123")
+
+
+# --- a veto: what still applies and what does not ----------------------------------------------
+
+
+def test_G7_an_excluded_person_cannot_reject_either() -> None:
+    commit = Commit(sha="d" * 40, in_receipts=True, pushers=(Pusher(actor("bob")),))
+    facts = base_facts(commits=(commit,))
+    refused(check(user("bob"), facts=facts, negative=True), "committer")
+    refused(check(user("rita"), negative=True), "requester")
+
+
+def test_T8_a_self_granting_admin_cannot_reject_either() -> None:
+    facts = base_facts(admin_actions=(AdminAction(actor("tess"), "mapping"),))
+    refused(check(user("tess"), facts=facts, negative=True), "admin_self_service")
+    commit = Commit(
+        sha="e" * 40, in_receipts=False, attributed_to=actor("amy"), attributed_by=actor("tess")
+    )
+    refused(
+        check(user("tess"), facts=base_facts(commits=(commit,)), negative=True),
+        "admin_self_service",
+    )
+
+
+def test_G7_the_review_approver_may_reject_at_qa() -> None:
+    qa = make_gate(GateType.QA, "qa_gate")
+    facts = base_facts(approvals=(Approval("review_gate", GateType.REVIEW, actor("bob")),))
+    assert check(user("bob", "qa"), gate=qa, facts=facts, negative=True).allowed
+    refused(check(user("bob", "qa"), gate=qa, facts=facts), "review_and_qa")  # twin
+
+
+def test_G7_approver_of_applies_to_approvals_only() -> None:
+    facts = base_facts(approvals=(Approval("review_gate", GateType.REVIEW, actor("bob")),))
+    gate = make_gate(GateType.CUSTOM, "release")
+    sod = sod_not({"approver_of": "review_gate"})
+    assert check(facts=facts, gate=gate, sod=sod, negative=True).allowed
+    refused(check(facts=facts, gate=gate, sod=sod), "approver_of:review_gate")
+
+
+# --- records that must not be half-read --------------------------------------------------------
+
+
+def test_G7_a_half_attributed_commit_still_blocks() -> None:
+    only_to = Commit(sha="e" * 40, in_receipts=False, attributed_to=actor("amy"))
+    refused(check(facts=base_facts(commits=(only_to,))), f"unattributed_commit:{only_to.sha}")
+    only_by = Commit(sha="f" * 40, in_receipts=False, attributed_by=actor("tess"))
+    refused(check(facts=base_facts(commits=(only_by,))), f"unattributed_commit:{only_by.sha}")
+
+
+def test_G7_only_the_named_gate_excludes_a_prior_approver() -> None:
+    approvals = (
+        Approval("other_gate", GateType.CUSTOM, actor("bob")),
+        Approval("review_gate", GateType.REVIEW, actor("carol")),
+    )
+    facts = base_facts(approvals=approvals)
+    gate = make_gate(GateType.CUSTOM, "release")
+    sod = sod_not({"approver_of": "review_gate"})
+    assert check(user("bob"), facts=facts, gate=gate, sod=sod).allowed
+    refused(check(user("carol"), facts=facts, gate=gate, sod=sod), "approver_of:review_gate")
+
+
+def test_G7_clearing_your_own_exclusion_is_not_admin_self_service() -> None:
+    co = Exclusion(actor("bob"), source="co-authored-by", cleared_by=actor("bob"))
+    commit = Commit(sha="d" * 40, in_receipts=True, coauthors=(co,))
+    verdict = check(user("bob"), facts=base_facts(commits=(commit,)))
+    refused(verdict, "committer")
+    assert "admin_self_service" not in verdict.reasons

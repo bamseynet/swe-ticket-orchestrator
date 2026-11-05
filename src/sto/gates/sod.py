@@ -39,7 +39,10 @@ Admin self-service is closed off. An actor who changed a mapping, published ``el
 attributed a commit, cleared an exclusion or extended eligibility is ineligible for the rounds that
 action affects (``admin_self_service``). Attributing and clearing are read from the commit records;
 the other kinds arrive as :class:`AdminAction` with the gate and round they touch (``None`` for
-all). A person cannot clear their own exclusion.
+all). Because a gate snapshots eligibility when it opens, a mapping or ``eligible_roles`` change
+covers that round **and every later one**; an extension covers exactly its round. An admin who
+resolves a term (:class:`Resolution`) is ineligible the same way, and a resolution naming nobody
+resolves nothing. A person cannot clear their own exclusion.
 
 Not here: writing these records (the attribute, clear and resolve endpoints), the audit entries
 for them, and wiring ``evaluate`` into ``GateService.decide`` (D3-06 owns that path).
@@ -47,8 +50,7 @@ for them, and wiring ``evaluate`` into ``GateService.decide`` (D3-06 owns that p
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from sto.config.schema import ApproverOf, Floors, SeparationOfDuties
@@ -60,28 +62,69 @@ __all__ = [
     "Approval",
     "Commit",
     "Exclusion",
+    "Pusher",
+    "Resolution",
     "RunFacts",
     "SodVerdict",
     "evaluate",
 ]
 
 AdminKind = Literal[
-    "mapping", "eligible_roles", "attribute", "clear_exclusion", "extend_eligibility"
+    "mapping",
+    "eligible_roles",
+    "attribute",
+    "clear_exclusion",
+    "extend_eligibility",
+    "resolve_term",
 ]
+# A gate snapshots eligibility when it opens, so a self-grant only ever helps a LATER round. These
+# kinds therefore cover the named round and every later round of the gate (or of the run when no
+# gate is named). An extension is about one open round, so it covers exactly that round.
+_ONWARD: frozenset[str] = frozenset({"mapping", "eligible_roles", "resolve_term"})
+
+
+def _actor(label: str, value: object) -> str:
+    """An actor is ``issuer|subject``, as :func:`evaluate` builds it. Any other spelling (a login,
+    an email) would silently exclude nobody, so a record carrying one is refused."""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an 'issuer|subject' string")
+    issuer, bar, subject = value.partition("|")
+    if not (issuer and bar and subject):
+        raise ValueError(f"{label} {value!r} must be in 'issuer|subject' form")
+    return value
+
+
+def _opt_actor(label: str, value: object) -> str | None:
+    return None if value is None else _actor(label, value)
 
 
 @dataclass(frozen=True)
 class Exclusion:
-    """A person a trailer or webhook names. ``cleared_by`` is the admin who called it false."""
+    """A person a ``Co-authored-by`` trailer names. ``cleared_by`` is the admin who called the
+    trailer false; a person cannot clear their own, so that does not count."""
 
     actor: str
     source: str
     cleared_by: str | None = None
 
+    def __post_init__(self) -> None:
+        _actor("exclusion actor", self.actor)
+        _opt_actor("exclusion cleared_by", self.cleared_by)
+
     @property
     def active(self) -> bool:
-        # a person cannot clear their own exclusion
         return self.cleared_by is None or self.cleared_by == self.actor
+
+
+@dataclass(frozen=True)
+class Pusher:
+    """Pusher data from a webhook. It adds an exclusion and **cannot be cleared**: PLAN 9.4 lets an
+    admin clear only a false trailer."""
+
+    actor: str
+
+    def __post_init__(self) -> None:
+        _actor("pusher actor", self.actor)
 
 
 @dataclass(frozen=True)
@@ -97,7 +140,11 @@ class Commit:
     attributed_by: str | None = None
     git_author: str = ""
     coauthors: tuple[Exclusion, ...] = ()
-    pushers: tuple[Exclusion, ...] = ()
+    pushers: tuple[Pusher, ...] = ()
+
+    def __post_init__(self) -> None:
+        _opt_actor("commit attributed_to", self.attributed_to)
+        _opt_actor("commit attributed_by", self.attributed_by)
 
 
 @dataclass(frozen=True)
@@ -105,6 +152,11 @@ class Approval:
     gate_name: str
     gate_type: GateType
     actor: str
+
+    def __post_init__(self) -> None:
+        _actor("approval actor", self.actor)
+        # a plain string from a store is coerced; an unknown one raises ValueError
+        object.__setattr__(self, "gate_type", GateType(self.gate_type))
 
 
 @dataclass(frozen=True)
@@ -114,10 +166,42 @@ class AdminAction:
     gate: str | None = None
     round: int | None = None
 
+    def __post_init__(self) -> None:
+        _actor("admin action actor", self.actor)
+
     def covers(self, gate: Gate) -> bool:
-        return (self.gate is None or self.gate == gate.name) and (
-            self.round is None or self.round == gate.round
-        )
+        if self.gate is not None and self.gate != gate.name:
+            return False
+        if self.round is None:
+            return True
+        if self.kind in _ONWARD:
+            return gate.round >= self.round
+        return gate.round == self.round
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """An admin's resolution of a term that could not be resolved. It names who becomes excluded
+    (``actors``); naming nobody resolves nothing. The resolver is ineligible, as for any
+    admin self-service, for ``gate`` and ``round`` onward."""
+
+    term: Literal["requester", "author"]
+    actors: frozenset[str]
+    resolved_by: str
+    gate: str | None = None
+    round: int | None = None
+
+    def __post_init__(self) -> None:
+        _actor("resolution resolved_by", self.resolved_by)
+        for a in self.actors:
+            _actor("resolution actor", a)
+
+    @property
+    def resolves(self) -> bool:
+        return bool(self.actors)
+
+    def as_action(self) -> AdminAction:
+        return AdminAction(self.resolved_by, "resolve_term", self.gate, self.round)
 
 
 @dataclass(frozen=True)
@@ -129,8 +213,13 @@ class RunFacts:
     assignees: frozenset[str] = frozenset()  # frozen union of every assignee seen in the run
     approvals: tuple[Approval, ...] = ()
     unresolved: frozenset[str] = frozenset()
-    resolutions: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    resolutions: tuple[Resolution, ...] = ()
     admin_actions: tuple[AdminAction, ...] = ()
+
+    def __post_init__(self) -> None:
+        _opt_actor("requester", self.requester)
+        for a in self.assignees:
+            _actor("assignee", a)
 
 
 @dataclass(frozen=True)
@@ -144,9 +233,17 @@ class SodVerdict:
 
 
 def _excluded_terms(
-    actor: str, gate: Gate, sod: SeparationOfDuties | None, floors: Floors, facts: RunFacts
-) -> tuple[list[str], list[str], set[str]]:
-    """Return (exclusion reasons, blocking reasons, the terms that apply)."""
+    actor: str,
+    gate: Gate,
+    sod: SeparationOfDuties | None,
+    floors: Floors,
+    facts: RunFacts,
+    *,
+    negative: bool,
+) -> tuple[list[str], list[str]]:
+    """Return (exclusion reasons, blocking reasons).
+
+    ``approver_of`` bars *approving*, so it is skipped for a negative decision."""
     terms: set[str] = {"committer"}
     approver_of: list[str] = []
     for term in sod.not_ if sod else ():
@@ -160,8 +257,9 @@ def _excluded_terms(
     excluded: list[str] = []
     blocking: list[str] = []
     for commit in facts.commits:
-        humans = [*commit.coauthors, *commit.pushers]
-        if any(e.actor == actor and e.active for e in humans):
+        if any(e.actor == actor and e.active for e in commit.coauthors) or any(
+            p.actor == actor for p in commit.pushers
+        ):
             excluded.append("committer")
         if commit.in_receipts:
             continue
@@ -176,24 +274,30 @@ def _excluded_terms(
     for term in ("requester", "author"):
         if term not in terms:
             continue
-        if actor in facts.resolutions.get(term, frozenset()):
+        resolved = [r for r in facts.resolutions if r.term == term and r.resolves]
+        if any(actor in r.actors for r in resolved):
             excluded.append(term)
         unresolved = term in facts.unresolved or (term == "requester" and facts.requester is None)
-        if unresolved and term not in facts.resolutions:
+        if unresolved and not resolved:
             blocking.append(f"unresolved_term:{term}")
-    for name in approver_of:
+    for name in () if negative else approver_of:
         if any(a.gate_name == name and a.actor == actor for a in facts.approvals):
             excluded.append(f"approver_of:{name}")
-    return excluded, blocking, terms
+    return excluded, blocking
+
+
+_PAIR = (GateType.REVIEW, GateType.QA)
 
 
 def _admin_self_service(actor: str, gate: Gate, facts: RunFacts) -> bool:
-    if any(a.actor == actor and a.covers(gate) for a in facts.admin_actions):
+    actions = [*facts.admin_actions, *(r.as_action() for r in facts.resolutions)]
+    if any(a.actor == actor and a.covers(gate) for a in actions):
         return True
     for commit in facts.commits:
         if commit.attributed_by == actor:
             return True
-        for e in (*commit.coauthors, *commit.pushers):
+        for e in commit.coauthors:
+            # clearing your own exclusion is not a clearance (see Exclusion.active)
             if e.cleared_by == actor and e.cleared_by != e.actor:
                 return True
     return False
@@ -224,11 +328,12 @@ def evaluate(
     if opened_with is None or actor not in opened_with:
         reasons.append("not_eligible_at_open")
 
-    excluded, blocking, _terms = _excluded_terms(actor, gate, sod, floors, facts)
+    excluded, blocking = _excluded_terms(actor, gate, sod, floors, facts, negative=negative)
     reasons.extend(excluded)
-    if not floors.single_human_allowed and gate.type in (GateType.REVIEW, GateType.QA):
+    # the floor bars *approving* both, so a prior approver may still reject or ask for changes
+    if not negative and not floors.single_human_allowed and gate.type in _PAIR:
         other = GateType.QA if gate.type is GateType.REVIEW else GateType.REVIEW
-        if any(a.actor == actor and a.gate_type is other for a in facts.approvals):
+        if any(a.actor == actor and a.gate_type == other for a in facts.approvals):
             reasons.append("review_and_qa")
     if _admin_self_service(actor, gate, facts):
         reasons.append("admin_self_service")
