@@ -103,7 +103,7 @@ def create_app(
 
     ``links`` (D3-04) mounts the account-linking routes, only when given: v0 has no vendors.
     ``session_of`` must come with it and says which SSO session a request belongs to. It is never
-    defaulted, and must not read a header the client can set: D3-27 adds a session field to
+    defaulted, and must not read a header the client can set: D3-27 (#396) adds a session field to
     ``Authorized`` for it to read, and until then the caller supplies it."""
     if (links is None) != (session_of is None):
         raise ValueError("links and session_of go together: pass both or neither")
