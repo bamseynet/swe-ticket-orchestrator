@@ -1,5 +1,10 @@
 """Jira webhook registration (D6-05, PLAN 10.4): one shared registration per Jira site, kept alive.
 
+* **Ours only.** The IDs this job registered are kept in the ``ORG / JIRAHOOK#<site>`` record. Only
+  those are refreshed, replaced or deleted; a webhook someone else registered (another install of
+  the app, or by hand) counts toward Jira's limit and is never touched. A crash between Jira's
+  answer and the record leaves one unrecorded hook: it counts toward the limit until a person
+  deletes it, and the job alerts at the limit.
 * **One per site.** Jira allows 5 webhooks per OAuth 2.0 app, per user, per tenant, so teams on a
   site never register their own. ``ProjectBindings`` says which team owns which project, and the
   site's single registration filters ``project in (...)`` over every bound project. Webhook JQL
@@ -14,14 +19,15 @@
   lost. A site that is bound but has no webhook at all is the same gap (``jira.webhook.missing``),
   except at the very first registration.
 * **No gap on change.** A changed binding registers the new filter BEFORE deleting the old one.
-* Jira is the source of truth: the job lists the registrations on each run. The only thing kept
-  is a marker that this site has been registered once, so an empty list means "vanished", not
-  "new".
+  Live hooks are refreshed first, so a hook that is about to be replaced cannot lapse meanwhile. If
+  Jira refuses the new one (the limit), our own stale hook is deleted and the registration retried
+  once.
+* **First versus vanished.** Our record is empty on a first registration and non-empty when Jira
+  lost a hook of ours. Unbinding every team deletes our hooks and clears the record.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import re
 import time
@@ -32,7 +38,7 @@ from typing import Any, Protocol
 from sto.domain.errors import PermanentError, TransientError
 from sto.ingest.core import Metrics
 from sto.ingest.jira import SUBSCRIBED_EVENTS
-from sto.store.ports import PLATFORM, Absent, ConditionFailedError, Key, Store
+from sto.store.ports import PLATFORM, Absent, ConditionFailedError, Key, Store, VersionIs
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +48,7 @@ REFRESH_WHEN_LEFT = 20 * DAY  # refresh at 10 days old, so a job that skips a fo
 WEBHOOK_LIMIT = 5  # per OAuth 2.0 app, per user, per tenant
 PAGE = 100
 MAX_PAGES = 50
+RECORD_RETRIES = 5
 
 _PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,9}", re.ASCII)
 
@@ -140,22 +147,31 @@ class SiteWebhooks:
     def sync(self) -> SyncReport:
         now = self._clock()
         hooks = self._list()
-        projects = self._bindings.projects()
-        expired = [h for h in hooks if self._expiry(h) <= now]
-        live = [h for h in hooks if self._expiry(h) > now]
+        owned = self._owned()
+        ours = [h for h in hooks if h["id"] in owned]  # never a hook someone else registered
+        expired = [h for h in ours if self._expiry(h) <= now]
+        live = [h for h in ours if self._expiry(h) > now]
         gap = False
         if expired:
-            ids = sorted(h["id"] for h in expired)
             self._metrics.incr("webhook.expired", surface=self._surface)
             self._alerts.alert(
                 "jira.webhook.expired",
                 f"Jira webhook expired on site {self._site}; the reconciler covers the gap",
                 site=self._site,
-                ids=ids,
+                ids=sorted(h["id"] for h in expired),
             )
             gap = True
+        projects = self._bindings.projects()
         if not projects:
-            return SyncReport(deleted=self._delete(hooks), expired=len(expired))
+            deleted = self._delete(ours)
+            self._disown(owned)  # nothing is ours any more: a later bind is a first registration
+            return SyncReport(deleted=deleted, expired=len(expired))
+        if owned and not ours:
+            self._missing()  # we registered one and Jira has none: events were missed
+            gap = True
+        self._disown(owned - {h["id"] for h in ours})
+        # first: a working hook must not lapse while we replace it
+        refreshed = self._refresh(live, now)
         jql = webhook_jql(projects)
         events = sorted(SUBSCRIBED_EVENTS)
         keep = [
@@ -163,21 +179,22 @@ class SiteWebhooks:
         ]
         stale = [h for h in live if h not in keep]
         extra, keep = keep[1:], keep[:1]  # one registration per site, however it got doubled
+        deleted = self._delete(expired)  # dead ones count against the limit until deleted
         registered = 0
         if not keep:
-            if not hooks and self._registered_before():
-                self._missing()  # it was there once and is gone: events were missed
-                gap = True
-            self._delete(expired)  # dead ones count against the limit until deleted
-            expired = []
-            keep = [self._register(jql, events)]
-            self._remember()
+            created = self._try_register(jql, events)
+            if isinstance(created, str) and stale:
+                # at the limit: free OUR OWN stale hook (never a foreign one) and try once more
+                deleted += self._delete(stale)
+                stale = []
+                created = self._try_register(jql, events)
+            if isinstance(created, str):
+                self._limit(created)
             registered = 1
-        deleted = self._delete([*expired, *stale, *extra])
-        refreshed = self._refresh(keep, now) if registered == 0 else 0
+        deleted += self._delete([*stale, *extra])
         if gap:
             self._tell_reconciler()
-        return SyncReport(registered, refreshed, deleted, len(hooks) - len(live))
+        return SyncReport(registered, refreshed, deleted, len(expired))
 
     # --- Jira calls -----------------------------------------------------------------------
 
@@ -187,7 +204,10 @@ class SiteWebhooks:
 
     @staticmethod
     def _expiry(hook: dict[str, Any]) -> float:
-        return float(hook["expirationDate"]) / 1000.0
+        stamp = hook.get("expirationDate")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            raise PermanentError("jira webhook has no numeric expirationDate")
+        return float(stamp) / 1000.0
 
     def _checked(self, reply: ApiReply, what: str, *ok: int) -> Any:
         if reply.status in ok:
@@ -206,34 +226,44 @@ class SiteWebhooks:
             values = body.get("values") if isinstance(body, dict) else None
             if not isinstance(values, list):
                 raise PermanentError("jira webhook list has no values")
-            out.extend(v for v in values if isinstance(v, dict))
+            for value in values:
+                ident = value.get("id") if isinstance(value, dict) else None
+                if isinstance(ident, bool) or not isinstance(ident, int):
+                    raise PermanentError("jira webhook list holds an entry with no integer id")
+                out.append(value)
             if body.get("isLast") is not False:
                 return out
         raise PermanentError("jira webhook list never ended")
 
-    def _register(self, jql: str, events: list[str]) -> dict[str, Any]:
+    def _try_register(self, jql: str, events: list[str]) -> int | str:
+        """The new webhook's ID, or Jira's reason for refusing it (the limit, usually)."""
         body = {"url": self._url, "webhooks": [{"events": events, "jqlFilter": jql}]}
         reply = self._api.call("POST", "/webhook", body)
         result = self._checked(reply, "register", 200)
         (entry,) = result["webhookRegistrationResult"]
-        if "createdWebhookId" not in entry:
-            reason = "; ".join(entry.get("errors", ["refused"]))
-            self._metrics.incr("webhook.register_refused", surface=self._surface)
-            self._alerts.alert(
-                "jira.webhook.limit",
-                f"Jira refused the webhook for site {self._site}: {reason}",
-                site=self._site,
-            )
-            raise WebhookLimitError(reason)
+        ident = entry.get("createdWebhookId")
+        if isinstance(ident, bool) or not isinstance(ident, int):
+            return "; ".join(entry.get("errors", ["refused"]))
+        self._own({ident})
         self._metrics.incr("webhook.registered", surface=self._surface)
-        # a fresh one is as good as just refreshed: it carries its full life
-        return {"id": entry["createdWebhookId"]}
+        return ident
+
+    def _limit(self, reason: str) -> None:
+        self._metrics.incr("webhook.register_refused", surface=self._surface)
+        self._alerts.alert(
+            "jira.webhook.limit",
+            f"Jira refused the webhook for site {self._site}: {reason}",
+            site=self._site,
+        )
+        raise WebhookLimitError(reason)
 
     def _delete(self, hooks: list[dict[str, Any]]) -> int:
         if not hooks:
             return 0
-        reply = self._api.call("DELETE", "/webhook", {"webhookIds": [h["id"] for h in hooks]})
+        ids = {h["id"] for h in hooks}
+        reply = self._api.call("DELETE", "/webhook", {"webhookIds": sorted(ids)})
         self._checked(reply, "delete", 200, 202)
+        self._disown(ids)
         return len(hooks)
 
     def _refresh(self, hooks: list[dict[str, Any]], now: float) -> int:
@@ -245,15 +275,42 @@ class SiteWebhooks:
         self._metrics.incr("webhook.refreshed", surface=self._surface)
         return len(due)
 
+    # --- the record of what this job registered ----------------------------------------------
+
     def _key(self) -> Key:
         return Key("ORG", f"JIRAHOOK#{self._site}")
 
-    def _registered_before(self) -> bool:
-        return self._store.get(PLATFORM, self._key()) is not None
+    def _owned(self) -> set[int]:
+        item = self._store.get(PLATFORM, self._key())
+        ids = item.data.get("ids") if item else None
+        return {i for i in ids if isinstance(i, int)} if isinstance(ids, list) else set()
 
-    def _remember(self) -> None:
-        with contextlib.suppress(ConditionFailedError):  # already marked
-            self._store.put(PLATFORM, self._key(), {"site": self._site}, when=Absent())
+    def _own(self, ids: set[int]) -> None:
+        self._change_record(lambda held: held | ids)
+
+    def _disown(self, ids: set[int]) -> None:
+        if ids:
+            self._change_record(lambda held: held - ids)
+
+    def _change_record(self, change: Callable[[set[int]], set[int]]) -> None:
+        """Compare-and-set the ID list; an empty list removes the record (so "first" is first)."""
+        for _ in range(RECORD_RETRIES):
+            item = self._store.get(PLATFORM, self._key())
+            held = {i for i in item.data.get("ids", []) if isinstance(i, int)} if item else set()
+            new = change(set(held))
+            if new == held:
+                return
+            when = Absent() if item is None else VersionIs(item.version)
+            try:
+                if new:
+                    data = {"site": self._site, "ids": sorted(new)}
+                    self._store.put(PLATFORM, self._key(), data, when=when)
+                else:
+                    self._store.delete(PLATFORM, self._key(), when=when)
+                return
+            except ConditionFailedError:
+                continue  # another run got in between our read and write: merge again
+        raise TransientError("jira webhook record kept changing")
 
     def _missing(self) -> None:
         self._alerts.alert(

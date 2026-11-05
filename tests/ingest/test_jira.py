@@ -31,6 +31,7 @@ from contract.suite import (
     Vendor,
     run_suite,
 )
+from fakes.jira.issues.server import EPOCH
 from fakes.jira.workflow import ADMIN_SECRET, CLIENT_SECRET, FakeJiraWebhooks, FakeJiraWorkflow
 from fakes.jira.workflow.webhooks import IDENT, RETRY, SIGNATURE
 from ingest.test_github import variable_time_signature_comparisons
@@ -45,6 +46,8 @@ from sto.adapters.ports import ChangeKind, MalformedWebhookError, RawWebhook, Ti
 from sto.domain.errors import PermanentError, TransientError
 from sto.ingest.core import InvalidSignatureError, Nudge
 from sto.ingest.jira import (
+    SUBSCRIBED_EVENTS,
+    TOKEN_MAX_AGE,
     JiraWebhooks,
     JiraWebhookVerifier,
     WebhookForm,
@@ -95,8 +98,12 @@ class World:
     def clock(self) -> float:
         return self.jira.now
 
-    def fresh(self, site: str = SITE, **secrets: bytes | None) -> JiraWebhooks:
-        both = {"admin_secret": ADMIN_SECRET, "client_secret": CLIENT_SECRET} | secrets
+    def fresh(self, site: str = SITE, **secrets: Any) -> JiraWebhooks:
+        both = {
+            "admin_secret": ADMIN_SECRET,
+            "client_secret": CLIENT_SECRET,
+            "app_issuer": ISSUER,
+        } | secrets
         return JiraWebhooks(
             site,
             self.store,
@@ -129,11 +136,31 @@ def b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def token(header: Mapping[str, Any], secret: bytes = CLIENT_SECRET) -> str:
+ISSUER = "synthetic-app"  # the fake sender's ``iss``
+T0 = EPOCH + 1_000.0  # "now" for verifiers built by ``make_verifier`` and tokens by ``token``
+
+
+def make_verifier(
+    admin: bytes | None = ADMIN_SECRET,
+    client: bytes | None = CLIENT_SECRET,
+    clock: Callable[[], float] | None = None,
+) -> JiraWebhookVerifier:
+    return JiraWebhookVerifier(
+        admin, client, app_issuer=ISSUER if client else None, clock=clock or (lambda: T0)
+    )
+
+
+def token(
+    header: Mapping[str, Any],
+    secret: bytes = CLIENT_SECRET,
+    claims: Mapping[str, Any] | None = None,
+) -> str:
+    """A token as the fake would make it at ``T0``, unless ``claims`` says otherwise."""
+    fresh = {"iss": ISSUER, "iat": int(T0) - 10, "exp": int(T0) + 290}
     head = b64(json.dumps(header).encode())
-    claims = b64(json.dumps({"iss": "synthetic-app"}).encode())
-    mac = hmac.new(secret, f"{head}.{claims}".encode(), hashlib.sha256).digest()
-    return f"{head}.{claims}.{b64(mac)}"
+    body = b64(json.dumps(fresh if claims is None else claims).encode())
+    mac = hmac.new(secret, f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{b64(mac)}"
 
 
 def signed_raw(body: bytes, ident: str = "i-1") -> RawWebhook:
@@ -150,7 +177,7 @@ def issue_body(key: str = "SYN-1", event: str = "jira:issue_updated", **extra: A
 
 def test_the_two_forms_and_their_delivery_ids() -> None:
     w = World()
-    verifier = JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET)
+    verifier = make_verifier(clock=w.clock)
     admin, bearer = w.hooks.admin_event(w.key), w.hooks.bearer_event(w.key)
     assert verifier.verify(headers_of(admin), admin.body) == admin.headers[IDENT]
     assert verifier.verify(headers_of(bearer), bearer.body) == bearer.headers[IDENT]
@@ -164,10 +191,12 @@ def test_an_empty_or_non_bytes_secret_is_refused_and_one_form_is_enough() -> Non
     for bad in (b"", "text", 5):
         with pytest.raises(ValueError, match="secret"):
             JiraWebhookVerifier(bad, None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="app_issuer"):
+        JiraWebhookVerifier(None, CLIENT_SECRET)
     with pytest.raises(ValueError, match="at least one"):
         JiraWebhookVerifier(None, None)
     JiraWebhookVerifier(ADMIN_SECRET, None)
-    JiraWebhookVerifier(None, CLIENT_SECRET)
+    JiraWebhookVerifier(None, CLIENT_SECRET, app_issuer=ISSUER)
 
 
 @pytest.mark.parametrize("form", ["admin", "bearer"])
@@ -175,25 +204,23 @@ def test_a_wrong_secret_is_rejected_in_either_form(form: str) -> None:
     w = World()
     raw = w.hooks.admin_event(w.key) if form == "admin" else w.hooks.bearer_event(w.key)
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(
-            headers_of(w.hooks.forged(raw)), raw.body
-        )
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers_of(w.hooks.forged(raw)), raw.body)
 
 
 def test_a_form_whose_secret_is_not_configured_is_refused() -> None:
     w = World()
     admin, bearer = w.hooks.admin_event(w.key), w.hooks.bearer_event(w.key)
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(None, CLIENT_SECRET).verify(headers_of(admin), admin.body)
+        make_verifier(None, CLIENT_SECRET).verify(headers_of(admin), admin.body)
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, None).verify(headers_of(bearer), bearer.body)
+        make_verifier(ADMIN_SECRET, None).verify(headers_of(bearer), bearer.body)
 
 
 def test_a_delivery_with_neither_credential_is_refused() -> None:
     raw = signed_raw(issue_body())
     bare = {k: v for k, v in headers_of(raw).items() if k != SIGNATURE.lower()}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(bare, raw.body)
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(bare, raw.body)
 
 
 def test_both_credentials_at_once_are_refused_not_picked_between() -> None:
@@ -201,7 +228,7 @@ def test_both_credentials_at_once_are_refused_not_picked_between() -> None:
     admin, bearer = w.hooks.admin_event(w.key), w.hooks.bearer_event(w.key)
     both = headers_of(admin) | {"authorization": bearer.headers["Authorization"]}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(both, admin.body)
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(both, admin.body)
 
 
 @pytest.mark.parametrize("method", ["sha1", "md5", "sha512", ""])
@@ -210,7 +237,7 @@ def test_only_the_sha256_method_is_accepted(method: str) -> None:
     digest = hmac.new(ADMIN_SECRET, body, hashlib.sha256).hexdigest()
     headers = {"x-atlassian-webhook-identifier": "i-1", "x-hub-signature": f"{method}={digest}"}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, body)
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, body)
 
 
 @pytest.mark.parametrize(
@@ -219,7 +246,7 @@ def test_only_the_sha256_method_is_accepted(method: str) -> None:
 def test_a_garbled_admin_signature_is_a_rejection_not_a_crash(value: str) -> None:
     headers = {"x-atlassian-webhook-identifier": "i-1", "x-hub-signature": value}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, issue_body())
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, issue_body())
 
 
 @pytest.mark.parametrize(
@@ -238,7 +265,7 @@ def test_a_garbled_admin_signature_is_a_rejection_not_a_crash(value: str) -> Non
 def test_a_garbled_bearer_token_is_a_rejection_not_a_crash(value: str) -> None:
     headers = {"x-atlassian-webhook-identifier": "i-1", "authorization": value}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, issue_body())
+        make_verifier(ADMIN_SECRET, CLIENT_SECRET).verify(headers, issue_body())
 
 
 @pytest.mark.parametrize("header", [{"alg": "none"}, {"alg": "HS512"}, {"alg": "HS256x"}, {}])
@@ -247,10 +274,10 @@ def test_a_token_whose_header_is_not_hs256_is_rejected_even_with_a_valid_mac(
 ) -> None:
     headers = {"x-atlassian-webhook-identifier": "i-1", "authorization": f"Bearer {token(header)}"}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(None, CLIENT_SECRET).verify(headers, issue_body())
+        make_verifier(None, CLIENT_SECRET).verify(headers, issue_body())
     good = {"x-atlassian-webhook-identifier": "i-1"}
     good["authorization"] = "bEaReR " + token({"alg": "HS256"})  # scheme is case-insensitive
-    assert JiraWebhookVerifier(None, CLIENT_SECRET).verify(good, issue_body()) == "i-1"
+    assert make_verifier(None, CLIENT_SECRET).verify(good, issue_body()) == "i-1"
 
 
 def test_a_token_header_that_is_not_json_is_rejected() -> None:
@@ -261,7 +288,7 @@ def test_a_token_header_that_is_not_json_is_rejected() -> None:
         "authorization": f"Bearer {head}.e30.{b64(mac)}",
     }
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(None, CLIENT_SECRET).verify(headers, issue_body())
+        make_verifier(None, CLIENT_SECRET).verify(headers, issue_body())
 
 
 @pytest.mark.parametrize("ident", ["", " ", "a b", "a#b", "a" * 129, "é", "a/b", "a:b"])
@@ -271,10 +298,10 @@ def test_a_missing_or_unsafe_identifier_is_refused_never_replaced_by_a_body_hash
     body = issue_body()
     raw = RawWebhook({IDENT: ident, SIGNATURE: sign(body)}, body)
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, None).verify(headers_of(raw), raw.body)
+        make_verifier(ADMIN_SECRET, None).verify(headers_of(raw), raw.body)
     no_id = {k: v for k, v in headers_of(raw).items() if k != IDENT.lower()}
     with pytest.raises(InvalidSignatureError):
-        JiraWebhookVerifier(ADMIN_SECRET, None).verify(no_id, raw.body)
+        make_verifier(ADMIN_SECRET, None).verify(no_id, raw.body)
 
 
 # --- the body: admin form covers it, bearer form does not (unconfirmed) ----------------------
@@ -319,7 +346,7 @@ def test_the_signature_is_checked_before_the_body_is_read(monkeypatch: pytest.Mo
 
 
 def test_there_is_no_replay_window_because_retries_come_5_to_15_minutes_apart() -> None:
-    verifier = JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET)
+    verifier = make_verifier(ADMIN_SECRET, CLIENT_SECRET)
     assert verifier.signed_timestamp is False
     assert verifier.replay_window is None
     assert not CAPABILITIES[Vendor.JIRA].signed_timestamp
@@ -683,7 +710,7 @@ def test_both_forms_compare_with_compare_digest_at_run_time(
 
     monkeypatch.setattr("sto.ingest.jira.hmac.compare_digest", spy)
     w = World()
-    verifier = JiraWebhookVerifier(ADMIN_SECRET, CLIENT_SECRET)
+    verifier = make_verifier(clock=w.clock)
     for raw in (w.hooks.admin_event(w.key), w.hooks.bearer_event(w.key)):
         seen.clear()
         verifier.verify(headers_of(raw), raw.body)
@@ -742,8 +769,10 @@ class Alerts:
 
 
 class Rig:
-    def __init__(self, projects: Mapping[str, str] | None = None) -> None:
-        self.jira = FakeJiraWorkflow()
+    def __init__(
+        self, projects: Mapping[str, str] | None = None, jira: FakeJiraWorkflow | None = None
+    ) -> None:
+        self.jira = jira or FakeJiraWorkflow()
         self.api = FakeApi(self.jira)
         self.alerts = Alerts()
         self.metrics = Metrics()
@@ -751,10 +780,11 @@ class Rig:
         self.bindings = ProjectBindings()
         for team, project in (projects or {"team-a": "SYN"}).items():
             self.bindings.bind(team, project)
+        self.store = MemoryStore()
         self.job = SiteWebhooks(
             SITE,
             URL,
-            MemoryStore(),
+            self.store,
             self.api,
             self.bindings,
             self.alerts,
@@ -762,6 +792,11 @@ class Rig:
             clock=lambda: self.jira.now,
             on_gap=self.gaps.append,
         )
+
+    @classmethod
+    def sharing(cls, other: Rig, projects: Mapping[str, str]) -> Rig:
+        """Another install of the same app, on the same Jira tenant: its own record and bindings."""
+        return cls(projects, jira=other.jira)
 
     def listed(self) -> list[dict[str, Any]]:
         return list(
@@ -772,6 +807,22 @@ class Rig:
 
     def ids(self) -> list[int]:
         return [h["id"] for h in self.listed()]
+
+    def foreign(self, jql: str = "project = X") -> int:
+        """A webhook registered by someone else (another install of the app, or by hand)."""
+        return self.register(jql, own=False)
+
+    def register(self, jql: str, own: bool = True, events: list[str] | None = None) -> int:
+        body = {
+            "url": URL,
+            "webhooks": [{"events": events or sorted(SUBSCRIBED_EVENTS), "jqlFilter": jql}],
+        }
+        reply = self.api.call("POST", "/webhook", body)
+        (entry,) = reply.body["webhookRegistrationResult"]
+        ident = int(entry["createdWebhookId"])
+        if own:
+            self.job._own({ident})
+        return ident
 
 
 def test_the_first_run_registers_one_webhook_for_the_bound_projects() -> None:
@@ -874,18 +925,11 @@ def test_the_filter_is_sorted_and_deduplicated() -> None:
 
 def test_another_registration_of_the_app_counts_against_the_limit_and_alerts() -> None:
     rig = Rig()
-    for _ in range(5):  # someone else filled the app's five slots
-        rig.api.call(
-            "POST",
-            "/webhook",
-            {
-                "url": URL,
-                "webhooks": [{"events": ["jira:issue_updated"], "jqlFilter": "project = X"}],
-            },
-        )
+    foreign = [rig.foreign(f"project = X{i}") for i in range(5)]  # someone filled the five slots
     with pytest.raises(WebhookLimitError):
         rig.job.sync()
     assert "jira.webhook.limit" in rig.alerts.names()
+    assert rig.ids() == foreign  # and not one of theirs was touched
 
 
 # --- the refresh job, on a fake clock -------------------------------------------------------------
@@ -1067,13 +1111,8 @@ def test_every_page_of_the_listing_is_read(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("sto.adapters.jira.webhooks.PAGE", 2)
     rig = Rig()
     rig.job.sync()
-    events = sorted(["jira:issue_created", "jira:issue_updated", "jira:issue_deleted"])
     for _ in range(3):  # three doubles of our own registration, beyond the first page of two
-        rig.api.call(
-            "POST",
-            "/webhook",
-            {"url": URL, "webhooks": [{"events": events, "jqlFilter": "project in (SYN)"}]},
-        )
+        rig.register("project in (SYN)")
     assert len(rig.ids()) == 4
     rig.job.sync()
     assert len(rig.ids()) == 1
@@ -1091,5 +1130,398 @@ def test_a_retryable_status_is_transient(status: int) -> None:
 def test_any_other_refusal_is_permanent(status: int) -> None:
     rig = Rig()
     rig.api.fail["GET /webhook"] = status
+    with pytest.raises(PermanentError):
+        rig.job.sync()
+
+
+# --- review pass 1: bearer claims ---------------------------------------------------------------
+
+
+def bearer_headers(claims: Mapping[str, Any] | None, ident: str = "i-1") -> dict[str, str]:
+    auth = "Bearer " + token({"alg": "HS256"}, claims=claims)
+    return {"x-atlassian-webhook-identifier": ident, "authorization": auth}
+
+
+def claims_at(**over: Any) -> dict[str, Any]:
+    return {"iss": ISSUER, "iat": int(T0) - 10, "exp": int(T0) + 290} | over
+
+
+def test_a_token_with_fresh_claims_for_our_app_is_accepted() -> None:
+    assert make_verifier(None).verify(bearer_headers(claims_at()), issue_body()) == "i-1"
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        claims_at(iss="some-other-app"),
+        {"iat": int(T0) - 10, "exp": int(T0) + 290},  # no iss
+        {"iss": ISSUER, "exp": int(T0) + 290},  # no iat
+        {"iss": ISSUER, "iat": int(T0) - 10},  # no exp
+        {},
+        claims_at(iss=7),
+        claims_at(iat="1767226600"),
+        claims_at(exp=True),
+        claims_at(iat=float("nan")),
+        claims_at(aud="elsewhere", iat=1_000_000_000, exp=1_000_000_300),  # 2001, expired
+        claims_at(iat=int(T0) - int(TOKEN_MAX_AGE) - 1, exp=int(T0) + 290),  # too old to be a retry
+        claims_at(iat=int(T0) + 301, exp=int(T0) + 900),  # from the future
+        claims_at(exp=int(T0) - 10_000),  # long expired, and before its own iat
+        claims_at(exp=int(T0) - 10),  # exp equal to iat: not after it
+        claims_at(iat=int(T0) - 2_000, exp=int(T0) - 5_000),  # exp before iat
+        claims_at(iat=int(T0) - 5_300, exp=int(T0) - 4_900),  # exp older than the retry span + skew
+    ],
+    ids=lambda c: "-".join(sorted(c)) or "empty",
+)
+def test_a_token_whose_claims_are_missing_wrong_old_or_early_is_refused(
+    claims: dict[str, Any],
+) -> None:
+    with pytest.raises(InvalidSignatureError):
+        make_verifier(None).verify(bearer_headers(claims), issue_body())
+
+
+@pytest.mark.parametrize("claims_json", [b"[]", b"7", b"not json", b'"text"'])
+def test_claims_that_are_not_an_object_are_refused(claims_json: bytes) -> None:
+    head = b64(json.dumps({"alg": "HS256"}).encode())
+    claims = b64(claims_json)
+    mac = hmac.new(CLIENT_SECRET, f"{head}.{claims}".encode(), hashlib.sha256).digest()
+    headers = {
+        "x-atlassian-webhook-identifier": "i-1",
+        "authorization": f"Bearer {head}.{claims}.{b64(mac)}",
+    }
+    with pytest.raises(InvalidSignatureError):
+        make_verifier(None).verify(headers, issue_body())
+
+
+def test_the_freshness_limits_are_inclusive() -> None:
+    oldest_iat = claims_at(iat=int(T0) - int(TOKEN_MAX_AGE), exp=int(T0) - 4_000)
+    oldest_exp = claims_at(iat=int(T0) - 5_100, exp=int(T0) - 4_800)  # retry span + skew exactly
+    earliest = claims_at(iat=int(T0) + 300, exp=int(T0) + 600)
+    for claims in (oldest_iat, oldest_exp, earliest):
+        assert make_verifier(None).verify(bearer_headers(claims), issue_body()) == "i-1"
+
+
+def test_a_captured_token_stops_working_once_it_is_older_than_the_retry_span() -> None:
+    """One leaked token no longer works forever, or on a body and identifier of the attacker's."""
+    w = World()
+    auth = w.hooks.bearer_event(w.key).headers["Authorization"]
+    evil = RawWebhook({IDENT: "attacker-1", "Authorization": auth}, issue_body("VICTIM-42"))
+    w.jira.now += TOKEN_MAX_AGE + 1
+    with pytest.raises(InvalidSignatureError):
+        w.receiver.receive(evil)
+    assert w.queue.items == []
+    # ... and so it cannot squat the identifier of the next genuine delivery either
+    nxt = w.hooks.admin_event(w.key)
+    squat = RawWebhook({IDENT: nxt.headers[IDENT], "Authorization": auth}, issue_body("J-1"))
+    with pytest.raises(InvalidSignatureError):
+        w.receiver.receive(squat)
+    assert w.receiver.receive(nxt) is not None
+
+
+def test_a_token_for_another_app_is_refused_by_the_receiver() -> None:
+    w = World()
+    other = w.fresh(app_issuer="a-different-app")
+    with pytest.raises(InvalidSignatureError):
+        other.receive(w.hooks.bearer_event(w.key))
+
+
+def test_the_cross_site_replay_is_bounded_only_by_freshness() -> None:
+    """The fake's token names no site, tenant or audience, so a FRESH token from site 1 does pass
+    at site 2 with a body of the attacker's. That is listed for D12; what is pinned here is that
+    it lapses (above), that the body is not queued, and that only the issue key leaves it."""
+    w1, w2 = World(), World("site-2")
+    auth = w1.hooks.bearer_event(w1.key).headers["Authorization"]
+    raw = RawWebhook({IDENT: "attacker-3", "Authorization": auth}, issue_body("OTHER-1"))
+    assert w2.receiver.receive(raw) is not None
+    (nudge,) = w2.queue.items
+    assert nudge.body == b""
+    assert nudge.body_omitted is True
+
+
+def test_the_slowest_retry_schedule_is_accepted_in_the_bearer_form_too() -> None:
+    """The same token and bytes come back 75 minutes later: its exp (iat + 5 min) is long past, and
+    that is a genuine retry, not an expired token."""
+    w = World()
+    raw = w.hooks.bearer_event(w.key)
+    attempts = {"n": 0}
+
+    def post(sent: RawWebhook) -> int:
+        attempts["n"] += 1
+        return 503 if attempts["n"] < 6 else w.post(sent)
+
+    w.hooks._rng.randint = lambda lo, hi: hi  # type: ignore[assignment,method-assign]
+    report = w.hooks.deliver(post, raw)
+    assert report.delivered
+    assert len(report.attempts) == 6
+    assert report.attempts[-1].at - report.attempts[0].at == 75 * 60
+    assert len(w.queue.items) == 1
+
+
+def test_a_valid_token_under_another_scheme_is_refused() -> None:
+    headers = bearer_headers(claims_at())
+    headers["authorization"] = headers["authorization"].replace("Bearer ", "Basic ")
+    with pytest.raises(InvalidSignatureError):
+        make_verifier(None).verify(headers, issue_body())
+
+
+# --- review pass 1: what the bearer form queues -------------------------------------------------
+
+
+def test_a_bearer_delivery_is_queued_without_its_body() -> None:
+    w = World()
+    raw = w.hooks.bearer_event(w.key)
+    assert w.post(raw) == 202
+    (nudge,) = w.queue.items
+    assert nudge.body_omitted is True
+    assert nudge.body == b""
+    assert nudge.body_size == len(raw.body)
+    assert nudge.reread is True
+
+
+def test_an_attacker_body_under_a_captured_bearer_token_reaches_nobody() -> None:
+    w = World()
+    auth = w.hooks.bearer_event(w.key).headers["Authorization"]
+    evil = issue_body("VICTIM-42", fields={"status": {"name": "Done"}}, approved=True)
+    assert w.receiver.receive(RawWebhook({IDENT: "attacker-4", "Authorization": auth}, evil))
+    (nudge,) = w.queue.items
+    assert evil not in (nudge.body, json.dumps(dict(nudge.headers)).encode())
+    assert b"approved" not in json.dumps(dict(nudge.headers)).encode()
+
+
+def test_an_admin_delivery_still_carries_its_body() -> None:
+    w = World()
+    raw = w.hooks.admin_event(w.key)
+    w.post(raw)
+    (nudge,) = w.queue.items
+    assert nudge.body == raw.body
+    assert nudge.body_omitted is False
+
+
+# --- review pass 1: issue keys with trailing junk -----------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["SYN-1x", "SYN-1 OR x", "SYN-1\n", "SYN-1;", " SYN-1", "SYN-1-2"])
+def test_an_issue_key_with_trailing_junk_is_refused(key: str) -> None:
+    with pytest.raises(MalformedWebhookError):
+        parse_event(issue_body(key))
+
+
+# --- review pass 1: the job touches only what it registered -------------------------------------
+
+
+def test_webhooks_someone_else_registered_are_never_deleted() -> None:
+    rig = Rig()
+    theirs = [rig.foreign(), rig.foreign("project = Y")]
+    report = rig.job.sync()
+    assert report.registered == 1
+    assert report.deleted == 0
+    assert set(theirs) <= set(rig.ids())
+    rig.bindings.bind("team-b", "OTH")
+    assert rig.job.sync().deleted == 1  # our own stale one
+    assert set(theirs) <= set(rig.ids())
+    assert len(rig.ids()) == 3
+
+
+def test_a_foreign_webhook_is_never_refreshed_replaced_or_alerted_on_either() -> None:
+    rig = Rig()
+    (theirs,) = [rig.foreign()]
+    rig.job.sync()
+    rig.jira.now += 31 * DAY  # theirs and ours both lapse
+    rig.job.sync()
+    assert theirs in rig.ids()  # an expired foreign hook is left for its owner
+    assert rig.alerts.fired[0][2]["ids"] != [theirs]
+    assert theirs not in rig.alerts.fired[0][2]["ids"]
+    assert rig.api.count("PUT", "/webhook/refresh") == 0
+
+
+def test_two_installs_sharing_an_app_do_not_delete_each_others_hooks() -> None:
+    a = Rig({"team-a": "SYN"})
+    b = Rig.sharing(a, {"team-b": "OTH"})
+    a.job.sync()
+    b.job.sync()
+    assert len(a.ids()) == 2
+    for _ in range(3):
+        a.jira.now += 12 * DAY
+        a.job.sync()
+        b.job.sync()
+    a.bindings.bind("team-c", "NEW")
+    a.job.sync()
+    assert len(a.ids()) == 2
+    assert {h["jqlFilter"] for h in a.listed()} == {"project in (NEW, SYN)", "project in (OTH)"}
+    b.bindings.unbind("team-b")
+    b.job.sync()
+    assert {h["jqlFilter"] for h in a.listed()} == {"project in (NEW, SYN)"}
+
+
+def test_the_record_lists_exactly_the_ids_this_job_registered() -> None:
+    rig = Rig()
+    theirs = rig.foreign()
+    rig.job.sync()
+    mine = {i for i in rig.ids() if i != theirs}
+    assert rig.job._owned() == mine
+    rig.job.sync()
+    assert rig.job._owned() == mine
+
+
+def test_a_doubled_registration_of_our_own_is_reduced_to_one() -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.register("project in (SYN)")  # a second of ours, as after a crashed run
+    assert len(rig.ids()) == 2
+    report = rig.job.sync()
+    assert report.deleted == 1
+    assert len(rig.ids()) == 1
+    assert len(rig.job._owned()) == 1
+
+
+def test_a_record_that_keeps_changing_is_a_transient_error() -> None:
+    from sto.store.ports import ConditionFailedError
+
+    rig = Rig()
+
+    class Racing(MemoryStore):
+        def put(self, *a: Any, **k: Any) -> Any:
+            raise ConditionFailedError([0])
+
+    rig.job._store = Racing()
+    with pytest.raises(TransientError):
+        rig.job.sync()
+
+
+# --- review pass 1: at the limit ----------------------------------------------------------------
+
+
+def test_at_the_limit_a_binding_change_frees_our_own_stale_hook_and_registers() -> None:
+    rig = Rig()
+    rig.job.sync()
+    theirs = [rig.foreign(f"project = X{i}") for i in range(4)]  # five in all: the limit
+    rig.bindings.bind("team-b", "OTH")
+    report = rig.job.sync()
+    assert report.registered == 1
+    assert report.deleted == 1
+    assert set(theirs) <= set(rig.ids())
+    assert len(rig.ids()) == 5
+    assert "jira.webhook.limit" not in rig.alerts.names()
+    assert rig.job.sync().registered == 0  # and the next day is quiet
+
+
+def test_at_the_limit_with_nothing_of_ours_to_free_it_alerts_and_changes_nothing() -> None:
+    rig = Rig()
+    theirs = [rig.foreign(f"project = X{i}") for i in range(5)]
+    for _ in range(3):
+        with pytest.raises(WebhookLimitError):
+            rig.job.sync()
+        rig.jira.now += DAY
+    assert rig.ids() == theirs
+    assert rig.alerts.names().count("jira.webhook.limit") == 3
+
+
+def test_a_stale_hook_is_refreshed_before_it_is_replaced() -> None:
+    """A working hook due for refresh is refreshed in the same run that replaces it, so a refusal
+    to register cannot leave it to lapse."""
+    rig = Rig()
+    rig.job.sync()
+    rig.jira.now += 11 * DAY
+    rig.bindings.bind("team-b", "OTH")
+    calls_before = len(rig.api.calls)
+    report = rig.job.sync()
+    assert report.refreshed == 1
+    assert report.registered == 1
+    order = [c for c in rig.api.calls[calls_before:] if c[0] != "GET"]
+    assert order[0] == ("PUT", "/webhook/refresh")
+    assert order.index(("POST", "/webhook")) < order.index(("DELETE", "/webhook"))
+
+
+def test_a_refused_registration_does_not_stop_the_refresh_of_the_working_hook() -> None:
+    rig = Rig()
+    rig.job.sync()
+    (mine,) = rig.ids()
+    for i in range(4):
+        rig.foreign(f"project = X{i}")
+    rig.jira.now += 12 * DAY
+    rig.bindings.bind("team-b", "OTH")
+    rig.api.fail["POST /webhook"] = 500  # registration keeps failing
+    with pytest.raises(TransientError):
+        rig.job.sync()
+    assert rig.jira.webhook_expiry(mine) == rig.jira.now + 30 * DAY  # refreshed all the same
+
+
+# --- review pass 1: unbinding everything --------------------------------------------------------
+
+
+def test_unbinding_every_team_and_binding_one_again_is_not_a_gap() -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.bindings.unbind("team-a")
+    rig.job.sync()
+    rig.bindings.bind("team-z", "ZZ")
+    report = rig.job.sync()
+    assert report.registered == 1
+    assert rig.alerts.fired == []
+    assert rig.gaps == []
+    assert rig.job._owned() == set(rig.ids())
+
+
+def test_unbinding_clears_the_record_even_when_jira_lost_our_hook_first() -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.jira.clear_webhooks()
+    rig.bindings.unbind("team-a")
+    rig.job.sync()
+    assert rig.job._owned() == set()
+    rig.bindings.bind("team-z", "ZZ")
+    rig.job.sync()
+    assert rig.gaps == []
+
+
+def test_a_vanished_hook_is_dropped_from_the_record() -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.jira.clear_webhooks()
+    rig.job.sync()
+    assert rig.job._owned() == set(rig.ids())
+
+
+# --- review pass 1: what Jira's listing may hold ------------------------------------------------
+
+
+class Mangled(FakeApi):
+    def __init__(self, jira: FakeJiraWorkflow, mangle: Callable[[dict[str, Any]], None]) -> None:
+        super().__init__(jira)
+        self.mangle = mangle
+
+    def call(self, method: str, path: str, body: Any = None, params: Any = None) -> ApiReply:
+        reply = super().call(method, path, body, params)
+        if (method, path) == ("GET", "/webhook"):
+            for hook in reply.body["values"]:
+                self.mangle(hook)
+        return reply
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda h: h.pop("expirationDate"),
+        lambda h: h.update(expirationDate="soon"),
+        lambda h: h.update(expirationDate=None),
+        lambda h: h.update(expirationDate=True),
+    ],
+    ids=["missing", "text", "null", "bool"],
+)
+def test_a_listing_without_a_usable_expiry_is_a_permanent_error(
+    mangle: Callable[[dict[str, Any]], None],
+) -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.api = Mangled(rig.jira, mangle)
+    rig.job._api = rig.api
+    with pytest.raises(PermanentError):
+        rig.job.sync()
+
+
+@pytest.mark.parametrize("ident", [None, "7", True, 1.5])
+def test_a_listing_with_a_hook_that_has_no_integer_id_is_a_permanent_error(ident: Any) -> None:
+    rig = Rig()
+    rig.job.sync()
+    rig.job._api = Mangled(rig.jira, lambda h: h.update(id=ident))
     with pytest.raises(PermanentError):
         rig.job.sync()

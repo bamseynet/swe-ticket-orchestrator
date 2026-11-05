@@ -7,14 +7,24 @@ Sourced to https://developer.atlassian.com/cloud/jira/platform/webhooks/ :
   in ``Authorization`` "signed with the app's client secret" (read here as an HS256 JWT).
 * **Does the token cover the body? Unconfirmed.** The page says nothing either way, and the fake
   sender's token does not. So the bearer form is read as proof of WHO sent a delivery and never of
-  WHAT it says: the receiver counts it (``webhook.body_unauthenticated``), takes only the issue key
-  from the body, and every consumer re-reads the issue. The suite's tamper test is run on the admin
-  form only. When D12 shows what Jira signs, a covering token can move up to the admin form's rule.
-* **No replay window.** Neither form signs a time, and Jira retries up to five times, 5 to 15
-  minutes apart (75 minutes in all, and a recipient that has been failing for 30 minutes gets one
-  attempt per webhook until it answers). Any window shorter than that would drop a genuine retry,
-  so there is none (``signed_timestamp`` False, ``replay_window`` None, as the suite's capability
-  table says for Jira) and the dedupe record on ``X-Atlassian-Webhook-Identifier`` never expires.
+  WHAT it says: the receiver counts it (``webhook.body_unauthenticated``), queues the nudge with
+  the body OMITTED (``UNCOVERED_BODY_LIMIT``), takes only the issue key from it, and every consumer
+  re-reads the issue. Only the admin form runs the conformance suite (its tamper tests need a body
+  the credential covers); the bearer form would need a suite change. When D12 shows what Jira
+  signs, a covering token can move up to the admin form's rule.
+* **Bearer claims.** After the MAC and ``alg`` match, the claims must carry ``iss`` equal to the
+  configured app, and numeric ``iat`` and ``exp``. ``iat`` may be at most ``TOKEN_MAX_AGE`` old
+  (the 75 minute retry span plus margin) and ``SKEW`` ahead; ``exp`` must be after ``iat`` and not
+  older than the retry span (a retry resends the same token, so an exp inside the span is genuine).
+  The token names no site, tenant or audience in the fake, so a fresh token cannot be told from one
+  site to another: that is listed for D12.
+* **No replay window on the dedupe.** Neither form signs a time the body is bound to, and Jira
+  retries up to five times, 5 to 15 minutes apart (75 minutes in all, and a recipient that has been
+  failing for 30 minutes gets one attempt per webhook until it answers). A window on the dedupe
+  record shorter than that would drop a genuine retry, so there is none (``signed_timestamp``
+  False, ``replay_window`` None, as the suite's capability table says for Jira) and the record on
+  ``X-Atlassian-Webhook-Identifier`` never expires. The bearer token's freshness is what bounds a
+  captured token.
 * **The identifier** is "unique within a tenant" and unchanged across retries. It is not covered by
   either credential, so it is a dedupe key only. The receiver is built per Jira site and its
   surface is ``jira.<site>``, so one tenant's identifiers never meet another's. A delivery without
@@ -51,6 +61,7 @@ from sto.adapters.ports import (
 from sto.domain.errors import PermanentError, TransientError
 from sto.ingest.core import (
     ACCEPTED,
+    DEFAULT_MAX_BODY_BYTES,
     DUPLICATE,
     UNAVAILABLE,
     InvalidSignatureError,
@@ -85,6 +96,13 @@ _SAFE_SITE = re.compile(r"[A-Za-z0-9_\-]{1,64}", re.ASCII)
 _ISSUE_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,9}-[1-9][0-9]{0,9}", re.ASCII)
 _SEGMENT = re.compile(r"[A-Za-z0-9_\-]+", re.ASCII)
 
+RETRY_SPAN = 75 * 60.0  # five resends, each up to 15 minutes after the last
+SKEW = 5 * 60.0
+TOKEN_MAX_AGE = RETRY_SPAN + 15 * 60.0  # the retry span plus margin: 90 minutes
+# A body no real delivery fits in: a nudge from a credential that does not cover the body queues
+# none of it (core omits any body over the limit and says so).
+UNCOVERED_BODY_LIMIT = 1
+
 
 class WebhookForm(StrEnum):
     ADMIN = "admin"
@@ -98,6 +116,13 @@ class WebhookForm(StrEnum):
 
 def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _stamp(claims: Mapping[str, Any], name: str) -> float:
+    value = claims.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        raise InvalidSignatureError(f"webhook token needs a numeric {name}")
+    return float(value)
 
 
 def _header_is_hs256(segment: str) -> bool:
@@ -117,14 +142,25 @@ class JiraWebhookVerifier:
     replay_window: float | None = None
     secret_headers: frozenset[str] = frozenset({HUB_HEADER})  # authorization: core's own list
 
-    def __init__(self, admin_secret: bytes | None, client_secret: bytes | None) -> None:
+    def __init__(
+        self,
+        admin_secret: bytes | None,
+        client_secret: bytes | None,
+        *,
+        app_issuer: str | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         for secret in (admin_secret, client_secret):
             if secret is not None and (not isinstance(secret, bytes) or not secret):
                 raise ValueError("a webhook secret must be non-empty bytes")
         if admin_secret is None and client_secret is None:
             raise ValueError("at least one of the admin secret and the client secret is required")
+        if client_secret is not None and (not isinstance(app_issuer, str) or not app_issuer):
+            raise ValueError("the OAuth form needs app_issuer, the token's iss for our app")
         self._admin = admin_secret
         self._client = client_secret
+        self._issuer = app_issuer
+        self._clock = clock
 
     def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
         self.form(headers, raw_body)
@@ -168,7 +204,27 @@ class JiraWebhookVerifier:
             raise InvalidSignatureError("webhook token mismatch")
         if not _header_is_hs256(parts[0]):
             raise InvalidSignatureError("webhook token is not HS256")
+        self._check_claims(parts[1])
         return WebhookForm.BEARER
+
+    def _check_claims(self, segment: str) -> None:
+        """Run only AFTER the MAC matched. A token that is old, for another app or missing a
+        claim is refused: one leaked token must not work forever."""
+        try:
+            padded = segment + "=" * (-len(segment) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(padded))
+        except (ValueError, binascii.Error, RecursionError) as exc:
+            raise InvalidSignatureError("webhook token claims are not JSON") from exc
+        if not isinstance(claims, dict):
+            raise InvalidSignatureError("webhook token claims are not an object")
+        if claims.get("iss") != self._issuer:
+            raise InvalidSignatureError("webhook token is for another app")
+        issued, expires = _stamp(claims, "iat"), _stamp(claims, "exp")
+        now = self._clock()
+        if now - issued > TOKEN_MAX_AGE or issued - now > SKEW:
+            raise InvalidSignatureError("webhook token was not issued recently")
+        if expires <= issued or now - expires > RETRY_SPAN + SKEW:
+            raise InvalidSignatureError("webhook token has expired")
 
     @staticmethod
     def _identifier(headers: Mapping[str, str]) -> str:
@@ -233,11 +289,14 @@ class JiraWebhooks:
         *,
         admin_secret: bytes | None = None,
         client_secret: bytes | None = None,
+        app_issuer: str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(site, str) or not _SAFE_SITE.fullmatch(site):
             raise ValueError("site must be 1 to 64 letters, digits, '_' or '-' (a cloud ID)")
-        self.verifier = JiraWebhookVerifier(admin_secret, client_secret)
+        self.verifier = JiraWebhookVerifier(
+            admin_secret, client_secret, app_issuer=app_issuer, clock=clock
+        )
         self._surface = f"{SURFACE_PREFIX}.{site}"
         self._store, self._queue, self._metrics, self._clock = store, queue, metrics, clock
 
@@ -272,6 +331,8 @@ class JiraWebhooks:
             self._queue,
             self._metrics,
             clock=self._clock,
+            # the body of a delivery whose credential does not cover it is never queued
+            max_body_bytes=DEFAULT_MAX_BODY_BYTES if form.covers_body else UNCOVERED_BODY_LIMIT,
         )
         response = ingest.handle(raw.headers, raw.body)
         if response.status == DUPLICATE:
