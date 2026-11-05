@@ -33,7 +33,7 @@ stages:
   merge: { requires_gates: [review_gate], next: { done: qa_auto } }
   qa_auto: { required: [staging-smoke], timeout: 1h }
   qa_gate:
-    gate: { eligible_roles: [qa, reviewer], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
+    gate: { eligible_roles: [qa, reviewer], quorum: [{ role: qa, count: 1 }], carry_over: none, timeouts: { remind_after: 4h, escalate_after: 1d } }
     next: { approved: release, rejected: revert_pr }
   release:
     kind: effect
