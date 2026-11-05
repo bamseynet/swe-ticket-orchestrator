@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from sto.adapters.fake.scm import FakeScm
 from sto.adapters.ports import MergeMethod, PrRef, PrSpec, RefusedError, RepoRef
+from sto.api.auth import Authorization, install_authorization
 from sto.api.routers import gates, runs
 from sto.api.routers.runs import ApiError, ErrorResponse
 from sto.api.runtime import Runtime, scm_merge_factory
@@ -82,15 +83,19 @@ def create_app(
     token: str,
     mode: str,
     services: Sequence[Service] = (),
+    authorization: Authorization | None = None,
 ) -> FastAPI:
     """The app. ``services`` are background coroutines that run while it is up (the local
-    stack's simulated merge queue)."""
-    if mode != "local":
-        raise DevAuthRefusedError(
-            f"dev auth only runs in local mode (STO_MODE=local); this is {mode!r}"
-        )
-    if not token:
-        raise DevAuthRefusedError("the dev token must not be empty")
+    stack's simulated merge queue). With ``authorization`` (D3-03) every request is authorised by
+    the middleware in ``sto.api.auth`` instead of the dev token, which is then neither checked
+    nor needed, and the mode is not restricted to local."""
+    if authorization is None:
+        if mode != "local":
+            raise DevAuthRefusedError(
+                f"dev auth only runs in local mode (STO_MODE=local); this is {mode!r}"
+            )
+        if not token:
+            raise DevAuthRefusedError("the dev token must not be empty")
 
     bearer = HTTPBearer(auto_error=False, description="The dev token (local mode only).")
 
@@ -167,13 +172,15 @@ def create_app(
             "runs_with_errors": runtime.errors(),
         }
 
-    protected = [Depends(authorize)]
+    protected = [] if authorization is not None else [Depends(authorize)]
     shared: dict[int | str, dict[str, Any]] = {
         401: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
     }
     app.include_router(runs.router, dependencies=protected, responses=shared)
     app.include_router(gates.router, dependencies=protected, responses=shared)
+    if authorization is not None:
+        install_authorization(app, authorization)
     return app
 
 
