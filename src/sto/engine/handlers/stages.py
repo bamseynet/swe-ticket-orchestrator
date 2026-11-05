@@ -11,8 +11,8 @@ instead of raising, because a refused event is dropped by the driver and the run
 * ``loop_exhausted``: the edge's named loop is at its cap (PLAN 6.2); an undeclared loop counts as
   exhausted, so a workflow the validator never saw cannot loop free.
 * ``max_steps_exceeded``: the entry would exceed ``limits.max_steps_per_run``.
-* ``stage_unsupported``: ``wait``, ``checks`` and ``route`` stages arrive in D2-13 and D2-23.
-  They are not skipped.
+* ``stage_unsupported``: ``route`` stages arrive in D2-23. They are not skipped. (``wait`` and
+  ``checks`` are D2-13: ``waits.py`` registers them in ``STAGE_ENTRY``.)
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
   ``RunState.routed_gates``, PLAN 4.3 rule 2) has no live approval.
 * ``subject_missing``: a gate or an effect with no live subject (of the right shape) to plan
@@ -47,7 +47,9 @@ is Malformed. ``workflow_version`` is the workflow's name until D2-07 pins the d
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from sto.config.schema import (
     AgentStage,
@@ -204,6 +206,20 @@ def _inc(pairs: tuple[tuple[str, int], ...], key: str) -> tuple[tuple[str, int],
 _SUPPORTED = (AgentStage, ReviewPanelStage, GateStage, EffectStage, TerminalStage)
 
 
+@dataclass(frozen=True)
+class StageEntry:
+    """How a stage kind defined in another handler module is entered (D2-13 wait and checks).
+
+    ``refuse`` runs with the other entry checks, before any counter moves, and returns a blocked
+    reason or ``None``. ``enter`` runs once the visit is counted and returns the transition."""
+
+    refuse: Callable[[RunState, Any], str | None]
+    enter: Callable[[RunState, Run, str, Any, int], Transition]
+
+
+STAGE_ENTRY: dict[type, StageEntry] = {}
+
+
 # --- entering a stage and ending the run ---------------------------------------------------
 
 
@@ -212,7 +228,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
 
     Every refusal is decided before any counter moves, so a BLOCKED run is exactly as it was."""
     stage = wf.stages[name]
-    if not isinstance(stage, _SUPPORTED):
+    entry = STAGE_ENTRY.get(type(stage))
+    if entry is None and not isinstance(stage, _SUPPORTED):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
         return _block(rs, "loop_exhausted")
@@ -223,6 +240,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
                     flagged=stage.result == "done_with_incident")  # fmt: skip
     if rs.steps >= wf.limits.max_steps_per_run:
         return _block(rs, "max_steps_exceeded")
+    if entry is not None and (why := entry.refuse(rs, stage)) is not None:
+        return _block(rs, why)
     approvals: dict[str, Approval] = {}
     needed: tuple[str, ...] = ()
     if isinstance(stage, GateStage) and not _fits(stage, rs.subject):
@@ -244,6 +263,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     )
     count = rs.count(name)
     run = dataclasses.replace(rs.run, stage=name)
+    if entry is not None:
+        return entry.enter(rs, run, name, stage, count)
     if isinstance(stage, GateStage):
         return _open_gate(rs, run, name, stage, count)
     if isinstance(stage, EffectStage):

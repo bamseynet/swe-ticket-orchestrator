@@ -1,6 +1,7 @@
 """D2-06: reducer v1 runs a validated ``Workflow`` (the D2-01 graph model) for agent,
 review_panel, gate, effect and terminal stages, with named loops, the step limit and the
-visited-gates rule. wait, checks and route are D2-13 and D2-23: entering one blocks the run.
+visited-gates rule. route is D2-23: entering one blocks the run. wait and checks are D2-13
+(tests/engine/test_waits.py).
 
 Fixtures are synthetic. The base workflow is a Kanban-shaped one (merge before QA) so that the
 incident rule has something to bite on; it is checked against the D2-03 validator below, because
@@ -953,42 +954,9 @@ def test_an_event_after_the_run_ended_is_refused() -> None:
 # --- stage kinds that come later -----------------------------------------------------------
 
 
-def test_a_wait_stage_in_a_workflow_the_validator_accepts_blocks_as_stage_unsupported() -> None:
-    def ask(d: dict[str, Any]) -> None:
-        d["stages"]["ask"] = {
-            "kind": "wait",
-            "wait_for": "human_answer",
-            "timeout": "2d",
-            "next": {"resumed": {"to": "implement", "loop": "fix"}, "timeout": "closed"},
-        }
-        d["stages"]["implement"]["next"]["blocked"] = "ask"
-
-    w = wf(ask)  # valid=True: validate_structure accepts it
-    t = next(started(w), StageReported(StepKey(RID, "implement", 1, 1), "blocked"), w)
-    assert (t.state.run.status, t.state.run.blocked_reason) == (
-        RunStatus.BLOCKED,
-        "stage_unsupported",
-    )
-    assert t.state.run.stage == "implement"
-    assert t.commands == ()
-
-
 @pytest.mark.parametrize(
     "stage",
     [
-        {
-            "kind": "wait",
-            "wait_for": "human_answer",
-            "timeout": "1d",
-            "next": {"resumed": "implement", "timeout": "closed"},
-        },
-        {
-            "kind": "checks",
-            "source": "ci",
-            "required": "team_default",
-            "timeout": "1h",
-            "next": {"green": "panel", "red": "closed"},
-        },
         {"kind": "route", "field": "risk", "next": {"default": "panel"}},
     ],
 )
