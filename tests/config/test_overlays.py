@@ -14,9 +14,9 @@ from sto.config.overlays import (
     FLOORS,
     Flattened,
     OverlayError,
-    flatten,
     merge_patch,
 )
+from sto.config.overlays import flatten as _flatten
 from sto.config.schema import (
     SchemaError,
     Workflow,
@@ -41,6 +41,11 @@ OVERLAY_TEXTS = {
     yaml.safe_load(b)["metadata"]["name"]: b for b in _BLOCKS if "kind: WorkflowOverlay" in b
 }
 TEMPLATE = load_workflow(STANDARD_TEXT)
+
+
+def flatten(template: Workflow, ov: WorkflowOverlay, **kw: Any) -> Flattened:
+    """``_flatten`` with the ref the overlay names, for tests that are not about the ref."""
+    return _flatten(template, ov, template_ref=ov.extends, **kw)
 
 
 def overlay(text: str) -> WorkflowOverlay:
@@ -313,6 +318,7 @@ def test_fail_closed_null_is_a_floor_error_not_false() -> None:
         ("fail_closed",),
         ("block_on",),
         ("gate", "quorum"),
+        ("gate", "path_owners"),
         ("gate", "eligible_roles"),
         ("gate", "decision_surfaces"),
         ("gate", "separation_of_duties"),
@@ -486,6 +492,15 @@ PREVIEW = {"kind": "effect", "effect": "env.deploy_preview", "requires_gates": [
         {"target": "eu_prod_1"},
         {"production": "yes"},
         {"nested": {"deep": ["staging", "prod"]}},
+        {"environment": "prodEnv"},
+        {"environment": "myProduction"},
+        {"environment": "prod1"},
+        {"environment": "production2"},
+        {"prodTarget": "x"},
+        {"environment": "\uff50\uff52\uff4f\uff44"},  # full-width "prod"
+        {"environment": "pr\u03bfd"},  # Greek omicron
+        {"environment": "live"},
+        {"environment": "prd"},
     ],
 )
 def test_deploy_preview_cannot_name_production(with_: dict[str, Any]) -> None:
@@ -497,7 +512,19 @@ def test_deploy_preview_cannot_name_production(with_: dict[str, Any]) -> None:
     assert "production" in text
 
 
-@pytest.mark.parametrize("value", ["preview", "staging", "reproduce", "approved", "product"])
+def test_a_template_of_another_version_is_refused() -> None:
+    ov = make({}, extends="standard@999")
+    with pytest.raises(OverlayError) as err:
+        _flatten(TEMPLATE, ov, template_ref="standard@1")
+    assert "standard@999" in issues_of(err.value)
+    assert "standard@1" in issues_of(err.value)
+    ok = _flatten(TEMPLATE, make({}), template_ref="standard@1")
+    assert ok.provenance.source(("start",)) == "standard@1"
+
+
+@pytest.mark.parametrize(
+    "value", ["preview", "staging", "reproduce", "approved", "product", "deliver", "alive"]
+)
 def test_other_words_are_not_production(value: str) -> None:
     ov = stage_patch("qa_env", {"with": {"environment": value}})
     assert flatten(TEMPLATE, ov).workflow.stages["qa_env"].kind == "effect"

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import copy
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -44,6 +45,7 @@ from pydantic import ValidationError
 from sto.config.schema import (
     MANDATORY_GATES,
     Issue,
+    Loc,
     SchemaError,
     Workflow,
     WorkflowOverlay,
@@ -77,7 +79,11 @@ FLOORS: Mapping[Path, str] = MappingProxyType(
         ),
         ("stages", _ANY, "fail_closed"): "removing it would fall back to False",
         ("stages", _ANY, "block_on"): "a review panel always has a severity that blocks",
-        ("stages", _ANY, "required"): "a review panel always has required reviewers",
+        (
+            "stages",
+            _ANY,
+            "required",
+        ): "a review panel or checks stage always names what is required",
         ("stages", _ANY, "gate", "eligible_roles"): "a gate always names who may decide",
         ("stages", _ANY, "gate", "decisions"): "a gate always names what may be decided",
         ("stages", _ANY, "gate", "decision_surfaces"): "a gate always names where it is decided",
@@ -92,7 +98,7 @@ FLOORS: Mapping[Path, str] = MappingProxyType(
     }
 )
 
-_PRODUCTION_WORDS = frozenset({"prod", "production", "prd"})
+_PRODUCTION_WORDS = frozenset({"prod", "production", "prd", "live"})
 
 
 class OverlayError(SchemaError):
@@ -241,9 +247,13 @@ def _nulls(value: Any) -> list[Issue]:
     return [Issue(None, i.path, i.message) for i in _null_issues(value, {})]
 
 
-def _present(value: Any, path: tuple[str | int, ...] = ()) -> dict[tuple[str | int, ...], int]:
-    """Every path of a document, so a validation error can be located without line numbers."""
-    found: dict[tuple[str | int, ...], int] = {path: 1}
+def _present(value: Any, path: Loc = ()) -> dict[Loc, int]:
+    """Every path of a document, so a validation error can be resolved to a path.
+
+    The value is a line number the resolver wants but a document built in memory has none; the
+    callers drop it from the issues.
+    """
+    found: dict[Loc, int] = {path: 1}
     if isinstance(value, dict):
         for k, v in value.items():
             found.update(_present(v, (*path, k)))
@@ -268,9 +278,31 @@ def _strings(value: Any, path: Path) -> list[tuple[Path, str]]:
     return found
 
 
+def _scripts(word: str) -> set[str]:
+    """The scripts of a word's letters (LATIN, GREEK, CYRILLIC, ...), from Unicode names."""
+    return {unicodedata.name(c, "?").split(" ")[0] for c in word if c.isalpha()}
+
+
+_BOUNDS = re.compile(
+    r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
+)
+
+
 def _names_production(text: str) -> bool:
-    words = {w for w in re.split(r"[^a-z0-9]+", text.lower()) if w}
-    return not words.isdisjoint(_PRODUCTION_WORDS)
+    """Whether ``text`` has a word that means production.
+
+    Compatibility forms (full-width letters) are folded first. Words are split at separators, at
+    lower-to-upper case and between letters and digits, so ``prodEnv`` and ``prod1`` count. A word
+    that mixes scripts (Latin with a Greek omicron) is refused, since it is written to look like
+    another word.
+    """
+    folded = unicodedata.normalize("NFKC", text)
+    for token in re.split(r"[\W_]+", folded):
+        if len(_scripts(token)) > 1:
+            return True
+        if any(w.lower() in _PRODUCTION_WORDS for w in _BOUNDS.sub(" ", token).split()):
+            return True
+    return False
 
 
 def _preview_issues(merged: Mapping[str, Any]) -> list[Issue]:
@@ -315,18 +347,39 @@ def _provenance(
 
 
 def flatten(
-    template: Workflow, overlay: WorkflowOverlay, *, require_publishable: bool = True
+    template: Workflow,
+    overlay: WorkflowOverlay,
+    *,
+    template_ref: str,
+    require_publishable: bool = True,
 ) -> Flattened:
     """Apply ``overlay`` to the ``template`` it extends and validate the result as a Workflow.
+
+    ``template_ref`` is the ``name@version`` the caller resolved ``template`` from. It must equal
+    the overlay's ``extends``, so provenance never records a version the template did not come
+    from. The result is schema-valid only: V1-V17 must run on it before it is stored or
+    published.
 
     Raises ``OverlayError`` listing every problem found. With ``require_publishable`` (the
     default, because flattening happens at publish) the result must also have an ``intake`` and
     a ``repo``, which a template may leave to its overlays.
     """
-    base_ref = overlay.extends
+    base_ref = template_ref
     top = f"overlay:{overlay.metadata.name}"
     source = overlay.metadata.name
     wanted = base_ref.partition("@")[0]
+    if base_ref != overlay.extends:
+        raise OverlayError(
+            [
+                Issue(
+                    None,
+                    "extends",
+                    f"this overlay extends {overlay.extends!r} but the template given is "
+                    f"{base_ref!r}",
+                )
+            ],
+            source,
+        )
     if template.metadata.name != wanted:
         raise OverlayError(
             [
