@@ -373,7 +373,7 @@ Maps merge, lists replace and `null` removes. A value below a floor gets an erro
 Implement V1, V2, V3, V7, V8, V9, V10, V13 and V15: references, reachability, outcomes, capped cycles, limits, surfaces, empty floors and typed `with`.
 Errors name the stage and say how to fix them.
 **AC:** a positive and a negative fixture per rule; an uncapped cycle is refused and the cycle is printed; `reviewers: []` and `required: []` are refused; an unknown `with` key is refused. A quorum role must be in `eligible_roles`; `with: {auto_approve: ...}` on `pr.merge` is refused; stage durations have an upper bound. In V10 a gate type missing from org `decision_surfaces` permits nothing, and the org document refuses `github` on `qa`. Duplicate quorum roles are refused. V9 needs org ceilings that `OrgPolicy` lacks: this issue adds them. An org-required gate that precedes `branch.promote` stays in its `requires_gates`, so QA secrets are not released before that gate decides. A team cannot rank a value below the org's in a route's `order` to skip a `when` gate: `OrgPolicy` gains an org-owned ordering. A test keeps `STALE_EDGE_TYPES` and `IMPLICIT_TYPES` in `src/sto/effects/ports.py` in step with the effect catalog: every name is a catalog effect or one of a pinned set of engine-only effects the catalog deliberately omits, and each classification agrees with PLAN.md. A team value unranked by the org may sit only above the org's highest ranked value, and every field an org `when` uses must have an org ordering that contains the value. After flattening, a gate with `escalate_after` and no `escalate_to` is refused (D2-12's timers refuse it at runtime too).
-**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `src/sto/config/schema.py`, `schemas/org-policy.schema.json`, `tests/config/test_validate_structure.py`, `tests/effects/test_catalog_sync.py`.
+**Deps:** D2-18, D2-24. **Size:** M. **Run:** parallel. **Files:** `src/sto/config/validate_structure.py`, `src/sto/config/org_policy.py`, `src/sto/config/schema.py`, `schemas/org-policy.schema.json`, `tests/config/test_validate_structure.py`, `tests/config/test_policy.py`, `tests/effects/test_catalog_sync.py`.
 
 #### D2-04: Gate dominance proof
 Implement V4, V5, V6, V11 and V14 by edge-removal reachability on the stage graph, deriving code-changing stages from the manifest, and V6's clause scoped to merges reachable with QA approvals removed.
@@ -522,7 +522,7 @@ Both are engine actions, so they are limited to what the graph allows. A patch b
 | 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
 | 4 | D3-15, D3-19 | D3-06 |
 | 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | D3-08b |
-| 6 | D3-07, D3-20 | D3-08a |
+| 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22 |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -656,6 +656,16 @@ The extender cannot vote in that round, and the added person must pass separatio
 **AC:** G7's extension cases pass; only org admins can do it; it is audited, and shown on the gate; ordinary mapping changes still do not reach open gates.
 **Deps:** D3-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/gates/extension.py`, `src/sto/api/routers/gate_extension.py`, `tests/gates/test_extension.py`.
 
+#### D3-21: Role mapping hardening
+Found in review of D3-05 and D3-18. An issuer containing `|` lets two identities share the `issuer|subject` actor key that separation of duties compares, and the bootstrap reaches into `RoleMapping`'s private helpers and copies its key layout.
+**AC:** `RoleMapping` refuses an issuer containing `|`, with a test; it exposes public helpers for text checks, issuer checks and "is any mapping stored", and `src/sto/identity/bootstrap.py` uses them, with a test that fails if bootstrap imports a private name from `mapping.py`.
+**Deps:** D3-18. **Size:** S. **Run:** parallel. **Files:** `src/sto/identity/mapping.py`, `src/sto/identity/bootstrap.py`, `tests/identity/test_mapping.py`, `tests/identity/test_bootstrap.py`.
+
+#### D3-22: Handlers enforce own and stop-at-gate grants
+Found in review of D3-03. The middleware refuses an "own" or stop-at-gate grant on any route that does not declare it checks ownership or the gate, so today a developer cannot cancel their own run, and a custom gate role cannot stop a run at its gate. The decide handler records every decision as actor `dev`.
+**AC:** the cancel route declares both checks and its handler enforces them: an "own" holder cancels only runs they started, and a stop-at-gate holder only a run waiting at a gate their role may decide; both are refused otherwise, by the shared tenancy suite. The decide handler records the authenticated actor, never a constant. The decide 409's stop link works for every role it is offered to.
+**Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
+
 ---
 
 ## D4: GitHub, live
@@ -680,7 +690,7 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 | 6 | D4-08 | D4-11 |
 | 7 | - | D4-21 |
 | 8 | D4-12, D4-14, D4-22 | - |
-| 9 | D4-26, D4-28 | - |
+| 9 | D4-26, D4-28, D4-29 | - |
 | 10 | - | D4-15 |
 | 11 | - | D4-23 |
 
@@ -846,6 +856,11 @@ The fork design from PLAN.md section 12: App on a bot-owned fork, commits and re
 It stays unsupported, and is not accepted as `attested`, until D4-23 passes, so the gate remains the default.
 **AC:** the flow works on the fake; a config flag holds it off until D4-23's result is recorded; what re-promotes after a fix round is tested.
 **Deps:** D4-17, D4-07, D4-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/adapters/github/fork.py`, `tests/adapters/github/test_fork.py`.
+
+#### D4-29: Nudge size and shape
+Found in review of D4-03. The queued nudge carries the whole raw body, but the edge accepts up to 10 MB and GitHub deliveries reach 25 MB, well over the SQS message limit, so a large delivery fails on every retry instead of transiently.
+**AC:** the nudge carries the delivery ID, event, surface and routing headers, plus the body only when it fits under a configured size well below the SQS limit; a larger delivery is queued without its body, marked so, and the consumer re-reads (webhooks are nudges, not facts); a test sends a body over the limit and sees one nudge queued, with no 503.
+**Deps:** D4-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
 
 ---
 
