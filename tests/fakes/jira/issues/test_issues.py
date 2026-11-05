@@ -37,6 +37,8 @@ def call(jira: FakeJiraIssues, method: str, path: str, **kw: Any) -> Response:
 
 
 def search(jira: FakeJiraIssues, jql: str, **body: Any) -> Response:
+    """A search asking for ``summary``, so that issues come back with their keys."""
+    body.setdefault("fields", ["summary"])
     return call(jira, "POST", "/search/jql", json={"jql": jql, **body})
 
 
@@ -269,9 +271,8 @@ def test_an_unknown_field_and_a_syntax_error_are_400s(jira: FakeJiraIssues) -> N
 
 def test_search_returns_only_ids_unless_fields_are_asked_for(jira: FakeJiraIssues) -> None:
     seeded(jira)
-    bare = search(jira, "project = SYN").body["issues"][0]
-    assert set(bare) >= {"id", "key", "self"}
-    assert bare.get("fields", {}) == {}
+    bare = call(jira, "POST", "/search/jql", json={"jql": "project = SYN"}).body["issues"][0]
+    assert bare == {"id": "10001"}  # spec: fields defaults to `id`, which returns only IDs
     rich = search(jira, "project = SYN", fields=["summary", "status"]).body["issues"][0]
     assert set(rich["fields"]) == {"summary", "status"}
     everything = search(jira, "project = SYN", fields=["*all"]).body["issues"][0]
@@ -350,7 +351,7 @@ def test_add_and_list_comments_with_adf_bodies(jira: FakeJiraIssues) -> None:
     listing = call(jira, "GET", "/issue/SYN-1/comment").body
     assert listing["total"] == 1
     assert listing["startAt"] == 0
-    assert listing["maxResults"] == 50
+    assert listing["maxResults"] == 100  # spec: the comment default
     assert adf_to_text(listing["comments"][0]["body"]) == "hello"
     assert call(jira, "GET", f"/issue/SYN-1/comment/{added.body['id']}").status == 200
 
