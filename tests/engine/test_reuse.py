@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 import yaml
 
+from sto.agents.prompts.render import PromptTemplate
 from sto.config.manifest import Manifest, load_manifest
 from sto.config.schema import Workflow as Graph
 from sto.config.schema import load_document
@@ -36,6 +37,10 @@ U2 = "01HZX0000000000000000000B2"
 PART = "TEAM#t1#RUN#r1"
 MAN: Manifest = load_manifest()
 PANEL_BY = ("correctness_reviewer", "security_reviewer")
+PROMPTS: dict[str, PromptTemplate] = {
+    name: PromptTemplate(name=name, version="1", text=f"You are {name}.")
+    for name in (*PANEL_BY, "qa_agent", "triage")
+}
 
 DOC: dict[str, Any] = {
     "apiVersion": "sto/v1",
@@ -127,7 +132,7 @@ def prior(
             else {"qa": ("qa_agent",), "triage": ("triage",)}.get(stage, ())
         )
     if digest == "auto":
-        digest = stage_digest(graph, MAN, stage)
+        digest = stage_digest(graph, MAN, stage, PROMPTS)
     return PriorResult(
         key=f"EV#{stage}#{ulid}",
         evidence=Evidence(tested, patch, validity),
@@ -147,7 +152,15 @@ def decide(
     graph: Graph = W,
     partition: str = PART,
 ) -> ReuseDecision:
-    return decide_reuse(graph, MAN, stage, cands, subject() if sub is None else sub, partition)
+    return decide_reuse(
+        graph,
+        MAN,
+        stage,
+        cands,
+        subject() if sub is None else sub,
+        partition,
+        prompts=PROMPTS,
+    )
 
 
 # --- the three acceptance criteria ---------------------------------------------------------
@@ -264,7 +277,7 @@ def test_a_qa_agent_that_could_write_code_is_not_reused() -> None:
     }
     man = MAN.model_copy(update={"profiles": profiles})
     p = prior("qa")
-    d = decide_reuse(W, man, "qa", [p], subject(), PART)
+    d = decide_reuse(W, man, "qa", [p], subject(), PART, prompts=PROMPTS)
     assert d.reuse is False
     assert d.reason == "not_qa_stage"
 
@@ -353,7 +366,7 @@ def test_a_changed_profile_re_runs() -> None:
         "qa_agent": MAN.profiles["qa_agent"].model_copy(update={"default_tier": "deep"}),
     }
     man = MAN.model_copy(update={"profiles": profiles})
-    d = decide_reuse(W, man, "qa", [prior("qa")], subject(), PART)
+    d = decide_reuse(W, man, "qa", [prior("qa")], subject(), PART, prompts=PROMPTS)
     assert (d.reuse, d.reason) == (False, "config_changed")
 
 
@@ -364,19 +377,19 @@ def test_a_result_with_no_config_digest_is_not_reused() -> None:
 
 
 def test_the_digest_is_stable_and_none_for_other_kinds() -> None:
-    assert stage_digest(W, MAN, "panel") == stage_digest(wf(), MAN, "panel")
-    assert stage_digest(W, MAN, "panel") != stage_digest(W, MAN, "qa")
-    assert stage_digest(W, MAN, "ci") is None
-    assert stage_digest(W, MAN, "nope") is None
+    assert stage_digest(W, MAN, "panel", PROMPTS) == stage_digest(wf(), MAN, "panel", PROMPTS)
+    assert stage_digest(W, MAN, "panel", PROMPTS) != stage_digest(W, MAN, "qa", PROMPTS)
+    assert stage_digest(W, MAN, "ci", PROMPTS) is None
+    assert stage_digest(W, MAN, "nope", PROMPTS) is None
 
 
 def test_an_unknown_profile_is_not_bound_or_reused() -> None:
     w = wf(lambda d: d["stages"]["panel"].update(reviewers=["ghost"], required=["ghost"]))
-    assert stage_digest(w, MAN, "panel") is None
+    assert stage_digest(w, MAN, "panel", PROMPTS) is None
     d = decide("panel", [prior(by=("ghost",), digest="x")], graph=w)
     assert (d.reuse, d.reason) == (False, "unknown_profile")
     w2 = wf(lambda d: d["stages"]["qa"].update(agent="ghost"))
-    assert stage_digest(w2, MAN, "qa") is None
+    assert stage_digest(w2, MAN, "qa", PROMPTS) is None
 
 
 # --- (5) the run partition -----------------------------------------------------------------
@@ -425,7 +438,7 @@ def test_no_prior_result_runs() -> None:
 
 
 def test_no_subject_runs() -> None:
-    d = decide_reuse(W, MAN, "panel", [prior()], None, PART)
+    d = decide_reuse(W, MAN, "panel", [prior()], None, PART, prompts=PROMPTS)
     assert (d.reuse, d.reason) == (False, "no_subject")
 
 
@@ -559,3 +572,72 @@ def test_decision_and_record_types_are_frozen() -> None:
         d.reuse = True  # type: ignore[misc]
     with pytest.raises(AttributeError):
         prior().outcome = "findings"  # type: ignore[misc]
+
+
+# --- D2-38: reuse hardening ----------------------------------------------------------------
+
+
+def test_a_panel_prior_listing_a_participant_twice_is_refused() -> None:
+    # same set as today's reviewers, but one listed twice: a frozenset comparison would pass it
+    d = decide("panel", [prior(by=(*PANEL_BY, "security_reviewer"))])
+    assert (d.reuse, d.reason) == (False, "reviewer_set_changed")
+
+
+def test_a_panel_prior_repeating_one_reviewer_for_two_is_refused() -> None:
+    d = decide("panel", [prior(by=("security_reviewer", "security_reviewer"))])
+    assert (d.reuse, d.reason) == (False, "reviewer_set_changed")
+
+
+def test_a_qa_prior_listing_the_agent_twice_is_refused() -> None:
+    d = decide("qa", [prior("qa", by=("qa_agent", "qa_agent"))])
+    assert (d.reuse, d.reason) == (False, "agent_changed")
+
+
+def _with_prompt(name: str, **change: str) -> dict[str, PromptTemplate]:
+    old = PROMPTS[name]
+    new = PromptTemplate(
+        name=old.name,
+        version=change.get("version", old.version),
+        text=change.get("text", old.text),
+    )
+    return {**PROMPTS, name: new}
+
+
+@pytest.mark.parametrize(
+    ("stage", "name"),
+    [("panel", "security_reviewer"), ("panel", "correctness_reviewer"), ("qa", "qa_agent")],
+)
+@pytest.mark.parametrize("change", [{"version": "2"}, {"text": "You are different."}])
+def test_a_prompt_change_invalidates_reuse(stage: str, name: str, change: dict[str, str]) -> None:
+    p = prior(stage)
+    assert stage_digest(W, MAN, stage, PROMPTS) != stage_digest(
+        W, MAN, stage, _with_prompt(name, **change)
+    )
+    d = decide_reuse(W, MAN, stage, [p], subject(), PART, prompts=_with_prompt(name, **change))
+    assert (d.reuse, d.reason) == (False, "config_changed")
+
+
+@pytest.mark.parametrize("stage", ["panel", "qa"])
+def test_a_missing_prompt_is_not_bound_and_re_runs(stage: str) -> None:
+    assert stage_digest(W, MAN, stage) is None
+    assert stage_digest(W, MAN, stage, {}) is None
+    d = decide_reuse(W, MAN, stage, [prior(stage)], subject(), PART)
+    assert (d.reuse, d.reason) == (False, "prompt_missing")
+    some = {k: v for k, v in PROMPTS.items() if k != "security_reviewer"}
+    d = decide_reuse(W, MAN, "panel", [prior()], subject(), PART, prompts=some)
+    assert (d.reuse, d.reason) == (False, "prompt_missing")
+
+
+def test_a_prompt_of_the_wrong_type_or_name_is_not_bound() -> None:
+    assert stage_digest(W, MAN, "qa", {**PROMPTS, "qa_agent": "text"}) is None  # type: ignore[dict-item]
+    other = PromptTemplate(name="triage", version="1", text="x")
+    assert stage_digest(W, MAN, "qa", {**PROMPTS, "qa_agent": other}) is None
+
+
+def test_a_profile_outcome_change_invalidates_reuse() -> None:
+    qa = MAN.profiles["qa_agent"]
+    profiles = {**MAN.profiles, "qa_agent": qa.model_copy(update={"outcomes": qa.outcomes | {"x"}})}
+    man = MAN.model_copy(update={"profiles": profiles})
+    assert stage_digest(W, man, "qa", PROMPTS) != stage_digest(W, MAN, "qa", PROMPTS)
+    d = decide_reuse(W, man, "qa", [prior("qa")], subject(), PART, prompts=PROMPTS)
+    assert (d.reuse, d.reason) == (False, "config_changed")
