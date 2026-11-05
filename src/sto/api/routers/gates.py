@@ -23,16 +23,18 @@ from sto.api.routers.runs import (
 from sto.api.runtime import DeliveryFailedError, RunNotFoundError, StoreConflictError
 from sto.domain import DecisionKind, Gate, Surface, TransientError
 from sto.gates.service import (
+    CommentRequiredError,
     DecisionNotAllowedError,
+    DuplicateVoteError,
     GateClosedError,
     GateConflictError,
     GateError,
     GateNotFoundError,
     GateRoundLimitError,
+    QuorumConfigError,
     StaleRoundError,
     StaleSubjectError,
 )
-from sto.store.ports import ConditionFailedError
 
 log = logging.getLogger("sto.api")
 router = APIRouter(tags=["gates"])
@@ -110,7 +112,10 @@ _REFUSALS: list[tuple[type[GateError], int]] = [
     (StaleSubjectError, 409),
     (StaleRoundError, 409),
     (GateConflictError, 409),
+    (DuplicateVoteError, 409),  # the person already holds a vote: the state conflicts
     (DecisionNotAllowedError, 422),
+    (CommentRequiredError, 422),  # the request is incomplete
+    (QuorumConfigError, 422),  # a gate whose quorum was refused cannot be decided as asked
     (GateRoundLimitError, 422),
 ]
 
@@ -218,11 +223,6 @@ async def decide(
         # refuses (a corrupt gate): a server fault, logged here and not described to the client.
         log.error("deciding gate %s of run %s hit corrupt data: %r", name, run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
-    except ConditionFailedError as e:
-        # The gate service ran out of retries on a gate that is still open (D3-06 reworks this).
-        raise ApiError(
-            503, "gate_contention", "the gate kept changing; try again", headers=_RETRY
-        ) from e
     except TransientError as e:  # the gate kept changing under the call
         raise ApiError(503, "gate_contention", str(e), headers=_RETRY) from e
     return {"decision_id": str(decided.decision.id), "gate": gate_out(decided.gate)}

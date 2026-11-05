@@ -9,8 +9,11 @@ against an independent oracle, not by sampling.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Collection, Iterable, Mapping, Sequence
+import sys
+import threading
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,6 +32,7 @@ from sto.domain import (
     to_wire,
 )
 from sto.engine.commands import OpenGate
+from sto.gates.hooks import AuditEntry, ChainedAuditWriter, ReadOnly
 from sto.gates.service import (
     CommentRequiredError,
     DecisionNotAllowedError,
@@ -53,7 +57,9 @@ from sto.store.ports import (
     Store,
     TeamScope,
     TransactionConflictError,
+    VersionIs,
 )
+from sto.store.sqlite import SqliteStore
 
 TEAM = TeamScope("t1")
 RUN = RunId.parse("01J00000000000000000000001")
@@ -743,3 +749,361 @@ def test_G3_a_late_veto_gets_gate_closed_and_leaves_the_approval_standing() -> N
     assert err.value.status is GateStatus.APPROVED
     assert err.value.closed_by == B
     assert gate_of(store).status is GateStatus.APPROVED
+
+
+# --- a stale count must not commit (the chain head the vote is conditioned on) ----------------
+
+
+def test_a_vote_that_commits_between_the_count_and_the_audit_read_is_counted() -> None:
+    """The count reads the votes, the audit writer reads the chain head later. A vote that lands
+    in between would condition this transaction on the new head with an old count: quorum met,
+    gate left open. The service must count again."""
+
+    class Inject(Recording):
+        hook: Any = None
+
+        def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
+            page = super().query(scope, pk, **kw)
+            if kw.get("sk_prefix", "").startswith("VOTE#") and self.hook:
+                hook, self.hook = self.hook, None
+                hook()
+            return page
+
+    store = Inject()
+    svc, gate, _ = quorum_service(store)
+    store.hook = lambda: decide(svc, APPROVE, B, gate=gate)
+    result = decide(svc, APPROVE, A, gate=gate)
+    assert result.closed
+    assert gate_of(store).status is GateStatus.APPROVED
+    assert audit_actions(store).count("gate.decided") == 1
+    with pytest.raises(GateClosedError):
+        decide(svc, REJECT, C, gate=gate)  # the late veto gets 409: the gate really closed
+
+
+class _fast_switching:
+    def __enter__(self) -> None:
+        self.old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+
+    def __exit__(self, *exc: object) -> None:
+        sys.setswitchinterval(self.old)
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def make_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Callable[[], Store]]:
+    made: list[SqliteStore] = []
+
+    def make() -> Store:
+        if request.param == "memory":
+            return Recording()
+        store = SqliteStore(tmp_path / f"s{len(made)}.db")
+        made.append(store)
+        return store
+
+    yield make
+    for s in made:
+        s.close()
+
+
+def _race(
+    make_store: Callable[[], Store], people: int, quorum: int, rejecters: int
+) -> tuple[Store, dict[str, Any]]:
+    store = make_store()
+    names = [f"iss|p{i}" for i in range(people)]
+    roles = {n: {"reviewer"} for n in names}
+    svc = GateService(store, policy=Policy([QuorumRule("reviewer", quorum)], roles))
+    gate = svc.open_gate(TEAM, open_cmd())
+    results: dict[str, Any] = {}
+    barrier = threading.Barrier(people)
+
+    def go(i: int) -> None:
+        kind = REJECT if i < rejecters else APPROVE
+        barrier.wait()
+        try:
+            results[names[i]] = (kind, decide(svc, kind, names[i], gate=gate))
+        except Exception as err:
+            results[names[i]] = (kind, err)
+
+    with _fast_switching():
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(people)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    return store, results
+
+
+def _assert_one_close(store: Store, results: dict[str, Any], quorum: int) -> None:
+    done = [(k, r) for k, r in results.values() if not isinstance(r, Exception)]
+    errors = {type(r).__name__ for _, r in results.values() if isinstance(r, Exception)}
+    assert errors <= {"GateClosedError"}, errors  # only a truly closed gate refuses
+    closers = [r for _, r in done if r.closed]
+    assert len(closers) == 1, "exactly one decision closes the gate"
+    gate = gate_of(store)
+    assert gate.closed_by == closers[0].decision.actor
+    assert [o.data["kind"] for o in items(store, "OUT#")] == ["gate.closed"]
+    assert audit_actions(store).count("gate.decided") == 1
+    votes = [r for _, r in done if not r.closed]
+    if gate.status is GateStatus.APPROVED:
+        assert len(votes) == quorum - 1  # every sub-quorum approval committed
+        assert len(closers[0].decision.actor) > 0
+        assert len(items(store, "OUT#")[0].data["decision_ids"]) == quorum
+    else:
+        assert len(votes) <= quorum - 1
+    assert verify_audit_chain(store, TEAM, RUN) >= 2
+
+
+def test_G5_concurrent_decisions_on_a_quorum_gate_close_exactly_once(
+    make_store: Callable[[], Store],
+) -> None:
+    for _ in range(6):
+        _assert_one_close(*_race(make_store, people=12, quorum=3, rejecters=1), quorum=3)
+
+
+def test_G5_fifty_concurrent_decisions_on_a_quorum_gate(
+    make_store: Callable[[], Store],
+) -> None:
+    store, results = _race(make_store, people=50, quorum=5, rejecters=0)
+    _assert_one_close(store, results, 5)
+    assert gate_of(store).status is GateStatus.APPROVED
+
+
+def test_G3_two_concurrent_approvals_of_a_quorum_of_two_always_close(
+    make_store: Callable[[], Store],
+) -> None:
+    """The stale-count race: both vote at once. Before the fix one run in four left the gate OPEN
+    with both votes in, so a later reject beat an approved quorum."""
+    for _ in range(20):
+        store, results = _race(make_store, people=2, quorum=2, rejecters=0)
+        assert gate_of(store).status is GateStatus.APPROVED, results
+        _assert_one_close(store, results, 2)
+
+
+def test_G3_a_concurrent_veto_and_the_deciding_approvals_close_one_way_only(
+    make_store: Callable[[], Store],
+) -> None:
+    seen = set()
+    for _ in range(15):
+        store, results = _race(make_store, people=3, quorum=2, rejecters=1)
+        _assert_one_close(store, results, 2)
+        seen.add(gate_of(store).status)
+        assert gate_of(store).status in (GateStatus.APPROVED, GateStatus.REJECTED)
+    assert seen  # either way is a legal commit order; the invariants above are what matter
+
+
+# --- every injection point -------------------------------------------------------------------
+
+
+class Windowed:
+    """A store that runs ``fire`` once, just before the k-th call (get, query or transact) made
+    while ``armed``, so another decision can commit inside that call's window."""
+
+    def __init__(self, inner: Store) -> None:
+        self.inner = inner
+        self.armed = False
+        self.calls = 0
+        self.at = 0
+        self.fire: Callable[[], None] | None = None
+        self.fired = False
+
+    def _tick(self) -> None:
+        if not self.armed:
+            return
+        self.calls += 1
+        if self.calls == self.at and self.fire is not None and not self.fired:
+            self.fired = True
+            self.armed = False  # the injected decision runs on the bare store
+            try:
+                self.fire()
+            finally:
+                self.armed = True
+
+    def get(self, scope: Scope, key: Key) -> Item | None:
+        self._tick()
+        return self.inner.get(scope, key)
+
+    def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
+        self._tick()
+        return self.inner.query(scope, pk, **kw)
+
+    def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
+        self._tick()
+        self.inner.transact(scope, ops)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+def _edit_gate(store: Store, change: Callable[[Gate], Gate | None], action: str) -> str:
+    """A timer's or an engine's write to the open gate: a conditional write on the version it
+    read, in one transaction with an audit entry, retried when it loses (as ``timers.py`` does)."""
+    for _ in range(MAX_TRIES):
+        item = store.get(TEAM, Key(pk(), "GATE#review#1"))
+        assert item is not None
+        gate = from_wire(Gate, item.data)
+        new = change(gate) if gate.is_open else None
+        if new is None:
+            return "noop"
+        entry = AuditEntry(RUN, action, "system:test", {}, 1)
+        ops: list[Op] = [
+            Put(item.key, to_wire(new), VersionIs(item.version)),
+            *ChainedAuditWriter().ops(ReadOnly(store), TEAM, entry),
+        ]
+        try:
+            store.transact(TEAM, ops)
+        except (ConditionFailedError, TransactionConflictError):
+            continue
+        return "done"
+    raise AssertionError("the edit never committed")
+
+
+MAX_TRIES = 10
+
+
+def _event(name: str, store: Store, svc: GateService, gate: Gate) -> str:
+    kinds = {"approve A": (APPROVE, A), "approve B": (APPROVE, B), "reject C": (REJECT, C)}
+    if name in kinds:
+        kind, who = kinds[name]
+        try:
+            return "closed" if decide(svc, kind, who, gate=gate).closed else "voted"
+        except Exception as err:
+            return type(err).__name__
+    if name == "move":
+        return _edit_gate(store, lambda g: replace(g, subject=subject("b")), "gate.moved")
+    if name == "expire":
+        return _edit_gate(store, lambda g: g.advance(GateStatus.EXPIRED), "gate.expired")
+    raise AssertionError(name)
+
+
+EVENTS = ["approve A", "approve B", "reject C", "move", "expire"]
+
+
+def _snapshot(store: Store, outcomes: dict[str, str]) -> tuple[Any, ...]:
+    gate = gate_of(store)
+    live = {
+        v.data["actor"]
+        for v in items(store, "VOTE#")
+        if from_wire(Decision, v.data["decision"]).subject_digest == gate.subject.digest()
+    }
+    return (
+        gate.status,
+        gate.closed_by,
+        gate.subject.digest(),
+        tuple(sorted(outcomes.items())),
+        tuple(sorted(live)) if gate.is_open else (),
+        len(items(store, "OUT#")),
+        audit_actions(store).count("gate.decided"),
+        verify_audit_chain(store, TEAM, RUN),
+    )
+
+
+def _model(order: Sequence[str]) -> tuple[Any, ...]:
+    store = Recording()
+    svc = GateService(store, policy=Policy([QuorumRule("reviewer", 2)], REVIEWERS))
+    gate = svc.open_gate(TEAM, open_cmd())
+    return _snapshot(store, {name: _event(name, store, svc, gate) for name in order})
+
+
+def _injected(make: Callable[[], Store], x: str, y: str, at: int) -> tuple[bool, tuple[Any, ...]]:
+    inner = make()
+    store = Windowed(inner)
+    svc = GateService(store, policy=Policy([QuorumRule("reviewer", 2)], REVIEWERS))
+    bare = GateService(inner, policy=Policy([QuorumRule("reviewer", 2)], REVIEWERS))
+    gate = svc.open_gate(TEAM, open_cmd())
+    outcomes: dict[str, str] = {}
+
+    def inject() -> None:
+        outcomes[y] = _event(y, inner, bare, gate)
+
+    store.at, store.fire, store.armed = at, inject, True
+    outcomes[x] = _event(x, store, svc, gate)
+    store.armed = False
+    if not store.fired:
+        outcomes[y] = _event(y, inner, bare, gate)
+    return store.fired, _snapshot(inner, outcomes)
+
+
+def test_G3_every_decision_pair_is_serialisable_at_every_injection_point(
+    make_store: Callable[[], Store],
+) -> None:
+    """For each ordered pair (X, Y) of {approve A, approve B, reject C, subject move, expire}, run
+    Y to completion inside X's window before each store call X makes, and compare the end state
+    and both outcomes with the model: Y then X, one after the other (X then Y if the window never
+    came). A lost update, a double close or a vote counted against a stale gate shows up as a
+    difference."""
+    models: dict[tuple[str, str, bool], tuple[Any, ...]] = {}
+    checked = 0
+    for x, y in itertools.permutations(EVENTS, 2):
+        for at in range(1, 16):
+            fired, got = _injected(make_store, x, y, at)
+            if not fired:
+                break
+            order = (y, x)
+            want = models.setdefault((x, y, True), _model(order))
+            assert got == want, f"G3 {y} injected at call {at} of {x}: {got} != {want}"
+            checked += 1
+        else:
+            raise AssertionError("an event made more than 15 store calls: raise the bound")
+        fired, got = _injected(make_store, x, y, 99)  # the window that never comes: x then y
+        assert not fired
+        assert got == models.setdefault((x, y, False), _model((x, y))), f"G3 {x} then {y}"
+    assert checked >= 100  # 20 pairs, several windows each
+
+
+# --- audit entries, paging, single fields -----------------------------------------------------
+
+
+def test_each_vote_writes_exactly_one_audit_entry_even_when_it_replaces_one() -> None:
+    store = Recording()
+    svc, gate, _ = quorum_service(store, (QuorumRule("reviewer", 3),))
+    decide(svc, APPROVE, A, gate=gate)
+    decide(svc, APPROVE, B, gate=gate)
+    assert audit_actions(store).count("gate.voted") == 2
+    moved = _move_subject(store, "b")
+    decide(svc, APPROVE, A, gate=moved)  # replaces A's vote for the old subject
+    entries = [
+        i.data
+        for i in store.query(TEAM, pk(), table=AUDIT).items
+        if i.data["action"] == "gate.voted"
+    ]
+    assert [e["actor"] for e in entries].count(A) == 2  # one per vote, none extra
+    assert len(entries) == 3
+    assert all("status" not in e["data"] for e in entries)  # always OPEN, so not recorded
+    assert len(items(store, "VOTE#")) == 2
+
+
+def test_every_page_of_votes_is_read() -> None:
+    class OneAtATime(Recording):
+        def query(self, scope: Scope, pk: str, **kw: Any) -> Any:
+            if kw.get("sk_prefix", "").startswith("VOTE#"):
+                kw["limit"] = 1
+            return super().query(scope, pk, **kw)
+
+    store = OneAtATime()
+    svc, gate, _ = quorum_service(store, (QuorumRule("reviewer", 3),))
+    decide(svc, APPROVE, A, gate=gate)
+    decide(svc, APPROVE, B, gate=gate)
+    assert not decide(svc, APPROVE, C, gate=gate).gate.is_open  # needs both earlier votes
+
+
+@pytest.mark.parametrize(
+    "field_name", ["patch_id", "ticket_revision", "head_sha", "evidence_digest", "attention_digest"]
+)
+def test_moving_any_single_subject_field_drops_the_earlier_votes(field_name: str) -> None:
+    store = Recording()
+    svc, gate, _ = quorum_service(store)
+    decide(svc, APPROVE, A, gate=gate)
+    item = store.get(TEAM, Key(pk(), "GATE#review#1"))
+    assert item is not None
+    moved = replace(
+        from_wire(Gate, item.data), subject=replace(gate.subject, **{field_name: "changed"})
+    )
+    assert moved.subject.digest() != gate.subject.digest()
+    store.transact(TEAM, [Put(item.key, to_wire(moved))])
+    decide(svc, APPROVE, B, gate=moved)
+    assert gate_of(store).is_open  # A's vote saw other inputs
+
+
+def test_a_merge_sha_alone_does_not_move_the_digest() -> None:
+    """Recorded after approval, so it must not unseat a standing vote (Subject.digest)."""
+    assert replace(subject(), merge_sha="m1").digest() == subject().digest()

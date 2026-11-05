@@ -365,9 +365,18 @@ class GateService:
             self._refuse_if_barred(scope, current, actor, kind)
             counted = [decision.id]
             if kind is DecisionKind.APPROVE:
+                # A vote's count is only as fresh as the chain head the audit entry will be
+                # conditioned on. Read the head BEFORE counting and compare it after the audit ops
+                # are built (they read it again): equal means no decision committed in between, so
+                # the count is the count this transaction commits against. Heads only move
+                # forward. A close needs no such check: it already counted a quorum, anything that
+                # lands in between is a veto or another close, and both move the gate's version.
+                head = self._head_version(scope, run_id)
                 tally = self._tally(scope, current, decision)
                 if not tally.closes:
                     own = self._vote_ops(scope, item, current, decision, tally)
+                    if self._head_version(scope, run_id) != head:
+                        continue  # a decision committed while we counted: count again
                     try:
                         self._store.transact(scope, _within_cap(own))
                     except ConditionFailedError as err:
@@ -417,6 +426,10 @@ class GateService:
                 f"{actor} may not {kind.value} gate {gate.name!r} round {gate.round}: "
                 + ", ".join(reasons)
             )
+
+    def _head_version(self, scope: Scope, run_id: RunId) -> int | None:
+        head = self._store.get(scope, Key(run_pk(run_id), CHAIN_SK))
+        return None if head is None else head.version
 
     def _rules(self, scope: Scope, gate: Gate) -> list[QuorumRule]:
         item = self._store.get(scope, _quorum_key(gate))
@@ -487,7 +500,6 @@ class GateService:
                 "decision": decision.kind.value,
                 "decision_id": str(decision.id),
                 "surface": decision.surface.value,
-                "status": gate.status.value,
                 "subject_digest": decision.subject_digest,
                 "comment": decision.comment,
                 "votes": tally.votes,
@@ -589,7 +601,9 @@ class GateService:
 @dataclass(frozen=True)
 class _Tally:
     closes: bool
-    counted: list[DecisionId]  # the approvals that stand, this one last
+    # the approvals that stand: earlier votes in the store's order of VOTE# keys (a hash of the
+    # voter, so NOT time order), then this decision last. Consumers must not read order as time.
+    counted: list[DecisionId]
     stale: Item | None  # this person's earlier vote for a subject that has moved
     votes: int | None  # people who now hold a vote, this one included
 
