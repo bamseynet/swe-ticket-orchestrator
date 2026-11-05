@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -55,7 +56,14 @@ from sto.ingest.core import (
     WebhookIngest,
     normalise_headers,
 )
-from sto.store.ports import Store
+from sto.store.ports import (
+    PLATFORM,
+    Absent,
+    ConditionFailedError,
+    Key,
+    Store,
+    VersionIs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +114,11 @@ class GitHubWebhookVerifier:
         received = headers.get(SIGNATURE_HEADER, "")
         expected = SIGNATURE_PREFIX + hmac.new(self._secret, raw_body, hashlib.sha256).hexdigest()
         # Bytes, so a non-ASCII header is a mismatch rather than a TypeError.
-        if not hmac.compare_digest(received.encode("utf-8"), expected.encode("ascii")):
+        try:
+            matches = hmac.compare_digest(received.encode("utf-8"), expected.encode("ascii"))
+        except UnicodeError as exc:  # a lone surrogate cannot be encoded: not a signature
+            raise InvalidSignatureError("webhook signature is not text") from exc
+        if not matches:
             raise InvalidSignatureError("webhook signature mismatch")
         delivery_id = headers.get(DELIVERY_HEADER, "")
         if not delivery_id:
@@ -118,6 +130,8 @@ class GitHubWebhookVerifier:
 
 
 def ticket_key(repo: RepoRef, number: int) -> str:
+    """``owner/name#N`` in the case GitHub sends. A rename or transfer gives a new key; the
+    reconciler follows GitHub's redirects to the new name."""
     return f"{repo.owner}/{repo.name}#{number}"
 
 
@@ -173,7 +187,9 @@ def _pr_numbers(parent: Mapping[str, Any]) -> list[int]:
     listed = parent.get("pull_requests", [])
     if not isinstance(listed, list):
         raise MalformedWebhookError("webhook pull_requests is not a list")
-    return [_number(pr, "number") for pr in listed if isinstance(pr, dict)]
+    if not all(isinstance(pr, dict) for pr in listed):
+        raise MalformedWebhookError("webhook pull_requests holds a non-object")
+    return [_number(pr, "number") for pr in listed]
 
 
 def _check_changes(
@@ -190,6 +206,17 @@ def _check_changes(
     ]
 
 
+def _head_branch(pr: Mapping[str, Any], repo: RepoRef) -> str | None:
+    """The PR's head branch, only when the head lives in the base repository. A fork can name its
+    branch ``sto/run-1`` too; that is not our branch, so a fork's PR carries none."""
+    head = _dict(pr, "head")
+    ref = _text(head, "ref")
+    head_repo = head.get("repo")
+    if isinstance(head_repo, dict) and head_repo.get("full_name") == f"{repo.owner}/{repo.name}":
+        return ref
+    return None
+
+
 def _issue(payload: dict[str, Any]) -> list[ExternalChange]:
     repo = _repo(payload)
     issue = _dict(payload, "issue")
@@ -202,14 +229,13 @@ def _issue(payload: dict[str, Any]) -> list[ExternalChange]:
 def _pull_request(payload: dict[str, Any]) -> list[ExternalChange]:
     repo = _repo(payload)
     pr = _dict(payload, "pull_request")
-    head = _dict(pr, "head")
     return [
         ExternalChange(
             ChangeKind.PR,
             repo=repo,
             pr=PrRef(repo, _number(pr, "number")),
-            sha=_text(head, "sha"),
-            branch=_text(head, "ref"),
+            sha=_text(_dict(pr, "head"), "sha"),
+            branch=_head_branch(pr, repo),
         )
     ]
 
@@ -223,7 +249,7 @@ def _review(payload: dict[str, Any]) -> list[ExternalChange]:
             repo=repo,
             pr=PrRef(repo, _number(pr, "number")),
             sha=_text(_dict(payload, "review"), "commit_id"),
-            branch=_text(_dict(pr, "head"), "ref"),
+            branch=_head_branch(pr, repo),
         )
     ]
 
@@ -233,9 +259,11 @@ def _push(payload: dict[str, Any]) -> list[ExternalChange]:
     ref = _text(payload, "ref")
     if not ref.startswith("refs/heads/"):
         return []  # a tag push names no branch we track
-    return [
-        ExternalChange(ChangeKind.PUSH, repo=repo, sha=_text(payload, "after"), branch=_branch(ref))
-    ]
+    after = _text(payload, "after")
+    if payload.get("deleted") is True or set(after) == {"0"}:
+        # A deleted branch has no head: ``sha`` None says so, instead of a zero SHA.
+        return [ExternalChange(ChangeKind.PUSH, repo=repo, sha=None, branch=_branch(ref))]
+    return [ExternalChange(ChangeKind.PUSH, repo=repo, sha=after, branch=_branch(ref))]
 
 
 def _check_suite(payload: dict[str, Any]) -> list[ExternalChange]:
@@ -276,8 +304,8 @@ def _merge_group(payload: dict[str, Any]) -> list[ExternalChange]:
 
 
 def _installation(payload: dict[str, Any]) -> list[ExternalChange]:
-    _number(_dict(payload, "installation"), "id")
-    return [ExternalChange(ChangeKind.INSTALLATION)]
+    installation_id = _number(_dict(payload, "installation"), "id")
+    return [ExternalChange(ChangeKind.INSTALLATION, installation_id=installation_id)]
 
 
 def _ping(payload: dict[str, Any]) -> list[ExternalChange]:
@@ -342,8 +370,58 @@ class ConnectionUpdate:
 
 class ConnectionSink(Protocol):
     def apply(self, update: ConnectionUpdate) -> None:
-        """Record the change and schedule a re-read of the installation. Idempotent."""
+        """Record that the installation changed and that it must be re-read. Idempotent.
+
+        The update comes from a body whose delivery ID the signature does not cover, so it can be
+        a replay or arrive out of order. A sink therefore NEVER sets an authoritative status from
+        it: it stores the update as a hint and marks the connection for a re-read, and only the
+        consumer that has read the installation from GitHub writes the status."""
         ...
+
+
+CONNECTION_KIND = "github"
+CONNECTION_RETRIES = 5
+
+
+def connection_key(installation_id: int) -> Key:
+    """``ORG`` / ``CONN#github#<installation id>`` (PLAN 11, Connection)."""
+    return Key("ORG", f"CONN#{CONNECTION_KIND}#{installation_id}")
+
+
+class StoreConnectionSink:
+    """``ConnectionSink`` over the store: sets ``reread_pending`` and a ``hint``, leaving every
+    other field (above all ``status``, written after a re-read) as it was. Replaying a body only
+    rewrites the same hint, so a replay can neither suspend nor resurrect an installation."""
+
+    def __init__(self, store: Store, clock: Callable[[], float] = time.time) -> None:
+        self._store = store
+        self._clock = clock
+
+    def apply(self, update: ConnectionUpdate) -> None:
+        key = connection_key(update.installation_id)
+        hint = {
+            "event": update.event,
+            "action": update.action,
+            "status": update.status.value,
+            "repositories_added": [f"{r.owner}/{r.name}" for r in update.repositories_added],
+            "repositories_removed": [f"{r.owner}/{r.name}" for r in update.repositories_removed],
+            "at": self._clock(),
+        }
+        for _ in range(CONNECTION_RETRIES):
+            item = self._store.get(PLATFORM, key)
+            record: dict[str, Any] = dict(item.data) if item else {"kind": CONNECTION_KIND}
+            record.update(installation_id=update.installation_id, reread_pending=True, hint=hint)
+            try:
+                self._store.put(
+                    PLATFORM,
+                    key,
+                    record,
+                    when=Absent() if item is None else VersionIs(item.version),
+                )
+                return
+            except ConditionFailedError:
+                continue  # someone else wrote between our read and write: merge again
+        raise TransientError("connection record kept changing")
 
 
 def _repos(payload: Mapping[str, Any], key: str) -> tuple[RepoRef, ...]:
@@ -383,6 +461,25 @@ def parse_connection_update(event: str, body: bytes) -> ConnectionUpdate | None:
 # --- the receiver -----------------------------------------------------------------------------
 
 
+GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+class _Verified:
+    """The verdict of the one signature check ``receive`` made, handed to ingest so the HMAC is
+    not computed twice. It checks nothing itself: it exists only because ``WebhookIngest`` wants a
+    verifier."""
+
+    signed_timestamp = False
+    replay_window: float | None = None
+
+    def __init__(self, delivery_id: str, secret_headers: frozenset[str]) -> None:
+        self._delivery_id = delivery_id
+        self.secret_headers = secret_headers
+
+    def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
+        return self._delivery_id
+
+
 class GitHubWebhooks:
     """Verify, parse, dedupe and enqueue one GitHub delivery. Implements no port: it only receives,
     so it exposes no write method (the conformance suite checks that)."""
@@ -393,45 +490,59 @@ class GitHubWebhooks:
         store: Store,
         queue: NudgeQueue,
         metrics: Metrics,
+        connections: ConnectionSink,
         *,
-        connections: ConnectionSink | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.verifier = GitHubWebhookVerifier(secret)
-        self._ingest = WebhookIngest(SURFACE, self.verifier, store, queue, metrics, clock=clock)
+        self._store, self._queue, self._clock = store, queue, clock
         self._metrics = metrics
         self._connections = connections
 
     def receive(self, raw: RawWebhook) -> list[ExternalChange] | None:
         """The changes a new delivery nudges about, or None for a duplicate.
 
-        Raises ``InvalidSignatureError`` (forged, unsigned, no ID), ``MalformedWebhookError`` (a
-        genuine body we cannot read; its ID stays unclaimed) or ``TransientError`` (store or queue
-        down: GitHub should redeliver, and the ID is not left claimed)."""
+        Raises ``InvalidSignatureError`` (forged, unsigned, no or odd ID), ``MalformedWebhookError``
+        (a genuine body we cannot read; its ID stays unclaimed) or ``TransientError`` (store or
+        queue down: GitHub should redeliver, and the ID is not left claimed)."""
         try:
             headers = normalise_headers(raw.headers)
-            self.verifier.verify(headers, raw.body)
+            delivery_id = self.verifier.verify(headers, raw.body)  # the only signature check
         except PermanentError as exc:
             self._metrics.incr("webhook.rejected", surface=SURFACE, reason="signature")
             raise InvalidSignatureError("webhook rejected") from exc
-        event = headers.get(EVENT_HEADER, "")
-        if not event:
-            raise MalformedWebhookError("webhook has no event header")
-        changes = parse_event(event, raw.body)
-        update = parse_connection_update(event, raw.body)
-        response = self._ingest.handle(raw.headers, raw.body)
+        if not GUID.fullmatch(delivery_id):
+            self._metrics.incr("webhook.rejected", surface=SURFACE, reason="delivery_id")
+            raise InvalidSignatureError("webhook delivery id is not a GUID")
+        try:
+            event = headers.get(EVENT_HEADER, "")
+            if not event:
+                raise MalformedWebhookError("webhook has no event header")
+            changes = parse_event(event, raw.body)
+            update = parse_connection_update(event, raw.body)
+        except MalformedWebhookError:
+            self._metrics.incr("webhook.malformed", surface=SURFACE)
+            raise
+        ingest = WebhookIngest(
+            SURFACE,
+            _Verified(delivery_id, self.verifier.secret_headers),
+            self._store,
+            self._queue,
+            self._metrics,
+            clock=self._clock,
+        )
+        response = ingest.handle(raw.headers, raw.body)
         if response.status == DUPLICATE:
             return None
         if response.status == UNAVAILABLE:
             raise TransientError("webhook could not be queued")
         if response.status != ACCEPTED:
             raise InvalidSignatureError(response.body)
-        if update is not None and self._connections is not None:
+        if update is not None:
             self._apply(update)
         return changes
 
     def _apply(self, update: ConnectionUpdate) -> None:
-        assert self._connections is not None
         try:
             self._connections.apply(update)
         except Exception:
