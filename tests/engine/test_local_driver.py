@@ -2193,10 +2193,63 @@ def transient_forever(key: str, command: object) -> Outcome | None:
     )
 
 
-def test_a_persistent_transient_error_ends_as_a_permanent_budget_error(tmp_path: Path) -> None:
-    clock = TickClock()
+def test_n1_a_persistent_transient_error_blocks_the_run_and_a_restart_spends_nothing(
+    tmp_path: Path,
+) -> None:
+    store, clock = MemoryStore(), TickClock()
     w = Worker(tmp_path / "l", override=transient_forever)
-    d = make(MemoryStore(), w, clock=clock, sleep=clock.sleep, retry_budget=30.0)
+    d = make(store, w, clock=clock, sleep=clock.sleep, retry_budget=30.0)
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = run(go())
+    assert rs.run.status is RunStatus.BLOCKED  # on the attention list, not RUNNING with work left
+    assert rs.run.blocked_reason == "permanent_failure"
+    assert d.pending_events(RID) == 0
+    spent = len(w.calls())
+    assert 30 <= spent <= 32  # one call a second for the budget, then it stops
+    restarted = make(store, w, clock=TickClock(), retry_budget=30.0)
+    run(restarted.resume_all())
+    assert len(w.calls()) == spent  # R1: a restart makes no new call
+
+
+def test_n1_a_persistent_transient_effect_blocks_as_a_blocked_effect(tmp_path: Path) -> None:
+    clock = TickClock()
+
+    def effect_flaky(key: str, command: object) -> Outcome | None:
+        if isinstance(command, RunEffect):
+            return StillRunning(1.0, "transient:ConnectionResetError")
+        return None
+
+    w = Worker(tmp_path / "l", override=effect_flaky)
+    d = make(MemoryStore(), w, clock=clock, sleep=clock.sleep, retry_budget=10.0)
+
+    async def go() -> RunState:
+        await d.start(new_run())
+        return await d.run_until_idle(RID)
+
+    rs = run(go())
+    assert rs.run.status is RunStatus.BLOCKED
+    assert rs.run.blocked_reason == "effect_failed"  # a blocked effect, so Retry can clear it
+
+
+def test_a_command_with_no_failure_event_raises_the_budget_error(tmp_path: Path) -> None:
+    clock = TickClock()
+
+    def gate_flaky(key: str, command: object) -> Outcome | None:
+        if isinstance(command, OpenGate):
+            return StillRunning(1.0, "transient:x")
+        return None
+
+    d = make(
+        MemoryStore(),
+        Worker(tmp_path / "l", override=gate_flaky),
+        clock=clock,
+        sleep=clock.sleep,
+        retry_budget=5.0,
+    )
 
     async def go() -> None:
         await d.start(new_run())
@@ -2205,8 +2258,60 @@ def test_a_persistent_transient_error_ends_as_a_permanent_budget_error(tmp_path:
     with pytest.raises(RetryBudgetExceededError) as e:
         run(go())
     assert classify(e.value) is FailureClass.PERMANENT
-    assert 30 <= len(w.calls()) <= 32  # one call a second for the budget, then it stops
-    assert clock.now - 1000.0 <= 32
+
+
+def test_the_budget_boundary_is_exclusive() -> None:
+    clock = Clock()
+    d = make(MemoryStore(), Worker(Path("/nonexistent/l")), clock=clock, retry_budget=30.0)
+    flaky = StillRunning(1.0, "transient:x")
+    assert d._budget_spent("k", flaky) is False  # starts the clock
+    clock.now += 30.0
+    assert d._budget_spent("k", flaky) is False  # exactly the budget: not yet
+    clock.now += 0.001
+    assert d._budget_spent("k", flaky) is True
+
+
+def test_a_retrying_effects_answers_are_capped_by_the_transient_prefix() -> None:
+    ex = EffectsExecutor(None, {}, lambda c: SUBJECT, lambda r: RunStatus.RUNNING)  # type: ignore[arg-type]
+    assert ex._again("k", "retrying", retrying=True).reason == "transient:retrying"
+    assert ex._again("k", "transient:X", retrying=True).reason == "transient:X"
+    assert ex._again("k", "moved", retrying=False).reason == "moved"  # a poll is not capped
+
+
+def test_a_driver_re_drives_by_default_and_can_opt_out(tmp_path: Path) -> None:
+    assert make(MemoryStore(), Worker(tmp_path / "a")).redriver is not None
+    assert make(MemoryStore(), Worker(tmp_path / "b"), redrive=None).redriver is None
+
+
+def test_aclose_ends_the_background_re_drives(tmp_path: Path) -> None:
+    store, clock = MemoryStore(), Clock()
+    hang = asyncio.Event()
+
+    async def never(seconds: float) -> None:
+        await hang.wait()
+
+    a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
+    b = make(
+        store,
+        Worker(tmp_path / "b"),
+        owner="b",
+        clock=clock,
+        sleep=never,
+        lease_seconds=10,
+        resume_wait=0,
+    )
+
+    async def go() -> bool:
+        await a.start(new_run())
+        await a.step(RID)
+        await b.resume_all()  # leased to a: gives up, and a background drive starts
+        await asyncio.sleep(0.05)
+        task = b.redriver.spawn(RID)  # type: ignore[union-attr]
+        assert not task.done()  # it is waiting out a backoff
+        await b.aclose()
+        return task.cancelled()
+
+    assert run(go())
 
 
 def test_a_poll_that_is_not_a_transient_error_is_not_capped(tmp_path: Path) -> None:
@@ -2286,7 +2391,15 @@ def test_a_drive_that_gave_up_is_driven_again_in_the_background(tmp_path: Path) 
 def test_without_a_redrive_policy_a_given_up_drive_stays_given_up(tmp_path: Path) -> None:
     store, clock = MemoryStore(), Clock()
     a = make(store, Worker(tmp_path / "a"), owner="a", clock=clock, lease_seconds=10)
-    b = make(store, Worker(tmp_path / "b"), owner="b", clock=clock, lease_seconds=10, resume_wait=0)
+    b = make(
+        store,
+        Worker(tmp_path / "b"),
+        owner="b",
+        clock=clock,
+        lease_seconds=10,
+        resume_wait=0,
+        redrive=None,
+    )
 
     async def go() -> None:
         await a.start(new_run())
@@ -2302,7 +2415,11 @@ def test_without_a_redrive_policy_a_given_up_drive_stays_given_up(tmp_path: Path
 def test_a_permanent_give_up_is_not_driven_again(tmp_path: Path) -> None:
     clock = TickClock()
     policy = RetryPolicy(max_attempts=6, base_delay=1.0, max_delay=1.0, total_budget=100.0)
-    w = Worker(tmp_path / "l", override=transient_forever)
+
+    def gate_flaky(key: str, command: object) -> Outcome | None:
+        return StillRunning(1.0, "transient:x") if isinstance(command, OpenGate) else None
+
+    w = Worker(tmp_path / "l", override=gate_flaky)
     d = make(MemoryStore(), w, clock=clock, sleep=clock.sleep, retry_budget=5.0, redrive=policy)
 
     async def go() -> int:

@@ -50,10 +50,12 @@ from sto.domain import (
     EVENTS,
     EffectClass,
     EffectStatus,
+    FailureClass,
     PermanentError,
     Run,
     RunId,
     RunStatus,
+    StepKey,
     Subject,
     TransientError,
     from_wire,
@@ -61,7 +63,7 @@ from sto.domain import (
 )
 from sto.effects.core import EffectExecutor, ExecResult
 from sto.effects.ports import EffectHandler
-from sto.engine.commands import RunEffect
+from sto.engine.commands import RunEffect, RunStep
 from sto.engine.drivers.ports import (
     CommandExecutor,
     Done,
@@ -70,7 +72,7 @@ from sto.engine.drivers.ports import (
     StillRunning,
     command_key,
 )
-from sto.engine.handlers.core import EffectConfirmed, EffectFailed, RunStarted
+from sto.engine.handlers.core import EffectConfirmed, EffectFailed, RunStarted, StepFailed
 from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
 from sto.engine.reducer import (
     HandlerRegistry,
@@ -163,6 +165,10 @@ class _Rec:
 _Change = Callable[[_Rec], tuple[_Rec, tuple[Put, ...]]]
 
 
+# Frozen, so one shared default is safe. Pass ``redrive=None`` to turn the background re-drive off.
+DEFAULT_REDRIVE = RetryPolicy()
+
+
 class LocalDriver:
     def __init__(
         self,
@@ -181,7 +187,7 @@ class LocalDriver:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backoff: float = 0.01,
         retry_budget: float = 600.0,
-        redrive: RetryPolicy | None = None,
+        redrive: RetryPolicy | None = DEFAULT_REDRIVE,
     ) -> None:
         if not lease_seconds > 0:
             raise ValueError("lease_seconds must be positive")
@@ -208,21 +214,46 @@ class LocalDriver:
         """The background re-driver, if ``redrive`` was given (see ``resume_all``)."""
         return self._redriver
 
-    def _within_budget(self, key: str, outcome: StillRunning) -> None:
+    def _budget_spent(self, key: str, outcome: StillRunning) -> bool:
         """Cap the total time a command may keep answering ``transient:``. The clock starts at its
-        first such answer (in memory: a restart starts it again) and any other answer clears it.
-        Past the budget this raises ``RetryBudgetExceededError`` (permanent), so a persistent
-        transient error ends the drive instead of backing off for ever; nothing re-drives it."""
+        first such answer (in memory) and any other answer clears it. True once it is spent: the
+        caller then ends the command with a failure (``_give_up``)."""
         if not outcome.reason.startswith("transient:"):
             self._retrying.pop(key, None)
-            return
+            return False
         started = self._retrying.setdefault(key, self._clock())
         if self._clock() - started > self._retry_budget:
             del self._retrying[key]
+            return True
+        return False
+
+    async def _give_up(self, run_id: RunId, head: dict[str, Any]) -> StepResult:
+        """The budget is spent: commit the head command as done with a failure the run hears, so
+        it BLOCKS (attention list, a person's Retry) and a restart does not spend a budget again.
+        A step fails permanently; an effect is reported ``blocked``, which Retry can clear. Any
+        other command has no failure event, so ``RetryBudgetExceededError`` (permanent) is
+        raised."""
+        cmd = decode(head["cmd"], "command")
+        event: object
+        if isinstance(cmd, RunStep):
+            event = StepFailed(
+                StepKey(run_id, cmd.stage, cmd.visit, cmd.attempt), FailureClass.PERMANENT
+            )
+        elif isinstance(cmd, RunEffect):
+            event = EffectFailed(run_id, cmd.type, cmd.visit, "blocked")
+        else:
             raise RetryBudgetExceededError(
-                f"command {key!r} kept failing with a transient error for over "
+                f"command {head['key']!r} kept failing with a transient error for over "
                 f"{self._retry_budget}s"
             )
+        wires = (encode(event, "event"),)
+        await self._commit(run_id, lambda r: self._done(r, head["key"], wires))
+        return "worked"
+
+    async def aclose(self) -> None:
+        """Cancel and await the background re-drive tasks. Call it when the driver is done."""
+        if self._redriver is not None:
+            await self._redriver.aclose()
 
     # --- storage ------------------------------------------------------------------------------
 
@@ -483,7 +514,8 @@ class LocalDriver:
             if probe:
                 return "worked"  # the probe has had its one call; go on to the StopRun
             if isinstance(outcome, StillRunning):
-                self._within_budget(head["key"], outcome)
+                if self._budget_spent(head["key"], outcome):
+                    return await self._give_up(run_id, head)
                 return Waiting(outcome.retry_after)
             return outcome
         self._retrying.pop(head["key"], None)
@@ -550,6 +582,8 @@ class LocalDriver:
             return rs
         finally:
             self._probed = {p for p in self._probed if p[0] != run_id}
+            # a retry clock belongs to one drive: none outlives it (a cancelled run's, say)
+            self._retrying = {k: v for k, v in self._retrying.items() if f":{run_id}:" not in k}
 
     def held(self, run_id: RunId) -> str | None:
         """Why the last ``run_until_idle`` of this run stopped on a held command, if it did."""

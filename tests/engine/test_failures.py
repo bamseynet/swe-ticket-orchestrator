@@ -948,3 +948,66 @@ def test_retry_requested_field_types_are_validated(over: dict[str, Any]) -> None
     }
     with pytest.raises(TypeError):
         RetryRequested(**{**base, **over})
+
+
+# --- review pass 2 ---------------------------------------------------------------------------
+
+
+def test_n2_a_delayed_second_click_cannot_clear_a_new_block() -> None:
+    rs, j = blocked_at_merge(), Journal()
+    moved = dataclasses.replace(rs, run=dataclasses.replace(rs.run, version=rs.run.version + 2))
+    loads = iter([rs, moved])  # read at the start, then the run has moved before the clear
+    sent: list[object] = []
+
+    async def submit(run_id: Any, event: object) -> None:
+        sent.append(event)
+
+    fx = FakeEffects(j, merge_key(rs))
+    svc = RetryService(
+        audit=FakeAudit(j),
+        stopper=FakeStopper(j),
+        effects=fx,
+        submit=submit,
+        load=lambda run_id: (loads.__next__(), W),
+    )
+    with pytest.raises(OutOfOrderEventError, match="changed"):
+        asyncio.run(svc.retry(RID, "bob", "again"))
+    assert fx.blocked == {merge_key(rs)}  # the new block was not cleared
+    assert sent == []
+    assert "retry_blocked" not in [e[0] for e in j.log]
+
+
+def test_a_value_error_that_is_not_the_not_blocked_refusal_is_not_swallowed() -> None:
+    rs, j = blocked_at_merge(), Journal()
+
+    class Broken(FakeEffects):
+        def retry_blocked(self, run_id: Any, idempotency_key: str) -> object:
+            raise ValueError("the store returned garbage")
+
+    fx = Broken(j)
+    fx.status = EffectStatus.PLANNED  # a status that would otherwise count as cleared
+    svc, sent = service(rs, j, effects=fx)
+    with pytest.raises(ValueError, match="garbage"):
+        asyncio.run(svc.retry(RID, "bob", "x"))
+    assert sent == []
+
+
+def test_redriver_aclose_cancels_and_awaits_the_background_drives() -> None:
+    started = asyncio.Event()
+
+    class Hangs:
+        async def run_until_idle(self, run_id: Any) -> RunState:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def go() -> tuple[bool, dict[Any, BaseException]]:
+        rd = Redriver(Hangs(), RetryPolicy(), clock=Clock(), sleep=Clock().asleep)
+        task = rd.spawn(RID)
+        await started.wait()
+        await rd.aclose()
+        return task.cancelled(), rd.failures
+
+    cancelled, failures = asyncio.run(go())
+    assert cancelled
+    assert failures == {}  # a cancelled drive is not a failure

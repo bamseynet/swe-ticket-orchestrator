@@ -399,6 +399,10 @@ class RetryService:
             },
         )
         if key is not None:
+            # A delayed click: the run may have moved since it was read (the first Retry ran and
+            # the effect blocked again). Clearing now would clear a new block nobody looked at.
+            if self._load(run_id)[0].run.version != rs.run.version:
+                raise OutOfOrderEventError("the run changed while this retry was being made")
             self._clear(run_id, key)
         else:
             self._stopper.stop_attempt(run_id, target.stage, target.visit, target.attempt)
@@ -410,8 +414,10 @@ class RetryService:
         with ``ValueError``): an effect that is PLANNED or RETRYING is cleared, so go on."""
         try:
             self._effects.retry_blocked(run_id, key)
-        except ValueError:
-            if self._effects.get(run_id, key).status not in (
+        except ValueError as e:
+            if "only a blocked effect" not in str(e) or self._effects.get(
+                run_id, key
+            ).status not in (
                 EffectStatus.PLANNED,
                 EffectStatus.RETRYING,
             ):
@@ -463,6 +469,13 @@ class Redriver:
         self._tasks[run_id] = task
         task.add_done_callback(lambda t: self._settle(run_id, t))
         return task
+
+    async def aclose(self) -> None:
+        """Cancel the background drives and wait for them to end."""
+        tasks = [t for t in self._tasks.values() if not t.done()]
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _settle(self, run_id: RunId, task: asyncio.Task[RunState]) -> None:
         if self._tasks.get(run_id) is task:
