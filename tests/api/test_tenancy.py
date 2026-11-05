@@ -20,7 +20,9 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI, Request, WebSocket
-from starlette.routing import BaseRoute
+from starlette.endpoints import HTTPEndpoint
+from starlette.responses import JSONResponse
+from starlette.routing import BaseRoute, Route
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -632,6 +634,18 @@ def test_overlapping_templates_are_refused_when_the_table_is_built(world: World)
         world.authz(method_differs)  # fine
     with pytest.raises(RouteTableError):  # a public route may not overlap a declared one either
         Authorization(world.validator, world.mapping, routes={("GET", "/{x}"): view}, public=PUBLIC)
+    # a parameter that is only part of a segment cannot be compared for overlap, so it is refused
+    partial: list[tuple[str, str]] = [
+        ("/a/b{y}", "/a/bz"),
+        ("/f/{name}.json", "/f/summary.json"),
+        ("/g/{a}-{b}", "/g/x-y"),
+        ("/org/{name}.json", "/org/floors.json"),
+    ]
+    for one, other in partial:
+        with pytest.raises(RouteTableError):
+            world.authz({("GET", one): view, ("GET", other): floors})
+        with pytest.raises(RouteTableError):
+            world.authz({("GET", one): view})
     for template in ("/files/{p:path}", "/x/{id:int}", "runs", "/a/{b", "/a/b}", "/a/{}"):
         with pytest.raises(RouteTableError):
             world.authz({("GET", template): view})
@@ -640,6 +654,20 @@ def test_overlapping_templates_are_refused_when_the_table_is_built(world: World)
 
 def listed(app: FastAPI) -> list[tuple[str, str]]:
     return undeclared_routes(app)
+
+
+def test_the_table_is_copied_so_a_later_change_cannot_skip_the_overlap_check(
+    world: World,
+) -> None:
+    view = RouteRule(Permission.VIEW_RUNS)
+    table = {**ROUTES, ("GET", "/x/{a}"): view}
+    authz = world.authz(table)
+    table[("GET", "/x/fixed")] = RouteRule(Permission.SET_FLOORS)  # would overlap
+    assert ("GET", "/x/fixed") not in authz.routes
+    with pytest.raises(TypeError):
+        authz.routes[("GET", "/x/fixed")] = view  # type: ignore[index]
+    loose: Any = {("GET", "/healthz")}  # a plain set, as a caller might pass
+    assert isinstance(Authorization(world.validator, world.mapping, public=loose).public, frozenset)
 
 
 def test_the_walker_lists_a_route_hidden_from_the_schema(world: World) -> None:
@@ -678,6 +706,41 @@ def test_the_walker_lists_mounts_and_their_routes(world: World) -> None:
         403,
         "no_permission_declared",
     )
+
+
+def test_an_included_routers_websocket_is_listed(world: World) -> None:
+    app = world.app()
+    router = APIRouter()
+
+    @router.websocket("/ws/{x}")
+    async def sock(ws: WebSocket, x: str) -> None:  # pragma: no cover
+        await ws.close()
+
+    app.include_router(router, prefix="/pre")
+    assert listed(app) == [("WEBSOCKET", "/pre/ws/{x}")]
+
+
+def test_a_route_with_no_method_list_is_listed_as_any(world: World) -> None:
+    class Endpoint(HTTPEndpoint):  # answers every method
+        async def get(self, request: Request) -> JSONResponse:  # pragma: no cover
+            return JSONResponse({})
+
+    app = world.app()
+    app.router.routes.append(Route("/endpoint", Endpoint))
+    assert listed(app) == [("ANY", "/endpoint")]
+    for method in ("GET", "POST", "DELETE"):
+        r = send(app, method, "/endpoint", world.user(ALPHA, "team_admin"))
+        refused(r, 403, "no_permission_declared", method)
+
+
+def test_an_app_level_frontend_is_listed(world: World, tmp_path: Path) -> None:
+    """``app.frontend()`` registers its routes as low priority, matched after the rest."""
+    (tmp_path / "index.html").write_text("<p>hi</p>")
+    app = world.app()
+    app.frontend("/ui", directory=str(tmp_path))
+    assert listed(app) != []
+    r = send(app, "GET", "/ui/index.html", world.user(ALPHA, "team_admin"))
+    refused(r, 403, "no_permission_declared")
 
 
 def test_a_path_converter_is_listed_once_in_its_declared_form(world: World) -> None:
@@ -824,9 +887,12 @@ def test_nothing_outside_tests_mentions_the_fake_issuer() -> None:
 
 def test_importing_every_module_never_loads_the_fake_issuer() -> None:
     """The runtime check for what a text scan cannot see (names built from pieces)."""
-    program = """
+    src = REPO_ROOT / "src"
+    program = f"""
 import importlib, pkgutil, sys
+sys.path.insert(0, {str(src)!r})  # -I ignores PYTHONPATH: this checkout, explicitly
 import sto
+assert sto.__file__.startswith({str(src)!r}), sto.__file__
 failed = []
 for m in pkgutil.walk_packages(sto.__path__, "sto.", onerror=lambda n: failed.append(n)):
     if m.name == "sto.identity.fake_issuer":
@@ -834,7 +900,7 @@ for m in pkgutil.walk_packages(sto.__path__, "sto.", onerror=lambda n: failed.ap
     try:
         importlib.import_module(m.name)
     except ImportError as e:  # an optional dependency that is not installed
-        failed.append(f"{m.name}: {e}")
+        failed.append(f"{{m.name}}: {{e}}")
 assert "sto.identity.fake_issuer" not in sys.modules, "the fake issuer was imported"
 assert "sto.api.auth" in sys.modules and "sto.api.app" in sys.modules, failed
 """

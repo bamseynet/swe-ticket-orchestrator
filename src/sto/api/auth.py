@@ -21,7 +21,10 @@ a route is added without a permission. A route type it does not understand is li
 Templates are matched by this module, not the router, so no pair of declared templates may
 overlap for one method (``/org/{name}`` and ``/org/summary``): the router serves whichever was
 registered first and the two could disagree on the permission. :class:`Authorization` refuses
-such a table, and a template with a converter (``{p:path}``), when it is built.
+such a table when it is built, and a template whose parameter is not a whole segment
+(``/f/{name}.json``) or has a converter (``{p:path}``), which the overlap check cannot compare.
+The table is copied and frozen at that point. A route with no method list (an ``HTTPEndpoint``)
+is listed as ``ANY``, which cannot be declared, so it is always refused.
 
 Per request, in this order: match the request against the declared templates (a path that
 matches none, whether a missing path, a wrong method or a route nobody declared, is refused the
@@ -64,6 +67,7 @@ import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Literal
 
 from fastapi import FastAPI
@@ -241,13 +245,18 @@ _PARAM = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
 def _segments(template: str) -> list[str]:
-    if (
-        not template.startswith("/")
-        or "{" in _PARAM.sub("", template)
-        or "}" in _PARAM.sub("", template)
-    ):
-        raise RouteTableError(f"unsupported path template {template!r} (no converters)")
-    return template.split("/")[1:]
+    """The segments of a template. A parameter must be a whole segment (``/runs/{run_id}``): a
+    partial one (``/f/{name}.json``, ``/g/{a}-{b}``) or a converter (``{p:path}``) is refused, so
+    "segment is a parameter" is the only wildcard the overlap check has to know."""
+    segments = template.split("/")[1:]
+    ok = template.startswith("/") and all(
+        _PARAM.fullmatch(seg) or ("{" not in seg and "}" not in seg) for seg in segments
+    )
+    if not ok:
+        raise RouteTableError(
+            f"unsupported path template {template!r} (whole-segment parameters only)"
+        )
+    return segments
 
 
 def _overlap(a: list[str], b: list[str]) -> bool:
@@ -276,7 +285,17 @@ class Authorization:
     team_of: TeamOf = runtime_team
 
     def __post_init__(self) -> None:
+        # Copied and frozen first, so a later change to the caller's dict cannot skip the check.
+        object.__setattr__(self, "routes", MappingProxyType(dict(self.routes)))
+        object.__setattr__(self, "public", frozenset(self.public))
         check_table(self.routes, self.public)
+
+
+def _methods(methods: Iterable[str] | None, path: str) -> Iterator[tuple[str, str]]:
+    """A route with no method list (an ``HTTPEndpoint``) answers every method: ``ANY``, which no
+    declared route can be, so it is always listed as undeclared and refused."""
+    found = sorted(m for m in methods or () if m != "HEAD")
+    yield from ((m, path) for m in found) if found else iter([("ANY", path)])
 
 
 def _walk(routes: Iterable[Any], prefix: str = "") -> Iterator[tuple[str, str]]:
@@ -294,7 +313,7 @@ def _walk(routes: Iterable[Any], prefix: str = "") -> Iterator[tuple[str, str]]:
                 starlette = getattr(r, "starlette_route", None)
                 yield (WEBSOCKET, getattr(starlette, "path", None) or original.path)
             elif isinstance(original, APIRoute | Route):
-                yield from ((m, r.path) for m in sorted(r.methods) if m != "HEAD")
+                yield from _methods(r.methods, r.path)
             else:
                 yield ("UNKNOWN", type(original).__name__)
         elif isinstance(r, Mount):
@@ -306,7 +325,7 @@ def _walk(routes: Iterable[Any], prefix: str = "") -> Iterator[tuple[str, str]]:
         elif isinstance(r, WebSocketRoute):
             yield (WEBSOCKET, prefix + r.path)
         elif isinstance(r, APIRoute | Route):
-            yield from ((m, prefix + r.path) for m in sorted(r.methods or ()) if m != "HEAD")
+            yield from _methods(r.methods, prefix + r.path)
         else:
             yield ("UNKNOWN", type(r).__name__)
 
@@ -314,7 +333,10 @@ def _walk(routes: Iterable[Any], prefix: str = "") -> Iterator[tuple[str, str]]:
 def routes_of(app: FastAPI) -> list[tuple[str, str]]:
     """Every ``(method, path template)`` the app serves, from its router tree (so including
     included routers, mounts, websockets and routes hidden from the schema)."""
-    return sorted(set(_walk(app.router.routes)))
+    router = app.router
+    # ``_low_priority_routes`` holds what an app-level ``frontend()`` registers: matched last.
+    low = getattr(router, "_low_priority_routes", ())
+    return sorted(set(_walk([*router.routes, *low])))
 
 
 def undeclared_routes(
