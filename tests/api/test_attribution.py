@@ -8,6 +8,7 @@ evaluator (``sto.gates.sod.evaluate``) on the records the routes wrote.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -33,11 +34,12 @@ from sto.api.auth import (
 )
 from sto.api.routers.attribution import blockers, commit_key, read_records
 from sto.config.org_policy import ORG_ADMIN
-from sto.config.schema import Floors
+from sto.config.schema import Floors, SeparationOfDuties
 from sto.domain import Gate, GateId, GateType, RunId, Subject
+from sto.engine.commands import OpenGate
 from sto.gates.hooks import ReadOnly, record_with_audit
 from sto.gates.service import verify_audit_chain
-from sto.gates.sod import RunFacts, evaluate
+from sto.gates.sod import Commit, Resolution, RunFacts, evaluate
 from sto.identity.mapping import UserIdentity
 from sto.store.memory import MemoryStore
 from sto.store.ports import AUDIT, ConditionFailedError, Key, Put, TeamScope
@@ -78,6 +80,9 @@ def admin_token(world: World, role: str = "team_admin") -> str:
 
 
 def gate(kind: GateType = GateType.REVIEW) -> Gate:
+    if kind is GateType.PRE_PUSH:
+        pre = Subject.pre_push(base_sha="a" * 40, patch_id="p1", ticket_revision="r1")
+        return Gate(GateId.new(), RunId.new(), "g", kind, 1, pre)
     subject = Subject(
         head_sha="b" * 40,
         patch_id="p1",
@@ -213,7 +218,7 @@ def test_another_teams_admin_and_a_service_are_refused(world: World) -> None:
 def test_an_unattributed_commit_blocks_and_the_gate_report_says_who_can_clear_it(
     world: World,
 ) -> None:
-    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"), gate=GateType.REVIEW)
     put_commit(world, run_id)
     put_commit(world, run_id, PLATFORM_SHA, in_receipts=True)  # platform made it: no block
     r = call(world.app(), "GET", f"/runs/{run_id}/sod-blocks", world.user(ALPHA, "developer"))
@@ -224,6 +229,8 @@ def test_an_unattributed_commit_blocks_and_the_gate_report_says_who_can_clear_it
             {
                 "reason": f"unattributed_commit:{SHA}",
                 "clear_with": f"POST /runs/{{run_id}}/commits/{SHA}:attribute",
+                "gate": "g",
+                "round": 1,
                 "who_can_clear": ["team_admin", "org_admin"],
             }
         ],
@@ -376,11 +383,75 @@ def test_a_pusher_exclusion_cannot_be_cleared_and_a_clear_is_not_repeated(world:
     assert len(audit(world, run_id)) == 1
 
 
+def test_a_false_trailer_on_a_platform_commit_can_be_cleared_but_not_attributed(
+    world: World,
+) -> None:
+    run_id = seed_run(world, started_by=None)
+    victim = f"{ISS}|rev"
+    put_commit(
+        world, run_id, PLATFORM_SHA, in_receipts=True,
+        coauthors=[{"actor": victim, "source": "trailer", "cleared_by": None}],
+    )  # fmt: skip
+    assert verdict(world, run_id, "rev").reasons == ("committer",)  # excluded before the skip
+    app, tok = world.app(), world.user(ALPHA, "team_admin")
+    path = f"/runs/{run_id}/commits/{PLATFORM_SHA}:attribute"
+    refused(call(app, "POST", path, tok, {"attributed_to": victim}), 409, "not_attributable")
+    assert call(app, "POST", path, tok, {"clear_exclusion": victim}).status_code == 200
+    assert verdict(world, run_id, "rev").allowed
+    assert [a["action"] for a in audit(world, run_id)] == ["commit.exclusion_cleared"]
+
+
+def test_clearing_a_duplicate_entry_keeps_the_earlier_clearer(world: World) -> None:
+    run_id = seed_run(world, started_by=None)
+    who = f"{ISS}|rev"
+    entries = [
+        {"actor": who, "source": "trailer-1", "cleared_by": f"{ISS}|earlier"},
+        {"actor": who, "source": "trailer-2", "cleared_by": None},
+    ]
+    put_commit(world, run_id, attributed_to=f"{ISS}|x", attributed_by=f"{ISS}|y", coauthors=entries)
+    path = f"/runs/{run_id}/commits/{SHA}:attribute"
+    r = call(world.app(), "POST", path, world.user(ALPHA, "team_admin"), {"clear_exclusion": who})
+    assert r.status_code == 200, r.text
+    cleared = [e["cleared_by"] for e in stored(world, run_id, SHA)["coauthors"]]
+    assert cleared == [f"{ISS}|earlier", f"{ISS}|alpha-team_admin-user"]
+
+
+def test_a_six_character_sha_is_not_a_commit_id(world: World) -> None:
+    run_id = seed_run(world, started_by=None)
+    put_commit(world, run_id, "abcdef")
+    r = call(
+        world.app(), "POST", f"/runs/{run_id}/commits/abcdef:attribute",
+        world.user(ALPHA, "team_admin"), {"attributed_to": f"{ISS}|rev"},
+    )  # fmt: skip
+    refused(r, 404, "commit_not_found")
+    assert "attributed_to" not in stored(world, run_id, "abcdef")
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/runs/{r}/sod-terms:resolve", {"term": "author", "actors": [f"{ISS}|a"]}),
+        (f"/runs/{{r}}/commits/{SHA}:attribute", {"attributed_to": f"{ISS}|a"}),
+        (f"/runs/{{r}}/commits/{SHA}:attribute", {"clear_exclusion": f"{ISS}|a"}),
+    ],
+)
+def test_a_well_formed_unknown_run_is_404_and_writes_nothing(
+    world: World, path: str, body: dict[str, Any]
+) -> None:
+    ghost = RunId.new()
+    r = call(world.app(), "POST", path.format(r=ghost), world.user(ALPHA, "team_admin"), body)
+    refused(r, 404, "run_not_found")
+    everything = world.runtime.store.query(world.scope, f"RUN#{ghost}")
+    assert everything.items == ()
+    assert audit(world, ghost) == []
+
+
 # --- term resolution ------------------------------------------------------------------------
 
 
 def test_an_unknown_requester_blocks_until_an_admin_names_them(world: World) -> None:
-    run_id = seed_run(world, started_by=None)  # a Jira automation started it: no requester
+    # a Jira automation started it: no requester
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
     app = world.app()
     r = call(app, "GET", f"/runs/{run_id}/sod-blocks", world.user(ALPHA, "reviewer"))
     assert [b["reason"] for b in r.json()["blocks"]] == ["unresolved_term:requester"]
@@ -398,7 +469,7 @@ def test_an_unknown_requester_blocks_until_an_admin_names_them(world: World) -> 
     assert verdict(world, run_id, "alpha-team_admin-user", requester=None).reasons == (
         "admin_self_service",
     )
-    (entry,) = audit(world, run_id)
+    (entry,) = [e for e in audit(world, run_id) if e["action"] == "sod_term.resolved"]
     assert (entry["action"], entry["actor"]) == (
         "sod_term.resolved",
         f"{ISS}|alpha-team_admin-user",
@@ -410,6 +481,58 @@ def test_a_known_requester_does_not_block(world: World) -> None:
     run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
     r = call(world.app(), "GET", f"/runs/{run_id}/sod-blocks", world.user(ALPHA, "auditor"))
     assert r.json() == {"blocked": False, "blocks": []}
+
+
+def test_resolving_twice_with_the_same_actors_is_idempotent(world: World) -> None:
+    run_id = seed_run(world, started_by=None)
+    app = world.app()
+    path = f"/runs/{run_id}/sod-terms:resolve"
+    a, b = f"{ISS}|a", f"{ISS}|b"
+    first = call(
+        app, "POST", path, world.user(ALPHA, "team_admin"), {"term": "requester", "actors": [a, b]}
+    )
+    again = call(
+        app,
+        "POST",
+        path,
+        world.token("org", ["org-admins"]),
+        {"term": "requester", "actors": [b, a, a]},
+    )
+    assert (first.status_code, again.status_code) == (200, 200)
+    assert again.json() == first.json()
+    assert len(audit(world, run_id)) == 1  # no second entry
+    records = world.runtime.store.query(world.scope, f"RUN#{run_id}", sk_prefix="SODRES#")
+    assert len(records.items) == 1
+    assert records.items[0].data["resolved_by"] == f"{ISS}|alpha-team_admin-user"
+    # different actors, or another term, are a new resolution
+    call(app, "POST", path, world.user(ALPHA, "team_admin"), {"term": "requester", "actors": [a]})
+    call(app, "POST", path, world.user(ALPHA, "team_admin"), {"term": "author", "actors": [a, b]})
+    assert len(audit(world, run_id)) == 3
+
+
+def test_an_oversized_actor_is_a_422_not_a_500(world: World) -> None:
+    run_id = seed_run(world, started_by=None)
+    path = f"/runs/{run_id}/sod-terms:resolve"
+    tok = world.user(ALPHA, "team_admin")
+    huge = [f"{ISS}|{'x' * 8_000}{n}" for n in range(50)]
+    r = call(world.app(), "POST", path, tok, {"term": "requester", "actors": huge})
+    assert r.status_code == 422, r.text[:200]
+    edge = [f"{ISS}|{'x' * 900}{n}" for n in range(50)]  # the allowed twin
+    assert (
+        call(world.app(), "POST", path, tok, {"term": "requester", "actors": edge}).status_code
+        == 200
+    )
+    assert (
+        call(
+            world.app(),
+            "POST",
+            path,
+            tok,
+            {"term": "requester", "actors": [f"{ISS}|{'y' * 1_001}"]},
+        ).status_code
+        == 422
+    )
+    assert audit(world, run_id)[0]["action"] == "sod_term.resolved"
 
 
 def test_a_resolution_naming_nobody_or_nothing_valid_is_refused(world: World) -> None:
@@ -442,21 +565,124 @@ def test_a_resolution_naming_nobody_or_nothing_valid_is_refused(world: World) ->
 # --- the report agrees with the evaluator, and writes survive a lost race --------------------
 
 
+def review_gate(name: str = "g", kind: GateType = GateType.REVIEW) -> Gate:
+    return replace(gate(kind), name=name)
+
+
 def test_the_report_names_exactly_what_the_evaluator_blocks_on(world: World) -> None:
     run_id = seed_run(world, started_by=None)
     put_commit(world, run_id)
     put_commit(world, run_id, SHA2, attributed_to=f"{ISS}|a", attributed_by=f"{ISS}|b")
     put_commit(world, run_id, PLATFORM_SHA, in_receipts=True)
     commits, resolutions = read_records(world.runtime.store, world.scope, run_id)
-    reported = {b.reason for b in blockers(commits, resolutions, requester=None)}
+    gates = [review_gate()]
+    reported = {b.reason for b in blockers(commits, resolutions, gates=gates, requester=None)}
     evaluated = set(verdict(world, run_id, "rev", requester=None).reasons)
     assert reported == evaluated == {f"unattributed_commit:{SHA}", "unresolved_term:requester"}
-    assert {
-        b.reason for b in blockers(commits, resolutions, requester="a|b", unresolved=["author"])
-    } == {
+    author = SeparationOfDuties.model_validate({"not": ["author"]})
+    found = blockers(
+        commits, resolutions, gates=gates, requester="a|b", unresolved=["author"],
+        sod_of=lambda g: author,
+    )  # fmt: skip
+    assert {b.reason for b in found} == {f"unattributed_commit:{SHA}", "unresolved_term:author"}
+
+
+@pytest.mark.parametrize(
+    ("kind", "blocked"),
+    [
+        (GateType.REVIEW, True),
+        (GateType.PRE_PUSH, True),
+        (GateType.QA, False),  # the requester floor covers review and pre_push only
+        (GateType.CUSTOM, False),
+    ],
+)
+def test_an_unknown_requester_blocks_only_the_gates_whose_terms_include_it(
+    world: World, kind: GateType, blocked: bool
+) -> None:
+    """``sod-blocks`` never says blocked when ``evaluate`` allows (and never the reverse)."""
+    run_id = seed_run(world, started_by=None)
+    world.runtime._gates.open_gate(world.scope, OpenGate(run_id, "g", kind, 1, gate(kind).subject))
+    r = call(world.app(), "GET", f"/runs/{run_id}/sod-blocks", world.user(ALPHA, "developer"))
+    assert r.json()["blocked"] is blocked, r.text
+    evaluated = evaluate_for(kind, run_id)
+    assert (any(x.startswith("unresolved_term:") for x in evaluated)) is blocked
+
+
+def evaluate_for(kind: GateType, run_id: RunId) -> tuple[str, ...]:
+    who = UserIdentity("rev", ISS, frozenset({(ALPHA, "reviewer")}))
+    return evaluate(
+        who=who,
+        linked=True,
+        team=ALPHA,
+        gate=gate(kind),
+        eligible_roles=frozenset({"reviewer"}),
+        opened_with=frozenset({f"{ISS}|rev"}),
+        sod=None,
+        floors=FLOORS,
+        facts=RunFacts(requester=None),
+    ).reasons
+
+
+def test_each_open_gate_is_reported_with_its_own_blocks(world: World) -> None:
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    subject = gate().subject
+    world.runtime._gates.open_gate(world.scope, OpenGate(run_id, "qa", GateType.QA, 1, subject))
+    put_commit(world, run_id)
+    r = call(world.app(), "GET", f"/runs/{run_id}/sod-blocks", world.user(ALPHA, "developer"))
+    seen = sorted((b["gate"], b["reason"]) for b in r.json()["blocks"])
+    assert seen == [
+        ("g", f"unattributed_commit:{SHA}"),
+        ("g", "unresolved_term:requester"),
+        ("qa", f"unattributed_commit:{SHA}"),  # a commit blocks every gate; the requester does not
+    ]
+
+
+def test_a_closed_gate_is_not_reported_and_a_later_round_is_reported_as_such(
+    world: World,
+) -> None:
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    put_commit(world, run_id)
+    app, reviewer = world.app(), world.user(ALPHA, "reviewer")
+    seen = call(app, "GET", f"/runs/{run_id}/sod-blocks", reviewer).json()
+    assert {(b["gate"], b["round"]) for b in seen["blocks"]} == {("g", 1)}
+    digest = gate().subject.digest()  # ``seed_run``'s subject
+    closed = call(
+        app, "POST", f"/runs/{run_id}/gates/g/1/decisions", reviewer,
+        {"kind": "reject", "comment": "no"},
+    )  # fmt: skip
+    assert closed.status_code == 202, (closed.text, digest)
+    after = call(app, "GET", f"/runs/{run_id}/sod-blocks", reviewer).json()
+    assert after == {"blocked": False, "blocks": []}  # nothing open: nothing waits
+    world.runtime._gates.open_gate(
+        world.scope, OpenGate(run_id, "g", GateType.REVIEW, 2, gate().subject)
+    )
+    later = call(app, "GET", f"/runs/{run_id}/sod-blocks", reviewer).json()
+    assert {(b["gate"], b["round"]) for b in later["blocks"]} == {("g", 2)}
+
+
+def test_blockers_counts_a_resolution_only_if_it_names_someone() -> None:
+    nobody = Resolution.__new__(Resolution)
+    fields = {"term": "requester", "actors": frozenset(), "resolved_by": "i|r"}
+    for name, value in {**fields, "gate": None, "round": None}.items():
+        object.__setattr__(
+            nobody, name, value
+        )  # Resolution refuses nothing here; it resolves nothing
+    assert not nobody.resolves
+    found = blockers((), [nobody], gates=[review_gate()], requester=None)
+    assert [b.reason for b in found] == ["unresolved_term:requester"]
+    named = Resolution("requester", frozenset({"i|a"}), "i|r")
+    assert blockers((), [named], gates=[review_gate()], requester=None) == []
+
+
+def test_blockers_needs_both_halves_of_an_attribution() -> None:
+    half = Commit(SHA, False, attributed_to="i|a", attributed_by=None)
+    other = Commit(SHA2, False, attributed_to=None, attributed_by="i|b")
+    full = Commit(PLATFORM_SHA, False, attributed_to="i|a", attributed_by="i|b")
+    found = blockers([half, other, full], (), gates=[review_gate()], requester="i|x")
+    assert sorted(b.reason for b in found) == [
         f"unattributed_commit:{SHA}",
-        "unresolved_term:author",
-    }
+        f"unattributed_commit:{SHA2}",
+    ]
 
 
 class FlakyOnce:

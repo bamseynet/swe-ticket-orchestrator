@@ -32,11 +32,11 @@ once ingest says so (the ``unresolved`` argument of :func:`blockers`).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
-import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -55,9 +55,10 @@ from sto.api.routers.runs import (
 )
 from sto.api.runtime import RunNotFoundError, Runtime, StoreConflictError
 from sto.config.org_policy import ORG_ADMIN
-from sto.domain import RunId
+from sto.config.schema import Floors, SeparationOfDuties
+from sto.domain import Gate, RunId
 from sto.gates.hooks import ReadOnly, record_with_audit, run_pk
-from sto.gates.sod import Commit, Exclusion, Pusher, Resolution
+from sto.gates.sod import Commit, Exclusion, Pusher, Resolution, RunFacts, evaluate
 from sto.identity.mapping import UserIdentity
 from sto.store.ports import (
     Absent,
@@ -135,39 +136,68 @@ def read_records(
 
 @dataclass(frozen=True)
 class Blocker:
-    """One thing that stops every approval, and who can clear it."""
+    """One thing that stops every approval of one gate, and who can clear it."""
 
     reason: (
         str  # ``unattributed_commit:<sha>`` or ``unresolved_term:<term>``, as the evaluator says
     )
     clear_with: str  # the route that clears it
+    gate: str
+    round: int
     who_can_clear: tuple[str, ...] = CLEARING_ROLES
+
+
+_PROBE = UserIdentity("probe", "probe", frozenset())
+# What the runtime knows of org policy until config is wired in: the schema's defaults (the
+# requester floor covers review and pre_push). ``model_construct`` skips the required fields the
+# evaluator never reads here.
+DEFAULT_FLOORS = Floors.model_construct()
+_BLOCKING = ("unattributed_commit:", "unresolved_term:")
 
 
 def blockers(
     commits: Iterable[Commit],
     resolutions: Iterable[Resolution],
     *,
+    gates: Iterable[Gate],
     requester: str | None,
     unresolved: Collection[str] = (),
+    floors: Floors = DEFAULT_FLOORS,
+    sod_of: Callable[[Gate], SeparationOfDuties | None] = lambda gate: None,
 ) -> list[Blocker]:
-    """What blocks approvals now: the same rules as ``sto.gates.sod``, so the gate can say what
-    to clear (a test holds the two together)."""
-    found = [
-        Blocker(
-            f"unattributed_commit:{c.sha}",
-            f"POST /runs/{{run_id}}/commits/{c.sha}:attribute",
+    """What blocks approvals of each of ``gates`` now. Which terms a gate has (the requester floor,
+    its own ``separation_of_duties``) is ``sto.gates.sod``'s table: this asks ``evaluate`` itself
+    with a probe who holds no role, and keeps only its blocking reasons, so the report can never
+    say "blocked" where ``evaluate`` allows. A commit blocks every gate; the requester only the
+    gates whose terms include it. ``sod_of`` gives a gate's own SoD terms (none until the
+    published config is wired in)."""
+    facts = RunFacts(
+        requester=requester,
+        commits=tuple(commits),
+        unresolved=frozenset(unresolved),
+        resolutions=tuple(resolutions),
+    )
+    found: list[Blocker] = []
+    for gate in gates:
+        verdict = evaluate(
+            who=_PROBE,
+            linked=False,
+            team="",
+            gate=gate,
+            eligible_roles=frozenset(),
+            opened_with=None,
+            sod=sod_of(gate),
+            floors=floors,
+            facts=facts,
         )
-        for c in commits
-        if not c.in_receipts and (c.attributed_to is None or c.attributed_by is None)
-    ]
-    resolved = {r.term for r in resolutions if r.resolves}
-    for term in ("requester", "author"):
-        open_ = term in unresolved or (term == "requester" and requester is None)
-        if open_ and term not in resolved:
-            found.append(
-                Blocker(f"unresolved_term:{term}", "POST /runs/{run_id}/sod-terms:resolve")
-            )
+        for reason in verdict.reasons:
+            if reason.startswith(_BLOCKING):
+                clear_with = (
+                    f"POST /runs/{{run_id}}/commits/{reason.partition(':')[2]}:attribute"
+                    if reason.startswith(_BLOCKING[0])
+                    else "POST /runs/{run_id}/sod-terms:resolve"
+                )
+                found.append(Blocker(reason, clear_with, gate.name, gate.round))
     return found
 
 
@@ -177,6 +207,8 @@ def blockers(
 class BlockOut(BaseModel):
     reason: str
     clear_with: str
+    gate: str
+    round: int
     who_can_clear: list[str]
 
 
@@ -201,7 +233,7 @@ class AttributeIn(BaseModel):
 
 class ResolveIn(BaseModel):
     term: Term
-    actors: list[str] = Field(
+    actors: list[Annotated[str, Field(max_length=1_000)]] = Field(
         min_length=1, max_length=50, description="Who the term excludes (`issuer|subject`)."
     )
 
@@ -214,7 +246,13 @@ class Changed(BaseModel):
 
 def _out(found: list[Blocker]) -> list[dict[str, Any]]:
     return [
-        {"reason": b.reason, "clear_with": b.clear_with, "who_can_clear": list(b.who_can_clear)}
+        {
+            "reason": b.reason,
+            "clear_with": b.clear_with,
+            "gate": b.gate,
+            "round": b.round,
+            "who_can_clear": list(b.who_can_clear),
+        }
         for b in found
     ]
 
@@ -280,8 +318,19 @@ async def _requester(rt: Runtime, run_id: RunId) -> str | None:
 
 
 async def _blocks_now(rt: Runtime, run_id: RunId) -> list[dict[str, Any]]:
+    gates = [g for g in _latest(await rt.gates(run_id)) if g.is_open]
     commits, resolutions = await asyncio.to_thread(read_records, rt.store, rt.scope, run_id)
-    return _out(blockers(commits, resolutions, requester=await _requester(rt, run_id)))
+    requester = await _requester(rt, run_id)
+    return _out(blockers(commits, resolutions, gates=gates, requester=requester))
+
+
+def _latest(gates: Iterable[Gate]) -> list[Gate]:
+    """The latest round of each gate (an earlier round no longer waits for anyone)."""
+    best: dict[str, Gate] = {}
+    for g in gates:
+        if g.name not in best or g.round > best[g.name].round:
+            best[g.name] = g
+    return list(best.values())
 
 
 # --- routes -------------------------------------------------------------------------------------
@@ -302,7 +351,7 @@ async def sod_blocks(run_id: str, rt: RuntimeDep) -> dict[str, Any]:
     except StoreConflictError as e:
         raise _busy(e) from e
     except (ValueError, KeyError, TypeError) as e:
-        log.error("run %s has a corrupt attribution record: %r", run_id, e, exc_info=e)
+        log.error("attribution on run %s hit data it cannot use: %r", run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
     return {"blocked": bool(blocks), "blocks": blocks}
 
@@ -344,13 +393,13 @@ async def attribute(
     except StoreConflictError as e:
         raise _busy(e) from e
     except (ValueError, KeyError, TypeError) as e:
-        log.error("commit %s of run %s has a corrupt record: %r", sha, run_id, e, exc_info=e)
+        log.error("commit %s of run %s hit data it cannot use: %r", sha, run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
     return {"audited": True, "blocked": bool(blocks), "blocks": blocks}
 
 
 async def _astate(rt: Runtime, run_id: RunId) -> None:
-    rt.state(run_id)  # 404 for an unknown run (raises RunNotFoundError)
+    await asyncio.to_thread(rt.state, run_id)  # 404 for an unknown run (RunNotFoundError)
 
 
 def _write_commit(
@@ -361,9 +410,9 @@ def _write_commit(
     if item is None:
         raise ApiError(404, "commit_not_found", "no such commit on this run")
     data = dict(item.data)
-    if data.get("in_receipts") is True:
-        raise ApiError(409, "not_attributable", "the platform made this commit; it has no author")
     if clearing:
+        # allowed on a platform commit too: the evaluator applies a trailer's exclusion before it
+        # skips a platform commit, so a false one would otherwise be permanent
         coauthors = [dict(e) for e in data.get("coauthors", ())]
         named = [e for e in coauthors if e["actor"] == target]
         if not named:  # a pusher cannot be cleared (PLAN 9.4), nor can someone never named
@@ -371,10 +420,15 @@ def _write_commit(
         if all(e.get("cleared_by") for e in named):
             raise ApiError(409, "already_cleared", "that exclusion is already cleared")
         for e in named:
-            e["cleared_by"] = admin
+            if not e.get("cleared_by"):  # an earlier clearer stays the one on record
+                e["cleared_by"] = admin
         data["coauthors"] = coauthors
         action, detail = "commit.exclusion_cleared", {"sha": sha, "actor": target}
     else:
+        if data.get("in_receipts") is True:
+            raise ApiError(
+                409, "not_attributable", "the platform made this commit; it has no author"
+            )
         if data.get("attributed_to") and data.get("attributed_by"):
             raise ApiError(409, "already_attributed", "this commit is already attributed")
         data["attributed_to"], data["attributed_by"] = target, admin
@@ -402,14 +456,19 @@ async def resolve_term(run_id: str, body: ResolveIn, rt: RuntimeDep, request: Re
     except StoreConflictError as e:
         raise _busy(e) from e
     except (ValueError, KeyError, TypeError) as e:
-        log.error("run %s has a corrupt attribution record: %r", run_id, e, exc_info=e)
+        log.error("attribution on run %s hit data it cannot use: %r", run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
     return {"audited": True, "blocked": bool(blocks), "blocks": blocks}
 
 
 def _write_resolution(rt: Runtime, run_id: RunId, admin: str, term: str, actors: list[str]) -> None:
+    """Idempotent: the record is keyed by the term and its sorted actors, so a repeat finds the
+    first one and writes nothing more (no second record, no second audit entry)."""
     data = {"term": term, "actors": actors, "resolved_by": admin}
     Resolution(data["term"], frozenset(actors), admin)  # type: ignore[arg-type]
-    key = Key(run_pk(run_id), f"{_RESOLUTION}{term}#{uuid.uuid4().hex}")
+    digest = hashlib.sha256("\n".join(actors).encode()).hexdigest()
+    key = Key(run_pk(run_id), f"{_RESOLUTION}{term}#{digest}")
+    if rt.store.get(rt.scope, key) is not None:
+        return
     detail = {"term": term, "actors": actors}
     _commit(rt, run_id, "sod_term.resolved", admin, detail, Put(key, data, Absent()))
