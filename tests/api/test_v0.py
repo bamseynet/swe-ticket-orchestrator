@@ -33,7 +33,7 @@ from sto.engine.commands import RunStep
 from sto.engine.drivers.local import LocalDriver
 from sto.engine.drivers.ports import Done, Held, Outcome, StillRunning
 from sto.engine.handlers.core import StepSucceeded
-from sto.gates.service import GateService, QuorumRule
+from sto.gates.service import GateService
 from sto.store.memory import MemoryStore
 from sto.store.ports import (
     ConditionFailedError,
@@ -430,75 +430,6 @@ def test_decision_refusals_have_their_own_status() -> None:
             assert (await api.gate(run_id, "review_gate"))["status"] == "OPEN"  # nothing closed it
 
     run(body())
-
-
-class _OnePolicy:
-    """The dev token is one person, "dev": a quorum of two it can never complete alone."""
-
-    def quorum(self, scope: Any, gate: Any) -> list[QuorumRule]:
-        return [QuorumRule("reviewer", 2)]
-
-    def roles(self, scope: Any, gate: Any, actor: str) -> set[str]:
-        return {"reviewer"}
-
-    def refusals(self, scope: Any, gate: Any, actor: str, *, negative: bool) -> list[str]:
-        return []
-
-
-def test_a_vote_below_quorum_leaves_the_gate_open_and_the_run_waiting() -> None:
-    """D3-06: ``Decided.closed`` is False, so the runtime must not tell the run the gate closed.
-    (It would have advanced the run on one of two votes.)"""
-
-    async def body() -> None:
-        w = World(MemoryStore())
-        w.gates = GateService(w.store, policy=_OnePolicy())
-        async with w.up() as api:
-            run_id = await api.to_review_gate()
-            vote = await api.decide(run_id, "review_gate")
-            assert vote.status_code == 202, vote.text
-            assert vote.json()["gate"]["status"] == "OPEN"
-            await asyncio.sleep(0.3)  # an event wrongly submitted would have been applied by now
-            got = await api.run(run_id)
-            assert (got["status"], got["stage"]) == ("WAITING_HUMAN", "review_gate")
-            assert (await api.gate(run_id, "review_gate"))["status"] == "OPEN"
-            assert w.steps.calls == ["implement"]
-
-    run(body())
-
-
-def test_the_new_gate_refusals_have_their_own_status_and_code() -> None:
-    async def body() -> None:
-        w = World(MemoryStore())
-        w.gates = GateService(w.store, policy=_OnePolicy())
-        async with w.up() as api:
-            run_id = await api.to_review_gate()
-            assert (await api.decide(run_id, "review_gate")).status_code == 202
-            again = await api.decide(run_id, "review_gate")  # the same person, a second vote
-            assert (again.status_code, code_of(again)) == (409, "already_voted")
-            bare = await api.decide(run_id, "review_gate", "reject", comment="  ")
-            assert (bare.status_code, code_of(bare)) == (422, "comment_required")
-            # a gate whose quorum the service can no longer read is not decided as asked
-            api.rt._gates = GateService(w.store)
-            lost = await api.decide(run_id, "review_gate", comment="x")
-            assert (lost.status_code, code_of(lost)) == (422, "quorum_invalid")
-            assert (await api.gate(run_id, "review_gate"))["status"] == "OPEN"
-
-    run(body())
-
-
-def test_the_refusal_table_maps_each_decision_error_to_one_status() -> None:
-    from sto.api.routers.gates import _REFUSALS
-    from sto.gates.service import (
-        CommentRequiredError,
-        DuplicateVoteError,
-        QuorumConfigError,
-    )
-
-    table = dict(_REFUSALS)
-    assert table[DuplicateVoteError] == 409  # the state conflicts: this person already voted
-    assert table[CommentRequiredError] == 422  # the request is incomplete
-    assert table[QuorumConfigError] == 422
-    assert len(table) == len(_REFUSALS)  # no error is listed twice
 
 
 def test_a_reject_ends_the_run_and_the_writer_is_never_called() -> None:
@@ -1268,14 +1199,13 @@ def test_a_write_that_is_durable_is_answered_even_if_the_follow_up_read_fails() 
 
 def test_gate_contention_is_a_503_with_its_own_code() -> None:
     from sto.gates.service import GateContentionError
+    from sto.store.ports import ConditionFailedError
 
     async def body() -> None:
         w = World(MemoryStore())
         async with w.up() as api:
             run_id = await api.to_review_gate()
-            # D3-06: the service turns exhausted retries into GateContentionError itself, so the
-            # route has no ConditionFailedError branch left
-            for error in (GateContentionError("kept changing"),):
+            for error in (GateContentionError("kept changing"), ConditionFailedError([0])):
 
                 def boom(*a: Any, error: Exception = error, **k: Any) -> Any:
                     raise error

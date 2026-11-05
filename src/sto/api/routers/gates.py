@@ -35,6 +35,7 @@ from sto.gates.service import (
     StaleRoundError,
     StaleSubjectError,
 )
+from sto.store.ports import ConditionFailedError
 
 log = logging.getLogger("sto.api")
 router = APIRouter(tags=["gates"])
@@ -223,6 +224,12 @@ async def decide(
         # refuses (a corrupt gate): a server fault, logged here and not described to the client.
         log.error("deciding gate %s of run %s hit corrupt data: %r", name, run_id, e, exc_info=e)
         raise ApiError(500, "internal_error", "the server could not process this request") from e
+    except ConditionFailedError as e:
+        # A hook's op (an audit op, D3-19) lost a race on a gate that is still open: contention,
+        # retryable. The service's own retries run out as GateContentionError (below).
+        raise ApiError(
+            503, "gate_contention", "the gate kept changing; try again", headers=_RETRY
+        ) from e
     except TransientError as e:  # the gate kept changing under the call
         raise ApiError(503, "gate_contention", str(e), headers=_RETRY) from e
     return {"decision_id": str(decided.decision.id), "gate": gate_out(decided.gate)}
