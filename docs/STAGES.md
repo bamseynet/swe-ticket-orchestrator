@@ -424,7 +424,7 @@ Carried from D1-03: add the stuck-stop alarm for a dead run whose `stop` or `rec
 Carried from D1-07: a stalled worker past its lease can still send a request after reconcile voided the effect, and a lookup handler that returns `Written` for `pr.merge` must supply the frozen subject.
 Stopping model calls mid-step and session stopping arrive in D10-06.
 **AC:** C3 passes on fakes; Stop beats an approved but unexecuted effect (G10); closing a browser does nothing (C4); gate-eligible people can use Stop; a stuck stop raises the alarm; Stop after merge plans a revert and never ends plain `CANCELLED`. `void_planned` after CONFIRMED reports the landed merge rather than staying silent (`effects/core.py:684-689`); the test uses a real Stop through the driver. A step-level stop exists (`end(2)` then `register(3)` stays live today) and ends the old visit's attempt. SCM reads have timeouts, so a hung read cannot starve the API thread pool. `void_planned` no longer silently does nothing after 8 `TransactionConflictError`s with no backoff (`effects/core.py:675-690`). A Stop never reports a false empty result.
-**Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `tests/engine/test_cancel.py`, `tests/adapters/test_fake.py`.
+**Deps:** D2-06, D1-03, D1-06, D1-07. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/cancel.py`, `src/sto/engine/drivers/local.py`, `src/sto/adapters/ports.py`, `src/sto/adapters/fake/scm.py`, `src/sto/effects/core.py`, `src/sto/engine/handlers/failures.py`, `tests/engine/test_cancel.py`, `tests/adapters/test_fake.py`, `tests/engine/test_local_driver.py`.
 
 #### D2-12: Timers and business calendar
 Timer port, a local implementation, and business-time maths from `TeamConfig` calendars.
@@ -706,7 +706,7 @@ Found in review of D2-10. The retry service accepts any non-blank actor. PLAN's 
 #### D3-24: Decisions use separation of duties and the gate's quorum
 Found in review of D3-06. The gate service takes a `DecisionPolicy`, but the app builds `GateService(store)` with none, so no quorum record is written and `sod.evaluate` (D3-05) decides nothing in production.
 **AC:** the app and runtime build the gate service with a policy that applies `sod.evaluate` and the workflow gate's quorum; a gate opened from a workflow with a quorum writes its quorum record; a sub-quorum vote never advances the run; an ineligible or SoD-excluded person is refused through the API, by the shared tenancy suite; a quorum the validator would refuse never reaches `open_gate`.
-**Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_policy.py`.
+**Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_gate_policy.py`.
 
 ## D4: GitHub, live
 
