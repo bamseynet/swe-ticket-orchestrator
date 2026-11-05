@@ -25,6 +25,7 @@ def _facts(**kw: object) -> DodFacts:
         "acceptance_criteria": ("it works",),
         "check_sha": SHA,
         "check_results": (CheckStatus("build", "passed"),),
+        "required_checks": (),
         "coverage": 90.0,
         "findings": (),
     }
@@ -303,7 +304,7 @@ def test_checks_green_a_missing_sha_says_so_not_a_crash(kw: dict[str, object]) -
 
 def test_checks_green_stale_message_is_exact() -> None:
     (why,) = _reasons("checks_green", None, _facts(check_sha=OTHER))
-    assert why == "the check results are stale: they are for bbbbbbb, the head is aaaaaaa"
+    assert why == f"the check results are stale: they are for {OTHER}, the head is {SHA}"
 
 
 def test_checks_green_a_name_reported_twice_is_flagged_even_if_both_pass() -> None:
@@ -320,3 +321,83 @@ def test_no_evidence_is_named_as_such() -> None:
 def test_registering_a_check_name_twice_is_refused() -> None:
     with pytest.raises(ValueError, match="already registered"):
         dod.check("ac_present")(lambda v, f: None)
+
+
+# --- review pass 1 ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["", " ", "   \n", "abc", "A" * 40, "g" * 40, "a" * 39, "a" * 41])
+@pytest.mark.parametrize("which", ["head_sha", "check_sha"])
+def test_checks_green_refuses_a_sha_that_is_not_40_hex(which: str, bad: str) -> None:
+    # Equal blank SHAs must not count as "the same commit".
+    kw: dict[str, object] = {"head_sha": bad, "check_sha": bad}
+    kw[which] = bad
+    (why,) = _reasons("checks_green", None, _facts(**kw))
+    assert why == "the check results cannot be tied to the head commit"
+
+
+def test_checks_green_one_valid_one_blank_sha_is_not_tied() -> None:
+    (why,) = _reasons("checks_green", None, _facts(check_sha=""))
+    assert why == "the check results cannot be tied to the head commit"
+
+
+def test_required_checks_unreadable_is_not_done() -> None:
+    (why,) = _reasons("checks_green", None, _facts(required_checks=None))
+    assert why == "the list of required checks could not be read"
+
+
+def test_required_checks_default_is_unreadable() -> None:
+    facts = DodFacts(head_sha=SHA, check_sha=SHA, check_results=(CheckStatus("a", "passed"),))
+    assert _reasons("checks_green", None, facts)
+
+
+def test_required_checks_empty_means_none_required() -> None:
+    assert _reasons("checks_green", None, _facts(required_checks=())) == []
+
+
+@pytest.mark.parametrize(
+    "make", [lambda: iter(()), lambda: (r for r in tuple[CheckStatus, ...]()), lambda: iter([])]
+)
+def test_an_empty_iterator_of_results_is_not_done(make: object) -> None:
+    (why,) = _reasons("checks_green", None, _facts(check_results=make()))  # type: ignore[operator]
+    assert why == "no check results are available"
+
+
+def test_a_generator_of_results_is_read_once_and_judged() -> None:
+    gen = (CheckStatus(n, s) for n, s in [("a", "passed"), ("b", "failed")])
+    (why,) = _reasons("checks_green", None, _facts(check_results=gen))
+    assert "b (failed)" in why
+
+
+def test_two_non_passing_statuses_of_one_name_are_listed_sorted() -> None:
+    res = (CheckStatus("a", "pending"), CheckStatus("a", "failed"))
+    (why,) = _reasons("checks_green", None, _facts(check_results=res))
+    assert why == "not green: a (failed, pending)"
+
+
+def test_status_vocabulary_is_the_one_waits_uses() -> None:
+    from sto.engine.handlers import waits
+
+    assert dod._PASSING is waits._PASSING  # type: ignore[attr-defined]
+
+
+def test_coverage_message_does_not_round() -> None:
+    (why,) = _reasons("coverage_at_least", 80, _facts(coverage=79.9999999))
+    assert "79.9999999" in why
+    assert "is 80%" not in why
+
+
+class _Booby:
+    """An entry whose attributes cannot be read."""
+
+    @property
+    def stage(self) -> str:
+        raise RuntimeError("boom")
+
+    check = "ac_present"
+    value = None
+
+
+def test_an_entry_that_cannot_be_read_fails_closed_not_raises() -> None:
+    (f,) = evaluate((_Booby(),), "g", _facts())
+    assert f.reason == "the check could not be evaluated"
