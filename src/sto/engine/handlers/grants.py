@@ -9,8 +9,17 @@ stage it was leaving. A team admin can grant it extra rounds of that loop. The g
 stage, the outcome (the looping edge) and the loop, and is bounded and fails closed. It gives no
 extra iteration when it is missing, is for another run, stage or loop edge, is not yet valid or has
 expired (``applied_at`` is outside ``[issued_at, expires_at)``, or a time is not finite), the loop
-is not actually spent, or the rounds would take the run's total grants for that loop past the loop's
-own configured cap (``MAX_GRANT_ROUNDS_FACTOR`` times it). Such an event is *not* an error and not
+is not actually spent, the stage has more than one spent looped edge (``ambiguous_edge``: the
+blocked edge is not recorded, so a grant must not pick one, and PLAN 6.2 says a grant never changes
+an outcome; with exactly one the grant must name it), or the rounds would take the run's total
+grants for that loop past the loop's own cap (``MAX_GRANT_ROUNDS_FACTOR`` times it) or past the org
+ceiling ``max_loop`` (``LoopGranted.loop_ceiling``, read by the service; none set means the platform
+cap), so the loop never runs more often than the org allows.
+
+Expiry is the service's: the reducer reads no clock, so ``applied_at`` is stamped on the event by
+the service and only compared. A grant is not revoked by time inside the reducer. The real guard
+against a late or replayed grant is ``run_version``: it must equal the run's version, and any
+accepted event bumps it. Such an event is *not* an error and not
 a new block: it returns the state as it was, because the run is already BLOCKED and a raise would
 drop the event. A stale or repeated event (wrong run version) and a run that is not blocked on a
 spent loop raise ``OutOfOrderEventError``, as ``RetryRequested`` does.
@@ -26,11 +35,12 @@ spent loop), a team admin sends the run to the gate its ``clean`` edge leads to,
 ``route_to_gate_allowed``. It opens that gate through the normal ``OpenGate`` command, puts the
 item on the attention list (``AddToAttention``, with the ``attention_digest``) and bars the actor
 from that gate round (``BarFromRound``, which is an SoD ``AdminAction``, so ``admin_self_service``
-excludes them). Refused (state unchanged) when: the patch is not *known* not to be blocked by path
-policy or a secret scan (G20: ``patch_blocked`` must be exactly ``False``), the floor is off (the
-default), the run is not at a review panel, the panel's ``clean`` edge does not lead straight to a
-gate (so the route never skips a stage, and never goes past ``branch.push``), or the gate would not
-open (no head subject, step limit). No loop counter moves.
+excludes them). The commands come in the order ``BarFromRound``, ``OpenGate``, ``AddToAttention``,
+so the router is barred before the gate exists. Refused (state unchanged) when: the patch is not
+*known* not to be blocked by path policy or a secret scan (G20: ``patch_blocked`` must be exactly
+``False``), the floor is off (the default), the run is not at a review panel, the panel's ``clean``
+edge does not lead straight to a gate (so the route never skips a stage, and never goes past
+``branch.push``), or the gate would not open (no head subject, step limit). No loop counter moves.
 
 ``GrantService`` and ``RouteService`` are the audited paths: check (role, floor, the same refusal
 the reducer would give, a dry run of the reducer), write the audit record (a refusal is audited
@@ -47,11 +57,11 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from sto.config.schema import GateStage, ReviewPanelStage
+from sto.config.schema import PLATFORM_MAX_STEPS, Edge, GateStage, ReviewPanelStage
 from sto.config.schema import Workflow as Graph
 from sto.domain import COMMANDS, EVENTS, RunId, RunStatus
 from sto.engine.handlers.stages import _goto, _target
@@ -66,6 +76,8 @@ from sto.gates.sod import AdminAction
 from sto.gates.subject import AttentionItems, attention_digest
 
 MAX_GRANT_ROUNDS_FACTOR = 1  # total rounds granted for a loop <= this times the loop's own cap
+# A loop never runs more than the org ceiling ``max_loop`` allows, grants included. With no ceiling
+# set the platform cap holds (``Ceilings`` docs).
 DEFAULT_GRANT_TTL = 900.0  # seconds a grant stays valid after it is issued
 GRANTED_SUFFIX = "#granted"
 
@@ -87,7 +99,7 @@ def _finite(*values: object) -> bool:
 class LoopGrant:
     """Extra ``rounds`` of ``loop``, for the edge ``stage`` -> ``outcome``, valid from
     ``issued_at`` until (not including) ``expires_at``. Times are seconds from the service's
-    injected clock. They are not validated here: a time that is not finite is refused at use."""
+    injected clock. A time that is not finite is refused at use, not at construction."""
 
     run_id: RunId
     stage: str
@@ -100,30 +112,72 @@ class LoopGrant:
     expires_at: float
 
     def __post_init__(self) -> None:
+        # A decoded event can carry any JSON, so every field is checked: a mistyped grant is
+        # refused here (ValueError, on decode) and never reaches the reducer as a TypeError.
+        if not isinstance(self.run_id, RunId):
+            raise ValueError(f"grant run_id must be a RunId, not {self.run_id!r}")
+        for name in ("stage", "outcome", "loop", "actor", "reason"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"grant {name} must be a non-blank string, not {value!r}")
         if type(self.rounds) is not int or self.rounds < 1:
-            raise ValueError(f"rounds must be a positive integer, not {self.rounds!r}")
+            raise ValueError(f"grant rounds must be a positive integer, not {self.rounds!r}")
+        for name in ("issued_at", "expires_at"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise ValueError(f"grant {name} must be a number, not {value!r}")
 
 
 @EVENTS.register("loop.granted")
 @dataclass(frozen=True)
 class LoopGranted:
     """A team admin's grant (or ``None``: no grant, which changes nothing), applied at
-    ``applied_at`` on the service's clock, against the run at ``run_version``."""
+    ``applied_at`` on the service's clock, against the run at ``run_version``. ``loop_ceiling`` is
+    the org's ``max_loop`` read by the service (``None``: none set, so the platform cap holds)."""
 
     run_id: RunId
     grant: LoopGrant | None
     run_version: int
     applied_at: float
+    loop_ceiling: int | None = None
 
 
 def _blocked_on_loop(rs: RunState) -> bool:
     return rs.run.status is RunStatus.BLOCKED and rs.run.blocked_reason == "loop_exhausted"
 
 
+def _edges(wf: Graph, stage: str | None) -> Mapping[str, str | Edge] | None:
+    found = wf.stages.get(stage or "")
+    edges = getattr(found, "next", None)
+    return edges if edges else None
+
+
+def _spent_edges(rs: RunState, wf: Graph, edges: Mapping[str, str | Edge]) -> list[str]:
+    """The outcomes of a stage whose edge names a declared loop that is at its cap."""
+    spent = []
+    for outcome, edge in edges.items():
+        _, loop = _target(edge)
+        cap = wf.limits.loops.get(loop) if loop is not None else None
+        if loop is not None and cap is not None and rs.loop_count(loop) >= cap:
+            spent.append(outcome)
+    return spent
+
+
 def grant_refusal(
-    rs: RunState, wf: Graph, grant: LoopGrant | None, *, applied_at: float
+    rs: RunState,
+    wf: Graph,
+    grant: LoopGrant | None,
+    *,
+    applied_at: float,
+    loop_ceiling: int | None = None,
 ) -> str | None:
-    """Why ``grant`` gives no extra iteration, or ``None`` when it does. Pure."""
+    """Why ``grant`` gives no extra iteration, or ``None`` when it does. Pure.
+
+    Which edge blocked is not recorded (``RunState`` has no field for it, and ``reducer.py`` is
+    serial), so a grant must not choose between two: PLAN 6.2 says a grant never changes an
+    outcome, and a QA stage blocked on request-changes must not be granted into a retest. It fails
+    closed: with more than one spent looped edge on the stage no grant applies
+    (``ambiguous_edge``), and with exactly one the grant must name it."""
     if grant is None:
         return "missing"
     if grant.run_id != rs.run.id:
@@ -136,9 +190,8 @@ def grant_refusal(
         return "expired"
     if grant.stage != rs.run.stage:
         return "other_stage"
-    stage = wf.stages.get(grant.stage)
-    edges = getattr(stage, "next", None)
-    if not edges or grant.outcome not in edges:
+    edges = _edges(wf, grant.stage)
+    if edges is None or grant.outcome not in edges:
         return "other_loop"
     _, edge_loop = _target(edges[grant.outcome])
     cap = wf.limits.loops.get(grant.loop)
@@ -146,7 +199,16 @@ def grant_refusal(
         return "other_loop"
     if rs.loop_count(grant.loop) < cap:
         return "not_spent"
-    if rs.loop_count(_granted_key(grant.loop)) + grant.rounds > cap * MAX_GRANT_ROUNDS_FACTOR:
+    spent = _spent_edges(rs, wf, edges)
+    if len(spent) > 1:
+        return "ambiguous_edge"
+    if spent != [grant.outcome]:
+        return "other_edge"
+    ceiling = PLATFORM_MAX_STEPS if loop_ceiling is None else loop_ceiling
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 1:
+        return "bad_ceiling"
+    room = min(cap * MAX_GRANT_ROUNDS_FACTOR, ceiling - cap)  # the loop never passes the ceiling
+    if rs.loop_count(_granted_key(grant.loop)) + grant.rounds > room:
         return "over_cap"
     return None
 
@@ -167,14 +229,13 @@ def on_loop_granted(rs: RunState, event: LoopGranted, wf: Graph) -> Transition:
         )
     if not _blocked_on_loop(rs):
         raise OutOfOrderEventError("a loop grant needs a run blocked on a spent loop")
-    if grant_refusal(rs, wf, event.grant, applied_at=event.applied_at) is not None:
+    grant, edges = event.grant, _edges(wf, event.grant.stage if event.grant else None)
+    why = grant_refusal(rs, wf, grant, applied_at=event.applied_at, loop_ceiling=event.loop_ceiling)
+    if why is not None or grant is None or edges is None:
         return Transition(rs)  # no extra iteration, and nothing moved
-    grant = event.grant
-    assert grant is not None
-    stage = wf.stages[grant.stage]
-    edges = getattr(stage, "next")  # noqa: B009 - grant_refusal proved the stage has edges
     to, loop = _target(edges[grant.outcome])
-    assert loop == grant.loop
+    if loop != grant.loop:  # grant_refusal proved this; kept explicit, not as an assert
+        return Transition(rs)
     cap = wf.limits.loops[grant.loop]
     loops = _with_count(rs.loops, grant.loop, min(rs.loop_count(grant.loop), cap) - grant.rounds)
     loops = _with_count(
@@ -296,8 +357,8 @@ def on_route_to_gate(rs: RunState, event: RouteToGateRequested, wf: Graph) -> Tr
     if route_refusal(rs, wf, event) is not None:
         return Transition(rs)
     target = _route_target(rs, wf)
-    assert target is not None
-    assert rs.run.stage is not None
+    if target is None or rs.run.stage is None:  # route_refusal proved both
+        return Transition(rs)
     out = _route(rs, wf, target)
     round_ = out.state.round
     add = AddToAttention(
@@ -311,7 +372,8 @@ def on_route_to_gate(rs: RunState, event: RouteToGateRequested, wf: Graph) -> Tr
         attention_digest(event.attention),
     )
     bar = BarFromRound(rs.run.id, event.actor, target, round_)
-    return Transition(out.state, (*out.commands, add, bar))
+    # The bar comes first, so the router is barred before the gate exists to be decided.
+    return Transition(out.state, (bar, *out.commands, add))
 
 
 # --- the audited services ------------------------------------------------------------------
@@ -343,6 +405,12 @@ class AttentionSource(Protocol):
     def items_for(self, run_id: RunId, stage: str) -> AttentionItems: ...
 
 
+class OrgCeilings(Protocol):
+    """The org's ``ceilings.max_loop``, read now (``None``: none set). D2-24's reader fills it."""
+
+    def max_loop(self, team: str) -> int | None: ...
+
+
 class RefusedError(PermissionError):
     """The action was refused; ``why`` is the stable reason that was audited."""
 
@@ -361,11 +429,13 @@ class GrantService:
         *,
         audit: Audit,
         admins: TeamAdmins,
+        ceilings: OrgCeilings,
         clock: Callable[[], float],
         submit: Submit,
         load: Load,
     ) -> None:
         self._audit, self._admins, self._clock = audit, admins, clock
+        self._ceilings = ceilings
         self._submit, self._load = submit, load
 
     async def grant(
@@ -396,14 +466,23 @@ class GrantService:
             self._refuse(run_id, actor, data, "no_reason")
         now = self._clock()
         grant = LoopGrant(run_id, stage, outcome, loop, rounds, actor, reason, now, now + ttl)
-        event = LoopGranted(run_id, grant, rs.run.version, now)
-        why = grant_refusal(rs, wf, grant, applied_at=now)
+        ceiling = self._ceilings.max_loop(rs.run.team)
+        event = LoopGranted(run_id, grant, rs.run.version, now, ceiling)
+        why = grant_refusal(rs, wf, grant, applied_at=now, loop_ceiling=ceiling)
         if why is not None:
             self._refuse(run_id, actor, data, why)
-        next_state = on_loop_granted(rs, event, wf)  # raises if stale or not blocked on a loop
-        assert next_state.state != rs
+        after = on_loop_granted(rs, event, wf).state  # raises if stale or not blocked on a loop
+        if after == rs:
+            self._refuse(run_id, actor, data, "no_effect")
+        # The real result: another guard (step limit, a gate's subject) may still block the run.
+        result = "resumed"
+        if after.run.status is RunStatus.BLOCKED:
+            result = f"blocked:{after.run.blocked_reason}"
         self._audit.record(
-            run_id, "loop.grant", actor, {**data, "expires_at": grant.expires_at, "issued_at": now}
+            run_id,
+            "loop.grant",
+            actor,
+            {**data, "expires_at": grant.expires_at, "issued_at": now, "result": result},
         )
         await self._submit(run_id, event)
         return event
@@ -475,6 +554,7 @@ class RouteService:
 __all__ = [
     "DEFAULT_GRANT_TTL",
     "MAX_GRANT_ROUNDS_FACTOR",
+    "OrgCeilings",
     "AddToAttention",
     "BarFromRound",
     "GrantService",

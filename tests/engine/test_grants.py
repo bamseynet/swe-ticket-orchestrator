@@ -528,6 +528,14 @@ class Attention:
         return self.items
 
 
+class Ceilings:
+    def __init__(self, max_loop: int | None = None) -> None:
+        self.max_loop_value = max_loop
+
+    def max_loop(self, team: str) -> int | None:
+        return self.max_loop_value
+
+
 class Clock:
     def __init__(self, t: float = NOW) -> None:
         self.t = t
@@ -546,6 +554,8 @@ def make(
     clock: Clock | None = None,
     audit_fails: bool = False,
     submit_fails: int = 0,
+    max_loop: int | None = None,
+    graph: Graph = W,
 ) -> tuple[GrantService, RouteService, list[object]]:
     sent: list[object] = []
     failures = [submit_fails]
@@ -560,11 +570,11 @@ def make(
     common: dict[str, Any] = {
         "audit": FakeAudit(j, audit_fails),
         "submit": submit,
-        "load": lambda run_id: (rs, W),
+        "load": lambda run_id: (rs, graph),
         "admins": Admins({ADMIN} if admins is None else admins),
     }
     attention = Attention(AttentionItems(blocking_findings=("F-1",)))
-    grants = GrantService(clock=clock or Clock(), **common)
+    grants = GrantService(clock=clock or Clock(), ceilings=Ceilings(max_loop), **common)
     routes = RouteService(
         policy=Policy(allowed),
         patches=Patches(blocked),
@@ -595,14 +605,16 @@ def test_a_grant_is_audited_before_the_run_hears_of_it() -> None:
     assert ev.grant.expires_at > NOW
 
 
-def test_a_grant_expires_by_the_injected_clock() -> None:
+def test_the_service_stamps_the_grant_and_the_event_from_its_injected_clock() -> None:
     rs, j = spent_at_panel(), Journal()
     clock = Clock(NOW)
     grants, _, sent = make(rs, j, clock=clock)
     g = run(grants.grant(RID, ADMIN, "panel", "findings", "fix", 1, "why", ttl=60)).grant
     assert g is not None
     assert (g.issued_at, g.expires_at) == (NOW, NOW + 60)
-    # the event carries the service's time, so the pure handler can compare without a clock
+    # The event carries the service's time so the pure handler can compare numbers. A grant is not
+    # revoked by the passing of time inside the reducer (it cannot read a clock): ``run_version``
+    # is the guard against a late grant, and the handler tests below pin that.
     assert sent[0].applied_at == NOW  # type: ignore[attr-defined]
 
 
@@ -759,3 +771,164 @@ def test_a_counter_above_the_cap_is_brought_back_to_the_cap_before_the_grant() -
     over = dataclasses.replace(rs, loops=(("fix", 5),))
     out = next(over, granted(over), W).state
     assert out.loop_count("fix") == W.limits.loops["fix"]  # (cap - 1) + 1 for the re-entry
+
+
+# --- review fixes (pass 1) -----------------------------------------------------------------
+
+
+def blocked_at(rs: RunState, stage: str, loops: tuple[tuple[str, int], ...]) -> RunState:
+    run = dataclasses.replace(
+        rs.run, stage=stage, status=RunStatus.BLOCKED, blocked_reason="loop_exhausted"
+    )
+    return dataclasses.replace(rs, run=run, loops=loops)
+
+
+def qa_blocked_with_both_loops_spent() -> RunState:
+    rs = started()
+    rs = report(rs, "ready")
+    rs = report(rs, "clean", S1)
+    return blocked_at(rs, "qa_gate", (("review_loop", 2), ("retest", 2)))
+
+
+def test_a_grant_cannot_turn_request_changes_into_a_retest() -> None:
+    """P1: QA asked for changes (review_loop spent) and retest is spent too. The blocked edge is not
+    recorded, so a grant could name either; with two spent looped edges it must name neither."""
+    rs = qa_blocked_with_both_loops_spent()
+    for outcome, loop in (("retest", "retest"), ("changes_requested", "review_loop")):
+        g = grant(rs, stage="qa_gate", outcome=outcome, loop=loop)
+        assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "ambiguous_edge"
+        unchanged(rs, granted(rs, g))
+
+
+def test_a_merge_with_both_conflict_and_stale_spent_takes_no_grant() -> None:
+    rs = blocked_at(started(), "merge", (("fix", 2), ("stale", 1)))
+    for outcome, loop in (("conflict", "fix"), ("stale", "stale")):
+        g = grant(rs, stage="merge", outcome=outcome, loop=loop)
+        assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "ambiguous_edge"
+        unchanged(rs, granted(rs, g))
+
+
+def test_with_exactly_one_spent_edge_the_grant_must_name_that_edge() -> None:
+    rs = blocked_at(started(), "merge", (("fix", 1), ("stale", 1)))  # only ``stale`` is spent
+    ok = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, W, ok, applied_at=NOW + 1) is None
+    other = grant(rs, stage="merge", outcome="conflict", loop="fix")  # not the blocked edge
+    assert grant_refusal(rs, W, other, applied_at=NOW + 1) == "not_spent"
+    unchanged(rs, granted(rs, other))
+
+
+def test_the_standard_template_qa_gate_takes_no_grant_when_both_its_loops_are_spent() -> None:
+    from sto.config.schema import load_document
+
+    path = Path(__file__).parents[2] / "templates" / "standard" / "workflow.yaml"
+    graph = load_document(path.read_text())
+    assert isinstance(graph, Graph)
+    edges = graph.stages["qa_gate"].next  # type: ignore[union-attr]
+    looped = {o: e.loop for o, e in edges.items() if not isinstance(e, str) and e.loop}
+    assert set(looped.values()) == {"qa_fix", "retest"}
+    rs = started(graph)
+    spent = tuple((lp, graph.limits.loops[lp]) for lp in looped.values())
+    rs = blocked_at(rs, "qa_gate", spent)
+    for outcome, loop in looped.items():
+        g = grant(rs, stage="qa_gate", outcome=outcome, loop=loop)
+        assert grant_refusal(rs, graph, g, applied_at=NOW + 1) == "ambiguous_edge"
+
+
+def test_route_emits_the_bar_before_the_gate_opens() -> None:
+    rs = spent_at_panel()
+    out = next(rs, route(rs), W)
+    assert [type(c) for c in out.commands] == [BarFromRound, OpenGate, AddToAttention]
+
+
+def test_the_total_never_passes_the_org_ceiling() -> None:
+    """P3: loop cap 5, org max_loop 5: a grant of 5 used to run the loop ten times."""
+    w5 = wf(lambda d: d["limits"]["loops"].update({"fix": 5}))
+    rs = started(w5)
+    for _ in range(5):
+        rs = report(rs, "ready", None, w5)
+        rs = report(rs, "findings", None, w5)
+    rs = report(rs, "ready", None, w5)
+    rs = report(rs, "findings", S1, w5)
+    g = grant(rs, rounds=5)
+    assert grant_refusal(rs, w5, g, applied_at=NOW + 1, loop_ceiling=5) == "over_cap"
+    unchanged(rs, granted(rs, g, loop_ceiling=5), w5)
+
+
+def test_a_grant_may_use_the_room_between_the_cap_and_the_ceiling() -> None:
+    rs = spent_at_panel()  # cap 2
+    assert grant_refusal(rs, W, grant(rs, rounds=1), applied_at=NOW + 1, loop_ceiling=3) is None
+    assert grant_refusal(rs, W, grant(rs, rounds=2), applied_at=NOW + 1, loop_ceiling=3) == (
+        "over_cap"
+    )
+    assert grant_refusal(rs, W, grant(rs, rounds=1), applied_at=NOW + 1, loop_ceiling=1) == (
+        "over_cap"
+    )  # a ceiling tightened below the cap leaves no room
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "5", 2.5])
+def test_a_mistyped_ceiling_fails_closed(bad: Any) -> None:
+    rs = spent_at_panel()
+    assert grant_refusal(rs, W, grant(rs), applied_at=NOW + 1, loop_ceiling=bad) == "bad_ceiling"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"stage": ["panel"]},
+        {"outcome": ["findings"]},
+        {"loop": {"a": 1}},
+        {"actor": 5},
+        {"reason": None},
+        {"run_id": "r1"},
+        {"issued_at": "now"},
+        {"expires_at": None},
+        {"issued_at": True},
+    ],
+)
+def test_a_mistyped_grant_is_refused_at_construction_not_with_a_type_error(
+    over: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="grant"):
+        grant(spent_at_panel(), **over)
+
+
+def test_a_mistyped_decoded_grant_is_refused_on_decode() -> None:
+    from sto.domain.serialize import from_wire, to_wire
+
+    rs = spent_at_panel()
+    wire = to_wire(granted(rs))
+    wire["grant"] = {**wire["grant"], "outcome": ["findings"]}
+    with pytest.raises(ValueError, match="grant"):
+        from_wire(LoopGranted, wire)
+
+
+def test_the_service_passes_the_org_ceiling_and_refuses_the_excess() -> None:
+    rs, j = spent_at_panel(), Journal()
+    grants, _, sent = make(rs, j, max_loop=3)
+    with pytest.raises(PermissionError):
+        run(grants.grant(RID, ADMIN, "panel", "findings", "fix", 2, "why"))
+    assert sent == []
+    assert j.log[0][3]["why"] == "over_cap"
+    ev = run(grants.grant(RID, ADMIN, "panel", "findings", "fix", 1, "why"))
+    assert ev.loop_ceiling == 3
+
+
+def test_the_audit_records_the_real_result_when_another_guard_blocks_the_grant() -> None:
+    small = wf(lambda d: d["limits"].update(max_steps_per_run=6))
+    rs = started(small)
+    for _ in range(2):
+        rs = report(rs, "ready", None, small)
+        rs = report(rs, "findings", None, small)
+    rs = report(rs, "ready", None, small)
+    rs = report(rs, "findings", S1, small)
+    j = Journal()
+    grants, _, _ = make(rs, j, graph=small)
+    run(grants.grant(RID, ADMIN, "panel", "findings", "fix", 1, "why"))
+    assert j.log[0][3]["result"] == "blocked:max_steps_exceeded"
+
+
+def test_the_audit_records_a_resumed_run() -> None:
+    rs, j = spent_at_panel(), Journal()
+    grants, _, _ = make(rs, j)
+    run(grants.grant(RID, ADMIN, "panel", "findings", "fix", 1, "why"))
+    assert j.log[0][3]["result"] == "resumed"
