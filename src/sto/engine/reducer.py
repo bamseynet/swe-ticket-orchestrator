@@ -17,14 +17,14 @@ by D2-03) is handled by ``GRAPH_HANDLERS`` (reducer v1, ``handlers/stages.py``),
 the structural validator instead of re-checking it. The two registries are separate because an
 event type has one handler per workflow kind.
 
-A graph registry passed as ``graph_registry=`` must also be able to *leave* every stage kind
-the run can enter. ``LEAVING_EVENTS`` names, per stage kind, the events that end its wait
-(``waits.py`` fills it for ``wait`` and ``checks``). ``next`` looks at what the handler did: if
-it entered such a stage and the registry in use has no handler for one of those events, nothing
-could ever end the wait, so it returns the run BLOCKED ``stage_unhandled`` instead, on the stage
-it was leaving, with no counter moved and no command. This is a return value, never an
-exception, and the registry is an argument: there are no context variables or other implicit
-state.
+A graph registry passed as ``graph_registry=`` must also be able to *leave* every non-terminal
+stage kind the run enters. ``LEAVING_EVENTS`` says, per stage kind, which events end it (each
+handler module fills it; see ``Leaving``). ``next`` looks at what the handler did: if it entered
+a stage whose leaving events the registry in use cannot handle, or whose kind has no entry at
+all (it fails closed), nothing could ever end the wait, so it returns the run BLOCKED
+``stage_unhandled`` instead, on the stage it was leaving, with the entry's counters restored and
+no command. This is a return value, never an exception, and the registry is an argument: there
+are no context variables or other implicit state. The default registry is not checked.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from sto.config.schema import TerminalStage
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import (
     BLOCKED_REASONS,
@@ -261,9 +262,30 @@ def handles_graph(event_type: type) -> Callable[[Handler], Handler]:
     return handles(event_type, registry=GRAPH_HANDLERS)
 
 
-# Per stage kind (a ``sto.config.schema`` stage class): the events that end its wait. A kind not
-# listed here is left by events every registry already has (a step, a gate close, an effect).
-LEAVING_EVENTS: dict[type, tuple[type, ...]] = {}
+@dataclass(frozen=True)
+class Leaving:
+    """The events that end a stage kind. ``all_of``: the registry needs a handler for every one
+    (a wait: resumed and timed out). ``any_of``: one is enough (an agent step is left by a report,
+    a success or a failure; an effect by a confirmation, a refusal or a failure)."""
+
+    all_of: tuple[type, ...] = ()
+    any_of: tuple[type, ...] = ()
+
+    def covered_by(self, registry: HandlerRegistry) -> bool:
+        return all(registry.get(e) is not None for e in self.all_of) and (
+            not self.any_of or any(registry.get(e) is not None for e in self.any_of)
+        )
+
+
+# Per stage kind (a ``sto.config.schema`` stage class): how it is left. Handler modules fill it
+# beside the handlers (``stages.py`` for the core kinds, ``waits.py`` for wait and checks). It
+# fails closed: a non-terminal kind with no entry here cannot be entered through an explicit
+# registry. A terminal ends the run and is left by nothing, so it is exempt.
+LEAVING_EVENTS: dict[type, Leaving] = {}
+
+# The position counters a stage entry moves in ``_goto`` (handlers/stages.py), besides ``run``.
+# ``_block_uncovered`` restores exactly these; a test fails if an entry changes any other.
+ENTRY_COUNTERS = ("steps", "visits", "loops", "visit", "attempt", "round")
 
 
 @BLOCKED_REASONS.register("stage_unhandled")
@@ -274,33 +296,26 @@ class StageUnhandled:
 def _uncovered_entry(
     before: RunState, out: Transition, workflow: GraphWorkflow, registry: HandlerRegistry
 ) -> bool:
-    """Did ``out`` enter a stage whose leaving events ``registry`` cannot handle?"""
+    """Did ``out`` enter a stage that ``registry`` cannot leave?"""
     after = out.state
     if after.steps <= before.steps or after.run.stage is None:
-        return False  # nothing was entered (an entry counts a step)
+        return False  # nothing was entered (an entry counts a step; a terminal does not)
     stage = workflow.stages.get(after.run.stage)
-    leaving = LEAVING_EVENTS.get(type(stage), ())
-    return any(registry.get(event_type) is None for event_type in leaving)
+    if isinstance(stage, TerminalStage):
+        return False
+    leaving = LEAVING_EVENTS.get(type(stage))
+    return leaving is None or not leaving.covered_by(registry)
 
 
 def _block_uncovered(before: RunState, out: Transition) -> Transition:
     """The refused entry, as if it had never counted: the run stays on the stage it was leaving
-    and the counters are the ones it had. What the handler decided before the entry (approvals,
-    subject) stands, as for any other blocked entry."""
+    and the ``ENTRY_COUNTERS`` are the ones it had. Everything else is ``out.state``'s: what the
+    handler decided before the entry (approvals, subject, merges) stands, as for any other
+    blocked entry."""
     run = dataclasses.replace(out.state.run, stage=before.run.stage)
     blocked = run.advance(RunStatus.BLOCKED, blocked_reason="stage_unhandled")
-    return Transition(
-        dataclasses.replace(
-            out.state,
-            run=blocked,
-            steps=before.steps,
-            visits=before.visits,
-            loops=before.loops,
-            visit=before.visit,
-            attempt=before.attempt,
-            round=before.round,
-        )
-    )
+    restored = {name: getattr(before, name) for name in ENTRY_COUNTERS}
+    return Transition(dataclasses.replace(out.state, run=blocked, **restored))
 
 
 def workflow_version(workflow: Workflow | GraphWorkflow) -> str:

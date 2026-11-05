@@ -91,7 +91,9 @@ from sto.engine.handlers.core import (
     StepSucceeded,
 )
 from sto.engine.reducer import (
+    LEAVING_EVENTS,
     Approval,
+    Leaving,
     MalformedEventError,
     Merge,
     OutOfOrderEventError,
@@ -251,6 +253,13 @@ class StageEntry:
 
 
 STAGE_ENTRY: dict[type, StageEntry] = {}
+
+# How each core kind is left (see ``Leaving``): an agent or panel by a report, a success or a
+# failure; a gate by its close or its expiry; an effect by a confirmation, a refusal or a failure.
+LEAVING_EVENTS[AgentStage] = Leaving(any_of=(StageReported, StepSucceeded, StepFailed))
+LEAVING_EVENTS[ReviewPanelStage] = LEAVING_EVENTS[AgentStage]
+LEAVING_EVENTS[GateStage] = Leaving(all_of=(GateClosed, GateExpired))
+LEAVING_EVENTS[EffectStage] = Leaving(any_of=(EffectConfirmed, EffectRefused, EffectFailed))
 
 
 # --- entering a stage and ending the run ---------------------------------------------------
