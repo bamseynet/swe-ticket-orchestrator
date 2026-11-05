@@ -288,6 +288,15 @@ def test_each_fixture_is_accepted_end_to_end_and_queued_as_a_nudge(event: str) -
     assert "x-hub-signature-256" not in nudge.headers
 
 
+@pytest.mark.parametrize("event", sorted(FIXTURES))
+def test_the_queued_nudge_carries_the_event_name_from_the_header(event: str) -> None:
+    # D4-30: ``Nudge.event`` is the X-GitHub-Event header, an unauthenticated routing hint.
+    queue = Queue()
+    make_receiver(queue=queue).receive(send(event, FIXTURES[event], gid(f"e-{event}")))
+    [nudge] = queue.items
+    assert nudge.event == event
+
+
 def test_a_pull_request_comment_is_a_pr_change_not_a_ticket() -> None:
     payload = json.loads(json.dumps(FIXTURES["issue_comment"]))
     payload["issue"]["pull_request"] = {"url": "https://example.invalid/pr/12"}
