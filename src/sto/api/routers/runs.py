@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
-from sto.api.auth import Authorization, Authorized, actor_key, may_stop, stop_flags
+from sto.api.auth import Authorization, Authorized, actor_key, may_retry, may_stop, stop_flags
 from sto.api.runtime import (
     BadCursorError,
     RunFinishedError,
@@ -19,6 +19,7 @@ from sto.api.runtime import (
 )
 from sto.domain import RunId
 from sto.domain.errors import InvalidIdError
+from sto.engine.reducer import OutOfOrderEventError
 
 router = APIRouter(tags=["runs"])
 
@@ -234,6 +235,48 @@ async def cancel(run_id: str, rt: RuntimeDep, request: Request) -> dict[str, Any
         raise ApiError(404, "run_not_found", str(e)) from e
     except RunFinishedError as e:
         raise ApiError(409, "run_finished", str(e)) from e
+    except StoreConflictError as e:
+        raise _busy(e) from e
+    return {"id": str(rid), "accepted": True}
+
+
+class RetryBody(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000, description="Why the run is retried.")
+
+
+@router.post(
+    "/runs/{run_id}/retry",
+    status_code=202,
+    response_model=Accepted,
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse, "description": "The run is not blocked, or has moved on."},
+        503: {"model": ErrorResponse},
+    },
+    summary="Retry a blocked run",
+    description=(
+        "Developers, reviewers and QA retry only runs they started; team and org admins any run "
+        "in their scope. The audited actor is the caller's issuer and subject."
+    ),
+)
+async def retry(run_id: str, body: RetryBody, rt: RuntimeDep, request: Request) -> dict[str, Any]:
+    rid = parse_run_id(run_id)
+    auth = authorization_of(request)
+    try:
+        started_by = await rt.started_by(rid)  # also the 404 for an unknown run
+        # The dev token has one identity, which may do anything.
+        if auth is not None and not may_retry(auth, started_by=started_by):
+            raise ApiError(403, "forbidden", "this request is not allowed")
+        service = getattr(request.app.state, "retry", None)
+        if service is None:
+            raise ApiError(503, "retry_unavailable", "retry is not available on this server")
+        actor = actor_key(auth.identity) if auth else "dev"  # the dev token's one actor
+        try:
+            await service.retry(rid, actor, body.reason)
+        except OutOfOrderEventError as e:
+            raise ApiError(409, "retry_refused", str(e)) from e
+    except RunNotFoundError as e:
+        raise ApiError(404, "run_not_found", str(e)) from e
     except StoreConflictError as e:
         raise _busy(e) from e
     return {"id": str(rid), "accepted": True}
