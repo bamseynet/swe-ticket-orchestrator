@@ -127,6 +127,7 @@ class Prepared:
     workflow: Workflow
     document: Mapping[str, Any]  # the flattened workflow as stored
     digest: str
+    prompts: Mapping[str, str]  # the checked prompts the digest covers
 
 
 @dataclass(frozen=True)
@@ -188,23 +189,42 @@ def manifest_digest(workflow: Workflow, manifest: Manifest, prompts: Mapping[str
     return _bundle_digest(_workflow_document(workflow), _manifest_document(manifest), prompts)
 
 
-def _check_prompts(prompts: object) -> dict[str, str]:
+def _check_prompts(prompts: object, manifest: Manifest) -> dict[str, str]:
+    """Prompts are keyed by profile: a key the manifest does not know is refused. Requiring a
+    prompt for every agent profile waits for the prompt catalog, so an empty map still publishes."""
     if not isinstance(prompts, Mapping):
         raise _refuse(Issue(None, "prompts", "prompts must be a map of profile name to text"))
     issues: list[Issue] = []
     for name, text in prompts.items():
         if not isinstance(name, str) or not name:
             issues.append(Issue(None, "prompts", "a prompt needs a profile name"))
-        elif not isinstance(text, str):
-            issues.append(Issue(None, f"prompts.{name}", "a prompt must be text"))
-        elif _bytes(text) > MAX_PROMPT_BYTES:
+        elif name not in manifest.profiles:
             issues.append(
                 Issue(
                     None,
                     f"prompts.{name}",
-                    f"the prompt is {_bytes(text)} bytes; the limit is {MAX_PROMPT_BYTES} bytes",
+                    f"{name!r} is not an agent profile; use one of: "
+                    f"{', '.join(sorted(manifest.profiles))}",
                 )
             )
+        elif not isinstance(text, str):
+            issues.append(Issue(None, f"prompts.{name}", "a prompt must be text"))
+        else:
+            try:
+                size = len(text.encode("utf-8"))  # strict: the store would fail on a lone surrogate
+            except UnicodeEncodeError:
+                issues.append(
+                    Issue(None, f"prompts.{name}", "the prompt is not valid text (lone surrogate)")
+                )
+                continue
+            if size > MAX_PROMPT_BYTES:
+                issues.append(
+                    Issue(
+                        None,
+                        f"prompts.{name}",
+                        f"the prompt is {size} bytes; the limit is {MAX_PROMPT_BYTES} bytes",
+                    )
+                )
     if issues:
         raise _refuse(*issues)
     return {str(k): str(v) for k, v in prompts.items()}
@@ -254,7 +274,7 @@ def prepare(
                 f"the document is {_bytes(text)} bytes; the limit is {MAX_PUBLISH_BYTES} bytes",
             )
         )
-    clean_prompts = _check_prompts(prompts)
+    clean_prompts = _check_prompts(prompts, manifest)
     workflow = _flatten(text, resolve_template)
     issues = [
         *validate_structure(
@@ -270,7 +290,7 @@ def prepare(
     if issues:
         raise SchemaError(issues, "publish")
     document = _workflow_document(workflow)
-    size = _bytes(json.dumps(document))
+    size = _bytes(json.dumps(document, ensure_ascii=False))
     if size > MAX_FLATTENED_BYTES:
         raise _refuse(
             Issue(
@@ -280,7 +300,7 @@ def prepare(
             )
         )
     manifest_doc = _manifest_document(manifest)
-    stored = _bytes(json.dumps([manifest_doc, clean_prompts]))
+    stored = _bytes(json.dumps([manifest_doc, clean_prompts], ensure_ascii=False))
     if stored > MAX_MANIFEST_ITEM_BYTES:
         raise _refuse(
             Issue(
@@ -295,7 +315,9 @@ def prepare(
             raise ValueError("differs")
     except (ValidationError, ValueError):
         raise _refuse(Issue(None, "", "the flattened workflow does not survive storage")) from None
-    return Prepared(workflow, document, _bundle_digest(document, manifest_doc, clean_prompts))
+    return Prepared(
+        workflow, document, _bundle_digest(document, manifest_doc, clean_prompts), clean_prompts
+    )
 
 
 # --- storage ---------------------------------------------------------------------------------
@@ -350,7 +372,7 @@ class Publisher:
             sandbox_images=self._images,
             team_config=TeamConfigStore(self._store).read(scope),
         )
-        self._store_manifest(prepared, manifest, prompts)
+        self._store_manifest(prepared, manifest)
         name = prepared.workflow.metadata.name
         for _ in range(_ATTEMPTS):
             version = self._next_version(scope, name)
@@ -398,9 +420,7 @@ class Publisher:
         best = self._latest_item(scope, name)
         return 1 if best is None else best[0] + 1
 
-    def _store_manifest(
-        self, prepared: Prepared, manifest: Manifest, prompts: Mapping[str, str]
-    ) -> None:
+    def _store_manifest(self, prepared: Prepared, manifest: Manifest) -> None:
         key = _manifest_key(prepared.digest)
         if self._store.get(PLATFORM, key) is not None:
             return  # content-addressed: the same digest is the same content
@@ -409,7 +429,7 @@ class Publisher:
             self._store.put(
                 PLATFORM,
                 key,
-                {**_manifest_document(manifest), "prompts": dict(prompts)},
+                {**_manifest_document(manifest), "prompts": dict(prepared.prompts)},
                 when=Absent(),
             )
 

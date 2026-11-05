@@ -127,8 +127,8 @@ def test_prepare_flattens_validates_and_digests() -> None:
 
 
 def test_digest_is_deterministic_and_order_independent() -> None:
-    a = _prepare(prompts={"a": "x", "b": "y"})
-    b = _prepare(prompts={"b": "y", "a": "x"})
+    a = _prepare(prompts={"planner": "x", "implementer": "y"})
+    b = _prepare(prompts={"implementer": "y", "planner": "x"})
     assert a.digest == b.digest
 
 
@@ -585,3 +585,91 @@ def test_a_full_document_without_an_intake_or_repo_is_refused() -> None:
     del doc["repo"]
     with pytest.raises(publish.SchemaError, match="repo"):
         _prepare(yaml.safe_dump(doc))
+
+
+# --- review pass 1 -----------------------------------------------------------------------------
+
+
+def test_a_prompt_for_a_profile_the_manifest_does_not_have_is_refused() -> None:
+    with pytest.raises(publish.SchemaError, match="nosuchprofile"):
+        _prepare(prompts={"nosuchprofile": "x"})
+
+
+def test_an_empty_prompt_map_still_publishes_until_the_prompt_catalog_exists() -> None:
+    assert _prepare(prompts={}).prompts == {}
+
+
+def test_a_prompt_with_a_lone_surrogate_is_refused_not_a_unicode_error() -> None:
+    with pytest.raises(publish.SchemaError, match="surrogate"):
+        _prepare(prompts={"planner": "bad \ud800 text"})
+
+
+def test_a_non_ascii_prompt_is_measured_in_utf8_bytes() -> None:
+    # 3 bytes each: under the cap as characters, over it as bytes
+    n = MAX_PROMPT_BYTES // 3 + 1
+    with pytest.raises(publish.SchemaError, match="bytes"):
+        _prepare(prompts={"planner": "\u20ac" * n})
+
+
+def test_the_flattened_cap_counts_utf8_bytes_not_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    doc = yaml.safe_load(OVERLAY_TEXT)
+    doc["intake"]["label"] = "\u20ac" * 10
+    size = len(
+        json.dumps(
+            _prepare(yaml.safe_dump(doc, allow_unicode=True)).document, ensure_ascii=False
+        ).encode()
+    )
+    monkeypatch.setattr(publish, "MAX_FLATTENED_BYTES", size)  # exactly fits as UTF-8
+    _prepare(yaml.safe_dump(doc, allow_unicode=True))
+
+
+def test_document_text_given_as_bytes_is_a_schema_error() -> None:
+    with pytest.raises(publish.SchemaError, match="text"):
+        _prepare(OVERLAY_TEXT.encode())  # type: ignore[arg-type]
+
+
+def test_prompts_that_are_not_a_map_are_a_schema_error() -> None:
+    with pytest.raises(publish.SchemaError, match="map"):
+        _prepare(prompts=["planner"])  # type: ignore[arg-type]
+
+
+def test_a_stored_manifest_that_is_not_a_record_is_corrupt(
+    publisher: Publisher, store: Store
+) -> None:
+    pin = _publish(publisher).pin
+    key = Key(f"MANIFEST#{pin.digest}", "META")
+    item = store.get(PLATFORM, key)
+    assert item is not None
+    store.put(PLATFORM, key, {**item.data, "prompts": "not a map"})
+    with pytest.raises(publish.PinnedCorruptError, match="malformed"):
+        load_pinned(store, SCOPE, pin)
+
+
+def test_a_stored_workflow_that_is_not_a_record_is_corrupt(
+    publisher: Publisher, store: Store
+) -> None:
+    pin = _publish(publisher).pin
+    key = Key("TEAM", f"WF#{pin.name}#{pin.version}")
+    item = store.get(SCOPE, key)
+    assert item is not None
+    store.put(SCOPE, key, {**item.data, "workflow": "not a map"})
+    with pytest.raises(publish.PinnedCorruptError, match="malformed"):
+        load_pinned(store, SCOPE, pin)
+
+
+def test_records_that_hash_correctly_but_no_longer_load_are_corrupt(
+    publisher: Publisher, store: Store
+) -> None:
+    """A schema change after publishing: the digest holds, the model refuses."""
+    pin = _publish(publisher).pin
+    wf_key = Key("TEAM", f"WF#{pin.name}#{pin.version}")
+    wf_item = store.get(SCOPE, wf_key)
+    man_item = store.get(PLATFORM, Key(f"MANIFEST#{pin.digest}", "META"))
+    assert wf_item is not None
+    assert man_item is not None
+    bad_wf = {**wf_item.data["workflow"], "a_key_the_schema_refuses": 1}
+    digest = publish._bundle_digest(bad_wf, man_item.data, man_item.data["prompts"])
+    store.put(SCOPE, wf_key, {**wf_item.data, "workflow": bad_wf, "digest": digest})
+    store.put(PLATFORM, Key(f"MANIFEST#{digest}", "META"), man_item.data)
+    with pytest.raises(publish.PinnedCorruptError, match="no longer load"):
+        load_pinned(store, SCOPE, Pin(pin.team, pin.name, pin.version, digest))
