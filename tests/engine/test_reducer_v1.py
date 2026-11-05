@@ -51,8 +51,10 @@ from sto.engine.handlers.stages import EffectRefused, GateExpired, StageReported
 from sto.engine.reducer import (
     GRAPH_HANDLERS,
     LINEAR_V0,
+    Approval,
     HandlerRegistry,
     MalformedEventError,
+    Merge,
     NoHandlerError,
     OutOfOrderEventError,
     RunState,
@@ -406,11 +408,36 @@ def test_a_gate_that_follows_needs_a_head_subject() -> None:
 
 
 def test_a_new_head_voids_every_earlier_approval() -> None:
-    rs = merged()
+    twin = _twin()  # review gate, then a QA agent, then the QA gate, then the merge
+    rs = report(started(twin), "ready", S1, twin)
+    rs = close(rs, K.APPROVE, w=twin)  # -> qa
     assert rs.approvals
-    out = report(rs, "pass", S2)  # QA reports a different head than the approved one
+    out = report(rs, "pass", S2, twin)  # QA reports a different head than the approved one
     assert out.approvals == ()
     assert out.subject == S2
+
+
+def test_merged_code_cannot_change_so_a_report_of_another_head_is_refused() -> None:
+    # P1: QA reports head def after abc was merged, then approves def. Refused at the report.
+    with pytest.raises(MalformedEventError, match="merged"):
+        report(merged("m1"), "pass", S2)
+    assert report(merged("m1"), "pass", S1).run.stage == "qa_gate"  # the merged head is fine
+
+
+def test_a_qa_approval_of_another_head_does_not_qualify_the_merge() -> None:
+    # The same hole, reached with a forged state: the merge was of abc and QA approved def.
+    rs = dataclasses.replace(at_qa_gate(), subject=S2)
+    t = next(rs, GateClosed(RID, "qa_gate", 1, K.APPROVE, "q", did(), S2), W)
+    assert (t.state.run.status, t.state.run.incident) == (RunStatus.DONE, True)
+    assert t.commands == (OpenRevert(RID, "m1"), Finish(RID, RunStatus.DONE, incident=True))
+
+
+def test_only_the_merges_no_qa_approval_covers_get_a_revert() -> None:
+    covered = Merge("m2", S2.head_sha)
+    rs = dataclasses.replace(at_qa_gate(), subject=S2, merges=(Merge("m1", "abc"), covered))
+    t = next(rs, GateClosed(RID, "qa_gate", 1, K.APPROVE, "q", did(), S2), W)
+    assert [c for c in t.commands if isinstance(c, OpenRevert)] == [OpenRevert(RID, "m1")]
+    assert t.state.run.incident is True
 
 
 # --- gates ---------------------------------------------------------------------------------
@@ -546,7 +573,7 @@ def test_a_pre_push_gate_takes_a_pre_push_subject_and_a_review_gate_refuses_one(
 def test_effect_done_follows_the_done_edge_and_records_the_merge() -> None:
     rs = merged("m1")
     assert status(rs) == (RunStatus.RUNNING, "qa_agent")
-    assert rs.merges == ("m1",)
+    assert rs.merges == (Merge("m1", S1.head_sha),)
 
 
 @pytest.mark.parametrize(
@@ -631,6 +658,108 @@ def test_a_scoped_effect_needs_no_approval_but_needs_a_subject() -> None:
     assert (out.run.status, out.run.blocked_reason) == (RunStatus.BLOCKED, "subject_missing")
 
 
+def test_a_confirmed_branch_update_voids_the_approvals_and_the_subject() -> None:
+    # P3: the updated branch has a new SHA nobody approved.
+    rs = step(at_merge(), EffectRefused(RID, "pr.merge", 1, "stale"))  # -> update
+    out = step(rs, EffectConfirmed(RID, "pr.update_branch", 1))
+    assert out.run.stage == "panel"
+    assert out.approvals == ()
+    assert out.subject is None
+    with pytest.raises(MalformedEventError, match="subject"):
+        report(out, "clean")  # the panel must report the new head before a gate can open
+    assert report(out, "clean", S2).run.stage == "review_gate"
+
+
+def test_an_update_branch_edge_straight_to_the_merge_cannot_merge_the_old_approval() -> None:
+    # P3b: the validator accepts update.done -> merge; the merge must not carry the old approval.
+    w = wf(lambda d: d["stages"]["update"]["next"].update(done="merge"))
+    rs = close(at_review_gate(w), K.APPROVE, w=w)
+    rs = step(rs, EffectRefused(RID, "pr.merge", 1, "stale"), w)
+    t = next(rs, EffectConfirmed(RID, "pr.update_branch", 1), w)
+    assert not any(isinstance(c, RunEffect) for c in t.commands)
+    assert (t.state.run.status, t.state.run.blocked_reason) == (
+        RunStatus.BLOCKED,
+        "subject_missing",
+    )
+
+
+def test_the_effect_command_names_the_routed_gates_and_their_decision_ids() -> None:
+    qa = Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha)
+    rs = dataclasses.replace(at_review_gate(), routed_gates=("qa_gate",), approvals=(qa,))
+    d = did()
+    t = next(rs, GateClosed(RID, "review_gate", 1, K.APPROVE, "a", d, S1), W)
+    (cmd,) = t.commands
+    assert isinstance(cmd, RunEffect)
+    assert cmd.requires_gates == ("review_gate", "qa_gate")
+    assert cmd.decision_ids == (d, qa.decision_id)
+
+
+def test_a_confirmation_that_is_not_a_refusal_outcome_is_malformed() -> None:
+    rs = at_merge()
+    with pytest.raises(MalformedEventError, match="not a refusal"):
+        step(rs, EffectRefused(RID, "pr.merge", 1, "done"))  # done has an edge, but is no refusal
+
+
+def test_effect_events_are_refused_while_the_run_is_stopping() -> None:
+    rs = step(at_merge(), CancelRequested(RID))
+    for event in (
+        EffectConfirmed(RID, "pr.merge", 1, "m1"),
+        EffectRefused(RID, "pr.merge", 1, "stale"),
+        EffectFailed(RID, "pr.merge", 1),
+    ):
+        with pytest.raises(OutOfOrderEventError):
+            step(rs, event)
+
+
+def test_a_late_event_from_an_older_attempt_is_refused() -> None:
+    rs = step(started(), StepFailed(StepKey(RID, "implement", 1, 1), FailureClass.TRANSIENT))
+    assert rs.attempt == 2
+    with pytest.raises(OutOfOrderEventError, match="attempt"):
+        step(rs, StageReported(StepKey(RID, "implement", 1, 1), "ready"))
+    with pytest.raises(OutOfOrderEventError, match="attempt"):
+        step(rs, StepFailed(StepKey(RID, "implement", 1, 1), FailureClass.PERMANENT))
+    assert report(rs, "ready").run.stage == "panel"
+
+
+def test_a_failure_that_leads_to_a_gate_with_no_subject_blocks_instead_of_hanging() -> None:
+    # P2/P9: a degraded panel failure carries no subject, and implement reported none.
+    rs = report(started(), "ready")
+    out = step(rs, StepFailed(StepKey(RID, "panel", 1, 1), FailureClass.DEGRADED))
+    assert (out.run.status, out.run.blocked_reason) == (RunStatus.BLOCKED, "subject_missing")
+    assert out.run.stage == "panel"
+    assert out.steps == rs.steps  # the refused gate entry took no step
+    assert out.round == rs.round
+
+
+def test_a_changes_requested_edge_into_a_gate_blocks_because_the_subject_was_voided() -> None:
+    # P10: request_changes clears the subject, and this edge goes straight to another gate.
+    w = wf(
+        lambda d: d["stages"]["review_gate"]["next"].update(
+            changes_requested={"to": "qa_gate", "loop": "review_loop"}
+        ),
+        valid=False,  # the loop now bypasses implement, which other rules refuse
+    )
+    out = close(at_review_gate(w), K.REQUEST_CHANGES, w=w)
+    assert (out.run.status, out.run.blocked_reason) == (RunStatus.BLOCKED, "subject_missing")
+    assert out.approvals == ()
+
+
+def test_a_stale_qa_approval_does_not_qualify_a_run_whose_qa_gate_then_rejects() -> None:
+    # PLAN 4.3 rule 3: a non-approving close drops that gate's approvals.
+    stale = Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha)
+    rs = dataclasses.replace(at_qa_gate(), approvals=(*at_qa_gate().approvals, stale))
+    out = next(rs, GateClosed(RID, "qa_gate", 1, K.REJECT, "q", did()), W)
+    assert all(a.gate != "qa_gate" for a in out.state.approvals)
+    assert out.state.run.incident is True
+    assert OpenRevert(RID, "m1") in out.commands
+
+
+def test_a_duplicate_merge_sha_plans_one_revert() -> None:
+    rs = dataclasses.replace(at_qa_gate(), merges=(Merge("m1", "abc"), Merge("m1", "abc")))
+    t = next(rs, GateClosed(RID, "qa_gate", 1, K.REJECT, "q", did()), W)
+    assert [c for c in t.commands if isinstance(c, OpenRevert)] == [OpenRevert(RID, "m1")]
+
+
 # --- loops ---------------------------------------------------------------------------------
 
 
@@ -657,6 +786,15 @@ def test_loops_count_separately_by_name() -> None:
     rs = _loop_to_implement(started())  # fix
     rs = close(report(report(rs, "ready"), "clean", S1), K.REQUEST_CHANGES)  # review_loop
     assert dict(rs.loops) == {"fix": 1, "review_loop": 1}
+
+
+def test_a_loop_edge_into_a_terminal_still_counts_the_loop() -> None:
+    w = wf(
+        lambda d: d["stages"]["implement"]["next"].update(blocked={"to": "closed", "loop": "fix"})
+    )
+    out = report(started(w), "blocked", w=w)
+    assert out.run.status is RunStatus.CLOSED
+    assert dict(out.loops) == {"fix": 1}
 
 
 def test_an_edge_without_a_loop_counts_nothing() -> None:
@@ -775,7 +913,7 @@ def test_the_incident_flag_rides_any_terminal() -> None:
 
 def test_one_revert_is_planned_for_each_unqualified_merge() -> None:
     rs = merged("m1")
-    rs = dataclasses.replace(rs, merges=("m0", *rs.merges))
+    rs = dataclasses.replace(rs, merges=(Merge("m0", "old"), *rs.merges))
     t = next(report(rs, "pass"), GateClosed(RID, "qa_gate", 1, K.REJECT, "q", did()), W)
     assert [c for c in t.commands if isinstance(c, OpenRevert)] == [
         OpenRevert(RID, "m0"),
@@ -813,6 +951,26 @@ def test_an_event_after_the_run_ended_is_refused() -> None:
 
 
 # --- stage kinds that come later -----------------------------------------------------------
+
+
+def test_a_wait_stage_in_a_workflow_the_validator_accepts_blocks_as_stage_unsupported() -> None:
+    def ask(d: dict[str, Any]) -> None:
+        d["stages"]["ask"] = {
+            "kind": "wait",
+            "wait_for": "human_answer",
+            "timeout": "2d",
+            "next": {"resumed": {"to": "implement", "loop": "fix"}, "timeout": "closed"},
+        }
+        d["stages"]["implement"]["next"]["blocked"] = "ask"
+
+    w = wf(ask)  # valid=True: validate_structure accepts it
+    t = next(started(w), StageReported(StepKey(RID, "implement", 1, 1), "blocked"), w)
+    assert (t.state.run.status, t.state.run.blocked_reason) == (
+        RunStatus.BLOCKED,
+        "stage_unsupported",
+    )
+    assert t.state.run.stage == "implement"
+    assert t.commands == ()
 
 
 @pytest.mark.parametrize(
@@ -969,7 +1127,9 @@ def _at(sha: str, ev: str = "e") -> Subject:
 
 
 # ('step', subject) is the agent step reporting; ('gate', kind) closes the open gate on the live
-# subject (negative decisions carry none); ('effect',) confirms the merge.
+# subject (negative decisions carry none); ('effect',) confirms the merge; ('fail', class) fails
+# the current step; ('effect_fail',) fails the effect; ('cancel',) and ('stopped',) are Stop;
+# ('stale',) sends a step event for a visit that is not live and expects both to refuse it.
 SEQUENCES: dict[str, list[tuple[Any, ...]]] = {
     "happy": [
         ("step", _at("a", "rev")),
@@ -1018,7 +1178,35 @@ SEQUENCES: dict[str, list[tuple[Any, ...]]] = {
         ("step", _at("a", "qa")),
         ("gate", K.REJECT),
     ],
+    "transient_then_ok": [
+        ("fail", FailureClass.TRANSIENT),
+        ("step", _at("a", "rev")),
+        ("gate", K.REJECT),
+    ],
+    "transient_exhausted": [("fail", FailureClass.TRANSIENT), ("fail", FailureClass.TRANSIENT)],
+    "permanent": [("fail", FailureClass.PERMANENT)],
+    "degraded": [("fail", FailureClass.DEGRADED)],
+    "qa_step_fails": [
+        ("step", _at("a", "rev")),
+        ("gate", K.APPROVE),
+        ("fail", FailureClass.PERMANENT),
+    ],
+    "effect_fails": [
+        ("step", _at("a", "rev")),
+        ("gate", K.APPROVE),
+        ("step", _at("a", "qa")),
+        ("gate", K.APPROVE),
+        ("effect_fail",),
+    ],
+    "stop_while_running": [("cancel",), ("stopped",)],
+    "stop_at_a_gate": [("step", _at("a", "rev")), ("cancel",), ("stopped",)],
+    "stale_events": [("stale",), ("step", _at("a", "rev")), ("stale",)],
 }
+
+
+def _approvals(rs: RunState) -> list[tuple[Any, ...]]:
+    """What both paths record. ``head_sha`` is the graph path's own addition (finding 1)."""
+    return [(a.gate, a.round, a.decision_id, a.subject_digest) for a in rs.approvals]
 
 
 @pytest.mark.parametrize("name", list(SEQUENCES))
@@ -1031,20 +1219,101 @@ def test_the_graph_twin_of_linear_v0_emits_the_same_commands_and_statuses(name: 
         ls = lin.state
         stage = ls.run.stage or ""
         key = StepKey(RID, stage, ls.visit, ls.attempt)
-        if item[0] == "step":
-            g_event: Any = StageReported(key, "ready" if stage == "implement" else "pass", item[1])
-            l_event: Any = StepSucceeded(key, item[1])
-        elif item[0] == "gate":
-            kind = item[1]
-            live = None if kind.is_negative or kind is K.RETEST else ls.subject
-            g_event = l_event = GateClosed(RID, stage, ls.round, kind, "alice", did(), live)
-        else:
-            g_event = l_event = EffectConfirmed(RID, "pr.merge", ls.count("merge"), "m1")
+        g_event: Any
+        l_event: Any
+        match item[0]:
+            case "step":
+                g_event = StageReported(key, "ready" if stage == "implement" else "pass", item[1])
+                l_event = StepSucceeded(key, item[1])
+            case "gate":
+                kind = item[1]
+                live = None if kind.is_negative or kind is K.RETEST else ls.subject
+                g_event = l_event = GateClosed(RID, stage, ls.round, kind, "alice", did(), live)
+            case "effect":
+                g_event = l_event = EffectConfirmed(RID, "pr.merge", ls.count("merge"), "m1")
+            case "fail":
+                g_event = l_event = StepFailed(key, item[1])
+            case "effect_fail":
+                g_event = l_event = EffectFailed(RID, "pr.merge", ls.count("merge"))
+            case "cancel":
+                g_event = l_event = CancelRequested(RID)
+            case "stopped":
+                g_event = l_event = CancelCompleted(RID)
+            case "stale":
+                late = StepKey(RID, stage, ls.visit + 7, ls.attempt)
+                g_event, l_event = StageReported(late, "ready"), StepSucceeded(late)
+                with pytest.raises(OutOfOrderEventError):
+                    next(g.state, g_event, twin)
+                with pytest.raises(OutOfOrderEventError):
+                    next(ls, l_event, LINEAR_V0)
+                continue
+            case other:
+                raise AssertionError(other)
         g, lin = next(g.state, g_event, twin), next(ls, l_event, LINEAR_V0)
         assert g.commands == lin.commands
         assert g.state.run.status == lin.state.run.status
-        assert g.state.approvals == lin.state.approvals
+        assert g.state.run.blocked_reason == lin.state.run.blocked_reason
+        assert g.state.attempt == lin.state.attempt
+        assert _approvals(g.state) == _approvals(lin.state)
         assert g.state.subject == lin.state.subject
         assert g.state.visits == lin.state.visits
         if not lin.state.run.status.is_terminal:
             assert g.state.run.stage == lin.state.run.stage
+
+
+def _apply(rs: RunState, event: Any, w: Any) -> RunState:
+    return next(rs, event, w).state
+
+
+# --- where the graph path legitimately differs from the linear one -------------------------
+
+
+def test_difference_a_qa_agent_that_changes_the_head_is_refused_by_linear_and_voids_on_graph() -> (
+    None
+):
+    # Linear: a non-code step may not report another SHA (the run is stuck, PLAN 4.3 rule 2 by
+    # refusal). Graph: any stage may produce code, so the report is taken and every earlier
+    # approval is voided, which is the same rule enforced by loss instead of by refusal.
+    twin = _twin()
+    other = subj("zzz", "qa")
+
+    def to_qa(w: Any) -> RunState:
+        rs = _apply(new(), RunStarted(RID), w)
+        rs = _apply(
+            rs,
+            StepSucceeded(StepKey(RID, "implement", 1, 1), S1)
+            if w is LINEAR_V0
+            else StageReported(StepKey(RID, "implement", 1, 1), "ready", S1),
+            w,
+        )
+        return _apply(rs, GateClosed(RID, "review_gate", 1, K.APPROVE, "a", did(), S1), w)
+
+    qa_key = StepKey(RID, "qa", 1, 1)
+    with pytest.raises(OutOfOrderEventError):
+        _apply(to_qa(LINEAR_V0), StepSucceeded(qa_key, other), LINEAR_V0)
+    out = _apply(to_qa(twin), StageReported(qa_key, "pass", other), twin)
+    assert out.approvals == ()  # the review approval of abc cannot reach the merge of zzz
+    assert out.subject == other
+
+
+def test_difference_a_retest_drops_the_qa_gates_own_earlier_approval_on_graph_only() -> None:
+    # PLAN 4.3 rule 3: any non-approving close drops that gate's approvals. Linear keeps them
+    # (its next approval replaces them anyway); the graph path drops them at the close.
+    twin = _twin()
+    stale = Approval("qa_gate", 1, did(), S1.digest(), S1.head_sha)
+
+    def at_gate(w: Any) -> RunState:
+        rs = _apply(new(), RunStarted(RID), w)
+        ok = StepSucceeded(StepKey(RID, "implement", 1, 1), S1)
+        ok_g = StageReported(StepKey(RID, "implement", 1, 1), "ready", S1)
+        rs = _apply(rs, ok if w is LINEAR_V0 else ok_g, w)
+        rs = _apply(rs, GateClosed(RID, "review_gate", 1, K.APPROVE, "a", did(), S1), w)
+        qa = StepKey(RID, "qa", 1, 1)
+        rs = _apply(
+            rs, StepSucceeded(qa, S1) if w is LINEAR_V0 else StageReported(qa, "pass", S1), w
+        )
+        return dataclasses.replace(rs, approvals=(*rs.approvals, stale))
+
+    retest = GateClosed(RID, "qa_gate", 1, K.RETEST, "q", did())
+    assert "qa_gate" in [a.gate for a in _apply(at_gate(LINEAR_V0), retest, LINEAR_V0).approvals]
+    assert "qa_gate" not in [a.gate for a in _apply(at_gate(twin), retest, twin).approvals]

@@ -15,9 +15,13 @@ instead of raising, because a refused event is dropped by the driver and the run
   They are not skipped.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
   ``RunState.routed_gates``, PLAN 4.3 rule 2) has no live approval.
-* ``subject_missing``: an effect with no live subject to plan against.
+* ``subject_missing``: a gate or an effect with no live subject (of the right shape) to plan
+  against. Only a ``StageReported`` or ``StepSucceeded`` that must carry a subject and omits it is
+  Malformed; a failure, a request for changes or a confirmed ``pr.update_branch`` can lead to a
+  gate with none, and that blocks.
 
-A BLOCKED run stays on the stage it was leaving, and no counter moves for the refused entry.
+A BLOCKED run stays on the stage it was leaving, and no counter moves for the refused entry. (A
+gate close that then blocks has already changed the approvals and subject, as the close does.)
 
 Position, as in core: ``Run.stage`` names the current stage; an agent, panel or effect stage is
 current while the run is RUNNING and a gate while it is WAITING_HUMAN. ``RunStarted`` and the
@@ -31,9 +35,13 @@ edge. A gate decision maps to an outcome: approve and waive to ``approved``, req
 
 Approvals follow PLAN 4.3: a close that is not an approval drops that gate's approvals; a request
 for changes drops them all (the code will change); a report of a different head SHA drops them
-all, so an approval is never reused on code it did not see. A run that merged and ends with no
-QA approval left (a waive counts) ends with ``incident`` set whichever terminal it reaches, plans
-one ``OpenRevert`` per merge, and says so in ``Finish`` (PLAN 6.2).
+all, so an approval is never reused on code it did not see; a confirmed ``pr.update_branch`` moves
+the head, so it drops them and the subject too, and the new SHA passes a gate again. Each approval
+records its ``head_sha``. A merge records the head it merged, and a merge is covered only by a QA
+approval (a waive counts) of that head. A run with an uncovered merge ends with ``incident`` set
+whichever terminal it reaches, plans one ``OpenRevert`` per uncovered merge SHA, and says so in
+``Finish`` (PLAN 6.2). Merged code is immutable: once a merge is recorded a report of any other head
+is Malformed. ``workflow_version`` is the workflow's name until D2-07 pins the digest.
 """
 
 from __future__ import annotations
@@ -77,6 +85,7 @@ from sto.engine.handlers.core import (
 from sto.engine.reducer import (
     Approval,
     MalformedEventError,
+    Merge,
     OutOfOrderEventError,
     RunState,
     Transition,
@@ -100,6 +109,7 @@ _DECISION_OUTCOME = {
     DecisionKind.RETEST: "retest",
 }
 _REFUSALS = frozenset({"conflict", "stale"})
+_MOVES_HEAD = frozenset({"pr.update_branch"})  # a confirmed effect that leaves a new head SHA
 
 
 @BLOCKED_REASONS.register("loop_exhausted")
@@ -214,6 +224,9 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     if rs.steps >= wf.limits.max_steps_per_run:
         return _block(rs, "max_steps_exceeded")
     approvals: dict[str, Approval] = {}
+    needed: tuple[str, ...] = ()
+    if isinstance(stage, GateStage) and not _fits(stage, rs.subject):
+        return _block(rs, "subject_missing")
     if isinstance(stage, EffectStage):
         if rs.subject is None:
             return _block(rs, "subject_missing")
@@ -235,7 +248,7 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
         return _open_gate(rs, run, name, stage, count)
     if isinstance(stage, EffectStage):
         assert rs.subject is not None
-        gates = tuple(stage.requires_gates or ())
+        # The claim re-checks every gate the command names, so it names the routed ones too.
         cmd = RunEffect(
             run.id,
             stage.effect,
@@ -243,41 +256,50 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
             count,
             rs.subject,
             rs.subject.digest(),
-            gates,
-            tuple(approvals[g].decision_id for g in gates),
+            needed,
+            tuple(approvals[g].decision_id for g in needed),
         )
         return Transition(_with(rs, run, round=0), (cmd,))
     nxt = _with(rs, run, visit=count, attempt=1, round=0)
     return Transition(nxt, (RunStep(run.id, name, visit=count, attempt=1),))
 
 
+def _fits(stage: GateStage, subject: Subject | None) -> bool:
+    """A gate takes a head subject, except ``pre_push``, which takes the pre-push one."""
+    if subject is None:
+        return False
+    return (GateType(stage.gate.type) is GateType.PRE_PUSH) == (subject.head_sha is None)
+
+
 def _open_gate(rs: RunState, run: Run, name: str, stage: GateStage, count: int) -> Transition:
-    subject, gate_type = rs.subject, GateType(stage.gate.type)
-    if subject is None or (gate_type is GateType.PRE_PUSH) != (subject.head_sha is None):
-        want = "a pre-push" if gate_type is GateType.PRE_PUSH else "a head"
-        raise MalformedEventError(f"gate {name!r} needs {want} subject")
+    assert rs.subject is not None  # _goto checked it before any counter moved
     waiting = run.advance(RunStatus.WAITING_HUMAN)
     return Transition(
-        _with(rs, waiting, round=count), (OpenGate(run.id, name, gate_type, count, subject),)
+        _with(rs, waiting, round=count),
+        (OpenGate(run.id, name, GateType(stage.gate.type), count, rs.subject),),
     )
 
 
-def _qualified(rs: RunState, wf: Graph) -> bool:
-    """A QA gate's approval of the live code still stands (a waive records one)."""
-    return any(
-        isinstance(stage := wf.stages.get(a.gate), GateStage) and stage.gate.type == "qa"
+def _uncovered(rs: RunState, wf: Graph) -> tuple[Merge, ...]:
+    """The merges no standing QA approval covers: a QA gate's approval (a waive records one) of the
+    merged head. An approval of any other head does not qualify code it never saw."""
+    qa_heads = {
+        a.head_sha
         for a in rs.approvals
-    )
+        if isinstance(stage := wf.stages.get(a.gate), GateStage) and stage.gate.type == "qa"
+    }
+    return tuple(m for m in rs.merges if m.head_sha is None or m.head_sha not in qa_heads)
 
 
 def _end(rs: RunState, wf: Graph, status: RunStatus, *, flagged: bool = False) -> Transition:
-    """End the run. Merged code with no QA approval left makes it an incident whichever terminal
-    it reaches, Stop included, and plans a revert for each merge (PLAN 6.2)."""
-    unqualified = bool(rs.merges) and not _qualified(rs, wf)
-    incident = flagged or unqualified
+    """End the run. Merged code no QA approval covers makes it an incident whichever terminal it
+    reaches, Stop included, and plans one revert per such merge SHA (PLAN 6.2, 6.3)."""
+    uncovered = _uncovered(rs, wf)
+    incident = flagged or bool(uncovered)
     run = rs.run.advance(status, incident=incident)
-    reverts = tuple(OpenRevert(run.id, sha) for sha in rs.merges) if unqualified else ()
-    return Transition(_with(rs, run), (*reverts, Finish(run.id, status, incident)))
+    shas = tuple(dict.fromkeys(m.sha for m in uncovered))
+    reverts = tuple(OpenRevert(rs.run.id, sha) for sha in shas)
+    return Transition(_with(rs, run), (*reverts, Finish(rs.run.id, status, incident)))
 
 
 def _close(
@@ -327,7 +349,11 @@ def _report(
     stage: AgentStage | ReviewPanelStage,
     outcome: str,
     subject: Subject | None,
+    *,
+    strict: bool = True,
 ) -> Transition:
+    """Follow ``outcome``. ``strict`` (a reporter's own event) makes a missing subject for the
+    next gate Malformed; a failure has no subject to give, and blocks at gate entry instead."""
     if outcome not in stage.next:
         raise MalformedEventError(
             f"stage {rs.run.stage!r} has no {outcome!r} outcome; it has: {', '.join(stage.next)}"
@@ -336,9 +362,15 @@ def _report(
         return _block(rs, "degraded")
     if subject is not None:
         live = rs.subject
+        if rs.merges and subject.head_sha not in {m.head_sha for m in rs.merges}:
+            raise MalformedEventError("merged code cannot change: report the merged head")
         moved = live is not None and live.head_sha is not None and live.head_sha != subject.head_sha
         rs = dataclasses.replace(rs, subject=subject, approvals=() if moved else rs.approvals)
     to, loop = _target(stage.next[outcome])
+    nxt = wf.stages[to]
+    if strict and isinstance(nxt, GateStage) and not _fits(nxt, rs.subject):
+        want = "a pre-push" if GateType(nxt.gate.type) is GateType.PRE_PUSH else "a head"
+        raise MalformedEventError(f"stage {rs.run.stage!r} must report {want} subject for {to!r}")
     return _goto(rs, wf, to, loop)
 
 
@@ -383,7 +415,7 @@ def on_step_failed(rs: RunState, event: StepFailed, wf: Graph) -> Transition:
         return _block(rs, "permanent_failure")
     # degraded: a review panel opens its gate with the flag, unless it fails closed (PLAN 6.2)
     if isinstance(stage, ReviewPanelStage) and not stage.fail_closed and "degraded" in stage.next:
-        return _report(rs, wf, stage, "degraded", None)
+        return _report(rs, wf, stage, "degraded", None, strict=False)
     return _block(rs, "degraded")
 
 
@@ -411,7 +443,13 @@ def on_gate_closed(rs: RunState, event: GateClosed, wf: Graph) -> Transition:
             raise MalformedEventError(f"{kind.value} needs the approved subject")
         if event.subject != rs.subject:
             raise _out("stale approval: the subject is not the live one")
-        approval = Approval(event.gate, event.round, event.decision_id, event.subject.digest())
+        approval = Approval(
+            event.gate,
+            event.round,
+            event.decision_id,
+            event.subject.digest(),
+            event.subject.head_sha,
+        )
     return _close(rs, wf, event.gate, outcome, approval)
 
 
@@ -449,7 +487,11 @@ def on_effect_confirmed(rs: RunState, event: EffectConfirmed, wf: Graph) -> Tran
         sha = (event.merge_sha or "").strip()
         if not sha:
             raise MalformedEventError("a pr.merge confirmation must report merge_sha")
-        rs = dataclasses.replace(rs, merges=(*rs.merges, sha))
+        head = rs.subject.head_sha if rs.subject else None
+        rs = dataclasses.replace(rs, merges=(*rs.merges, Merge(sha, head)))
+    if stage.effect in _MOVES_HEAD:
+        # The new SHA was never approved: it passes through the gates again (PLAN 4.3 rule 2).
+        rs = dataclasses.replace(rs, approvals=(), subject=None)
     return _follow(rs, wf, stage, "done")
 
 

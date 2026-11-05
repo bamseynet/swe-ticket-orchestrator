@@ -162,6 +162,15 @@ class Approval:
     round: int
     decision_id: DecisionId
     subject_digest: str
+    head_sha: str | None = None  # set by the graph handlers, so a merge can be matched to QA
+
+
+@dataclass(frozen=True)
+class Merge:
+    """A confirmed ``pr.merge``: its SHA and the head it merged (what a QA approval must cover)."""
+
+    sha: str
+    head_sha: str | None
 
 
 @dataclass(frozen=True)
@@ -181,7 +190,7 @@ class RunState:
     # stay required once visited (PLAN 4.3 rule 2; the route stage sets them, D2-23).
     loops: tuple[tuple[str, int], ...] = ()
     steps: int = 0
-    merges: tuple[str, ...] = ()
+    merges: tuple[Merge, ...] = ()
     routed_gates: tuple[str, ...] = ()
 
     def count(self, node: str) -> int:
