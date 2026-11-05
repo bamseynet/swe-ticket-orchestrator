@@ -20,7 +20,17 @@ import pytest
 import yaml
 
 from sto.config.manifest import load_manifest
-from sto.config.schema import OrgPolicy, load_document
+from sto.config.schema import (
+    AgentStage,
+    ChecksStage,
+    EffectStage,
+    GateStage,
+    OrgPolicy,
+    ReviewPanelStage,
+    TerminalStage,
+    WaitStage,
+    load_document,
+)
 from sto.config.schema import Workflow as Graph
 from sto.config.validate_structure import validate_structure
 from sto.domain import (
@@ -49,8 +59,11 @@ from sto.engine.handlers.core import (
     StepSucceeded,
 )
 from sto.engine.handlers.stages import EffectRefused, GateExpired, StageReported
+from sto.engine.handlers.waits import CheckResult, CheckResults, StageTimedOut, WaitResumed
 from sto.engine.reducer import (
+    ENTRY_COUNTERS,
     GRAPH_HANDLERS,
+    LEAVING_EVENTS,
     LINEAR_V0,
     Approval,
     HandlerRegistry,
@@ -59,6 +72,7 @@ from sto.engine.reducer import (
     NoHandlerError,
     OutOfOrderEventError,
     RunState,
+    Transition,
     WorkflowMismatchError,
     load_handlers,
     next,
@@ -1287,3 +1301,346 @@ def test_difference_a_retest_drops_the_qa_gates_own_earlier_approval_on_graph_on
     retest = GateClosed(RID, "qa_gate", 1, K.RETEST, "q", did())
     assert "qa_gate" in [a.gate for a in _apply(at_gate(LINEAR_V0), retest, LINEAR_V0).approvals]
     assert "qa_gate" not in [a.gate for a in _apply(at_gate(twin), retest, twin).approvals]
+
+
+# --- D2-29: a registry must be able to leave every stage the run can enter ------------------
+
+
+def _waiting_doc(d: dict[str, Any]) -> None:
+    d["stages"]["implement"]["next"]["blocked"] = {"to": "ask", "loop": "stale"}
+    d["stages"]["ask"] = {
+        "kind": "wait",
+        "wait_for": "human_answer",
+        "timeout": "2d",
+        "next": {"resumed": {"to": "implement", "loop": "fix"}, "timeout": "closed"},
+    }
+    d["stages"]["panel"]["next"]["clean"] = "ci"
+    d["stages"]["ci"] = {
+        "kind": "checks",
+        "source": "ci",
+        "required": ["unit"],
+        "timeout": "45m",
+        "next": {"green": "review_gate", "red": {"to": "implement", "loop": "fix"}},
+    }
+
+
+WW = wf(_waiting_doc)
+_LEAVING = {WaitResumed, StageTimedOut, CheckResults}
+
+
+def _graph_registry_without(*dropped: type) -> HandlerRegistry:
+    """A registry like the default graph one, minus the handlers of ``dropped``."""
+    reg = HandlerRegistry()
+    for event_type in GRAPH_HANDLERS.event_types() - set(dropped):
+        handler = GRAPH_HANDLERS.get(event_type)
+        assert handler is not None
+        reg.register(event_type, handler)
+    return reg
+
+
+def _blocked_by_registry(rs: RunState, event: Any, reg: HandlerRegistry) -> Transition:
+    t = next(rs, event, WW, graph_registry=reg)
+    assert t.state.run.status is RunStatus.BLOCKED
+    assert t.state.run.blocked_reason == "stage_unhandled"
+    assert t.commands == ()
+    return t
+
+
+def test_a_registry_without_the_wait_handlers_blocks_entering_a_wait() -> None:
+    rs = started(WW)
+    reg = _graph_registry_without(*_LEAVING)
+    event = StageReported(StepKey(RID, "implement", 1, 1), "blocked")
+    t = _blocked_by_registry(rs, event, reg)
+    # no counter moved: the run is exactly where it was, on the stage it was leaving
+    s = t.state
+    assert s.run.stage == "implement"
+    assert (s.steps, s.visits, s.loops) == (rs.steps, rs.visits, rs.loops)
+    assert (s.visit, s.attempt, s.round) == (rs.visit, rs.attempt, rs.round)
+    assert s.count("ask") == 0
+
+
+def test_a_registry_without_the_wait_handlers_blocks_entering_checks() -> None:
+    rs = report(started(WW), "ready", w=WW)  # implement -> panel
+    event = StageReported(StepKey(RID, "panel", 1, 1), "clean", S1)
+    t = _blocked_by_registry(rs, event, _graph_registry_without(*_LEAVING))
+    assert t.state.run.stage == "panel"
+    assert (t.state.steps, t.state.visits) == (rs.steps, rs.visits)
+    assert t.state.count("ci") == 0
+
+
+@pytest.mark.parametrize(
+    ("missing", "reason"),
+    [
+        (WaitResumed, "stage_unhandled"),
+        (StageTimedOut, "stage_unhandled"),
+    ],
+)
+def test_a_wait_needs_every_one_of_its_leaving_events(missing: type, reason: str) -> None:
+    event = StageReported(StepKey(RID, "implement", 1, 1), "blocked")
+    t = next(started(WW), event, WW, graph_registry=_graph_registry_without(missing))
+    assert t.state.run.blocked_reason == reason
+
+
+def test_checks_need_results_and_timeout_but_not_the_wait_resume() -> None:
+    rs = report(started(WW), "ready", w=WW)
+    event = StageReported(StepKey(RID, "panel", 1, 1), "clean", S1)
+    ok = next(rs, event, WW, graph_registry=_graph_registry_without(WaitResumed))
+    assert (ok.state.run.status, ok.state.run.stage) == (RunStatus.WAITING_EXTERNAL, "ci")
+    for lacking in (CheckResults, StageTimedOut):
+        t = next(rs, event, WW, graph_registry=_graph_registry_without(lacking))
+        assert t.state.run.blocked_reason == "stage_unhandled"
+
+
+def test_a_registry_that_lacks_only_unrelated_handlers_still_enters_waits() -> None:
+    reg = _graph_registry_without(EffectRefused)
+    t = next(started(WW), StageReported(StepKey(RID, "implement", 1, 1), "blocked"), WW,
+             graph_registry=reg)  # fmt: skip
+    assert (t.state.run.status, t.state.run.stage) == (RunStatus.WAITING_HUMAN, "ask")
+
+
+def test_the_default_registry_is_unaffected_by_the_coverage_check() -> None:
+    event = StageReported(StepKey(RID, "implement", 1, 1), "blocked")
+    t = next(started(WW), event, WW)
+    assert (t.state.run.status, t.state.run.stage) == (RunStatus.WAITING_HUMAN, "ask")
+    assert t.state.steps == 2
+    explicit = next(started(WW), event, WW, graph_registry=GRAPH_HANDLERS)
+    assert explicit == t
+
+
+def test_a_workflow_with_no_wait_stages_runs_on_a_registry_without_wait_handlers() -> None:
+    reg = _graph_registry_without(*_LEAVING)
+    t = next(new(), RunStarted(RID), W, graph_registry=reg)
+    assert status(t.state) == (RunStatus.RUNNING, "implement")
+
+
+def test_the_coverage_check_is_pure_and_the_reducer_holds_no_context_variable() -> None:
+    import sto.engine.reducer as reducer
+
+    reg = _graph_registry_without(*_LEAVING)
+    event = StageReported(StepKey(RID, "implement", 1, 1), "blocked")
+    first = next(started(WW), event, WW, graph_registry=reg)
+    assert next(started(WW), event, WW, graph_registry=reg) == first
+    import contextvars
+
+    assert not [v for v in vars(reducer).values() if isinstance(v, contextvars.ContextVar)]
+    assert BLOCKED_REASONS.get("stage_unhandled") is not None
+
+
+def test_a_refused_entry_over_a_loop_edge_leaves_every_position_counter_as_it_was() -> None:
+    rs = dataclasses.replace(
+        started(WW), visit=7, attempt=3, round=2, visits=(("implement", 7),), steps=4
+    )
+    event = StageReported(StepKey(RID, "implement", 7, 3), "blocked")
+    t = next(rs, event, WW, graph_registry=_graph_registry_without(*_LEAVING))
+    s = t.state
+    assert s.run.blocked_reason == "stage_unhandled"
+    assert (s.visit, s.attempt, s.round, s.steps) == (7, 3, 2, 4)
+    assert s.visits == (("implement", 7),)
+    assert s.loops == rs.loops
+    assert s.loop_count("stale") == 0
+    ok = next(rs, event, WW)  # the default registry does enter, over the loop
+    assert (ok.state.visit, ok.state.attempt, ok.state.round, ok.state.steps) == (1, 1, 0, 5)
+    assert ok.state.loop_count("stale") == 1
+
+
+def test_an_event_that_decides_nothing_on_a_live_checks_stage_is_not_an_entry() -> None:
+    rs = report(started(WW), "ready", w=WW)
+    rs = step(rs, StageReported(StepKey(RID, "panel", 1, 1), "clean", S1), WW)
+    assert rs.run.stage == "ci"
+    reg = _graph_registry_without(StageTimedOut)  # results are handled, the timeout is not
+    pending = CheckResults(RID, "ci", 1, "abc", (CheckResult("unit", "pending"),))
+    t = next(rs, pending, WW, graph_registry=reg)
+    assert t.state == rs  # nothing moved: it is a wait, not an entry
+    assert t.state.run.status is RunStatus.WAITING_EXTERNAL
+
+
+# --- D2-29 review pass 1: every non-terminal kind, fail closed -----------------------------
+
+_CORE = {
+    "agent": (StageReported, StepSucceeded, StepFailed),
+    "gate": (GateClosed, GateExpired),
+    "effect": (EffectConfirmed, EffectRefused, EffectFailed),
+}
+
+
+def _registry_with_only(*kept: type) -> HandlerRegistry:
+    reg = HandlerRegistry()
+    for event_type in kept:
+        handler = GRAPH_HANDLERS.get(event_type)
+        assert handler is not None
+        reg.register(event_type, handler)
+    return reg
+
+
+def _entering(kind: str) -> tuple[RunState, Any, Graph]:
+    """A state and the event that enters a stage of ``kind`` (for the base workflow)."""
+    if kind == "agent":
+        return new(), RunStarted(RID), W
+    if kind == "panel":
+        return started(), StageReported(StepKey(RID, "implement", 1, 1), "ready", S1), W
+    if kind == "gate":
+        return (
+            report(started(), "ready"),
+            StageReported(StepKey(RID, "panel", 1, 1), "clean", S1),
+            W,
+        )
+    assert kind == "effect"
+    g = at_review_gate()
+    return g, GateClosed(RID, "review_gate", g.round, K.APPROVE, "alice", did(), g.subject), W
+
+
+@pytest.mark.parametrize("kind", ["agent", "panel", "gate", "effect"])
+def test_the_default_graph_registry_enters_every_core_kind(kind: str) -> None:
+    rs, event, w = _entering(kind)
+    ok = next(rs, event, w, graph_registry=GRAPH_HANDLERS)
+    assert ok.state.run.status is not RunStatus.BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("kind", "dropped"),
+    [
+        ("agent", _CORE["agent"]),
+        ("gate", (GateClosed,)),
+        ("gate", (GateExpired,)),
+        ("gate", _CORE["gate"]),
+        ("effect", _CORE["effect"]),
+    ],
+)
+def test_a_registry_that_cannot_leave_a_core_kind_blocks_its_entry(
+    kind: str, dropped: tuple[type, ...]
+) -> None:
+    rs, event, w = _entering(kind)
+    # the registry still handles the event that makes the entry; only the leaving ones are gone
+    t = next(rs, event, w, graph_registry=_graph_registry_without(*dropped))
+    assert t.state.run.blocked_reason == "stage_unhandled"
+    assert t.commands == ()
+    assert (t.state.steps, t.state.visits, t.state.loops) == (rs.steps, rs.visits, rs.loops)
+
+
+@pytest.mark.parametrize("kind", ["agent", "effect"])
+def test_a_stage_with_alternative_leaving_events_needs_only_one(kind: str) -> None:
+    rs, event, w = _entering(kind)
+    dropped = _CORE[kind]
+    for keep in dropped:
+        kept = (GRAPH_HANDLERS.event_types() - set(dropped)) | {keep, type(event)}
+        reg = _registry_with_only(*kept)
+        t = next(rs, event, w, graph_registry=reg)
+        assert t.state.run.status is not RunStatus.BLOCKED, keep
+
+
+@pytest.mark.parametrize(
+    "stage_type", [AgentStage, ReviewPanelStage, GateStage, EffectStage, WaitStage, ChecksStage]
+)
+def test_a_non_terminal_kind_with_no_leaving_entry_blocks_even_on_the_full_registry(
+    stage_type: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delitem(LEAVING_EVENTS, stage_type)
+    rs, event = {
+        AgentStage: (new(), RunStarted(RID)),
+        ReviewPanelStage: _entering("panel")[:2],
+        GateStage: _entering("gate")[:2],
+        EffectStage: _entering("effect")[:2],
+        WaitStage: (started(WW), StageReported(StepKey(RID, "implement", 1, 1), "blocked")),
+        ChecksStage: (
+            report(started(WW), "ready", w=WW),
+            StageReported(StepKey(RID, "panel", 1, 1), "clean", S1),
+        ),
+    }[stage_type]  # type: ignore[index]
+    w = WW if stage_type in (WaitStage, ChecksStage) else W
+    t = next(rs, event, w, graph_registry=GRAPH_HANDLERS)
+    assert t.state.run.blocked_reason == "stage_unhandled"
+
+
+def test_reaching_a_terminal_needs_no_leaving_events() -> None:
+    reg = _registry_with_only(RunStarted, StageReported)
+    rs = next(new(), RunStarted(RID), W, graph_registry=reg).state
+    t = next(rs, StageReported(StepKey(RID, "implement", 1, 1), "blocked"), W, graph_registry=reg)
+    assert t.state.run.status is RunStatus.CLOSED
+
+
+def test_every_core_and_wait_kind_is_registered_for_leaving_events() -> None:
+    assert {AgentStage, ReviewPanelStage, GateStage, EffectStage, WaitStage, ChecksStage} <= set(
+        LEAVING_EVENTS
+    )
+    assert TerminalStage not in LEAVING_EVENTS
+
+
+# --- the blocked state keeps what the handler decided before the entry -----------------------
+
+
+def _approved_into_wait(d: dict[str, Any]) -> None:
+    _waiting_doc(d)
+    d["stages"]["panel"]["next"]["clean"] = "review_gate"  # keep the gate before the checks
+    d["stages"]["review_gate"]["next"]["approved"] = "ask"
+
+
+def _merged_into_checks(d: dict[str, Any]) -> None:
+    _waiting_doc(d)
+    d["stages"]["panel"]["next"]["clean"] = "review_gate"
+    d["stages"]["merge"]["next"]["done"] = "ci"
+
+
+def test_a_blocked_wait_entry_keeps_the_approval_the_gate_close_recorded() -> None:
+    w = wf(_approved_into_wait, valid=False)
+    rs = report(started(w), "ready", w=w)
+    rs = report(rs, "clean", S1, w)
+    reg = _graph_registry_without(*_LEAVING)
+    t = next(
+        rs, GateClosed(RID, "review_gate", rs.round, K.APPROVE, "a", did(), S1), w,
+        graph_registry=reg,
+    )  # fmt: skip
+    assert t.state.run.blocked_reason == "stage_unhandled"
+    assert t.state.run.stage == "review_gate"
+    assert [a.gate for a in t.state.approvals] == ["review_gate"]
+    assert t.state.subject == S1
+
+
+def test_a_blocked_checks_entry_keeps_the_merge_the_confirmation_recorded() -> None:
+    w = wf(_merged_into_checks, valid=False)
+    rs = close(at_review_gate(w), K.APPROVE, w=w)
+    assert rs.run.stage == "merge"
+    reg = _graph_registry_without(CheckResults)
+    t = next(rs, EffectConfirmed(RID, "pr.merge", rs.count("merge"), "m1"), w, graph_registry=reg)
+    assert t.state.run.blocked_reason == "stage_unhandled"
+    assert t.state.run.stage == "merge"
+    assert t.state.merges == (Merge("m1", S1.head_sha),)
+
+
+def test_the_counters_a_blocked_entry_restores_are_exactly_those_an_entry_changes() -> None:
+    rs = dataclasses.replace(
+        started(WW), visit=7, attempt=3, round=2, visits=(("implement", 7),), steps=4
+    )
+    event = StageReported(StepKey(RID, "implement", 7, 3), "blocked")
+    entered = next(rs, event, WW).state
+    changed = {
+        f.name
+        for f in dataclasses.fields(RunState)
+        if getattr(entered, f.name) != getattr(rs, f.name)
+    }
+    assert changed == {"run", *ENTRY_COUNTERS}  # none missing from the list, none dead weight
+
+
+def test_a_review_panel_entered_from_an_effect_needs_a_step_leaving_event() -> None:
+    # update_branch -> panel is entered by an effect event, so the registry can lack every
+    # agent leaving event and still reach the panel; it must then be refused.
+    rs = step(at_merge(), EffectRefused(RID, "pr.merge", 1, "stale"))  # -> update
+    assert rs.run.stage == "update"
+    confirm = EffectConfirmed(RID, "pr.update_branch", 1)
+    lacking = _graph_registry_without(StageReported, StepSucceeded, StepFailed)
+    t = next(rs, confirm, W, graph_registry=lacking)
+    assert t.state.run.blocked_reason == "stage_unhandled"
+    assert t.state.run.stage == "update"
+    ok = next(rs, confirm, W, graph_registry=_graph_registry_without(StepSucceeded, StepFailed))
+    assert ok.state.run.stage == "panel"
+
+
+def test_a_terminal_is_exempt_whatever_the_registry_and_the_step_count() -> None:
+    from sto.engine.reducer import _uncovered_entry
+
+    rs = started()
+    ended = dataclasses.replace(
+        rs, steps=rs.steps + 1, run=dataclasses.replace(rs.run, stage="done")
+    )
+    assert not _uncovered_entry(rs, Transition(ended), W, HandlerRegistry())
+    not_terminal = dataclasses.replace(ended, run=dataclasses.replace(rs.run, stage="panel"))
+    assert _uncovered_entry(rs, Transition(not_terminal), W, HandlerRegistry())
