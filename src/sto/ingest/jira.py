@@ -45,6 +45,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -118,18 +119,40 @@ def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
+def _object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse a duplicate key: the last-wins reading would let two readers disagree."""
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_segment(segment: str) -> Any:
+    """A base64url JSON segment of a token. A duplicate key is refused; NaN and Infinity are
+    refused where a number is read (``_stamp``)."""
+    padded = segment + "=" * (-len(segment) % 4)
+    return json.loads(base64.urlsafe_b64decode(padded), object_pairs_hook=_object_pairs)
+
+
 def _stamp(claims: Mapping[str, Any], name: str) -> float:
     value = claims.get(name)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidSignatureError(f"webhook token needs a numeric {name}")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:  # 10**400 is an int Python cannot make a float of
+        raise InvalidSignatureError(f"webhook token {name} is out of range") from exc
+    if not math.isfinite(number):
+        raise InvalidSignatureError(f"webhook token {name} is out of range")
+    return number
 
 
 def _header_is_hs256(segment: str) -> bool:
     """Run only AFTER the MAC matched: a token that names another algorithm is refused anyway."""
     try:
-        padded = segment + "=" * (-len(segment) % 4)
-        header = json.loads(base64.urlsafe_b64decode(padded))
+        header = _load_segment(segment)
     except (ValueError, binascii.Error, RecursionError):
         return False
     return isinstance(header, dict) and header.get("alg") == "HS256"
@@ -211,8 +234,7 @@ class JiraWebhookVerifier:
         """Run only AFTER the MAC matched. A token that is old, for another app or missing a
         claim is refused: one leaked token must not work forever."""
         try:
-            padded = segment + "=" * (-len(segment) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(padded))
+            claims = _load_segment(segment)
         except (ValueError, binascii.Error, RecursionError) as exc:
             raise InvalidSignatureError("webhook token claims are not JSON") from exc
         if not isinstance(claims, dict):

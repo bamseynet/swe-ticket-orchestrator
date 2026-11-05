@@ -22,12 +22,16 @@
   Live hooks are refreshed first, so a hook that is about to be replaced cannot lapse meanwhile. If
   Jira refuses the new one (the limit), our own stale hook is deleted and the registration retried
   once.
+* **A gap is remembered before anything changes** (``ORG / JIRAGAP#<site>``), the reconciler is told
+  at once, and the note is cleared only when its callback returns. A run that then fails (a refused
+  or failed registration) cannot lose the gap; the next run tells again until it is acknowledged.
 * **First versus vanished.** Our record is empty on a first registration and non-empty when Jira
   lost a hook of ours. Unbinding every team deletes our hooks and clears the record.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -53,8 +57,12 @@ RECORD_RETRIES = 5
 _PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,9}", re.ASCII)
 
 
-class WebhookLimitError(PermanentError):
-    """The app's webhook limit is reached, or registration was refused: a person must act."""
+class WebhookRefusedError(PermanentError):
+    """Jira refused the registration (a bad filter, a second URL): a person must look."""
+
+
+class WebhookLimitError(WebhookRefusedError):
+    """The app's webhook limit is reached: a person must free a slot."""
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,12 @@ class JiraApi(Protocol):
 
 class Alerts(Protocol):
     def alert(self, name: str, message: str, **details: Any) -> None: ...
+
+
+def _ids(value: object) -> set[int]:
+    if not isinstance(value, list):
+        return set()
+    return {i for i in value if isinstance(i, int) and not isinstance(i, bool)}
 
 
 def _valid_project(key: object) -> str:
@@ -146,12 +160,16 @@ class SiteWebhooks:
 
     def sync(self) -> SyncReport:
         now = self._clock()
-        hooks = self._list()
+        if self._gap_pending():  # told earlier and not acknowledged, or the run died first
+            self._tell_reconciler()
+        # The record is read BEFORE the listing: a hook a concurrent run registers meanwhile is in
+        # the listing but not in our snapshot (left alone), never in our snapshot but missing from
+        # the listing (which would read as vanished).
         owned = self._owned()
+        hooks = self._list()
         ours = [h for h in hooks if h["id"] in owned]  # never a hook someone else registered
         expired = [h for h in ours if self._expiry(h) <= now]
         live = [h for h in ours if self._expiry(h) > now]
-        gap = False
         if expired:
             self._metrics.incr("webhook.expired", surface=self._surface)
             self._alerts.alert(
@@ -160,7 +178,7 @@ class SiteWebhooks:
                 site=self._site,
                 ids=sorted(h["id"] for h in expired),
             )
-            gap = True
+            self._gap_known()
         projects = self._bindings.projects()
         if not projects:
             deleted = self._delete(ours)
@@ -168,14 +186,14 @@ class SiteWebhooks:
             return SyncReport(deleted=deleted, expired=len(expired))
         if owned and not ours:
             self._missing()  # we registered one and Jira has none: events were missed
-            gap = True
+            self._gap_known()
         self._disown(owned - {h["id"] for h in ours})
         # first: a working hook must not lapse while we replace it
         refreshed = self._refresh(live, now)
         jql = webhook_jql(projects)
         events = sorted(SUBSCRIBED_EVENTS)
         keep = [
-            h for h in live if h.get("jqlFilter") == jql and sorted(h.get("events", [])) == events
+            h for h in live if h.get("jqlFilter") == jql and sorted(h.get("events") or []) == events
         ]
         stale = [h for h in live if h not in keep]
         extra, keep = keep[1:], keep[:1]  # one registration per site, however it got doubled
@@ -183,17 +201,18 @@ class SiteWebhooks:
         registered = 0
         if not keep:
             created = self._try_register(jql, events)
-            if isinstance(created, str) and stale:
-                # at the limit: free OUR OWN stale hook (never a foreign one) and try once more
+            at_limit = len(hooks) - len(expired) >= WEBHOOK_LIMIT
+            if isinstance(created, str) and at_limit and stale:
+                # at the limit: free OUR OWN stale hook (never a foreign one) and try once more.
+                # Deleting the one that still works opens a gap: the reconciler hears first.
+                self._gap_known()
                 deleted += self._delete(stale)
                 stale = []
                 created = self._try_register(jql, events)
             if isinstance(created, str):
-                self._limit(created)
+                self._refused(created, at_limit)
             registered = 1
         deleted += self._delete([*stale, *extra])
-        if gap:
-            self._tell_reconciler()
         return SyncReport(registered, refreshed, deleted, len(expired))
 
     # --- Jira calls -----------------------------------------------------------------------
@@ -236,26 +255,31 @@ class SiteWebhooks:
         raise PermanentError("jira webhook list never ended")
 
     def _try_register(self, jql: str, events: list[str]) -> int | str:
-        """The new webhook's ID, or Jira's reason for refusing it (the limit, usually)."""
+        """The new webhook's ID, or Jira's reason for refusing it."""
         body = {"url": self._url, "webhooks": [{"events": events, "jqlFilter": jql}]}
         reply = self._api.call("POST", "/webhook", body)
         result = self._checked(reply, "register", 200)
-        (entry,) = result["webhookRegistrationResult"]
+        listed = result.get("webhookRegistrationResult") if isinstance(result, dict) else None
+        if not isinstance(listed, list) or len(listed) != 1 or not isinstance(listed[0], dict):
+            raise PermanentError("jira webhook registration reply is not one result")
+        entry = listed[0]
         ident = entry.get("createdWebhookId")
-        if isinstance(ident, bool) or not isinstance(ident, int):
-            return "; ".join(entry.get("errors", ["refused"]))
-        self._own({ident})
-        self._metrics.incr("webhook.registered", surface=self._surface)
-        return ident
+        if isinstance(ident, int) and not isinstance(ident, bool):
+            self._own({ident})
+            self._metrics.incr("webhook.registered", surface=self._surface)
+            return ident
+        errors = entry.get("errors")
+        if not (isinstance(errors, list) and errors and all(isinstance(e, str) for e in errors)):
+            raise PermanentError("jira webhook registration gave neither an ID nor errors")
+        return "; ".join(errors)
 
-    def _limit(self, reason: str) -> None:
+    def _refused(self, reason: str, at_limit: bool) -> None:
         self._metrics.incr("webhook.register_refused", surface=self._surface)
+        name = "jira.webhook.limit" if at_limit else "jira.webhook.refused"
         self._alerts.alert(
-            "jira.webhook.limit",
-            f"Jira refused the webhook for site {self._site}: {reason}",
-            site=self._site,
+            name, f"Jira refused the webhook for site {self._site}: {reason}", site=self._site
         )
-        raise WebhookLimitError(reason)
+        raise (WebhookLimitError if at_limit else WebhookRefusedError)(reason)
 
     def _delete(self, hooks: list[dict[str, Any]]) -> int:
         if not hooks:
@@ -283,7 +307,7 @@ class SiteWebhooks:
     def _owned(self) -> set[int]:
         item = self._store.get(PLATFORM, self._key())
         ids = item.data.get("ids") if item else None
-        return {i for i in ids if isinstance(i, int)} if isinstance(ids, list) else set()
+        return _ids(ids)
 
     def _own(self, ids: set[int]) -> None:
         self._change_record(lambda held: held | ids)
@@ -296,7 +320,7 @@ class SiteWebhooks:
         """Compare-and-set the ID list; an empty list removes the record (so "first" is first)."""
         for _ in range(RECORD_RETRIES):
             item = self._store.get(PLATFORM, self._key())
-            held = {i for i in item.data.get("ids", []) if isinstance(i, int)} if item else set()
+            held = _ids(item.data.get("ids")) if item else set()
             new = change(set(held))
             if new == held:
                 return
@@ -319,9 +343,27 @@ class SiteWebhooks:
             site=self._site,
         )
 
+    def _gap_key(self) -> Key:
+        return Key("ORG", f"JIRAGAP#{self._site}")
+
+    def _gap_pending(self) -> bool:
+        return self._store.get(PLATFORM, self._gap_key()) is not None
+
+    def _gap_known(self) -> None:
+        """Events may have been missed. Remember it BEFORE anything changes, so a run that then
+        fails cannot lose it, and tell the reconciler now."""
+        with contextlib.suppress(ConditionFailedError):  # already pending
+            self._store.put(
+                PLATFORM, self._gap_key(), {"site": self._site, "at": self._clock()}, when=Absent()
+            )
+        self._tell_reconciler()
+
     def _tell_reconciler(self) -> None:
+        """The pending gap stays until the callback returns without raising, then it is cleared."""
         try:
             self._on_gap(self._site)
         except Exception:
             log.exception("webhook gap callback failed", extra={"site": self._site})
             self._metrics.incr("webhook.gap_failed", surface=self._surface)
+            return
+        self._store.delete(PLATFORM, self._gap_key())
