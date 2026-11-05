@@ -346,7 +346,7 @@ Property tests pass over all templates, with crash injection.
 | 2 | D2-18, D2-24 | - |
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
-| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21 | - |
+| 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
 | 6 | D2-09, D2-19, D2-23, D2-25 | - |
 | 7 | D2-14, D2-15 | - |
 | 8 | D2-20 | - |
@@ -442,13 +442,13 @@ No compute is held while waiting, and `team_default` resolving to no checks bloc
 `sto validate` and `sto dry-run` walk a workflow with the fake LLM and print the path taken.
 A team can try any outcome without touching anything real.
 **AC:** a chosen outcome sequence is scriptable; no real writes occur (asserted by spy); output is usable in CI.
-**Deps:** D2-06, D2-02, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `src/sto/cli/`, `tests/cli/`.
+**Deps:** D2-06, D2-26, D2-02, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `src/sto/cli/`, `tests/cli/`.
 
 #### D2-15: Property and crash tests
 Hypothesis generates valid workflows and event sequences, and a crash is injected at every commit.
 Invariants: terminates or waits, never runs gated effects unapproved, never loses a decision.
 **AC:** R3 and the store-level part of G6 pass; a seed is printed on failure; runs under a fixed time budget in CI.
-**Deps:** D2-06, D2-05, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `tests/engine/test_properties.py`, `tests/gates/test_crash.py`.
+**Deps:** D2-06, D2-26, D2-05, D2-13, D2-23. **Size:** M. **Run:** parallel. **Files:** `tests/engine/test_properties.py`, `tests/gates/test_crash.py`.
 
 #### D2-16: Definition of done checks
 Machine-evaluated conditions from config, evaluated **before a gate opens** or before a stage exits, blocking with a clear reason.
@@ -503,6 +503,16 @@ A team admin can grant extra rounds to a run at a spent loop, and, under `route_
 Both are engine actions, so they are limited to what the graph allows. A patch blocked by path policy or a secret scan is never routed past `branch.push`.
 **AC:** route-to-gate puts the item on the attention list and makes the actor ineligible for that round; it is refused by default, from a non-review stage, and for a policy-blocked patch (G20); both are audited.
 **Deps:** D2-10, D2-08. **Size:** S. **Run:** parallel. **Files:** `src/sto/engine/handlers/grants.py`, `tests/engine/test_grants.py`.
+
+#### D2-26: Run the graph reducer everywhere
+Found in review of D2-06. Reducer v1 runs any validated workflow, but `api/runtime.py` and the local driver still default to `LINEAR_V0`, so the hard-coded path is not yet replaced, and no driver can execute `OpenRevert`.
+**AC:** the runtime and the local driver run every workflow through the graph reducer by default, with `LINEAR_V0` expressed as its graph twin; an `OpenRevert` executor opens the revert idempotently per `(run, merge_sha)`; the gate suite runs against v1 and passes unchanged.
+**Deps:** D2-06. **Size:** M. **Run:** serial. **Files:** `src/sto/api/runtime.py`, `src/sto/drivers/local.py`, `tests/drivers/test_local_v1.py`.
+
+#### D2-27: PLAN examples agree with the bundled templates
+Found in review of D2-05. PLAN's OrgPolicy example refuses PLAN's own workflows: it names no `pre_push` or `custom` surface, its 60-day run age is below the regulated workflow's 90, and its 14-day stage limit is below four `expire_after` values. PLAN 7.7's Kanban QA gate has no quorum, so QA can pass with no QA person.
+**AC:** PLAN's OrgPolicy example validates PLAN's three workflows; PLAN 7.7 and the shipped Kanban overlay carry `quorum: [{role: qa, count: 1}]`; the template tests compare both to PLAN with no remaining exceptions.
+**Deps:** D2-05. **Size:** S. **Run:** parallel. **Files:** `docs/PLAN.md`, `templates/`, `tests/config/test_templates.py`.
 
 ---
 
@@ -664,7 +674,7 @@ Found in review of D3-05 and D3-18. An issuer containing `|` lets two identities
 #### D3-22: Handlers enforce own and stop-at-gate grants
 Found in review of D3-03. The middleware refuses an "own" or stop-at-gate grant on any route that does not declare it checks ownership or the gate, so today a developer cannot cancel their own run, and a custom gate role cannot stop a run at its gate. The decide handler records every decision as actor `dev`.
 **AC:** the cancel route declares both checks and its handler enforces them: an "own" holder cancels only runs they started, and a stop-at-gate holder only a run waiting at a gate their role may decide; both are refused otherwise, by the shared tenancy suite. The decide handler records the authenticated actor, never a constant. The decide 409's stop link works for every role it is offered to.
-**Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
+**Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`, `src/sto/api/runtime.py` (records who started a run, and a gate's deciding roles).
 
 ---
 
@@ -690,7 +700,7 @@ an issue becomes a merged PR, and each merge guard blocks when it should. No bra
 | 6 | D4-08 | D4-11 |
 | 7 | - | D4-21 |
 | 8 | D4-12, D4-14, D4-22 | - |
-| 9 | D4-26, D4-28, D4-29 | - |
+| 9 | D4-26, D4-28, D4-29, D4-30 | - |
 | 10 | - | D4-15 |
 | 11 | - | D4-23 |
 
@@ -861,6 +871,11 @@ It stays unsupported, and is not accepted as `attested`, until D4-23 passes, so 
 Found in review of D4-03. The queued nudge carries the whole raw body, but the edge accepts up to 10 MB and GitHub deliveries reach 25 MB, well over the SQS message limit, so a large delivery fails on every retry instead of transiently.
 **AC:** the nudge carries the delivery ID, event, surface and routing headers, plus the body only when it fits under a configured size well below the SQS limit; a larger delivery is queued without its body, marked so, and the consumer re-reads (webhooks are nudges, not facts); a test sends a body over the limit and sees one nudge queued, with no 503.
 **Deps:** D4-03. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/core.py`, `tests/ingest/test_core.py`.
+
+#### D4-30: GitHub nudges carry the event name
+Found in review of D4-29. `github.py` builds `WebhookIngest` without `event_header`, so GitHub nudges carry `event=None` although `X-GitHub-Event` is present.
+**AC:** GitHub nudges carry the event name from `X-GitHub-Event`, documented as an unauthenticated routing hint; a test pins it.
+**Deps:** D4-04, D4-29. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
 
 ---
 
