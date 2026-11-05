@@ -418,10 +418,12 @@ def test_a_new_head_voids_every_earlier_approval() -> None:
     assert out.subject == S2
 
 
-def test_merged_code_cannot_change_so_a_report_of_another_head_is_refused() -> None:
-    # P1: QA reports head def after abc was merged, then approves def. Refused at the report.
-    with pytest.raises(MalformedEventError, match="merged"):
-        report(merged("m1"), "pass", S2)
+def test_merged_code_cannot_change_so_a_report_of_another_head_blocks() -> None:
+    # P1: QA reports head def after abc was merged, then approves def. The run blocks at the report
+    # (D2-10: raising would be dropped by the driver and wedge the run).
+    out = report(merged("m1"), "pass", S2)
+    assert status(out) == (RunStatus.BLOCKED, "qa_agent")
+    assert out.run.blocked_reason == "head_moved"
     assert report(merged("m1"), "pass", S1).run.stage == "qa_gate"  # the merged head is fine
 
 

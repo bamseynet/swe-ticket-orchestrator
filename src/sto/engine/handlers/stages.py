@@ -18,6 +18,8 @@ instead of raising, because a refused event is dropped by the driver and the run
   (PLAN 6.2, WAITING_EXTERNAL to BLOCKED), or its ``team_default`` resolved to no checks.
 * ``gate_invalid``: a gated effect whose required gate (``requires_gates``, plus every gate in
   ``RunState.routed_gates``, PLAN 4.3 rule 2) has no live approval.
+* ``head_moved``: a report of a head other than the merged one, after a merge (D2-10). Merged code
+  cannot change, so the run blocks where it stands and a Retry cannot step past it.
 * ``subject_missing``: a gate or an effect with no live subject (of the right shape) to plan
   against. Only a ``StageReported`` or ``StepSucceeded`` that must carry a subject and omits it is
   Malformed; a failure, a request for changes or a confirmed ``pr.update_branch`` can lead to a
@@ -44,7 +46,8 @@ records its ``head_sha``. A merge records the head it merged, and a merge is cov
 approval (a waive counts) of that head. A run with an uncovered merge ends with ``incident`` set
 whichever terminal it reaches, plans one ``OpenRevert`` per uncovered merge SHA, and says so in
 ``Finish`` (PLAN 6.2). Merged code is immutable: once a merge is recorded a report of any other head
-is Malformed. ``workflow_version`` is the workflow's name until D2-07 pins the digest.
+BLOCKS the run (``head_moved``). ``workflow_version`` is the workflow's name until D2-07 pins
+the digest.
 """
 
 from __future__ import annotations
@@ -139,6 +142,11 @@ class GateInvalid:
 
 @BLOCKED_REASONS.register("subject_missing")
 class SubjectMissing:
+    pass
+
+
+@BLOCKED_REASONS.register("head_moved")
+class HeadMoved:
     pass
 
 
@@ -395,7 +403,9 @@ def _report(
     if subject is not None:
         live = rs.subject
         if rs.merges and subject.head_sha not in {m.head_sha for m in rs.merges}:
-            raise MalformedEventError("merged code cannot change: report the merged head")
+            # Well formed but unsafe: raising would be dropped and the run would wedge. Merged
+            # code cannot change, so the run BLOCKS with the subject and approvals untouched.
+            return _block(rs, "head_moved")
         moved = live is not None and live.head_sha is not None and live.head_sha != subject.head_sha
         rs = dataclasses.replace(rs, subject=subject, approvals=() if moved else rs.approvals)
     to, loop = _target(stage.next[outcome])
