@@ -10,6 +10,7 @@ from fakes.jira.issues import BASIC
 from fakes.jira.workflow import FakeJiraWorkflow
 
 AGILE = "/rest/agile/1.0"
+DATES = {"startDate": "2026-01-05T09:00:00.000Z", "endDate": "2026-01-19T09:00:00.000Z"}
 
 
 @pytest.fixture
@@ -95,12 +96,12 @@ def test_team_managed_board_depends_on_the_sprint_feature(jira: FakeJiraWorkflow
 def test_sprint_lifecycle_through_the_api(jira: FakeJiraWorkflow) -> None:
     board = jira.add_board("Scrum", "scrum", "SYN")
     s1, s2 = jira.add_sprint(board, "S1", "future"), jira.add_sprint(board, "S2", "future")
-    assert send(jira, "POST", f"/sprint/{s1}", {"state": "active"}).status == 200
+    assert send(jira, "POST", f"/sprint/{s1}", {"state": "active", **DATES}).status == 200
     assert get(jira, f"/sprint/{s1}").body["state"] == "active"
     # one active sprint at a time unless parallel sprints are on
-    assert send(jira, "POST", f"/sprint/{s2}", {"state": "active"}).status == 400
+    assert send(jira, "POST", f"/sprint/{s2}", {"state": "active", **DATES}).status == 400
     assert send(jira, "POST", f"/sprint/{s1}", {"state": "closed"}).status == 200
-    assert send(jira, "POST", f"/sprint/{s2}", {"state": "active"}).status == 200
+    assert send(jira, "POST", f"/sprint/{s2}", {"state": "active", **DATES}).status == 200
     assert send(jira, "POST", f"/sprint/{s1}", {"state": "future"}).status == 400  # no way back
     assert send(jira, "POST", f"/sprint/{s1}", {"state": "bogus"}).status == 400
     assert get(jira, "/sprint/999").status == 404
@@ -110,8 +111,8 @@ def test_parallel_sprints_allow_two_active(jira: FakeJiraWorkflow) -> None:
     jira = FakeJiraWorkflow(parallel_sprints=True)
     board = jira.add_board("Scrum", "scrum", "SYN")
     a, b = jira.add_sprint(board, "A", "future"), jira.add_sprint(board, "B", "future")
-    assert send(jira, "POST", f"/sprint/{a}", {"state": "active"}).status == 200
-    assert send(jira, "POST", f"/sprint/{b}", {"state": "active"}).status == 200
+    assert send(jira, "POST", f"/sprint/{a}", {"state": "active", **DATES}).status == 200
+    assert send(jira, "POST", f"/sprint/{b}", {"state": "active", **DATES}).status == 200
 
 
 def test_moving_issues_into_a_sprint_moves_eligibility(jira: FakeJiraWorkflow) -> None:

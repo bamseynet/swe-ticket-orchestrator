@@ -56,6 +56,7 @@ RETRY_MIN, RETRY_MAX = 5 * 60, 15 * 60
 IDENT = "X-Atlassian-Webhook-Identifier"
 RETRY = "X-Atlassian-Webhook-Retry"
 SIGNATURE = "X-Hub-Signature"
+_TYPE_NAMES = {"jira:issue_created": "issue_created", "jira:issue_deleted": "issue_deleted"}
 
 
 def _b64(raw: bytes) -> str:
@@ -102,15 +103,21 @@ class FakeJiraWebhooks:
         seed: int = 7,
     ) -> None:
         self.jira, self.admin_secret, self.client_secret = jira, admin_secret, client_secret
-        self.degraded = False
+        self._failing_since: float | None = None
         self._rng = random.Random(seed)
         self._n = 0
+
+    @property
+    def degraded(self) -> bool:
+        """No success for 30 minutes: a single attempt per webhook until one succeeds."""
+        since = self._failing_since
+        return since is not None and self.jira.now - since >= SLOW_AFTER
 
     def _body(self, event: str, key: str, matched: list[int] | None) -> bytes:
         payload: dict[str, Any] = {
             "timestamp": int(self.jira.now * 1000),
             "webhookEvent": event,
-            "issue_event_type_name": "issue_generic",
+            "issue_event_type_name": _TYPE_NAMES.get(event, "issue_generic"),
             "user": {"accountId": ACCOUNT_ID},
             "issue": self.jira.issue_snapshot(key),
         }
@@ -189,7 +196,6 @@ class FakeJiraWebhooks:
         or dropped connection) and retry as Jira does, advancing the fake clock between attempts."""
         attempts: list[Attempt] = []
         allowed = 1 if self.degraded else MAX_RESENDS + 1
-        first = self.jira.now
         while True:
             n = len(attempts)
             sent = raw if n == 0 else RawWebhook({**raw.headers, RETRY: str(n)}, raw.body)
@@ -198,13 +204,12 @@ class FakeJiraWebhooks:
             except (TimeoutError, ConnectionError, OSError):
                 status = None
             attempts.append(Attempt(self.jira.now, status))
+            if status is not None and 200 <= status < 300:
+                self._failing_since = None
+            elif self._failing_since is None:
+                self._failing_since = self.jira.now
             done = status is not None and status not in RETRYABLE and status < 500
             if done or len(attempts) >= allowed:
                 break
             self.jira.now += self._rng.randint(RETRY_MIN, RETRY_MAX)
-        report = DeliveryReport(raw.headers[IDENT], tuple(attempts))
-        if report.delivered:
-            self.degraded = False
-        elif self.jira.now - first >= SLOW_AFTER or self.degraded:
-            self.degraded = True
-        return report
+        return DeliveryReport(raw.headers[IDENT], tuple(attempts))

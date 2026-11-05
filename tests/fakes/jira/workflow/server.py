@@ -21,6 +21,22 @@ Sources (https://developer.atlassian.com/cloud/jira/platform/):
   closed (comma separated); issues can be moved only into an open or active sprint, at most 50
   per call; the issue resource carries ``sprint`` and ``closedSprints``.
 
+Reach-ins (D6-01's package is outside this issue's files, so there is no public seam yet; the
+test ``test_review1.py::test_every_private_name_relied_on_exists_on_the_parent`` fails loudly if
+a rename breaks one): from ``fakes.jira.issues.server`` the names ``_UNKNOWN_FIELD``, ``_err``,
+``_errors``, ``_flag``, ``_int``, ``_iso``, ``_not_modelled``, ``HOST``, ``PROJECTS``,
+``ACCOUNT_ID``, ``SOURCES``, ``Headers`` and ``Response``; on ``FakeJiraIssues`` the methods
+``_visible``, ``_touch``, ``_route`` (overridden), ``_select``, ``_field_list``, ``_add_comment``,
+``_comment_body_problem``, ``add_issue`` (overridden), ``add_status`` and the ``request`` dispatch
+to ``self._<op>(*args, params=, body=)``; and the state ``_issues``, ``_by_id``, ``_statuses``.
+
+Sourced to the saved OpenAPI documents (v3 and Agile): a transition may carry
+``update.comment [{add: {body: ADF}}]`` (the ``IssueUpdateDetails`` example); a sprint moves only
+future to active (needs ``startDate`` and ``endDate``) and active to closed, "Other changes to
+state are not allowed", a closed sprint changes only name and goal; ``WebhookRegistrationDetails``
+and ``WebhookDetails`` have ``additionalProperties: false``, ``events`` is an enum, "Only a single
+URL per app is allowed"; ``GET /webhook`` ``maxResults`` defaults to 100, the board list to 50.
+
 Unsourced departures, observed behaviour to prove in D12:
 
 * Error TEXTS for: a missing required screen field ("<Name> is required."), a transition not valid
@@ -28,29 +44,40 @@ Unsourced departures, observed behaviour to prove in D12:
   JQL filter and a non-app caller (403). The status codes are documented unless said here.
 * A team-managed ("simple") board supports sprints only when ``sprints=True`` (the sprints
   feature). A kanban board never does. One active sprint per board unless ``parallel_sprints``.
-* A sprint's state moves future to active to closed only; starting needs no dates here (Jira
-  asks for them) and the fake fills them in. Closing leaves issues pointing at nothing (Jira asks
+* A same-state sprint update is a no-op (200). Closing leaves issues pointing at nothing (Jira asks
   where unfinished work goes). An issue is in at most one open sprint. The board filter is not
-  modelled: any issue can go in any sprint. The sprint list has no ``total``.
-* Registered webhook IDs count against the limit of 5 until deleted, expired or not. Event names
-  are not validated against Jira's list. ``fieldIdsFilter`` and ``issuePropertyKeysFilter`` are
-  refused as not modelled. Webhook registration, refresh and delete need a bearer (OAuth) token:
-  a basic-auth API token is a 403 (documented as app-only; the status is the spec's).
-* Boards are one per project at most per call of ``add_board``; paging is ``startAt`` and
-  ``maxResults`` (cap 50); a transition "looped" flag and sorting options are not modelled.
-* Refused as "not modelled" (400): ``skipRemoteOnlyCondition`` and ``sortByOpsBarAndStatus`` on
-  Get transitions, ``historyMetadata`` and ``properties`` on Transition issue, PUT on a sprint.
+  modelled: any issue can go in any sprint. The sprint list has no ``total`` and is ordered closed,
+  active, future, then by ID (reported by the pass-1 reviewer; the spec says nothing).
+* Registered webhook IDs count against the limit of 5 until deleted, expired or not. A second URL
+  is answered 200 with a per-webhook ``errors`` entry (the response shape is unsourced), as are the
+  limit and a bad filter; a bad event name or an unknown key is a 400 (Jira may answer per
+  webhook). ``fieldIdsFilter`` and ``issuePropertyKeysFilter`` are refused as not modelled.
+  Webhook registration, refresh and delete need a bearer (OAuth) token: a basic-auth API token is
+  a 403 (documented as app-only; the status is the spec's).
+* ``maxResults`` of 0 is a 400 (Jira's answer is unknown; a paging loop would never end). Paging is
+  ``startAt`` and ``maxResults`` (cap 50, 100 for webhooks).
+* A query parameter that is not modelled is a 400, never ignored: on transitions everything but
+  ``expand``, ``transitionId`` and ``includeUnavailableTransitions``; on the Agile operations
+  everything outside the few modelled (board ``name``, ``orderBy``, ``expand``, sprint-issue
+  ``jql``, ``fields``, ``validateQuery``, issue ``expand`` and ``updateHistory`` among them).
+* An unsupported method on a known path is a 404 (Jira probably answers 405).
+* Refused as "not modelled" (400): ``historyMetadata`` and ``properties`` on Transition issue,
+  comment ``visibility`` on a transition comment, PUT on a sprint, and sprint fields other than
+  state, name, goal, startDate and endDate.
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from datetime import datetime
 from typing import Any
 
 from fakes.jira.issues.server import (
     _UNKNOWN_FIELD,
+    ACCOUNT_ID,
     HOST,
+    PROJECTS,
     FakeJiraIssues,
     Headers,
     Response,
@@ -96,20 +123,49 @@ MAX_MOVE = 50  # sprint API: issues moved per call
 PAGE_CAP = 50
 BOARD_TYPES = ("scrum", "kanban", "simple")
 SPRINT_STATES = ("future", "active", "closed")
-_ORDER = {"future": 0, "active": 1, "closed": 2}
+_LISTED = {"closed": 0, "active": 1, "future": 2}  # sprint list order (unsourced)
+_MOVES = {("future", "active"), ("active", "closed")}  # sprint update notes: no other change
+_SPRINT_WRITABLE = frozenset({"state", "name", "goal", "startDate", "endDate"})
+WEBHOOK_PAGE = 100  # v3 spec: GET /webhook maxResults default
+# v3 spec: WebhookDetails.events items enum
+WEBHOOK_EVENTS = frozenset(
+    {
+        "jira:issue_created", "jira:issue_updated", "jira:issue_deleted", "comment_created",
+        "comment_updated", "comment_deleted", "issue_property_set", "issue_property_deleted",
+        "sprint_created", "sprint_updated", "sprint_closed", "sprint_deleted", "sprint_started",
+        "jira:version_released", "jira:version_unreleased", "jira:version_created",
+        "jira:version_moved", "jira:version_updated", "jira:version_merged",
+        "jira:version_deleted",
+    }
+)  # fmt: skip
+_HOOK_KEYS = frozenset({"events", "jqlFilter", "fieldIdsFilter", "issuePropertyKeysFilter"})
 AGILE = "/rest/agile/1.0/"
 _NOT_VALID = "Transition id '{}' is not valid for this issue."
+
+
+def _date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def _app_only() -> Response:
     return _err(403, "Only Connect and OAuth 2.0 apps can use this operation.")
 
 
-def _paged(items: list[Any], params: Mapping[str, Any], *, total: bool) -> Response:
-    start, size = _int(params.get("startAt"), 0), _int(params.get("maxResults"), PAGE_CAP)
-    if start is None or size is None or start < 0 or size < 0:
-        return _err(400, "'startAt' and 'maxResults' must be non-negative integers.")
-    size = min(size, PAGE_CAP)
+def _paged(
+    items: list[Any], params: Mapping[str, Any], *, total: bool, default: int = PAGE_CAP
+) -> Response:
+    """A ``startAt``/``maxResults`` page. ``maxResults`` of 0 is refused (unsourced): a loop that
+    pages by ``isLast`` would otherwise never end."""
+    start, size = _int(params.get("startAt"), 0), _int(params.get("maxResults"), default)
+    if start is None or size is None or start < 0 or size < 1:
+        return _err(400, "'startAt' must be 0 or more and 'maxResults' 1 or more.")
+    size = min(size, max(default, PAGE_CAP))
     page = items[start : start + size]
     body: dict[str, Any] = {
         "maxResults": size,
@@ -143,6 +199,33 @@ class FakeJiraWorkflow(FakeJiraIssues):
 
     # --- seeding and controls -------------------------------------------------------------
 
+    def add_issue(  # noqa: PLR0913 - the parent's own signature
+        self,
+        *,
+        summary: str,
+        project: str = "SYN",
+        status: str = "To Do",
+        labels: list[str] | None = None,
+        assignee: str | None = ACCOUNT_ID,
+        issuetype: str = "Task",
+        priority: str = "Medium",
+        description: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """The parent's seeding, with the status set through the workflow so that a seeded status
+        has the category and shape it has after a transition."""
+        issue = super().add_issue(
+            summary=summary,
+            project=project,
+            status=status,
+            labels=labels,
+            assignee=assignee,
+            issuetype=issuetype,
+            priority=priority,
+            description=description,
+        )
+        self._set_status(issue, status)
+        return issue
+
     def assign_workflow(self, project: str, workflow: Workflow) -> None:
         self._workflows[project] = workflow
         for name in workflow.statuses:
@@ -165,26 +248,63 @@ class FakeJiraWorkflow(FakeJiraIssues):
             "self": f"{HOST}/rest/agile/1.0/board/{ident}",
             "name": name,
             "type": board_type,
-            "location": {"projectKey": project, "projectId": 10000 + ident},
+            "location": {"projectKey": project, "projectId": int(PROJECTS.get(project, "10999"))},
             "_sprints": board_type == "scrum" or (board_type == "simple" and sprints),
         }
         return ident
 
-    def add_sprint(self, board: int, name: str, state: str = "future") -> int:
+    def add_sprint(
+        self,
+        board: int,
+        name: str,
+        state: str = "future",
+        *,
+        goal: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
+        """Seed a sprint under the API's own rules: the board must exist and support sprints,
+        and a second active sprint needs ``parallel_sprints``. Active and closed sprints get dates
+        (given, or two weeks from now); a future sprint has them only if given."""
+        if state not in SPRINT_STATES:
+            raise ValueError(f"sprint state must be one of {SPRINT_STATES}")
+        found = self._boards.get(board)
+        if found is None:
+            raise ValueError(f"no board {board}")
+        if not found["_sprints"]:
+            raise ValueError(f"board {board} does not support sprints")
+        if state == "active" and not self.parallel_sprints and self._has_active(board):
+            raise ValueError(f"board {board} already has an active sprint")
         ident, self._next_sprint = self._next_sprint, self._next_sprint + 1
         sprint: dict[str, Any] = {
             "id": ident,
             "self": f"{HOST}/rest/agile/1.0/sprint/{ident}",
             "state": "future",
             "name": name,
+            "createdDate": _iso(self.now),
             "originBoardId": board,
         }
+        if goal is not None:
+            sprint["goal"] = goal
+        if start_date is not None:
+            sprint["startDate"] = start_date
+        if end_date is not None:
+            sprint["endDate"] = end_date
         self._sprints[ident] = sprint
         if state != "future":
-            self._start(sprint)
+            self._start(
+                sprint,
+                start_date or _iso(self.now),
+                end_date or _iso(self.now + 14 * DAY),
+            )
         if state == "closed":
             self._finish(sprint)
         return ident
+
+    def _has_active(self, board: int) -> bool:
+        return any(
+            s["state"] == "active" and s["originBoardId"] == board for s in self._sprints.values()
+        )
 
     def webhook_expiry(self, ident: int) -> float:
         return float(self._hooks[ident]["expires"])
@@ -340,9 +460,9 @@ class FakeJiraWorkflow(FakeJiraIssues):
         issue = self._visible(ref)
         if issue is None:
             return _err(404, "Issue does not exist or you do not have permission to see it.")
-        for name in ("skipRemoteOnlyCondition", "sortByOpsBarAndStatus"):
-            if name in params:
-                return _not_modelled(f"'{name}' on get transitions")
+        allowed = ("expand", "transitionId", "includeUnavailableTransitions")
+        if (refused := self._only(params, allowed, "get transitions")) is not None:
+            return refused
         expand = params.get("expand")
         if expand not in (None, "transitions.fields"):
             return _not_modelled("'expand' other than 'transitions.fields' on get transitions")
@@ -366,10 +486,14 @@ class FakeJiraWorkflow(FakeJiraIssues):
         issue = self._visible(ref)
         if issue is None:
             return _err(404, "Issue does not exist or you do not have permission to see it.")
+        if (refused := self._only(params, (), "transition issue")) is not None:
+            return refused
         if body.get("historyMetadata") is not None or body.get("properties") is not None:
             return _not_modelled("'historyMetadata' and 'properties' on transition issue")
         wanted = body.get("transition")
         ident = wanted.get("id") if isinstance(wanted, Mapping) else None
+        if isinstance(ident, int | float) and not isinstance(ident, bool):
+            return _err(400, "The transition id must be a string.")  # spec: id is a string
         if not isinstance(ident, str) or not ident:
             return _err(400, "No transition specified.")
         chosen = next((t for t, ok in self._offered(issue) if ok and t.id == ident), None)
@@ -383,8 +507,14 @@ class FakeJiraWorkflow(FakeJiraIssues):
             for n in fields.keys() & update.keys()
         }
         values: dict[str, Any] = dict(fields)
+        comments: list[dict[str, Any]] = []
         for name, operations in update.items():
             if name in errors:
+                continue
+            if name == "comment":  # the spec's own example: update.comment [{add: {body: ADF}}]
+                problem = self._comment_ops(operations, comments)
+                if problem:
+                    errors[name] = problem
                 continue
             if (
                 not isinstance(operations, list)
@@ -411,7 +541,24 @@ class FakeJiraWorkflow(FakeJiraIssues):
         issue["fields"].update(stored)
         self._set_status(issue, chosen.to)
         self._touch(issue)
+        for comment in comments:  # the parent's own comment path
+            self._add_comment(issue["key"], params={}, body=comment)
         return Response(204, Headers(), None)
+
+    def _comment_ops(self, operations: Any, out: list[dict[str, Any]]) -> str | None:
+        """``update.comment``: a list of ``{"add": {"body": ADF}}``; only ``add`` is modelled."""
+        if not isinstance(operations, list) or not operations:
+            return "Operation value must be an array of single-operation objects"
+        for operation in operations:
+            if not isinstance(operation, dict) or len(operation) != 1:
+                return "Operation value must be an array of single-operation objects"
+            ((verb, value),) = operation.items()
+            if verb != "add":
+                return f"Not modelled by the fake Jira: operation '{verb}' on 'comment'"
+            if not isinstance(value, dict) or self._comment_body_problem(value) is not None:
+                return "Comment body is not valid!"
+            out.append(value)
+        return None
 
     @staticmethod
     def _check_screen_value(
@@ -439,6 +586,14 @@ class FakeJiraWorkflow(FakeJiraIssues):
 
     # --- boards and sprints ---------------------------------------------------------------
 
+    @staticmethod
+    def _only(params: Mapping[str, Any], allowed: Collection[str], what: str) -> Response | None:
+        """Refuse a query parameter this fake does not model, rather than ignore it."""
+        for name in params:
+            if name not in allowed:
+                return _not_modelled(f"query parameter '{name}' on {what}")
+        return None
+
     def _board(self, raw: str) -> dict[str, Any] | None:
         return self._boards.get(int(raw)) if raw.isdigit() else None
 
@@ -450,6 +605,9 @@ class FakeJiraWorkflow(FakeJiraIssues):
         return {k: v for k, v in entry.items() if not k.startswith("_")}
 
     def _list_boards(self, *, params: Mapping[str, Any], body: Any) -> Response:
+        allowed = ("startAt", "maxResults", "type", "projectKeyOrId")
+        if (refused := self._only(params, allowed, "get all boards")) is not None:
+            return refused
         kind, project = params.get("type"), params.get("projectKeyOrId")
         if kind is not None and kind not in BOARD_TYPES:
             return _err(400, f"Invalid board type '{kind}'.")
@@ -465,34 +623,43 @@ class FakeJiraWorkflow(FakeJiraIssues):
         board = self._board(raw)
         if board is None:
             return _err(404, "Board does not exist or you do not have permission to see it.")
+        if (refused := self._only(params, (), "get board")) is not None:
+            return refused
         return Response(200, Headers(), self._public(board))
 
     def _board_sprints(self, raw: str, *, params: Mapping[str, Any], body: Any) -> Response:
         board = self._board(raw)
         if board is None:
             return _err(404, "Board does not exist or you do not have permission to see it.")
+        if (
+            refused := self._only(params, ("startAt", "maxResults", "state"), "sprints")
+        ) is not None:
+            return refused
         if not board["_sprints"]:
             return _err(400, "The board does not support sprints")
         states = str(params.get("state") or ",".join(SPRINT_STATES)).split(",")
         if any(s.strip() not in SPRINT_STATES for s in states):
             return _err(400, f"Invalid sprint state in '{params.get('state')}'.")
+        wanted = {x.strip() for x in states}
         found = [
             dict(s)
             for s in self._sprints.values()
-            if s["originBoardId"] == board["id"] and s["state"] in {x.strip() for x in states}
+            if s["originBoardId"] == board["id"] and s["state"] in wanted
         ]
+        found.sort(key=lambda s: (_LISTED[s["state"]], s["id"]))
         return _paged(found, params, total=False)
 
     def _get_sprint(self, raw: str, *, params: Mapping[str, Any], body: Any) -> Response:
         sprint = self._sprint(raw)
         if sprint is None:
             return _err(404, "Sprint does not exist or you do not have permission to view it.")
+        if (refused := self._only(params, (), "get sprint")) is not None:
+            return refused
         return Response(200, Headers(), dict(sprint))
 
-    def _start(self, sprint: dict[str, Any]) -> None:
+    def _start(self, sprint: dict[str, Any], start: str, end: str) -> None:
         sprint["state"] = "active"
-        sprint["startDate"] = _iso(self.now)
-        sprint["endDate"] = _iso(self.now + 14 * DAY)
+        sprint["startDate"], sprint["endDate"] = start, end
 
     def _finish(self, sprint: dict[str, Any]) -> None:
         sprint["state"] = "closed"
@@ -505,33 +672,42 @@ class FakeJiraWorkflow(FakeJiraIssues):
     def _update_sprint(
         self, raw: str, *, params: Mapping[str, Any], body: Mapping[str, Any]
     ) -> Response:
+        """POST /sprint/{id}, the partial update. Agile spec: starting needs ``startDate`` and
+        ``endDate``; only future to active and active to closed are allowed; a closed sprint
+        changes only ``name`` and ``goal`` (other changes are ignored)."""
         sprint = self._sprint(raw)
         if sprint is None:
             return _err(404, "Sprint does not exist or you do not have permission to view it.")
-        extra = set(body) - {"state", "name"}
-        if extra:
-            return _not_modelled(f"{sorted(extra)} on sprint update")
-        state = body.get("state", sprint["state"])
-        if state not in SPRINT_STATES or _ORDER[state] < _ORDER[sprint["state"]]:
-            return _err(400, f"The sprint cannot move from '{sprint['state']}' to '{state}'.")
-        if (
-            state == "active"
-            and sprint["state"] != "active"
-            and not self.parallel_sprints
-            and any(
-                s["state"] == "active" and s["originBoardId"] == sprint["originBoardId"]
-                for s in self._sprints.values()
-            )
-        ):
+        if (refused := self._only(params, (), "sprint update")) is not None:
+            return refused
+        unknown = set(body) - _SPRINT_WRITABLE
+        if unknown:
+            return _not_modelled(f"{sorted(unknown)} on sprint update")
+        for key, value in body.items():
+            if key in ("startDate", "endDate"):
+                good = _date(value)
+            else:
+                good = isinstance(value, str) and (key == "goal" or bool(value.strip()))
+            if not good:
+                return _err(400, f"'{key}' is not valid.")
+        old, state = sprint["state"], body.get("state", sprint["state"])
+        if state not in SPRINT_STATES or (state != old and (old, state) not in _MOVES):
+            return _err(400, f"The sprint cannot move from '{old}' to '{state}'.")
+        shut = old == "closed"
+        start = body.get("startDate", sprint.get("startDate")) if not shut else None
+        end = body.get("endDate", sprint.get("endDate")) if not shut else None
+        starting = (old, state) == ("future", "active")
+        if starting and not (start and end):
+            return _err(400, "Starting a sprint needs a startDate and an endDate.")
+        if starting and not self.parallel_sprints and self._has_active(sprint["originBoardId"]):
             return _err(400, "Only one active sprint is allowed on this board.")
-        if "name" in body:
-            if not isinstance(body["name"], str) or not body["name"].strip():
-                return _err(400, "The sprint name must not be empty.")
-            sprint["name"] = body["name"]
-        if state != sprint["state"]:
-            if sprint["state"] == "future" and state == "closed":
-                self._start(sprint)
-            (self._start if state == "active" else self._finish)(sprint)
+        for key in ("name", "goal") if shut else ("name", "goal", "startDate", "endDate"):
+            if key in body:
+                sprint[key] = body[key]
+        if starting:
+            self._start(sprint, str(start), str(end))
+        elif state != old:
+            self._finish(sprint)
         return Response(200, Headers(), dict(sprint))
 
     def _agile_issue_body(self, issue: dict[str, Any]) -> dict[str, Any]:
@@ -547,12 +723,18 @@ class FakeJiraWorkflow(FakeJiraIssues):
         issue = self._visible(ref)
         if issue is None:
             return _err(404, "Issue does not exist or you do not have permission to see it.")
-        return Response(200, Headers(), self._agile_issue_body(issue))
+        if (refused := self._only(params, ("fields",), "get issue")) is not None:
+            return refused
+        shown = self._agile_issue_body(issue)
+        shown["fields"] = self._select(shown["fields"], self._field_list(params.get("fields")))
+        return Response(200, Headers(), shown)
 
     def _sprint_issues(self, raw: str, *, params: Mapping[str, Any], body: Any) -> Response:
         sprint = self._sprint(raw)
         if sprint is None:
             return _err(404, "Sprint does not exist or you do not have permission to view it.")
+        if (refused := self._only(params, ("startAt", "maxResults"), "sprint issues")) is not None:
+            return refused
         found = [
             self._agile_issue_body(self._issues[k])
             for k, i in self._in_sprint.items()
@@ -579,6 +761,8 @@ class FakeJiraWorkflow(FakeJiraIssues):
         sprint = self._sprint(raw)
         if sprint is None:
             return _err(404, "Sprint does not exist or you do not have permission to view it.")
+        if (refused := self._only(params, (), "move issues to sprint")) is not None:
+            return refused
         keys = body.get("issues")
         if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
             return _err(400, "'issues' must be a non-empty list of issue keys or IDs.")
@@ -607,29 +791,35 @@ class FakeJiraWorkflow(FakeJiraIssues):
     def _register_webhooks(self, *, params: Mapping[str, Any], body: Mapping[str, Any]) -> Response:
         if not self._is_app():
             return _app_only()
+        if (refused := self._only(params, (), "register webhooks")) is not None:
+            return refused
         url, hooks = body.get("url"), body.get("webhooks")
-        if not (
-            isinstance(url, str)
+        if not (  # v3 spec: additionalProperties is false on both objects, events is an enum
+            set(body) <= {"url", "webhooks"}
+            and isinstance(url, str)
             and url
             and isinstance(hooks, list)
             and hooks
             and all(
                 isinstance(h, Mapping)
+                and set(h) <= _HOOK_KEYS
                 and isinstance(h.get("events"), list)
                 and h["events"]
+                and all(isinstance(e, str) and e in WEBHOOK_EVENTS for e in h["events"])
                 and isinstance(h.get("jqlFilter"), str)
                 for h in hooks
             )
         ):
-            return _err(
-                400, "'url' and a non-empty 'webhooks' list of events and jqlFilter are required."
-            )
+            return _err(400, "The webhook registration is invalid: see the 'url' and 'webhooks'.")
         self._purge_hooks()
+        theirs = next((h["url"] for h in self._hooks.values()), url)
         results: list[dict[str, Any]] = []
         for hook in hooks:
             clauses, why = parse_filter(hook["jqlFilter"])
             if hook.get("fieldIdsFilter") or hook.get("issuePropertyKeysFilter"):
                 why = "Not modelled by the fake Jira: field and property filters."
+            elif url != theirs:  # spec: "Only a single URL per app is allowed" (response unsourced)
+                why = "Only a single URL per app is allowed to be registered."
             elif why is None and len(self._hooks) >= WEBHOOK_LIMIT:
                 why = "The maximum number of webhooks for this app and user has been reached."
             if why is not None:
@@ -649,6 +839,8 @@ class FakeJiraWorkflow(FakeJiraIssues):
     def _list_webhooks(self, *, params: Mapping[str, Any], body: Any) -> Response:
         if not self._is_app():
             return _app_only()
+        if (refused := self._only(params, ("startAt", "maxResults"), "get webhooks")) is not None:
+            return refused
         self._purge_hooks()
         listed = [
             {
@@ -659,7 +851,7 @@ class FakeJiraWorkflow(FakeJiraIssues):
             }
             for i, h in self._hooks.items()
         ]
-        return _paged(listed, params, total=True)
+        return _paged(listed, params, total=True, default=WEBHOOK_PAGE)
 
     def _ids(self, body: Mapping[str, Any]) -> list[int] | None:
         ids = body.get("webhookIds")
@@ -674,6 +866,8 @@ class FakeJiraWorkflow(FakeJiraIssues):
     def _refresh_webhooks(self, *, params: Mapping[str, Any], body: Mapping[str, Any]) -> Response:
         if not self._is_app():
             return _app_only()
+        if (refused := self._only(params, (), "refresh webhooks")) is not None:
+            return refused
         ids = self._ids(body)
         if ids is None:
             return _err(400, "'webhookIds' must be a non-empty list of webhook IDs.")
@@ -686,6 +880,8 @@ class FakeJiraWorkflow(FakeJiraIssues):
     def _delete_webhooks(self, *, params: Mapping[str, Any], body: Mapping[str, Any]) -> Response:
         if not self._is_app():
             return _app_only()
+        if (refused := self._only(params, (), "delete webhooks")) is not None:
+            return refused
         ids = self._ids(body)
         if ids is None:
             return _err(400, "'webhookIds' must be a non-empty list of webhook IDs.")

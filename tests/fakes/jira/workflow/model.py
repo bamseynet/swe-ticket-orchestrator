@@ -110,7 +110,7 @@ SERVICE = Workflow(
 )
 
 _FILTER_FIELDS = {"issuekey", "project", "issuetype", "status", "priority", "assignee", "reporter"}
-_VALUE = r'(?:"[^"]*"|[^\s,()"]+)'
+_VALUE = r"""(?:"[^"]*"|'[^']*'|[^\s,()"']+)"""
 _CLAUSE = re.compile(
     rf"^(?P<field>[A-Za-z.]+|cf\[\d+\])\s*(?P<op>!=|=|NOT\s+IN|IN)\s*"
     rf"(?P<value>{_VALUE}|\(\s*{_VALUE}(?:\s*,\s*{_VALUE})*\s*\))$",
@@ -137,7 +137,7 @@ def parse_filter(jql: str) -> tuple[list[Clause], None] | tuple[None, str]:
             (
                 field,
                 op.startswith("NOT") or op == "!=",
-                frozenset(v.strip('"').casefold() for v in values),
+                frozenset(v[1:-1].casefold() if v[0] in "'\"" else v.casefold() for v in values),
             )
         )
     return clauses, None
@@ -157,4 +157,8 @@ def filter_matches(clauses: list[Clause], issue: Mapping[str, Any]) -> bool:
             {str(thing["key"]).casefold()} if "key" in thing else set()
         )
 
-    return all(bool(have(f) & values) != negated for f, negated, values in clauses)
+    # JQL: != and NOT IN do not match an empty field (the JQL operators page)
+    return all(
+        (present := have(f)) != set() and bool(present & values) != negated
+        for f, negated, values in clauses
+    )
