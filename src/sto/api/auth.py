@@ -107,6 +107,7 @@ __all__ = [
     "install_authorization",
     "may_stop",
     "routes_of",
+    "stop_flags",
     "undeclared_routes",
 ]
 
@@ -239,35 +240,42 @@ def actor_key(identity: UserIdentity | ServiceIdentity) -> str:
     return f"{identity.issuer}|{identity.subject}"
 
 
-def may_stop(auth: Authorized, *, started_by: str | None, gate_roles: frozenset[str]) -> bool:
-    """The check a handler promises when its route declares ``checks_own`` / ``checks_gate``.
+def may_stop(
+    auth: Authorized,
+    flags: tuple[bool, bool] | None,
+    *,
+    started_by: str | None,
+    gate_roles: frozenset[str],
+) -> bool:
+    """Whether the caller may Stop a run, given how the cancel route admits them.
 
-    Judged by the cancel route's rule for the caller's roles, wherever it is asked. A holder of
-    the permission outright may. An "own" holder may if they started the
-    run; a stop-at-gate holder may if a role they hold that carries ``STOP_AT_GATE`` is among
-    ``gate_roles``, the roles that may decide the run's open gates. A holder of both grants
-    needs either. Anything else, including a service or an unknown starter, may not.
+    ``flags`` is ``(own_only, gate_only)`` from the cancel rule *in force* (the middleware's
+    :class:`Authorized` on the cancel route itself, :func:`stop_flags` anywhere else), or ``None``
+    if that rule does not admit them at all. No flag means the caller holds the permission
+    outright. Otherwise an "own" holder may Stop a run they started, and a stop-at-gate holder
+    one where a role they hold that carries ``STOP_AT_GATE`` is among ``gate_roles`` (the roles
+    of the gates that may still be stopped at). A holder of both needs either. A service, an
+    unknown starter and a rule that checks nothing admit nobody.
     """
     identity = auth.identity
-    if not isinstance(identity, UserIdentity) or not isinstance(auth.scope, TeamScope):
+    if flags is None or not isinstance(identity, UserIdentity):
         return False
-    team = auth.scope.team
-    roles = set(identity.roles_in(team))
-    if (None, ORG_ADMIN) in identity.memberships:
-        roles.add(ORG_ADMIN)
-    # Always the cancel rule's admission, not the flags of the route being served: the decide
-    # route admits a reviewer outright, but the Stop it offers is the cancel route's.
-    admitted = _admission(ROUTES[STOP_ROUTE], roles)
-    if admitted is None:
-        return False
-    own_only, gate_only = admitted
+    own_only, gate_only = flags
     if not (own_only or gate_only):
         return True
     if own_only and started_by is not None and started_by == actor_key(identity):
         return True
-    return gate_only and any(
-        r in gate_roles and grants(Permission.STOP_AT_GATE, r) is not None for r in roles
-    )
+    if not (gate_only and isinstance(auth.scope, TeamScope)):
+        return False
+    roles = _roles_of(identity, auth.scope.team)
+    return any(r in gate_roles and grants(Permission.STOP_AT_GATE, r) is not None for r in roles)
+
+
+def _roles_of(identity: UserIdentity, team: str) -> set[str]:
+    roles = set(identity.roles_in(team))
+    if (None, ORG_ADMIN) in identity.memberships:
+        roles.add(ORG_ADMIN)
+    return roles
 
 
 TeamOf = Callable[[HTTPConnection], str | None]
@@ -333,6 +341,19 @@ class Authorization:
         object.__setattr__(self, "routes", MappingProxyType(dict(self.routes)))
         object.__setattr__(self, "public", frozenset(self.public))
         check_table(self.routes, self.public)
+
+
+def stop_flags(authorization: Authorization, auth: Authorized) -> tuple[bool, bool] | None:
+    """How the cancel route *of this installed table* admits the caller: ``(own_only,
+    gate_only)``, or ``None`` if it does not. For a handler that offers the Stop link from another
+    route; the cancel route's own handler reads the flags the middleware set."""
+    rule = authorization.routes.get(STOP_ROUTE)
+    identity = auth.identity
+    if rule is None or not isinstance(identity, UserIdentity):
+        return None
+    if not isinstance(auth.scope, TeamScope):
+        return None
+    return _admission(rule, _roles_of(identity, auth.scope.team))
 
 
 def _methods(methods: Iterable[str] | None, path: str) -> Iterator[tuple[str, str]]:
@@ -499,10 +520,7 @@ class AuthorizationMiddleware:
         team = self.authz.team_of(conn)
         if team is None:
             return _FORBIDDEN
-        roles = set(identity.roles_in(team))
-        if (None, ORG_ADMIN) in identity.memberships:
-            roles.add(ORG_ADMIN)
-        admitted = _admission(rule, roles)
+        admitted = _admission(rule, _roles_of(identity, team))
         if admitted is None:
             return _FORBIDDEN
         self._set(scope, Authorized(identity, TeamScope(team), *admitted))
@@ -515,5 +533,7 @@ class AuthorizationMiddleware:
 
 
 def install_authorization(app: FastAPI, authorization: Authorization) -> None:
-    """Add the middleware. Call before the app starts."""
+    """Add the middleware. Call before the app starts. The table in force is kept on
+    ``app.state.authorization`` for handlers that must judge another route's rule."""
+    app.state.authorization = authorization
     app.add_middleware(AuthorizationMiddleware, authorization=authorization)

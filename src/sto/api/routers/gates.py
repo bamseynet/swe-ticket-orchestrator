@@ -194,7 +194,9 @@ async def decide(
             rid = parse_run_id(run_id)
             # offered only to a caller the cancel route will let through, and only if there is
             # still something to stop
-            stop_offered = await rt.can_stop(rid) and await may_stop_run(request, rt, rid)
+            stop_offered = await rt.can_stop(rid) and await may_stop_run(
+                request, rt, rid, offer=True
+            )
         except Exception as stop_error:  # the 409 is true whether or not we can say who can stop
             log.warning("could not tell whether run %s can be stopped: %r", run_id, stop_error)
             stop_offered = False

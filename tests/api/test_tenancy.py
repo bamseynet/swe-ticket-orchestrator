@@ -40,17 +40,18 @@ from sto.api.auth import (
     RouteTableError,
     check_table,
     grants,
+    may_stop,
     routes_of,
     undeclared_routes,
 )
 from sto.api.runtime import Runtime, default_gate_roles
 from sto.config.org_policy import ORG_ADMIN, Principal
-from sto.domain import Gate, GateType, RunId, Subject
+from sto.domain import Gate, GateId, GateStatus, GateType, RunId, Subject
 from sto.effects.core import EffectExecutor
 from sto.engine.commands import OpenGate
 from sto.gates.service import GateService
 from sto.identity.fake_issuer import FakeIssuer
-from sto.identity.mapping import RoleMapping
+from sto.identity.mapping import RoleMapping, ServiceIdentity, UserIdentity
 from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks
 from sto.store.memory import MemoryStore
 from sto.store.ports import PLATFORM, Key, TeamScope
@@ -1018,19 +1019,60 @@ def test_a_stop_at_gate_holder_cancels_only_a_run_waiting_at_a_gate_their_role_m
     refused(send(app, "POST", f"/runs/{no_gate}/cancel", officer), 403, "forbidden")
 
 
-def test_a_closed_gate_no_longer_lets_its_role_stop_the_run(world: World) -> None:
-    app = world.app()
-    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
-    d = post(
-        app,
-        f"/runs/{run_id}/gates/g/1/decisions",
-        world.user(ALPHA, "reviewer"),
+def approve(world: World, run_id: RunId, name: str = "g") -> None:
+    r = post(
+        world.app(),
+        f"/runs/{run_id}/gates/{name}/1/decisions",
+        world.user(ALPHA, "team_admin"),
         {"kind": "approve", "subject_digest": digest_of(world, run_id)},
     )
-    assert d.status_code == 202, d.text
-    refused(
-        send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "reviewer")), 403, "forbidden"
+    assert r.status_code == 202, r.text
+
+
+def test_a_just_approved_gate_still_lets_its_role_stop_the_run(world: World) -> None:
+    """PLAN 9.3 and 4.3 rule 5: eligible for an open or just-approved gate. The late reject gets
+    a 409 with a Stop link, and the link works (the JWT path agrees with the dev-token case)."""
+    app = world.app()
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    approve(world, run_id)
+    reviewer = world.user(ALPHA, "reviewer")
+    late = decide_twice(world, run_id, reviewer)
+    assert (late.status_code, code(late)) == (409, "gate_closed")
+    assert late.json()["error"]["stop"] == {"method": "POST", "href": f"/runs/{run_id}/cancel"}
+    assert send(app, "POST", f"/runs/{run_id}/cancel", reviewer).status_code == 202
+    # a role that may not decide that gate still may not
+    other = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    approve(world, other)
+    refused(send(app, "POST", f"/runs/{other}/cancel", world.user(ALPHA, "qa")), 403, "forbidden")
+
+
+def test_once_the_run_has_moved_past_the_gate_its_role_can_no_longer_stop(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = world.app()
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    approve(world, run_id)
+    subject = Subject(
+        head_sha="c" * 40,
+        patch_id="p3",
+        ticket_revision="r1",
+        evidence_digest="e1",
+        attention_digest="t1",
     )
+    world.runtime._gates.open_gate(world.scope, OpenGate(run_id, "qa", GateType.QA, 1, subject))
+    real = world.runtime._astate
+
+    async def at_qa(rid: RunId) -> Any:
+        state = await real(rid)
+        return replace(state, run=replace(state.run, stage="qa"))
+
+    monkeypatch.setattr(world.runtime, "_astate", at_qa)
+    reviewer = world.user(ALPHA, "reviewer")
+    refused(send(app, "POST", f"/runs/{run_id}/cancel", reviewer), 403, "forbidden")
+    refused(decide_twice(world, run_id, reviewer), 409, "gate_closed")  # no stop link
+    assert "stop" not in decide_twice(world, run_id, reviewer).json()["error"]
+    # the role of the gate the run is at now still can
+    assert send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "qa")).status_code == 202
 
 
 def test_an_unknown_run_is_404_for_a_holder_the_middleware_admitted(world: World) -> None:
@@ -1108,8 +1150,8 @@ def test_the_409_stop_link_is_offered_only_to_roles_that_can_use_it(world: World
     offered = {
         "developer": link,  # the owner
         "team_admin": link,
-        "qa": None,  # not the owner, and no open gate qa may decide
-        "reviewer": None,
+        "qa": None,  # not the owner, and no gate qa may decide is open or just approved
+        "reviewer": link,  # the just-approved review gate (PLAN 9.3)
         CUSTOM: link,
     }
     for role, want in offered.items():
@@ -1133,3 +1175,179 @@ def test_the_409_stop_link_is_offered_only_to_roles_that_can_use_it(world: World
         r = decide_twice(world, fresh, world.user(ALPHA, role))
         href = r.json()["error"]["stop"]["href"]
         assert send(app, "POST", href, world.user(ALPHA, role)).status_code == 202, role
+
+
+def only(
+    *, checks_own: bool = False, checks_gate: bool = False
+) -> dict[tuple[str, str], RouteRule]:
+    """The table with the cancel route declaring just the checks given."""
+    rule = replace(ROUTES[CANCEL], checks_own=checks_own, checks_gate=checks_gate)
+    return {**ROUTES, CANCEL: rule}
+
+
+def test_the_table_in_force_decides_which_check_a_stop_honours(world: World) -> None:
+    """A grant fails closed unless the route declares its check: a table declaring only the gate
+    check must not let an owner (an "own" grant) stop a run that is at no gate, and one declaring
+    only the own check must not let a gate role stop a run it does not own."""
+    reviewer_owner = actor_of(ALPHA, "reviewer")
+    gate_only, own_only = world.app(only(checks_gate=True)), world.app(only(checks_own=True))
+    owned = seed_run(world, started_by=reviewer_owner)
+    refused(
+        send(gate_only, "POST", f"/runs/{owned}/cancel", world.user(ALPHA, "reviewer")),
+        403,
+        "forbidden",
+    )
+    assert (
+        send(own_only, "POST", f"/runs/{owned}/cancel", world.user(ALPHA, "reviewer")).status_code
+        == 202
+    )
+    at_gate = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    refused(
+        send(own_only, "POST", f"/runs/{at_gate}/cancel", world.user(ALPHA, "reviewer")),
+        403,
+        "forbidden",
+    )
+    assert (
+        send(
+            gate_only, "POST", f"/runs/{at_gate}/cancel", world.user(ALPHA, "reviewer")
+        ).status_code
+        == 202
+    )
+
+
+def test_the_409_offer_follows_the_installed_cancel_rule(world: World) -> None:
+    """The link is offered exactly when the installed table's cancel route would admit."""
+    owner = actor_of(ALPHA, "developer")
+    for table, want in ((only(checks_own=True), True), (only(checks_gate=True), False)):
+        app = world.app(table)
+        run_id = seed_run(world, started_by=owner, gate=GateType.REVIEW)
+        approve(world, run_id)
+        late = post(
+            app,
+            f"/runs/{run_id}/gates/g/1/decisions",
+            world.user(ALPHA, "developer"),
+            {"kind": "reject", "comment": "no"},
+        )
+        assert ("stop" in late.json()["error"]) is want, table[CANCEL]
+        cancel = send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "developer"))
+        assert (cancel.status_code == 202) is want
+
+
+def test_a_run_started_through_the_api_records_the_callers_actor(world: World) -> None:
+    app = world.app()
+    dev = world.user(ALPHA, "developer")
+    started = post(app, "/runs", dev, {"ticket": "T-9"})
+    assert started.status_code == 202, started.text
+    run_id = started.json()["id"]
+    assert asyncio.run(world.runtime.started_by(RunId.parse(run_id))) == actor_of(
+        ALPHA, "developer"
+    )
+    refused(send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "qa")), 403, "forbidden")
+    assert send(app, "POST", f"/runs/{run_id}/cancel", dev).status_code == 202
+
+
+def test_an_org_admin_with_no_team_role_can_cancel(world: World) -> None:
+    run_id = seed_run(world, started_by=None)
+    org = world.token("root-user", ["org-admins"])
+    assert send(world.app(), "POST", f"/runs/{run_id}/cancel", org).status_code == 202
+
+
+def test_may_stop_refuses_a_service_identity_whatever_the_flags() -> None:
+    service = ServiceIdentity(subject="svc", issuer=ISS, client_id="svc")
+    auth = Authorized(service, TeamScope(ALPHA))
+    for flags in ((False, False), (True, False), (False, True), (True, True)):
+        assert not may_stop(auth, flags, started_by=f"{ISS}|svc", gate_roles=frozenset({"x"}))
+
+
+def test_may_stop_refuses_when_the_cancel_rule_does_not_admit() -> None:
+    user = UserIdentity(subject="u", issuer=ISS, memberships=frozenset({(ALPHA, "team_admin")}))
+    assert not may_stop(
+        Authorized(user, TeamScope(ALPHA)), None, started_by=None, gate_roles=frozenset()
+    )
+
+
+def make_gate(kind: GateType) -> Gate:
+    if kind is GateType.PRE_PUSH:
+        subject = Subject.pre_push(base_sha="a" * 40, patch_id="p", ticket_revision="r")
+    else:
+        subject = Subject(
+            head_sha="b" * 40,
+            patch_id="p",
+            ticket_revision="r",
+            evidence_digest="e",
+            attention_digest="t",
+        )
+    return Gate(GateId.new(), RunId.new(), "g", kind, 1, subject)
+
+
+@pytest.mark.parametrize("kind", list(GateType))
+def test_the_default_gate_roles_name_nobody_but_review_and_qa(kind: GateType) -> None:
+    """Custom and pre_push gates fail closed until the snapshotted eligible_roles (D3-08a)."""
+    want = {GateType.REVIEW: {"reviewer"}, GateType.QA: {"qa"}}.get(kind)
+    got = default_gate_roles(make_gate(kind))
+    assert (set(got) if got is not None else None) == want
+
+
+def test_reading_who_may_stop_never_drives_the_run(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+
+    async def no_drive(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a read must not drive the run")
+
+    monkeypatch.setattr(world.runtime, "_ensure_driven", no_drive)
+    assert asyncio.run(world.runtime.stop_gate_roles(run_id)) == {"reviewer"}
+
+
+@pytest.mark.parametrize(
+    ("flags", "owner", "roles", "allowed"),
+    [
+        ((True, False), True, set(), True),  # own holder, their run
+        ((True, False), False, {"reviewer"}, False),  # own holder: a gate role is no help
+        ((False, True), True, set(), False),  # gate holder: owning the run is no help
+        ((False, True), False, {"reviewer"}, True),
+        ((False, True), False, {"qa"}, False),  # a gate that is not theirs
+        ((True, True), True, set(), True),  # both grants: either
+        ((True, True), False, {"reviewer"}, True),
+        ((True, True), False, set(), False),
+        ((False, False), False, set(), True),  # outright
+    ],
+)
+def test_may_stop_honours_exactly_the_flags_it_is_given(
+    flags: tuple[bool, bool], owner: bool, roles: set[str], allowed: bool
+) -> None:
+    user = UserIdentity("u", ISS, frozenset({(ALPHA, "reviewer")}))
+    started_by = f"{ISS}|u" if owner else f"{ISS}|someone-else"
+    auth = Authorized(user, TeamScope(ALPHA))
+    assert may_stop(auth, flags, started_by=started_by, gate_roles=frozenset(roles)) is allowed
+
+
+def test_only_the_latest_round_of_a_gate_counts_for_a_stop(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 approved, round 2 rejected. The gate service voids the approval when round 2
+    closes, so this shape is fed in directly: defence in depth, the run is not at an approved
+    gate and its role cannot Stop through round 1."""
+    app = world.app()
+    run_id = seed_run(world, started_by=None, gate=GateType.REVIEW)
+    approve(world, run_id)
+    (first,) = asyncio.run(world.runtime.gates(run_id))
+    second = replace(first, id=GateId.new(), round=2, status=GateStatus.REJECTED, closed_by="x")
+
+    async def both(rid: RunId) -> list[Gate]:
+        return [first, second]
+
+    monkeypatch.setattr(world.runtime, "_read_gates", both)
+    refused(
+        send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "reviewer")), 403, "forbidden"
+    )
+    monkeypatch.setattr(world.runtime, "_read_gates", lambda rid: _only(first))
+    assert (
+        send(app, "POST", f"/runs/{run_id}/cancel", world.user(ALPHA, "reviewer")).status_code
+        == 202
+    )
+
+
+async def _only(gate: Gate) -> list[Gate]:
+    return [gate]

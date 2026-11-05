@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
-from sto.api.auth import Authorized, actor_key, may_stop
+from sto.api.auth import Authorization, Authorized, actor_key, may_stop, stop_flags
 from sto.api.runtime import (
     BadCursorError,
     RunFinishedError,
@@ -227,7 +227,7 @@ async def events(
 async def cancel(run_id: str, rt: RuntimeDep, request: Request) -> dict[str, Any]:
     rid = parse_run_id(run_id)
     try:
-        if not await may_stop_run(request, rt, rid):
+        if not await may_stop_run(request, rt, rid, offer=False):
             raise ApiError(403, "forbidden", "this request is not allowed")
         await rt.cancel(rid)
     except RunNotFoundError as e:
@@ -245,18 +245,30 @@ def authorization_of(request: Request) -> Authorized | None:
     return auth if isinstance(auth, Authorized) else None
 
 
-async def may_stop_run(request: Request, rt: Runtime, run_id: RunId) -> bool:
+async def may_stop_run(request: Request, rt: Runtime, run_id: RunId, *, offer: bool) -> bool:
     """The conditions behind the cancel route's "own" and stop-at-gate grants (D3-22): the caller
-    started the run, or holds a role that may decide a gate the run is waiting at. Raises
-    ``RunNotFoundError`` for an unknown run. The same answer decides whether a 409 offers Stop."""
+    started the run, or holds a role that may decide a gate the run may still be stopped at.
+    Raises ``RunNotFoundError`` for an unknown run.
+
+    On the cancel route (``offer=False``) the flags are the ones the middleware set from the
+    table in force. From another route (``offer=True``: the 409's Stop link) they are looked up in
+    the installed table's cancel rule, so the link is offered exactly when cancel would admit.
+    """
     auth = authorization_of(request)
     if auth is None:  # the dev token has one identity, which may do anything
         return True
-    # Always read both: the decide route's flags say nothing about the Stop it offers.
+    if offer:
+        installed = getattr(request.app.state, "authorization", None)
+        flags = stop_flags(installed, auth) if isinstance(installed, Authorization) else None
+    else:
+        flags = (auth.own_only, auth.gate_only)
+    if flags is None:
+        return False
     return may_stop(
         auth,
-        started_by=await rt.started_by(run_id),
-        gate_roles=await rt.open_gate_roles(run_id),
+        flags,
+        started_by=await rt.started_by(run_id) if flags[0] else None,
+        gate_roles=await rt.stop_gate_roles(run_id) if flags[1] else frozenset(),
     )
 
 

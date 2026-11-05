@@ -42,6 +42,7 @@ from sto.domain import (
     DecisionKind,
     Effect,
     Gate,
+    GateStatus,
     GateType,
     PermanentError,
     Run,
@@ -651,11 +652,23 @@ class Runtime:
         found = item.data.get("started_by") if item else None
         return found if isinstance(found, str) else None
 
-    async def open_gate_roles(self, run_id: RunId) -> frozenset[str]:
-        """The roles that may decide any gate of the run that is open now."""
+    async def stop_gate_roles(self, run_id: RunId) -> frozenset[str]:
+        """The roles that may Stop the run through a gate (PLAN 9.3: "open or just-approved").
+
+        Those of every gate that is open, and of a gate that closed APPROVED in its latest round
+        while the run has not moved past it: the run's stage does not name another of its gates
+        (PLAN 4.3 rule 5, the late reject, where the 409 offers Stop). Reads without driving.
+        """
+        stage = (await self._astate(run_id)).run.stage
+        latest: dict[str, Gate] = {}
+        for gate in await self._read_gates(run_id):
+            if gate.name not in latest or gate.round > latest[gate.name].round:
+                latest[gate.name] = gate
         roles: set[str] = set()
-        for gate in await self.gates(run_id):
-            if gate.is_open:
+        for gate in latest.values():
+            moved_on = stage in latest and stage != gate.name
+            just_approved = gate.status is GateStatus.APPROVED and not moved_on
+            if gate.is_open or just_approved:
                 roles |= self._gate_roles(gate) or frozenset()
         return frozenset(roles)
 
@@ -684,6 +697,10 @@ class Runtime:
     async def gates(self, run_id: RunId) -> list[Gate]:
         await self._astate(run_id)
         await self._ensure_driven(run_id)
+        return await self._read_gates(run_id)
+
+    async def _read_gates(self, run_id: RunId) -> list[Gate]:
+        """The run's gates from the store, without driving the run."""
 
         def read() -> list[Gate]:
             found: list[Gate] = []
