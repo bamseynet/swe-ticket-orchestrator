@@ -348,7 +348,7 @@ Property tests pass over all templates, with crash injection.
 | 4 | D2-05 | D2-06 |
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
 | 6 | D2-09, D2-23, D2-25 | D2-29, D2-30 |
-| 7 | D2-14, D2-15, D2-19, D2-28 | - |
+| 7 | D2-14, D2-15, D2-19, D2-28 | D2-31 |
 | 8 | D2-20 | - |
 
 #### D2-01: Workflow schema
@@ -531,6 +531,11 @@ Found in review of D2-07. Publishing stores immutable manifests and `load_pinned
 **AC:** the run starter reads `Publisher.latest` for the team and workflow, records `(team, name, version, digest)` on the run at start, and every later step loads the manifest through `load_pinned`; `workflow_version()` returns the pin and the reducer docstring says so; a publish during a run, including a changed profile outcome or prompt, changes nothing for that run in an end-to-end test on the local driver; a run whose pinned manifest no longer loads blocks with a reason instead of raising. `FLOOR_TRACKING` in `org_policy.py` drops D2-07.
 **Deps:** D2-07, D2-26. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `src/sto/engine/handlers/stages.py`, `src/sto/api/runtime.py`, `src/sto/config/org_policy.py`, `tests/engine/test_pinning.py`, `tests/config/test_policy.py`.
 
+#### D2-31: Carry-over in the engine
+Found in review of D2-09. `gates/carry_over.py` decides whether a re-entered gate may close on an earlier approval, but nothing calls it, and G13 holds in production only if the engine feeds it true history and emits the close safely.
+**AC:** each gate round persists its `merge_base` and `carried_from`; the patch history passed to carry-over is every head the run has had since the origin decision (each push and each PR synchronize, with a computed `patch_id`; a head whose `patch_id` cannot be computed refuses), anchored to that decision; the full history of the gate name comes from the store, unfiltered; the approver check calls `sod.evaluate` per voted role with fresh identity and membership and passes only when allowed and not blocked; file lists come from `git diff --name-only -z --no-renames` with the trailing NUL required, surrogateescape decoding, and `complete` set only after a full read, measured from the merge base of the subject head; the carried close is a conditional write (gate still open, same subject, nothing new since the read), emitted only by the engine under a service identity with the `Citation` in audit, and a service approval without a citation is refused by the reducer and guard 2; `carry_over` is read from the pinned workflow and checked against the org's `allowed_carry_over`. G13 end-to-end tests on the local driver: P1, P2, P1 with P2 never reaching the gate asks again.
+**Deps:** D2-09, D2-26, D2-30, D3-06. **Size:** M. **Run:** serial. **Files:** `src/sto/engine/handlers/carry.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_carry.py`.
+
 ## D3: Identity and complete gates
 
 **Goal:** real identities, roles and every gate rule in PLAN.md section 4.
@@ -547,7 +552,7 @@ Found in review of D2-07. Publishing stores immutable manifests and `load_pinned
 | 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
 | 4 | D3-15, D3-19 | D3-06 |
 | 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | D3-08b |
-| 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22, D3-23 |
+| 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22, D3-23, D3-24 |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -583,7 +588,7 @@ An admin who changed a mapping, attributed a commit or cleared an exclusion is i
 Quorum per role, one vote per person, and veto by any negative decision, replacing the v0 decision path. All surfaces use it.
 Negative decisions are exempt from the digest match, and a moved subject drops earlier votes.
 **AC:** G3 by every commit order; a per-role quorum needs each role; votes drop on a ticket edit; required comments are enforced. Duplicate roles in a quorum are refused, so one role cannot count twice. Contention in `service.py:308-309` and `open_gate` raises `GateContentionError`, not `ConditionFailedError`.
-**Deps:** D3-05, D2-08. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_decisions.py`.
+**Deps:** D3-05, D2-08. **Size:** M. **Run:** serial. **Files:** `src/sto/gates/service.py`, `tests/gates/test_decisions.py`, `tests/gates/test_service.py`, `src/sto/api/runtime.py` (only a vote that closes the gate becomes `GateClosed`), `src/sto/api/routers/gates.py` (refusal mapping).
 
 #### D3-07: Eligibility display and escalation
 Show who can decide, warn when nobody can, and run reminders and escalation through timers.
@@ -697,6 +702,11 @@ Found in review of D3-03. The middleware refuses an "own" or stop-at-gate grant 
 Found in review of D2-10. The retry service accepts any non-blank actor. PLAN's role table lets a developer, reviewer or QA person retry only their own run, and a team or org admin any run of their scope.
 **AC:** the Retry route declares the "own" check and its handler enforces it through the shared tenancy suite: a holder of the own grant retries only runs they started, an admin any run in scope, a service never; the audited actor is the authenticated `issuer|subject`.
 **Deps:** D2-10, D3-22. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
+
+#### D3-24: Decisions use separation of duties and the gate's quorum
+Found in review of D3-06. The gate service takes a `DecisionPolicy`, but the app builds `GateService(store)` with none, so no quorum record is written and `sod.evaluate` (D3-05) decides nothing in production.
+**AC:** the app and runtime build the gate service with a policy that applies `sod.evaluate` and the workflow gate's quorum; a gate opened from a workflow with a quorum writes its quorum record; a sub-quorum vote never advances the run; an ineligible or SoD-excluded person is refused through the API, by the shared tenancy suite; a quorum the validator would refuse never reaches `open_gate`.
+**Deps:** D3-06, D3-05. **Size:** S. **Run:** serial. **Files:** `src/sto/gates/policy.py`, `src/sto/api/app.py`, `tests/gates/test_policy.py`.
 
 ## D4: GitHub, live
 
