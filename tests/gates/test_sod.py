@@ -411,10 +411,19 @@ def test_T8_self_grant_covers_its_round_and_every_later_round_of_the_gate() -> N
     facts = base_facts(admin_actions=(action,))
     for rnd in (2, 3, 9):
         refused(check(user("tess"), facts=facts, gate=make_gate(rnd=rnd)), "admin_self_service")
-    # an earlier round was already open before the action, and another gate is unaffected
+    # an earlier round of the named gate was already open before the action
     assert check(user("tess"), facts=facts, gate=make_gate(rnd=1)).allowed
-    other = make_gate(GateType.QA, "qa_gate", rnd=3)
-    assert check(user("tess", "qa"), facts=facts, gate=other).allowed
+
+
+@pytest.mark.parametrize("kind", ["mapping", "eligible_roles", "attribute", "clear_exclusion"])
+def test_T8_a_self_grant_covers_a_gate_that_opens_later_too(kind: str) -> None:
+    # scoped to review_gate, but qa_gate opening afterwards snapshots the grant as well
+    action = AdminAction(actor("tess"), kind, gate="review_gate", round=1)  # type: ignore[arg-type]
+    facts = base_facts(admin_actions=(action,))
+    for rnd in (1, 2):
+        other = make_gate(GateType.QA, "qa_gate", rnd=rnd)
+        refused(check(user("tess", "qa"), facts=facts, gate=other), "admin_self_service")
+    assert check(user("bob", "qa"), facts=facts, gate=make_gate(GateType.QA, "qa_gate")).allowed
 
 
 def test_T8_eligible_roles_self_grant_covers_later_rounds_too() -> None:
@@ -477,7 +486,13 @@ def test_G7_the_admin_who_resolves_a_term_is_ineligible() -> None:
 
 
 def test_G7_the_resolver_stays_ineligible_in_later_rounds() -> None:
-    res = Resolution("requester", frozenset({actor("rita")}), resolved_by=actor("tess"), round=1)
+    res = Resolution(
+        "requester",
+        frozenset({actor("rita")}),
+        resolved_by=actor("tess"),
+        gate="review_gate",
+        round=1,
+    )
     facts = base_facts(requester=None, resolutions=(res,))
     refused(check(user("tess"), facts=facts, gate=make_gate(rnd=3)), "admin_self_service")
 
@@ -612,3 +627,77 @@ def test_G7_clearing_your_own_exclusion_is_not_admin_self_service() -> None:
     verdict = check(user("bob"), facts=base_facts(commits=(commit,)))
     refused(verdict, "committer")
     assert "admin_self_service" not in verdict.reasons
+
+
+def test_G7_the_resolver_is_ineligible_on_a_second_gate_their_resolution_unblocked() -> None:
+    res = Resolution(
+        "requester",
+        frozenset({actor("rita")}),
+        resolved_by=actor("tess"),
+        gate="review_gate",
+        round=1,
+    )
+    facts = base_facts(requester=None, resolutions=(res,))
+    qa = make_gate(GateType.QA, "qa_gate")
+    qa_floors = make_floors(requester_excluded_from=["review", "pre_push", "qa"])
+    refused(check(user("tess", "qa"), gate=qa, facts=facts, floors=qa_floors), "admin_self_service")
+    assert check(user("bob", "qa"), gate=qa, facts=facts, floors=qa_floors).allowed
+
+
+def test_G7_resolving_author_does_not_lift_an_unresolved_requester() -> None:
+    res = Resolution("author", frozenset({actor("jo")}), resolved_by=actor("tess"))
+    facts = base_facts(requester=None, resolutions=(res,))
+    refused(check(user("bob"), facts=facts), "unresolved_term:requester")
+
+
+def test_T8_a_round_without_a_gate_is_refused() -> None:
+    with pytest.raises(ValueError, match="gate"):
+        AdminAction(actor("tess"), "mapping", round=2)
+    with pytest.raises(ValueError, match="gate"):
+        Resolution("requester", frozenset({actor("a")}), resolved_by=actor("tess"), round=2)
+
+
+@pytest.mark.parametrize("kind", ["Mapping", "", "grant", "MAPPING "])
+def test_T8_an_unknown_admin_action_kind_is_refused(kind: str) -> None:
+    with pytest.raises(ValueError, match="kind"):
+        AdminAction(actor("tess"), kind)  # type: ignore[arg-type]
+
+
+def test_G7_an_extension_needs_both_gate_and_round() -> None:
+    with pytest.raises(ValueError, match="gate and a round"):
+        AdminAction(actor("olga"), "extend_eligibility", gate="review_gate")
+    with pytest.raises(ValueError, match="gate and a round"):
+        AdminAction(actor("olga"), "extend_eligibility")
+
+
+@pytest.mark.parametrize("bad", [0, -1, "2", 1.5, True])
+def test_T8_a_bad_round_is_refused_clearly(bad: object) -> None:
+    with pytest.raises(ValueError, match="round must be a positive integer"):
+        AdminAction(actor("tess"), "mapping", gate="g", round=bad)  # type: ignore[arg-type]
+
+
+def test_G7_resolution_term_and_actors_are_validated() -> None:
+    with pytest.raises(ValueError, match="cannot resolve term"):
+        Resolution("committer", frozenset(), resolved_by=actor("tess"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="not a string"):
+        Resolution("requester", actor("rita"), resolved_by=actor("tess"))  # type: ignore[arg-type]
+    res = Resolution("requester", [actor("rita")], resolved_by=actor("tess"))  # type: ignore[arg-type]
+    assert res.actors == frozenset({actor("rita")})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [f"{ISS}| sub", f"{ISS}|sub ", f"{ISS}|sub\n", f" {ISS}|sub", f"{ISS} |sub", f"{ISS}|s\x00b"],
+)
+def test_G7_an_actor_with_whitespace_or_control_characters_is_refused(bad: str) -> None:
+    with pytest.raises(ValueError, match="whitespace or control"):
+        Pusher(bad)
+    with pytest.raises(ValueError, match="whitespace or control"):
+        Exclusion(bad, source="co-authored-by")
+
+
+def test_G7_an_extension_does_not_cover_another_gate_in_the_same_round() -> None:
+    action = AdminAction(actor("olga"), "extend_eligibility", gate="review_gate", round=1)
+    facts = base_facts(admin_actions=(action,))
+    qa = make_gate(GateType.QA, "qa_gate", rnd=1)
+    assert check(user("olga", "qa"), facts=facts, gate=qa).allowed

@@ -38,9 +38,9 @@ accepted while blocked, but not while excluded.
 Admin self-service is closed off. An actor who changed a mapping, published ``eligible_roles``,
 attributed a commit, cleared an exclusion or extended eligibility is ineligible for the rounds that
 action affects (``admin_self_service``). Attributing and clearing are read from the commit records;
-the other kinds arrive as :class:`AdminAction` with the gate and round they touch (``None`` for
-all). Because a gate snapshots eligibility when it opens, a mapping or ``eligible_roles`` change
-covers that round **and every later one**; an extension covers exactly its round. An admin who
+the other kinds arrive as :class:`AdminAction`. Because any gate that opens later snapshots a
+grant, every kind but an extension is run-wide (see :class:`AdminAction`); an extension covers
+exactly its round. An admin who
 resolves a term (:class:`Resolution`) is ineligible the same way, and a resolution naming nobody
 resolves nothing. A person cannot clear their own exclusion.
 
@@ -50,8 +50,10 @@ for them, and wiring ``evaluate`` into ``GateService.decide`` (D3-06 owns that p
 
 from __future__ import annotations
 
+import unicodedata
+from collections.abc import Collection
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from sto.config.schema import ApproverOf, Floors, SeparationOfDuties
 from sto.domain import Gate, GateType
@@ -77,10 +79,6 @@ AdminKind = Literal[
     "extend_eligibility",
     "resolve_term",
 ]
-# A gate snapshots eligibility when it opens, so a self-grant only ever helps a LATER round. These
-# kinds therefore cover the named round and every later round of the gate (or of the run when no
-# gate is named). An extension is about one open round, so it covers exactly that round.
-_ONWARD: frozenset[str] = frozenset({"mapping", "eligible_roles", "resolve_term"})
 
 
 def _actor(label: str, value: object) -> str:
@@ -91,6 +89,14 @@ def _actor(label: str, value: object) -> str:
     issuer, bar, subject = value.partition("|")
     if not (issuer and bar and subject):
         raise ValueError(f"{label} {value!r} must be in 'issuer|subject' form")
+    for part in (issuer, subject):
+        # a stray space or newline would make the key differ from the one evaluate() builds, so
+        # the record would silently exclude nobody
+        if part != part.strip() or any(unicodedata.category(c).startswith("C") for c in part):
+            raise ValueError(
+                f"{label} {value!r}: issuer|subject must have no surrounding whitespace "
+                "or control characters"
+            )
     return value
 
 
@@ -159,8 +165,26 @@ class Approval:
         object.__setattr__(self, "gate_type", GateType(self.gate_type))
 
 
+def _round(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"round must be a positive integer or None, not {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class AdminAction:
+    """Something an admin did. ``round`` is the round of ``gate`` the action **happened in**, not
+    the round it takes effect in.
+
+    Coverage. ``extend_eligibility`` covers exactly its ``gate`` and ``round`` (both required).
+    Every other kind (``mapping``, ``eligible_roles``, ``attribute``, ``clear_exclusion``,
+    ``resolve_term``) is run-wide, because any gate that opens later snapshots the grant too: it
+    covers every gate of the run, and with ``gate`` and ``round`` given, that gate only from
+    ``round`` onward (rounds of different gates cannot be ordered, so the others are all covered).
+    A ``round`` without a ``gate`` is refused."""
+
     actor: str
     kind: AdminKind
     gate: str | None = None
@@ -168,22 +192,28 @@ class AdminAction:
 
     def __post_init__(self) -> None:
         _actor("admin action actor", self.actor)
+        if self.kind not in get_args(AdminKind):
+            raise ValueError(f"unknown admin action kind {self.kind!r}")
+        _round(self.round)
+        if self.round is not None and self.gate is None:
+            raise ValueError("an admin action with a round must name its gate")
+        if self.kind == "extend_eligibility" and (self.gate is None or self.round is None):
+            raise ValueError("an extension covers one round, so it needs a gate and a round")
 
     def covers(self, gate: Gate) -> bool:
-        if self.gate is not None and self.gate != gate.name:
-            return False
-        if self.round is None:
+        if self.kind == "extend_eligibility":
+            return self.gate == gate.name and self.round == gate.round
+        if self.gate is None or self.gate != gate.name or self.round is None:
             return True
-        if self.kind in _ONWARD:
-            return gate.round >= self.round
-        return gate.round == self.round
+        return gate.round >= self.round
 
 
 @dataclass(frozen=True)
 class Resolution:
     """An admin's resolution of a term that could not be resolved. It names who becomes excluded
-    (``actors``); naming nobody resolves nothing. The resolver is ineligible, as for any
-    admin self-service, for ``gate`` and ``round`` onward."""
+    (``actors``); naming nobody resolves nothing. It lifts the block on every gate of the run (the
+    term is run-level), so the resolver is ineligible everywhere, as a run-wide ``resolve_term``
+    action; ``gate`` and ``round`` are where it happened, as for :class:`AdminAction`."""
 
     term: Literal["requester", "author"]
     actors: frozenset[str]
@@ -192,9 +222,15 @@ class Resolution:
     round: int | None = None
 
     def __post_init__(self) -> None:
+        if self.term not in ("requester", "author"):
+            raise ValueError(f"cannot resolve term {self.term!r}: only requester or author")
+        if isinstance(self.actors, str) or not isinstance(self.actors, Collection):
+            raise ValueError("resolution actors must be a collection of actors, not a string")
+        object.__setattr__(self, "actors", frozenset(self.actors))
         _actor("resolution resolved_by", self.resolved_by)
         for a in self.actors:
             _actor("resolution actor", a)
+        self.as_action()  # validates gate and round
 
     @property
     def resolves(self) -> bool:
