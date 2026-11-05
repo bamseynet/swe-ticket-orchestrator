@@ -1240,14 +1240,87 @@ def test_pass1_2_a_team_value_below_the_orgs_highest_is_refused_naming_the_gate(
 
 def test_pass1_2_a_team_value_above_the_orgs_highest_is_allowed() -> None:
     wf = _skipping_route(["low", "medium", "high", "critical"], "critical")
-    issues = check_route_orders(wf, _org(_when_org("medium")))
-    assert issues == []
+    policy = _org(_when_org("medium"))
+    assert check_route_orders(wf, policy) == []
+    # the ordering is the team's to extend, but the V17 walk covers every value ranked above the
+    # org's, so the route that sends critical past the gate is still refused
+    issues = check_org_required_gates(wf, policy, team="ledger")
+    assert any("change_gate" in i.message for i in issues), _text(issues)
 
 
 def test_pass1_2_a_value_below_the_orgs_lowest_is_refused_too() -> None:
     wf = _skipping_route(["trivial", "low", "medium", "high"], "trivial")
     issues = check_route_orders(wf, _org(_when_org("medium")))
-    assert any("trivial" in i.message for i in issues), _text(issues)
+    hits = [i for i in issues if "trivial" in i.message]
+    assert hits, _text(issues)
+    assert "below low, the org's lowest ranked risk value" in hits[0].message
+
+
+def test_pass2_a_team_value_directly_below_the_orgs_highest_is_refused() -> None:
+    wf = _skipping_route(["low", "medium", "critical", "high"], "critical")
+    issues = check_route_orders(wf, _org(_when_org("medium")))
+    hits = [i for i in issues if "critical" in i.message]
+    assert hits, _text(issues)
+    assert "below high, the org's highest ranked risk value" in hits[0].message
+
+
+def test_pass2_the_message_names_only_the_workflows_teams_gates() -> None:
+    def org(d: dict[str, Any]) -> None:
+        _when_org("medium")(d)
+        d["teams"]["other"] = {
+            "required_gates": [
+                {
+                    "id": "other_gate",
+                    "role": "x",
+                    "when": {"field": "risk", "value": "high"},
+                }
+            ]
+        }
+
+    wf = _skipping_route(["low", "critical", "medium", "high"], "critical")
+    text = _text(check_route_orders(wf, _org(org)))
+    assert "change_gate" in text
+    assert "other_gate" not in text
+
+
+def test_pass2_a_required_gate_without_when_does_not_end_the_ranking_check() -> None:
+    def org(d: dict[str, Any]) -> None:
+        d["teams"] = {
+            "ledger": {
+                "required_gates": [
+                    {"id": "review_gate", "role": "reviewer"},
+                    {
+                        "id": "change_gate",
+                        "role": "change_manager",
+                        "when": {"field": "risk", "value": "critical"},
+                    },
+                ]
+            }
+        }
+
+    with pytest.raises(SchemaError) as err:
+        _org(org)  # critical is not ranked, and the unconditional entry came first
+    assert "change_gate" in str(err.value)
+
+
+def test_pass2_a_gate_timeout_of_only_remind_after_passes() -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["review_gate"]["gate"]["timeouts"] = {"remind_after": "1d"}
+
+    assert _issues(_stages(change)) == []
+
+
+def test_pass2_a_stage_duration_equal_to_the_limit_passes() -> None:
+    def run_age(d: dict[str, Any]) -> None:
+        d["limits"]["max_run_age"] = "10d"
+        d["stages"]["ask"]["timeout"] = "10d"
+
+    assert _issues(run_age) == []
+
+    def org_stage(s: dict[str, Any]) -> None:
+        s["ask"]["timeout"] = "14d"  # equal to the org's max_stage_duration
+
+    assert _issues(_stages(org_stage)) == []
 
 
 def _promote_org(role: str, gate: str) -> Callable[[dict[str, Any]], None]:

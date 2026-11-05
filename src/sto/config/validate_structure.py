@@ -13,15 +13,19 @@ it. The gate-dominance rules (V4, V5, V6, V11, V14) are D2-04's; V17 is ``org_po
   ``default``, and no edge outside the route's ``order``.
 * **V3** every cycle contains an edge with a named ``loop`` whose limit is declared, at most the
   platform cap and at most the org's ``max_loop``. The cycle is printed.
-* **V7** a gate has eligible roles, each quorum role is eligible and appears once. (A gate has no
-  ``auto_approve`` key and no ``timeout`` outcome: the schema refuses both.)
-* **V8** an ``expired`` or ``rejected`` edge cannot reach a gated effect. The search does not
-  follow a gate's ``approved`` edge, since a later approval is what earns that effect.
+* **V7** a gate has eligible roles, each quorum role is eligible and appears once, and a gate
+  that sets ``escalate_after`` also sets ``escalate_to`` (the timers refuse it at run time).
+  (A gate has no ``auto_approve`` key and no ``timeout`` outcome: the schema refuses both.)
+* **V8** an ``expired`` or ``rejected`` edge cannot reach a gated effect. For each effect the
+  search does not follow the ``approved`` edge of a gate in that effect's ``requires_gates``,
+  since that approval is what earns it; another gate's approval is no help.
 * **V9** ``max_steps_per_run``, ``max_run_age`` and loop limits are within the platform caps and
   the org ceilings; every stage duration (wait, checks, gate timeouts) is at most ``max_run_age``
   and ``max_stage_duration``; a route's ``order`` agrees with the org's ordering; a team's budget
-  is within ``max_run_usd`` (``check_budget_ceilings``). The tier and the tools of a profile are
-  fixed by the manifest, which a workflow cannot override, so there is nothing to check there.
+  is within ``max_run_usd`` (``check_budget_ceilings``, run by ``validate_structure`` only when
+  it is given the ``team_config``; without it no budget is checked). The tier and the tools of a
+  profile are fixed by the manifest, which a workflow cannot override, so there is nothing to
+  check there.
 * **V10** every decision surface is permitted for the gate's type (a type the org does not name
   permits none), ``github`` only on a ``review`` gate, ``waive`` only if the org allows it.
 * **V13** a review panel has reviewers and required reviewers (each required one on the panel);
@@ -622,12 +626,12 @@ def check_budget_ceilings(config: TeamConfig, policy: OrgPolicy) -> list[Issue]:
     return issues
 
 
-def _gates_on(policy: OrgPolicy, field: str) -> str:
-    """The org gates a route on ``field`` could skip, for a message."""
+def _gates_on(policy: OrgPolicy, team: str, field: str) -> str:
+    """The org gates a route on ``field`` could skip for ``team``, for a message."""
+    team_policy = policy.teams.get(team)
     named = [
         f"{g.id} (when {field} is {g.when.value})"
-        for team in policy.teams.values()
-        for g in team.required_gates
+        for g in (team_policy.required_gates if team_policy else ())
         if g.when is not None and g.when.field == field
     ]
     return "the org gate " + ", ".join(dict.fromkeys(named)) if named else "an org gate"
@@ -665,18 +669,25 @@ def check_route_orders(wf: Workflow, policy: OrgPolicy) -> list[Issue]:
                     f"ranks {stage.field} {ranking}, so include every one",
                 )
             )
-        last = max((i for i, v in enumerate(stage.order) if v in org), default=-1)
+        ranked_at = [i for i, v in enumerate(stage.order) if v in org]
+        first, last = (ranked_at[0], ranked_at[-1]) if ranked_at else (0, -1)
+        gates = _gates_on(policy, wf.metadata.team, stage.field)
         for i, value in enumerate(stage.order):
-            if value not in org and i < last:
-                issues.append(
-                    Issue(
-                        None,
-                        _at(sid, "order"),
-                        f"stage {sid}: order ranks {value} below {org[-1]}, so a route could "
-                        f"send {value} past {_gates_on(policy, stage.field)}; move {value} "
-                        f"above {org[-1]}, the org's highest {stage.field}",
-                    )
+            if value in org or i > last:
+                continue
+            where = (
+                f"below {org[0]}, the org's lowest ranked {stage.field} value"
+                if i < first
+                else f"below {org[-1]}, the org's highest ranked {stage.field} value"
+            )
+            issues.append(
+                Issue(
+                    None,
+                    _at(sid, "order"),
+                    f"stage {sid}: order ranks {value} {where}, so a route could send "
+                    f"{value} past {gates}; move {value} above {org[-1]}",
                 )
+            )
         theirs = [v for v in stage.order if v in org]
         if theirs != [v for v in org if v in theirs]:
             issues.append(
