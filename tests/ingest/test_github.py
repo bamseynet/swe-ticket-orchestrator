@@ -941,7 +941,7 @@ def test_a_fork_review_carries_no_branch() -> None:
 
 
 @pytest.mark.parametrize(
-    "after, extra",
+    ("after", "extra"),
     [("0" * 40, {"deleted": True}), ("0" * 40, {}), (SHA, {"deleted": True})],
 )
 def test_a_branch_deletion_is_a_push_with_no_sha(after: str, extra: dict[str, Any]) -> None:
