@@ -795,3 +795,241 @@ def test_payload_must_be_strict_utf8(issuer: FakeIssuer) -> None:
         NOW + 99,
     )
     _refused(_validator(issuer), issuer.issue_raw(payload=body), "malformed")
+
+
+# --- review pass 2 -------------------------------------------------------------------------
+
+
+# 1. deep nesting inside a validly signed token
+@pytest.mark.parametrize(
+    "nested",
+    [b"[" * 600 + b"]" * 600, b'{"a":' * 1100 + b"1" + b"}" * 1100],
+    ids=["lists-600", "dicts-1100"],
+)
+def test_deeply_nested_claim_in_signed_token_is_invalid_not_a_crash(
+    issuer: FakeIssuer, nested: bytes
+) -> None:
+    body = b'{"iss":"%s","aud":"%s","sub":"u","exp":%d,"x":%s}' % (
+        ISS.encode(),
+        AUD.encode(),
+        NOW + 99,
+        nested,
+    )
+    _refused(_validator(issuer), issuer.issue_raw(payload=body), "malformed")
+
+
+# 2. in-flight refresh
+def test_unknown_kid_while_a_refresh_is_in_flight_is_transient() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    first = json.dumps(fake.jwks()).encode()
+    k1_token = fake.issue(sub="u", audience=AUD)
+    fake.rotate("k2")
+    entered, release, counter = threading.Event(), threading.Event(), itertools.count(1)
+
+    def fetch(_uri: str) -> bytes:
+        if next(counter) == 1:
+            return first
+        entered.set()
+        assert release.wait(10)  # the IdP black-holes this request
+        raise OSError("timeout")
+
+    now = [1000.0]
+    v = OidcValidator(_config(), CachedJwks(URI, fetch, clock=lambda: now[0]), clock=lambda: NOW)
+    k2_token = fake.issue(sub="u", audience=AUD)
+    errors: list[BaseException] = []
+
+    def request_a() -> None:
+        try:
+            v.validate(k2_token)
+        except BaseException as exc:  # recorded and asserted below
+            errors.append(exc)
+
+    v.validate(k1_token)
+    now[0] += 31
+    a = threading.Thread(target=request_a)
+    a.start()
+    assert entered.wait(10)
+    with pytest.raises(TransientError):
+        v.validate(k2_token)  # request B: the refresh A started has no outcome yet
+    release.set()
+    a.join(10)
+    assert len(errors) == 1
+    assert isinstance(errors[0], TransientError)
+
+
+# 3. healthy cold start under concurrency: one fetch, the rest are transient
+def test_concurrent_cold_start_fetches_once() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    entered, release, calls = threading.Event(), threading.Event(), itertools.count(1)
+
+    def fetch(_uri: str) -> bytes:
+        next(calls)
+        entered.set()
+        assert release.wait(10)
+        return json.dumps(fake.jwks()).encode()
+
+    jwks = CachedJwks(URI, fetch, clock=lambda: 1000.0)
+    first = threading.Thread(target=lambda: jwks.get("k1"))
+    first.start()
+    assert entered.wait(10)
+    for _ in range(11):
+        with pytest.raises(TransientError):
+            jwks.get("k1")
+    release.set()
+    first.join(10)
+    assert next(calls) == 2  # exactly one fetch happened
+    assert jwks.get("k1") is not None
+
+
+# ruling: an empty key list is a success and works as a kill switch at the IdP
+def test_empty_key_list_is_a_successful_refresh_that_revokes_everything() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    bodies = [json.dumps(fake.jwks()).encode()]
+    now = [1000.0]
+    jwks = CachedJwks(
+        URI, lambda _u: bodies[0], ttl_seconds=300, max_stale_seconds=600, clock=lambda: now[0]
+    )
+    v = OidcValidator(_config(), jwks, clock=lambda: NOW)
+    token = fake.issue(sub="u", audience=AUD)
+    v.validate(token)
+    bodies[0] = b'{"keys": []}'
+    now[0] += 301
+    _refused(v, token, "unknown_key")  # permanent, not transient
+    now[0] += 500  # past max_stale from the first fetch: the empty 200 reset the clock
+    _refused(v, token, "unknown_key")
+
+
+# named tests for the pass 2 surviving mutants
+def test_kept_keys_200_does_not_reset_the_stale_clock() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    bodies = [json.dumps(fake.jwks()).encode()]
+    now = [1000.0]
+    jwks = CachedJwks(
+        URI, lambda _u: bodies[0], ttl_seconds=300, max_stale_seconds=600, clock=lambda: now[0]
+    )
+    v = OidcValidator(_config(), jwks, clock=lambda: NOW)
+    token = fake.issue(sub="u", audience=AUD)
+    v.validate(token)
+    bodies[0] = b'{"keys":[{"kty":"oct","kid":"k1","k":"AA"}]}'
+    now[0] = 1301.0
+    assert v.validate(token).subject == "u"  # old keys kept
+    now[0] = 1650.0
+    with pytest.raises(TransientError):
+        v.validate(token)  # 650s since the last real success
+
+
+def test_default_max_stale_is_exactly_six_hours() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    fetch, now = Fetch(fake), [0.0]
+    jwks = CachedJwks(URI, fetch, clock=lambda: now[0])
+    assert jwks.get("k1") is not None
+    fetch.fail = OSError("down")
+    now[0] = 6 * 3600 - 1
+    assert jwks.get("k1") is not None
+    now[0] = 6 * 3600
+    with pytest.raises(TransientError):
+        jwks.get("k1")
+
+
+def test_max_stale_boundary_is_inclusive() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    fetch, now = Fetch(fake), [1000.0]
+    jwks = CachedJwks(URI, fetch, ttl_seconds=300, max_stale_seconds=600, clock=lambda: now[0])
+    assert jwks.get("k1") is not None
+    fetch.fail = OSError("down")
+    now[0] = 1599.0
+    assert jwks.get("k1") is not None
+    now[0] = 1600.0
+    with pytest.raises(TransientError):
+        jwks.get("k1")
+
+
+def test_validator_clock_defaults_to_wall_time() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1")  # real wall clock
+    v = OidcValidator(_config(), StaticJwks(fake.jwks()))
+    token = fake.issue(sub="u", audience=AUD, extra={"nbf": time.time() - 10})
+    assert v.validate(token).subject == "u"  # a monotonic clock would be decades before nbf
+
+
+def test_success_clears_last_failed() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    fetch, now = Fetch(fake), [1000.0]
+    v, _ = _cached(fetch, now)
+    v.validate(fake.issue(sub="u", audience=AUD))
+    fetch.fail = OSError("down")
+    now[0] += 301
+    v.validate(fake.issue(sub="u", audience=AUD))  # TTL refresh fails, stale keys serve
+    fetch.fail = None
+    now[0] += 31
+    v.validate(fake.issue(sub="u", audience=AUD))  # TTL refresh succeeds
+    junk = fake.issue(sub="u", audience=AUD, header={"kid": "junk"})
+    _refused(v, junk, "unknown_key")  # permanent again, not transient
+
+
+def test_duplicate_check_counts_unusable_entries() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    unusable: dict[str, object] = {"kty": "oct", "kid": "k1", "k": "AA"}
+    assert _get([unusable, _jwk(fake)], "k1") is None
+    assert _get([_jwk(fake), unusable], "k1") is None
+
+
+def test_older_failure_is_not_recorded_after_a_newer_success() -> None:
+    fake = FakeIssuer(issuer=ISS, key_id="k1", clock=lambda: NOW)
+    good = json.dumps(fake.jwks()).encode()
+    entered, release, counter = threading.Event(), threading.Event(), itertools.count(1)
+
+    def fetch(_uri: str) -> bytes:
+        if next(counter) == 1:
+            entered.set()
+            assert release.wait(10)
+            raise OSError("slow failure")
+        return good
+
+    now = [1000.0]
+    jwks = CachedJwks(URI, fetch, clock=lambda: now[0])
+    errors: list[BaseException] = []
+
+    def cold() -> None:
+        try:
+            jwks.get("k1")
+        except BaseException as exc:  # expected: the slow failure
+            errors.append(exc)
+
+    slow = threading.Thread(target=cold)
+    slow.start()
+    assert entered.wait(10)
+    now[0] += 31
+    assert jwks.get("k1") is not None  # newer success commits
+    release.set()
+    slow.join(10)
+    assert len(errors) == 1
+    assert isinstance(errors[0], TransientError)
+    assert jwks.get("junk") is None  # the older failure did not mark the cache as failed
+
+
+def test_pool_id_must_match_in_full() -> None:
+    with pytest.raises(ValueError, match="user_pool_id"):
+        cognito_config(region="eu-west-2", user_pool_id="eu-west-2_abc/x", client_id="c")
+
+
+# small items
+@pytest.mark.parametrize("issuer_url", ["https:///x", "https://?", "https://#f"])
+def test_issuer_without_a_host_refused(issuer_url: str) -> None:
+    with pytest.raises(ValueError, match="issuer"):
+        OidcConfig(issuer=issuer_url, audience=AUD)
+
+
+@pytest.mark.parametrize("uri", ["https://", "https:///jwks", "https://?x"])
+def test_jwks_uri_without_a_host_refused(uri: str) -> None:
+    with pytest.raises(ValueError, match="jwks_uri"):
+        OidcConfig(issuer=ISS, audience=AUD, jwks_uri=uri)
+    with pytest.raises(ValueError, match="https"):
+        CachedJwks(uri, lambda _u: b"")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+@pytest.mark.parametrize("name", ["ttl_seconds", "min_refetch_seconds", "max_stale_seconds"])
+def test_cache_timings_must_be_finite(name: str, bad: float) -> None:
+    kwargs: dict[str, float] = {name: bad}
+    with pytest.raises(ValueError, match="finite"):
+        CachedJwks(URI, lambda _u: b"", **kwargs)  # type: ignore[arg-type]

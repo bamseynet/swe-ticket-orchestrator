@@ -25,8 +25,13 @@ Decisions:
   keys must be P-256 points on the curve. JWKS entries with private parameters, a non-``verify``
   ``key_ops``, ``use`` other than ``sig``, or a duplicated ``kid`` (both are dropped) are ignored.
   A key whose own ``alg`` differs from the token's header ``alg`` is refused.
-* Cold-start fetches are rate limited like any other. With a healthy cold start, concurrent
-  requests may each fetch once (no lock, accepted); the cache dict is swapped whole.
+* Cold-start fetches are rate limited like any other: concurrent cold-start requests make one
+  fetch, and the others get ``TransientError`` until it lands (12 threads: 1 fetch, 11
+  transient). While any refresh is in flight, an unknown ``kid`` is transient, not invalid.
+  No lock: the cache dict is swapped whole, and only the newest attempt's outcome is recorded.
+* A 200 with ``{"keys": []}`` is a successful refresh: it resets the stale clock, drops every
+  key and makes every token ``unknown_key``. That is a kill switch at the IdP, and it means an
+  IdP incident that returns an empty 200 gives permanent 401s until the JWKS is repaired.
 * Cache timing (TTL, rate limit, staleness) uses a monotonic clock; token claims use wall time.
 
 Known limits (stated, not fixed):
@@ -36,6 +41,11 @@ Known limits (stated, not fixed):
 * With a healthy JWKS, a key removed at the IdP stays trusted until the TTL (1 hour by default),
   alongside access tokens that last 15 minutes.
 * Real Cognito tokens are checked only by D12-10 (see docs/findings/sso.md).
+* A junk ``kid`` can use the refetch slot just before a rotation, so the first real token with
+  the new ``kid`` gets ``unknown_key`` for up to ``min_refetch_seconds`` (29s by default).
+* ``time.monotonic`` does not count time a VM spends suspended, so staleness is under-counted
+  across a suspend.
+* A duplicated ``kid`` drops both entries, even when one of them is ``use: enc``.
 
 Network access is injected (``fetch``); this module opens no sockets itself.
 """
@@ -51,6 +61,7 @@ import math
 import re
 import time
 import types
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -94,20 +105,23 @@ class OidcConfig:
     groups_claim: str = "groups"
 
     def __post_init__(self) -> None:
-        if (
-            not self.issuer.startswith("https://")
-            or len(self.issuer) <= len("https://")
-            or any(c.isspace() for c in self.issuer)
-        ):
+        if not _https_url(self.issuer):
             raise ValueError("issuer must be an https URL with a host")
         if not self.audience:
             raise ValueError("audience must be non-empty")
-        if self.jwks_uri is not None and not self.jwks_uri.startswith("https://"):
-            raise ValueError("jwks_uri must be https")
+        if self.jwks_uri is not None and not _https_url(self.jwks_uri):
+            raise ValueError("jwks_uri must be an https URL with a host")
         if not self.algorithms or any(a not in SUPPORTED_ALGORITHMS for a in self.algorithms):
             raise ValueError(f"algorithm must be among {SUPPORTED_ALGORITHMS}")
         if not 0 <= self.leeway_seconds <= MAX_LEEWAY_SECONDS:
             raise ValueError(f"leeway_seconds must be between 0 and {MAX_LEEWAY_SECONDS}")
+
+
+def _https_url(value: str) -> bool:
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return False
+    parts = urllib.parse.urlsplit(value)
+    return parts.scheme == "https" and bool(parts.hostname)
 
 
 _REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]", re.ASCII)
@@ -136,7 +150,12 @@ def cognito_config(*, region: str, user_pool_id: str, client_id: str) -> OidcCon
 
 @dataclass(frozen=True)
 class VerifiedToken:
-    """A validated token. ``claims`` is deeply read-only and left out of equality and hash."""
+    """A validated token. ``claims`` is deeply read-only and left out of equality and hash.
+
+    Read-only means mapping proxies and tuples: JSON lists come back as tuples, and
+    ``copy.deepcopy``, ``dataclasses.asdict`` and ``json.dumps(dict(claims))`` raise
+    ``TypeError``. A later stage that logs claims must convert them itself.
+    """
 
     subject: str
     issuer: str
@@ -267,8 +286,10 @@ class CachedJwks:
         max_stale_seconds: float = 6 * 3600,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not uri.startswith("https://"):
-            raise ValueError("JWKS URI must be https")
+        if not _https_url(uri):
+            raise ValueError("JWKS URI must be an https URL with a host")
+        if not all(math.isfinite(t) for t in (ttl_seconds, min_refetch_seconds, max_stale_seconds)):
+            raise ValueError("cache timings must be finite")
         if ttl_seconds <= 0 or min_refetch_seconds <= 0:
             raise ValueError("ttl_seconds and min_refetch_seconds must be positive")
         if max_stale_seconds < ttl_seconds:
@@ -312,8 +333,8 @@ class CachedJwks:
         if keys is None or self._clock() - self._fetched_at >= self._max_stale:
             raise TransientError("JWKS unavailable: no fresh keys")
         key = keys.get(kid)
-        if key is None and self._last_failed:
-            raise TransientError("JWKS unavailable: cannot rule out a rotated key")
+        if key is None and (self._last_failed or self._outcome_seq < self._seq):
+            raise TransientError("JWKS unavailable: cannot rule out a rotated key yet")
         return key
 
 
@@ -448,13 +469,17 @@ class OidcValidator:
         auth_time = _number(claims, "auth_time")
         if auth_time is not None and auth_time > now + cfg.leeway_seconds:
             raise InvalidTokenError("bad_auth_time", "auth_time is in the future")
+        try:
+            frozen = _freeze(claims)
+        except RecursionError as exc:
+            raise InvalidTokenError("malformed", "claims are nested too deeply") from exc
         return VerifiedToken(
             subject=sub,
             issuer=cfg.issuer,
             groups=self._groups(claims.get(cfg.groups_claim)),
             auth_time=auth_time,
             expires_at=exp,
-            claims=_freeze(claims),
+            claims=frozen,
         )
 
     @staticmethod

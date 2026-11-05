@@ -6,18 +6,25 @@ place where its results go. Nothing below has been observed yet.
 
 ## What the D3-01 review found, to check against the real thing
 
-- **Issuer form.** The review of D3-01 notes that AWS recommends an `https://issuer-cognito-idp...`
-  form of the issuer for some setups, which `cognito_config` cannot produce. `OidcConfig` takes any
-  https issuer, so using it is config only. D12-10 reads the real `iss` claim and the discovery
-  document and records which form the pool issues.
-- **`aud` on access tokens.** `cognito_config` assumes access tokens carry `client_id` and no
-  `aud`. That is not true for resource-bound access tokens, which can carry `aud`. Record what the
-  pool issues for our app client, with and without a resource server, and set `audience_claim`
-  to match.
+- **Issuer form.** AWS documents `https://issuer-cognito-idp.{region}.amazonaws.com/{pool}` as the
+  "Updated issuer", "Recommended for all user pools", with the original
+  `https://cognito-idp.{region}.amazonaws.com/{pool}` as the "current default"
+  ([AWS: federation endpoints](https://docs.aws.amazon.com/cognito/latest/developerguide/federation-endpoints.html)).
+  `cognito_config` produces only the original form. `OidcConfig` takes any https issuer, so the
+  updated form is config only. D12-10 reads the real `iss` claim and the discovery document,
+  records which form the pool issues, and switches `cognito_config` if it is the updated one.
+- **`aud` on access tokens: a decision for D12-10.** `cognito_config` checks `client_id` and
+  ignores `aud`. A resource-bound access token keeps `client_id` and adds `aud`, so a token from
+  our app client that is bound to a different API is accepted today (reproduced in the D3-01
+  review). Switching to `audience_claim="aud"` also means setting `audience` to our API's
+  resource URL, and then tokens without that binding are refused. D12-10 records what the pool
+  issues for our client with and without a resource server, and decides between: client-bound
+  tokens only (today, accepting the cross-API case), or resource-bound tokens only (`aud` equal
+  to our resource URL).
 - **M2M tokens and service identities.** A `client_credentials` token has `sub == client_id`, no
   groups and `token_use=access`. If its `client_id` is ours it validates today and yields a
   `VerifiedToken` with empty groups. PLAN 9.2 says service identities are distinct and never
-  eligible for a gate, and D3-05 and D10 say the same. D3-01 does not classify them: nothing in
+  eligible for a gate, and D3-05 and D13-12 say the same. D3-01 does not classify them: nothing in
   `VerifiedToken` marks a token as a service identity. Safety rests on D3-02 (an unmapped user has
   no access) and D3-05 (service identities excluded), and neither says how a service identity is
   recognised. Decide that in D3-02 (for example `sub == client_id`, or a separate audience) and
@@ -27,17 +34,20 @@ place where its results go. Nothing below has been observed yet.
   including how multi-valued attributes are encoded in the claim.
 
 ## Group list size
+
 - Put a test user in far more groups than the app needs. Confirm sign-in succeeds with only the
   app-relevant IDs, or fails visibly. Record the real limit (the 2,048 character attribute cap is
   documented, not observed).
 - Confirm the Inbound federation trigger sends immutable group IDs only, never display names.
 
 ## Step-up
+
 - Sign in with `prompt=login` and `max_age` through managed login. Confirm the IdP is asked again
   and `auth_time` moves, and that it does not move on a plain refresh.
 - Reuse a session cookie. Confirm the token is fresh but `auth_time` (our `as_of`) is not.
 
 ## Revocation
+
 - Remove a user from their last group at the IdP and sign in again. Confirm the groups attribute
   is cleared (Cognito keeps old attributes unless the trigger writes an explicit blank, which the
   validator normalises to no groups).
@@ -47,6 +57,7 @@ place where its results go. Nothing below has been observed yet.
   1 hour by default).
 
 ## Also check against the real pool
+
 - Claim names: `client_id`, `token_use`, `cognito:groups` and `auth_time` on real tokens.
 - A federated user cannot overwrite the mapped groups attribute (self-write attempt fails).
 - Key rotation: rotate the pool's signing key and confirm `CachedJwks` picks up the new `kid`.
