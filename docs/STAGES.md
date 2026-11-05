@@ -347,7 +347,7 @@ Property tests pass over all templates, with crash injection.
 | 3 | D2-02, D2-03, D2-04, D2-12 | - |
 | 4 | D2-05 | D2-06 |
 | 5 | D2-07, D2-08, D2-10, D2-11, D2-13, D2-16, D2-17, D2-21, D2-27 | D2-26 |
-| 6 | D2-09, D2-19, D2-23, D2-25 | - |
+| 6 | D2-09, D2-19, D2-23, D2-25, D2-28 | D2-29 |
 | 7 | D2-14, D2-15 | - |
 | 8 | D2-20 | - |
 
@@ -416,7 +416,7 @@ Classify errors, apply one retry layer, send permanent failures to `BLOCKED`, an
 This fixes the PoC's re-spending on restart. Retry only re-runs a step, and can never change an outcome.
 Carried from D1-03: the local driver retries a persistent `TransientError` with capped backoff but no limit on total time, so cap it, and classify permanent errors that arrive as transient.
 **AC:** R1: spend stays flat across restarts for a permanent failure; R2: one retry layer counted at a stub; retry does not reset loop counters or step past `block_on`; it is audited. A head that moves during the QA step blocks the run; today it wedges with `RunWedgedError` and no merge. A run whose drive gave up is re-driven in the background, not only when someone next asks about it.
-**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`.
+**Deps:** D2-06. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/failures.py`, `tests/engine/test_failures.py`, `src/sto/engine/handlers/stages.py` (`head_moved` block), `tests/engine/test_reducer_v1.py`, `src/sto/engine/drivers/local.py` (backoff cap, re-drive hook), `tests/engine/test_local_driver.py`.
 
 #### D2-11: Cancel v1
 Add the `CANCELLING` state from any active state, with a timeout and alarm, voiding planned effects, closing gates and stopping dispatch of new steps. A run stopped after a merge ends `done_with_incident`, with the revert. To tell that a merge landed, add a read-only `find_merge(pr)` to `ScmProvider` and the fake, since D1-07's `reconcile` only dequeues. D4-06 implements it for GitHub.
@@ -516,6 +516,16 @@ Found in review of D2-05. PLAN's OrgPolicy example refuses PLAN's own workflows:
 
 ---
 
+#### D2-28: Return to the first invalid gate
+Found in review of D2-10. PLAN section 6.3 sends a run whose effect is voided with `gate_invalid` back to the first gate whose approval no longer holds. Reducer v1 and D2-10 only block it as `effect_failed`, and a Retry of a voided or failed effect is refused, so today the run can only be cancelled.
+**AC:** an effect voided with `gate_invalid` returns the run to the first gate, in workflow order, whose approval no longer holds for the current subject, opening a new round linked to the last (D2-08) with carry-over decided by D2-09; a permanent failure stays blocked with its reason; no loop counter moves and `max_steps` is respected; replays are refused.
+**Deps:** D2-09, D2-10. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/handlers/regate.py`, `tests/engine/test_regate.py`.
+
+#### D2-29: The graph registry covers every stage it can enter
+Found in review of D2-13. Wait and checks stages are entered through `STAGE_ENTRY` in `handlers/stages.py`, but `next()` with an explicit `graph_registry=` can enter a stage whose leaving events that registry cannot handle, so the run waits for ever.
+**AC:** `next()` refuses, as a BLOCKED reason and not an exception, to enter a stage kind whose leaving events the registry in use has no handler for; the default registry is unaffected; a test builds a registry without the wait handlers and shows the block. The reducer stays pure: no context variables or other implicit state.
+**Deps:** D2-13. **Size:** S. **Run:** serial. **Files:** `src/sto/engine/reducer.py`, `tests/engine/test_reducer_v1.py`.
+
 ## D3: Identity and complete gates
 
 **Goal:** real identities, roles and every gate rule in PLAN.md section 4.
@@ -532,7 +542,7 @@ Found in review of D2-05. PLAN's OrgPolicy example refuses PLAN's own workflows:
 | 3 | D3-04, D3-05, D3-14, D3-18 | D3-03 |
 | 4 | D3-15, D3-19 | D3-06 |
 | 5 | D3-11, D3-12, D3-13, D3-16, D3-17 | D3-08b |
-| 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22 |
+| 6 | D3-07, D3-20, D3-21 | D3-08a, D3-22, D3-23 |
 
 #### D3-01: OIDC validation and fake issuer
 Validate any issuer's JWTs by JWKS, with a fake issuer for tests and local use.
@@ -677,6 +687,11 @@ Found in review of D3-03. The middleware refuses an "own" or stop-at-gate grant 
 **Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`, `src/sto/api/runtime.py` (records who started a run, and a gate's deciding roles).
 
 ---
+
+#### D3-23: Who may Retry a blocked run
+Found in review of D2-10. The retry service accepts any non-blank actor. PLAN's role table lets a developer, reviewer or QA person retry only their own run, and a team or org admin any run of their scope.
+**AC:** the Retry route declares the "own" check and its handler enforces it through the shared tenancy suite: a holder of the own grant retries only runs they started, an admin any run in scope, a service never; the audited actor is the authenticated `issuer|subject`.
+**Deps:** D2-10, D3-22. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
 
 ## D4: GitHub, live
 
