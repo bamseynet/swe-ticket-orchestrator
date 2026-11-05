@@ -21,10 +21,11 @@ at once, since the rest would rest on it.
    Waived approvals never carry (a waiver is recorded per criterion, with a reason, and is not
    extended silently).
 2. Its ``patch_id`` equals the current one, and so does that of every instance since the decision
-   (``patch_changed``), and that of every subject the *run* has had since (``patch_ids_since``,
-   required, ``patch_changed_since``): a push that never reached a round of this gate still counts,
-   so P1, P2, P1 asks again whether or not P2 opened a round. No ids at all is
-   ``patch_history_unknown``.
+   (``patch_changed``), and so does every head the *run* has had since (:class:`PatchHistory`,
+   required, ``patch_changed_since``). The list is every head, not every subject: a push that
+   opens no gate still counts, so P1, P2, P1 asks again whether or not P2 opened a round. It is
+   anchored to the origin decision's gate id and must end at the current patch, else
+   ``patch_history_mismatch``: passing only the current patch cannot satisfy it.
 3. Every approver it cites passes the **approver port** (``ApproverRecheck``), which D3-05's
    ``sod.evaluate`` fills, asked per ``(actor, role)`` with the role they voted as: they still hold
    that role, were eligible when the gate opened, and separation of duties holds against the
@@ -43,6 +44,9 @@ at once, since the rest would rest on it.
    (``patch_files_unknown``). Paths are compared after NFC and case folding, and a path that
    contains or is contained by another counts as touched, so a file that became a directory, or
    the reverse, and a case-insensitive checkout do not slip through.
+   A path that could be read two ways is a ``ValueError``, not normalised: a ``..`` segment, NUL,
+   a newline, a backslash, or leading or trailing whitespace. Only ``.`` and empty segments are
+   dropped when comparing.
 
 The history must be exactly rounds 1 to ``gate.round - 1`` of this run, gate name and type, or it
 is ``inconsistent_history``: a missing round could hide a close.
@@ -83,6 +87,7 @@ __all__ = [
     "CarryOverDecision",
     "Citation",
     "GateInstance",
+    "PatchHistory",
     "Vote",
     "evaluate_carry_over",
     "invalidated_by_close",
@@ -154,10 +159,45 @@ class GateInstance:
             raise TypeError("instance carried_from must be a GateId")
 
 
+def _path(label: str, value: object) -> str:
+    """A repository path as git prints it. Refused outright, not normalised, when it could be read
+    two ways: a ``..`` segment, NUL, a newline, a backslash, or surrounding whitespace."""
+    text = _nonblank(label, value)
+    if text != text.strip() or any(c in text for c in ("\x00", "\n", "\\")):
+        raise ValueError(f"{label} {text!r} has whitespace, NUL, a newline or a backslash")
+    if ".." in text.split("/"):
+        raise ValueError(f"{label} {text!r} has a '..' segment")
+    return text
+
+
 def _paths(label: str, paths: Collection[str]) -> frozenset[str]:
     if isinstance(paths, str) or not isinstance(paths, Collection):
         raise TypeError(f"{label}s must be a collection of strings, not a string")
-    return frozenset(_nonblank(label, p) for p in paths)
+    return frozenset(_path(label, p) for p in paths)
+
+
+@dataclass(frozen=True)
+class PatchHistory:
+    """Every head the run has had from the origin decision up to now, as patch ids in order.
+
+    ``anchor`` is the origin decision's **gate id**: the first instance of the line, the one a
+    person decided. ``patch_ids`` runs from that decision's head to the current head, inclusive. It
+    lists *heads*, not subjects: a push or PR synchronize that opened no gate is still a head.
+    Heads whose patch id cannot be computed are the producer's to refuse, not to skip.
+    """
+
+    anchor: GateId
+    patch_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.anchor, GateId):
+            raise TypeError("patch history anchor must be a GateId")
+        if isinstance(self.patch_ids, str) or not isinstance(self.patch_ids, Sequence):
+            raise TypeError("patch history patch_ids must be a sequence of patch ids")
+        ids = tuple(_nonblank("patch id", p) for p in self.patch_ids)
+        if not ids:
+            raise ValueError("patch history needs at least the current patch id")
+        object.__setattr__(self, "patch_ids", ids)
 
 
 @dataclass(frozen=True)
@@ -264,24 +304,23 @@ def evaluate_carry_over(
     merge_base: str,
     patch_files: Collection[str],
     base_range: BaseRange | None,
-    patch_ids_since: Sequence[str],
+    patch_history: PatchHistory,
     recheck: ApproverRecheck,
 ) -> CarryOverDecision:
     """May the re-entered ``gate`` (open, round ``plan.round``) close approved by carry-over?
 
     ``history`` is every earlier instance of this gate in the run. ``quorum`` is the gate's
     current quorum (``None`` means one approval), ``merge_base`` the commit the current diff is
-    against and ``patch_files`` the paths the patch touches. ``patch_ids_since`` is the patch id of
-    every subject the **run** has had since the human decision, whichever gate it was for (required;
-    a push that no round of this gate saw still shows here). See the module docstring.
+    against and ``patch_files`` the paths the patch touches. ``patch_history`` is every head the
+    **run** has had since the human decision, not only those a round of this gate saw (required).
+    See the module docstring.
     """
     if not isinstance(gate, Gate) or not isinstance(plan, RoundPlan):
         raise TypeError("gate must be a Gate and plan a RoundPlan")
     _nonblank("merge_base", merge_base)
     files = _paths("patch file path", patch_files)
-    if isinstance(patch_ids_since, str) or not isinstance(patch_ids_since, Sequence):
-        raise TypeError("patch_ids_since must be a sequence of patch ids")
-    seen_patches = tuple(_nonblank("patch id", p) for p in patch_ids_since)
+    if not isinstance(patch_history, PatchHistory):
+        raise TypeError("patch_history must be a PatchHistory")
     if base_range is not None and not isinstance(base_range, BaseRange):
         raise TypeError("base_range must be a BaseRange or None")
     if carry_over != "patch_id":
@@ -339,9 +378,9 @@ def evaluate_carry_over(
     subject = gate.subject
     if any(i.gate.subject.patch_id != subject.patch_id for i in span):
         reasons.append("patch_changed")
-    if not seen_patches:
-        reasons.append("patch_history_unknown")
-    elif any(p != origin.gate.subject.patch_id for p in seen_patches):
+    if patch_history.anchor != origin.gate.id or patch_history.patch_ids[-1] != subject.patch_id:
+        reasons.append("patch_history_mismatch")
+    elif any(p != origin.gate.subject.patch_id for p in patch_history.patch_ids):
         reasons.append("patch_changed_since")
     if any(i.gate.subject.ticket_revision != subject.ticket_revision for i in span):
         reasons.append("ticket_revision_changed")
@@ -424,9 +463,9 @@ def invalidated_by_patch(
     ``patch_id``: a patch change voids an approval for good.
 
     Carry-over does not depend on anyone calling this. A push that no round of the gate saw leaves
-    the stored row ``APPROVED``, so :func:`evaluate_carry_over` takes the run's ``patch_ids_since``
-    and refuses on any difference (``patch_changed_since``). Calling this just keeps the stored
-    status honest.
+    the stored row ``APPROVED``, so :func:`evaluate_carry_over` takes the run's
+    :class:`PatchHistory` and refuses on any difference (``patch_changed_since``). Calling this
+    just keeps the stored status honest.
     """
     _nonblank("patch_id", patch_id)
     stale = [
