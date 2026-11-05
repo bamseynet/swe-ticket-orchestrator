@@ -8,12 +8,14 @@ refusal cannot be routed past the push.
 
 from __future__ import annotations
 
+import signal
+import time
+
 import pytest
 
 from sto.domain.errors import PermanentError
 from sto.workspace.path_policy import (
     DEFAULT_DENIED,
-    NO_ROUTE_PAST_PUSH,
     RESOLUTIONS,
     ChangeKind,
     PathChange,
@@ -44,6 +46,20 @@ DEFAULT_PATHS = [
     ".forgejo/workflows/x.yml",
     ".git/hooks/pre-commit",
     ".sto/workflows/default.yaml",
+    # review pass 1, item 1
+    "buildkite.yml",
+    "buildkite.yaml",
+    "buildkite.json",
+    ".cirrus.star",
+    ".drone.star",
+    ".teamcity/settings.kts",
+    ".tekton/pipeline.yaml",
+    "bitrise.yml",
+    "codemagic.yaml",
+    "cloudbuild.json",
+    "buildspec.yaml",
+    "buildspec-test.yaml",
+    ".gitmodules",
 ]
 
 
@@ -294,7 +310,6 @@ def test_a_refusal_can_only_be_corrected_or_waived_by_org() -> None:
     assert result.resolutions == RESOLUTIONS == ("corrected_patch", "org_waiver")
     assert "route_to_gate" not in RESOLUTIONS
     assert result.routable_past_push is False
-    assert NO_ROUTE_PAST_PUSH is True
 
 
 def test_allowed_result_has_no_resolutions() -> None:
@@ -336,3 +351,171 @@ def test_rename_requires_old_path() -> None:
         PathChange(ChangeKind.COPY, "b")
     with pytest.raises(PathPolicyError):
         PathChange(ChangeKind.MODIFY, "b", old_path="a")
+
+
+# --- review pass 1 -----------------------------------------------------------------------------
+
+
+def test_gitattributes_is_left_to_the_patch_flow() -> None:
+    assert check_paths([_modify(".gitattributes")], POLICY).allowed  # D5-07 handles it
+
+
+@pytest.mark.parametrize(
+    "short",
+    [
+        "GITLAB~1.YML",
+        "TRAVIS~1.YML",
+        "APPVEY~1.YML",
+        "BITBUC~1.YML",
+        "AZURE-~1.YML",
+        "JENKIN~1",  # stem from the wildcard pattern Jenkinsfile*
+        "AZURE-~1.YAML",
+        "BUILDS~1.YML",
+        "CLOUDB~1.JSON",
+        "GITMOD~1",
+        "sub/dir/GITLAB~2.yml",
+    ],
+)
+def test_short_names_with_an_extension_or_from_wildcard_patterns_are_refused(short: str) -> None:
+    result = check_paths([_modify(short)], POLICY)
+    assert [v.rule for v in result.violations] == ["short_name"]
+
+
+def test_unrelated_short_looking_names_are_allowed() -> None:
+    assert check_paths([_modify("REPORT~1.TXT")], POLICY).allowed
+    assert check_paths([_modify("docs/notes~1.md")], POLICY).allowed
+
+
+def _timed(policy: PathPolicy, parts: int, leaf: str = "x") -> float:
+    """Seconds one check takes. A SIGALRM at 5 s fails the test, so a regression to a
+    super-linear matcher is a named failure and not a hang."""
+
+    def too_slow(signum: int, frame: object) -> None:
+        raise AssertionError("path matching took over 5 s: super-linear glob matcher")
+
+    path = "/".join(["a"] * parts + [leaf])
+    previous = signal.signal(signal.SIGALRM, too_slow)
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        started = time.perf_counter()
+        check_paths([PathChange(ChangeKind.ADD, path)], policy)
+        return time.perf_counter() - started
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "**/a/**/a/**/secret",
+        "/".join(["**"] * 5 + ["zz"]),
+        "**/a/**/a/**/a/**/a/**/a/**/secret",
+        "a/**/a/**/a/**/a/**/a/**/a/**/a/**/zz",
+        "**/**/**/**/**/zz",
+    ],
+)
+def test_matching_time_is_bounded_for_adversarial_patterns_and_paths(pattern: str) -> None:
+    assert _timed(PathPolicy(extra_denied=(pattern,)), 2000) < 1.0
+    assert _timed(PathPolicy(extra_denied=(pattern,)), 2000, leaf="secret") < 1.0
+
+
+def test_matching_time_is_bounded_against_the_defaults() -> None:
+    assert _timed(POLICY, 2000) < 1.0
+
+
+def test_globstar_semantics_survive_the_rewrite() -> None:
+    policy = PathPolicy(extra_denied=("**/a/**/a/**/secret", "x/**/y"))
+    assert not check_paths([_modify("a/a/secret")], policy).allowed
+    assert not check_paths([_modify("q/a/m/n/a/secret")], policy).allowed
+    assert check_paths([_modify("a/secret")], policy).allowed
+    assert not check_paths([_modify("x/y")], policy).allowed
+    assert not check_paths([_modify("x/1/2/y")], policy).allowed
+    assert check_paths([_modify("x/1/2/z")], policy).allowed
+
+
+@pytest.mark.parametrize(
+    "link", ["/usr/bin/tool", "C:/tools/x", "c:\\tools", "\\\\host\\share", "bad\x00target"]
+)
+def test_an_absolute_base_symlink_does_not_block_unrelated_patches(link: str) -> None:
+    links = {"vendor/tool": link}
+    assert check_paths([_modify("src/app.py")], POLICY, symlinks=links).allowed
+    through = check_paths([_modify("vendor/tool/x")], POLICY, symlinks=links)
+    assert not through.allowed
+    assert through.violations[0].rule == "malformed"  # recorded as leaving the repository
+
+
+def test_a_new_absolute_symlink_does_not_block_other_paths() -> None:
+    new = PathChange(ChangeKind.ADD, "l", symlink_target="/etc/passwd")
+    result = check_paths([_modify("src/app.py"), new], POLICY)
+    assert [v.path for v in result.violations] == ["l"]
+    through = check_paths([new, _modify("l/x")], POLICY)
+    assert [v.path for v in through.violations] == ["l", "l/x"]
+
+
+def test_modifying_a_base_symlink_that_points_at_a_denied_file_is_refused() -> None:
+    result = check_paths([_modify("link")], POLICY, symlinks={"link": ".github/workflows/ci.yml"})
+    assert [v.rule for v in result.violations] == ["via_symlink"]
+
+
+def test_trailing_slash_in_a_team_pattern_means_everything_below() -> None:
+    policy = PathPolicy(extra_denied=("infra/",))
+    assert not check_paths([_modify("infra/x")], policy).allowed
+    assert not check_paths([_modify("infra/a/b")], policy).allowed
+    assert check_paths([_modify("other/x")], policy).allowed
+
+
+def test_a_malformed_base_symlink_entry_raises_instead_of_being_skipped() -> None:
+    with pytest.raises(PathPolicyError):
+        check_paths([_modify("src/a.py")], POLICY, symlinks={"bad\x00link": "x"})
+    with pytest.raises(PathPolicyError):
+        check_paths([_modify("src/a.py")], POLICY, symlinks={"": "x"})
+
+
+def test_a_legitimate_two_link_chain_is_allowed() -> None:
+    chain = {"a": "b", "b": "src"}
+    assert check_paths([_modify("a/x.py")], POLICY, symlinks=chain).allowed
+
+
+def test_a_chain_just_under_the_hop_limit_is_followed_and_over_it_fails_closed() -> None:
+    def chain(length: int) -> dict[str, str]:
+        links = {f"l{i}": f"l{i + 1}" for i in range(length)}
+        links[f"l{length}"] = "src"
+        return links
+
+    assert check_paths([_modify("l0/x")], POLICY, symlinks=chain(30)).allowed
+    over = check_paths([_modify("l0/x")], POLICY, symlinks=chain(60))
+    assert [v.rule for v in over.violations] == ["malformed"]
+
+
+def test_kind_is_coerced_so_a_string_cannot_skip_the_checks() -> None:
+    with pytest.raises(PathPolicyError):
+        PathChange("delete", "a", symlink_target="b")  # type: ignore[arg-type]
+    with pytest.raises(PathPolicyError):
+        PathChange("rename", "b")  # type: ignore[arg-type]
+    with pytest.raises(PathPolicyError):
+        PathChange("nonsense", "b")  # type: ignore[arg-type]
+    assert PathChange("add", "b").kind is ChangeKind.ADD  # type: ignore[arg-type]
+
+
+def test_a_bare_string_is_not_a_list_of_patterns() -> None:
+    with pytest.raises(PathPolicyError):
+        PathPolicy(extra_denied="*.tf")  # type: ignore[arg-type]
+    with pytest.raises(PathPolicyError):
+        PathPolicy(extra_denied="tf")  # type: ignore[arg-type]  # every character is a valid pattern
+
+
+def test_case_folding_can_change_length_and_is_a_known_limit() -> None:
+    policy = PathPolicy(extra_denied=("stra?e.cfg",))
+    assert check_paths([_modify("straße.cfg")], policy).allowed  # ß folds to ss: documented
+    assert not check_paths(
+        [_modify("strasse.cfg")], PathPolicy(extra_denied=("strasse.cfg",))
+    ).allowed
+    assert not check_paths(
+        [_modify("straße.cfg")], PathPolicy(extra_denied=("strasse.cfg",))
+    ).allowed
+
+
+def test_the_source_of_a_copy_is_refused_deliberately() -> None:
+    change = PathChange(ChangeKind.COPY, "src/copy.yml", old_path=".github/workflows/ci.yml")
+    assert not check_paths([change], POLICY).allowed

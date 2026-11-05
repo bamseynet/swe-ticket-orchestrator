@@ -17,15 +17,17 @@ step is BLOCKED at once and never retried.
 
 Threats covered (the check is a pure function of strings):
 
-* case folding, Unicode (NFKC, so fullwidth forms and look-alikes), and zero-width or other
-  format characters that HFS+ and NTFS ignore;
+* case folding, Unicode compatibility forms (NFKC, so fullwidth letters and ligatures; NFKC does
+  not map cross-script homoglyphs such as Cyrillic ``а``, which are different names on every
+  filesystem), and zero-width or other format characters that HFS+ and NTFS ignore;
 * ``.`` and empty segments, doubled and trailing slashes, backslash separators, trailing dots and
   spaces (NTFS drops them), NTFS alternate data streams (``name::$DATA``), 8.3 short names
   (``GITHU~1``) and drive letters;
 * absolute paths, UNC paths, ``..`` anywhere (refused outright, never resolved lexically, because
   after a symlink it lands elsewhere), NUL, control and line-separator characters;
-* a rename or copy into **or out of** a denied path, and a new symlink whose target is denied or
-  leaves the repo;
+* a rename or copy into **or out of** a denied path (refusing the source of a copy is deliberate:
+  a patch that reads from a protected file into a new one is as suspect as one that writes it), and
+  a new symlink whose target is denied or leaves the repo;
 * a write through a symlink, when the caller passes the base tree's symlinks (plus any the patch
   adds), including chains, and loops fail closed.
 
@@ -34,7 +36,9 @@ Not covered:
 * a symlink the caller does not tell it about: it cannot see the repository, so the caller must
   pass every symlink in the base tree (``symlinks=``);
 * case-sensitivity or Unicode behaviour of a filesystem it was not written for: it folds more than
-  any one filesystem does, so it over-refuses rather than under-refuses;
+  any one filesystem does, so it over-refuses rather than under-refuses. Case folding can change
+  a name's length (``ß`` becomes ``ss``), so a team pattern ``stra?e.cfg`` misses ``straße.cfg``;
+  write ``strasse.cfg`` (patterns are folded the same way) or ``stra*e.cfg``;
 * what a file does once committed: CI, hooks run elsewhere, git attributes and submodule config
   are not interpreted, and a permitted file can still run code in CI (see above);
 * content: it never reads file contents (the secret scan does that);
@@ -51,9 +55,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from sto.domain.errors import PermanentError
-
-NO_ROUTE_PAST_PUSH = True
-"""A refused patch is never routed past ``branch.push``."""
 
 RESOLUTIONS = ("corrected_patch", "org_waiver")
 """The only ways out of a refusal. There is deliberately no route-to-gate."""
@@ -84,6 +85,18 @@ DEFAULT_DENIED: tuple[str, ...] = (
     ".woodpecker.yaml",
     ".cirrus.yml",
     ".semaphore/**",
+    ".teamcity/**",
+    ".tekton/**",
+    "buildkite.yml",
+    "buildkite.yaml",
+    "buildkite.json",
+    ".cirrus.star",
+    ".drone.star",
+    "bitrise.yml",
+    "codemagic.yaml",
+    "cloudbuild.json",
+    "buildspec*.yaml",
+    ".gitmodules",  # a checkout with submodules fetches whatever URL this names
     "appveyor.yml",
     ".appveyor.yml",
     "cloudbuild.yml",
@@ -95,7 +108,7 @@ _MAX_PATH_CHARS = 4096
 _MAX_SYMLINK_HOPS = 40
 _BAD_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
 _DRIVE = re.compile(r"[a-z]:")
-_SHORT_NAME = re.compile(r"(.*)~[0-9]+")
+_SHORT_NAME = re.compile(r"(.*)~[0-9]+(\.[^./]*)?")
 _GLOBSTAR = "**"
 
 
@@ -122,6 +135,10 @@ class PathChange:
     symlink_target: str | None = None
 
     def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "kind", ChangeKind(self.kind))  # "delete" must not slip by
+        except ValueError:
+            raise PathPolicyError("unknown change kind") from None
         moves = self.kind in (ChangeKind.RENAME, ChangeKind.COPY)
         if moves and self.old_path is None:
             raise PathPolicyError(f"a {self.kind.value} needs old_path")
@@ -227,16 +244,31 @@ def _compile(pattern: str) -> tuple[str, ...]:
     parts = _components(pattern)
     if not parts:
         raise PathPolicyError("bad deny pattern: empty")
-    return (_GLOBSTAR, *parts) if len(parts) == 1 else parts
+    collapsed = [
+        p for i, p in enumerate(parts) if p != _GLOBSTAR or parts[i - 1 : i] != (_GLOBSTAR,)
+    ]
+    compiled = tuple(collapsed)
+    return (_GLOBSTAR, *compiled) if len(compiled) == 1 else compiled
 
 
 def _match(pattern: tuple[str, ...], parts: tuple[str, ...]) -> bool:
-    if not pattern:
-        return not parts
-    head, rest = pattern[0], pattern[1:]
-    if head == _GLOBSTAR:
-        return any(_match(rest, parts[i:]) for i in range(len(parts) + 1))
-    return bool(parts) and fnmatch.fnmatchcase(parts[0], head) and _match(rest, parts[1:])
+    """Segment glob match in O(len(pattern) * len(parts)): one pass per pattern segment over the
+    set of positions in ``parts`` reachable so far. No backtracking, so no adversarial blow-up."""
+    size = len(parts)
+    reach = [True] + [False] * size
+    for segment in pattern:
+        following = [False] * (size + 1)
+        if segment == _GLOBSTAR:
+            seen = False
+            for pos in range(size + 1):
+                seen = seen or reach[pos]
+                following[pos] = seen
+        else:
+            for pos in range(size):
+                if reach[pos] and fnmatch.fnmatchcase(parts[pos], segment):
+                    following[pos + 1] = True
+        reach = following
+    return reach[size]
 
 
 def _stems(patterns: Iterable[tuple[str, ...]]) -> frozenset[str]:
@@ -244,10 +276,12 @@ def _stems(patterns: Iterable[tuple[str, ...]]) -> frozenset[str]:
     stems: set[str] = set()
     for pattern in patterns:
         for part in pattern:
-            if part != _GLOBSTAR and not set(part) & set("*?["):
-                stem = part.lstrip(".").split(".")[0]
-                if stem:
-                    stems.add(stem)
+            if part == _GLOBSTAR:
+                continue
+            literal = re.split(r"[*?\[]", part, maxsplit=1)[0]  # prefix before any wildcard
+            stem = literal.lstrip(".").split(".")[0]
+            if stem:
+                stems.add(stem)
     return frozenset(stems)
 
 
@@ -267,6 +301,8 @@ class PathPolicy:
     _stem_set: frozenset[str] = field(init=False, repr=False, compare=False, default=frozenset())
 
     def __post_init__(self) -> None:
+        if isinstance(self.extra_denied, str):
+            raise PathPolicyError("extra_denied must be a sequence of patterns, not a string")
         extras = tuple(self.extra_denied)
         object.__setattr__(self, "extra_denied", extras)
         compiled = tuple((p, _compile(p)) for p in (*DEFAULT_DENIED, *extras))
@@ -308,7 +344,7 @@ def _join(base: Sequence[str], target: Sequence[str]) -> tuple[str, ...] | None:
 
 def _expansions(
     parts: tuple[str, ...],
-    links: Mapping[tuple[str, ...], tuple[str, ...]],
+    links: Mapping[tuple[str, ...], tuple[str, ...] | None],
     *,
     follow_last: bool = True,
 ) -> list[tuple[str, ...]]:
@@ -317,10 +353,10 @@ def _expansions(
     current = parts
     for _ in range(_MAX_SYMLINK_HOPS + 1):
         for i in range(1, len(current) + (1 if follow_last else 0)):
-            target = links.get(current[:i])
-            if target is None:
+            if current[:i] not in links:
                 continue
-            landed = _join(current[: i - 1], target)
+            target = links[current[:i]]
+            landed = None if target is None else _join(current[: i - 1], target)
             if landed is None:
                 raise PathPolicyError("malformed path: symlink leaves the repository")
             current = (*landed, *current[i:])
@@ -333,20 +369,25 @@ def _expansions(
 
 def _links(
     changes: Sequence[PathChange], base: Mapping[str, str] | None
-) -> dict[tuple[str, ...], tuple[str, ...]]:
-    links: dict[tuple[str, ...], tuple[str, ...]] = {}
-    entries: list[tuple[str, str]] = list((base or {}).items())
-    entries += [(c.path, c.symlink_target) for c in changes if c.symlink_target is not None]
-    for link, target in entries:
+) -> dict[tuple[str, ...], tuple[str, ...] | None]:
+    """Symlinks by canonical path. A target that leaves the repository (relative, absolute, drive
+    letter or malformed) is recorded as ``None``: only paths through that link are refused."""
+    links: dict[tuple[str, ...], tuple[str, ...] | None] = {}
+    entries = [(link, target, True) for link, target in (base or {}).items()]
+    entries += [(c.path, c.symlink_target, False) for c in changes if c.symlink_target is not None]
+    for link, target, from_base in entries:
         try:
             link_parts = _components(link)
-            target_parts = _components(target, allow_parent=True)
+            if not link_parts:
+                raise PathPolicyError("malformed path: empty")
         except PathPolicyError as exc:
-            if link in (base or {}):
+            if from_base:
                 raise PathPolicyError(f"bad symlink map entry: {exc}") from exc
             continue  # a malformed new symlink is reported on its own change
-        if link_parts and not target.startswith(("/", "\\")):
-            links[link_parts] = target_parts
+        try:
+            links[link_parts] = _components(target, allow_parent=True)
+        except PathPolicyError:
+            links[link_parts] = None
     return links
 
 
