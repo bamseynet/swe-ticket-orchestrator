@@ -10,7 +10,10 @@ Durability: WAL with ``synchronous=FULL``, so a committed transaction survives `
 power loss); an uncommitted one is rolled back on the next open.
 
 Semantics match ``MemoryStore`` and are proved by the same contract suite. Items are stored as
-canonical JSON text; the version counter is a column.
+canonical JSON text; the version counter is a column. Promoted attributes (D3-10) are JSON in an
+``attrs`` column (added to older files on open), and each index entry is also a row of
+``item_index``, keyed ``(partition, index, ipk, isk, pk, sk)``, so ``query_index`` is a range read
+of that table's primary key and never a scan.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any
 # One definition of the condition rules, shared with MemoryStore (private to the store package).
 from .memory import _holds
 from .ports import (
+    INDEXES,
     MAIN,
     Addr,
     Condition,
@@ -40,12 +44,16 @@ from .ports import (
     Put,
     Scope,
     TransactionConflictError,
+    check_index_args,
     check_query_args,
     decode_cursor,
+    decode_index_cursor,
     encode_cursor,
+    encode_index_cursor,
     require_key,
     require_scope,
     resolve,
+    resolve_index_pk,
     validate_ops,
 )
 
@@ -58,6 +66,21 @@ CREATE TABLE IF NOT EXISTS items (
     data      TEXT NOT NULL,
     version   INTEGER NOT NULL,
     PRIMARY KEY (partition, tbl, pk, sk)
+) WITHOUT ROWID
+"""
+# PRAGMA user_version: 0 is a file from before D3-10 (or a new one), 1 has the ``attrs`` column and
+# the ``item_index`` table. A file with a higher number was made by newer code: refuse it.
+_SCHEMA_VERSION = 1
+_ATTRS_COLUMN = "ALTER TABLE items ADD COLUMN attrs TEXT NOT NULL DEFAULT '{}'"
+_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS item_index (
+    partition TEXT NOT NULL,
+    idx       TEXT NOT NULL,
+    ipk       BLOB NOT NULL,
+    isk       BLOB NOT NULL,
+    pk        BLOB NOT NULL,
+    sk        BLOB NOT NULL,
+    PRIMARY KEY (partition, idx, ipk, isk, pk, sk)
 ) WITHOUT ROWID
 """
 
@@ -114,6 +137,22 @@ class SqliteStore:
                 if str(mode).lower() != "wal":
                     raise RuntimeError(f"cannot use WAL journaling here (got {mode!r})")
                 self._conn.execute(_SCHEMA)
+                found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                if found > _SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"store file has schema version {found}; this code knows up to "
+                        f"{_SCHEMA_VERSION}"
+                    )
+                columns = {r[1] for r in self._conn.execute("PRAGMA table_info(items)")}
+                if "attrs" not in columns:
+                    try:
+                        self._conn.execute(_ATTRS_COLUMN)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc):  # another opener added it first
+                            raise
+                self._conn.execute(_INDEX_SCHEMA)
+                if found < _SCHEMA_VERSION:
+                    self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
                 return
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc) or time.monotonic() >= deadline:
@@ -132,11 +171,18 @@ class SqliteStore:
 
     def _read(self, addr: Addr) -> Item | None:
         row = self._conn.execute(
-            "SELECT data, version FROM items WHERE partition=? AND tbl=? AND pk=? AND sk=?",
+            "SELECT data, version, attrs FROM items WHERE partition=? AND tbl=? AND pk=? AND sk=?",
             (addr.partition, addr.table, _b(addr.pk), _b(addr.sk)),
         ).fetchone()
         return (
-            None if row is None else Item(Key(addr.pk or "-", addr.sk), json.loads(row[0]), row[1])
+            None
+            if row is None
+            else Item(
+                Key(addr.pk or "-", addr.sk, addr.table),
+                json.loads(row[0]),
+                row[1],
+                json.loads(row[2]),
+            )
         )
 
     def get(self, scope: Scope, key: Key) -> Item | None:
@@ -145,7 +191,7 @@ class SqliteStore:
             self._check_open()
             found = self._read(addr)
         # Rebuild with the caller's key (it may be the TEAM_ROOT pseudo pk, stored as "").
-        return None if found is None else Item(key, found.data, found.version)
+        return None if found is None else Item(key, found.data, found.version, found.attrs)
 
     def query(
         self,
@@ -163,7 +209,7 @@ class SqliteStore:
         after = (
             None if cursor is None else decode_cursor(cursor, root.partition, table, pk, sk_prefix)
         )
-        sql = "SELECT sk, data, version FROM items WHERE partition=? AND tbl=? AND pk=?"
+        sql = "SELECT sk, data, version, attrs FROM items WHERE partition=? AND tbl=? AND pk=?"
         args: list[Any] = [root.partition, table, _b(root.pk)]
         if sk_prefix:  # a byte-wise substr, not LIKE: the prefix is literal, NUL included
             prefix = _b(sk_prefix)
@@ -182,10 +228,77 @@ class SqliteStore:
         more = limit is not None and len(rows) > limit
         if limit is not None:
             rows = rows[:limit]
-        items = tuple(Item(Key(pk, _s(sk), table), json.loads(d), v) for sk, d, v in rows)
+        items = tuple(
+            Item(Key(pk, _s(sk), table), json.loads(d), v, json.loads(a)) for sk, d, v, a in rows
+        )
         return Page(
             items,
             encode_cursor(root.partition, table, pk, sk_prefix, items[-1].key.sk) if more else None,
+        )
+
+    def query_index(
+        self,
+        scope: Scope,
+        index: str,
+        pk: str,
+        *,
+        sk_prefix: str = "",
+        limit: int | None = None,
+        cursor: str | None = None,
+        descending: bool = False,
+    ) -> Page:
+        require_scope(scope)
+        check_index_args(index, pk, limit, sk_prefix)
+        partition, _ = resolve_index_pk(scope, pk)
+        after = (
+            None
+            if cursor is None
+            else decode_index_cursor(cursor, partition, index, pk, sk_prefix, descending)
+        )
+        sql = (
+            "SELECT x.isk, x.pk, x.sk, i.data, i.version, i.attrs FROM item_index x"
+            " JOIN items i ON i.partition=x.partition AND i.tbl=? AND i.pk=x.pk AND i.sk=x.sk"
+            " WHERE x.partition=? AND x.idx=? AND x.ipk=?"
+        )
+        args: list[Any] = [MAIN, partition, index, _b(pk)]
+        if sk_prefix:
+            prefix = _b(sk_prefix)
+            sql += " AND substr(x.isk, 1, ?) = ?"
+            args += [len(prefix), prefix]
+        if after is not None:
+            sql += f" AND (x.isk, x.pk, x.sk) {'<' if descending else '>'} (?, ?, ?)"
+            args += [_b(after[0]), _b(after[1]), _b(after[2])]
+        sql += (
+            " ORDER BY x.isk, x.pk, x.sk"
+            if not descending
+            else " ORDER BY x.isk DESC, x.pk DESC, x.sk DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(min(limit, 2**62) + 1)
+        with self._lock:
+            self._check_open()
+            rows = self._conn.execute(sql, args).fetchall()
+        more = limit is not None and len(rows) > limit
+        if limit is not None:
+            rows = rows[:limit]
+        items = tuple(
+            Item(Key(_s(item_pk) or "TEAM", _s(sk), MAIN), json.loads(d), v, json.loads(a))
+            for _isk, item_pk, sk, d, v, a in rows
+        )
+        last = rows[-1] if rows else None
+        return Page(
+            items,
+            encode_index_cursor(
+                partition,
+                index,
+                pk,
+                sk_prefix,
+                descending,
+                (_s(last[0]), _s(last[1]), _s(last[2])),
+            )
+            if more and last is not None
+            else None,
         )
 
     def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
@@ -218,11 +331,13 @@ class SqliteStore:
         for p in prepared:
             a = p.addr
             match p:
-                case Prepared(op=Put(), data=d) if d is not None:
+                case Prepared(op=Put(), data=d, attrs=attrs) if d is not None:
                     old = current[a]
+                    self._unindex(a, old)
                     self._conn.execute(
-                        "INSERT OR REPLACE INTO items (partition, tbl, pk, sk, data, version)"
-                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO items"
+                        " (partition, tbl, pk, sk, data, version, attrs)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             a.partition,
                             a.table,
@@ -230,13 +345,48 @@ class SqliteStore:
                             _b(a.sk),
                             _json(d),
                             1 if old is None else old.version + 1,
+                            _json(attrs),
                         ),
                     )
+                    for idx in INDEXES:
+                        if f"{idx}pk" in attrs:
+                            self._conn.execute(
+                                "INSERT INTO item_index (partition, idx, ipk, isk, pk, sk)"
+                                " VALUES (?, ?, ?, ?, ?, ?)",
+                                (
+                                    a.partition,
+                                    idx,
+                                    _b(str(attrs[f"{idx}pk"])),
+                                    _b(str(attrs[f"{idx}sk"])),
+                                    _b(a.pk),
+                                    _b(a.sk),
+                                ),
+                            )
                 case Prepared(op=Delete()):
+                    self._unindex(a, current[a])
                     self._conn.execute(
                         "DELETE FROM items WHERE partition=? AND tbl=? AND pk=? AND sk=?",
                         (a.partition, a.table, _b(a.pk), _b(a.sk)),
                     )
+
+    def _unindex(self, a: Addr, old: Item | None) -> None:
+        """Drop the index rows of the item's current attributes (inside the transaction)."""
+        if old is None:
+            return
+        for idx in INDEXES:
+            if f"{idx}pk" in old.attrs:
+                self._conn.execute(
+                    "DELETE FROM item_index WHERE partition=? AND idx=? AND ipk=? AND isk=?"
+                    " AND pk=? AND sk=?",
+                    (
+                        a.partition,
+                        idx,
+                        _b(str(old.attrs[f"{idx}pk"])),
+                        _b(str(old.attrs[f"{idx}sk"])),
+                        _b(a.pk),
+                        _b(a.sk),
+                    ),
+                )
 
     def put(
         self,

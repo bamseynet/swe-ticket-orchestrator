@@ -18,6 +18,16 @@ with conditions on the version counter or a status field. One contract suite
 * Items live in a ``table`` (``MAIN`` or ``AUDIT``; ADR-0017), so a decision, its audit event
   and the outbox entry can commit in one transaction (PLAN 4.3 rule 6). The audit table is
   append-only: only ``Put`` with ``Absent()`` (and ``Check``) are allowed on it.
+* A ``Put`` may promote top-level *attributes* next to the data: the keys of the five GSIs
+  (``gsi1pk``/``gsi1sk`` ... ``gsi5pk``/``gsi5sk``, PLAN 11) and ``ttl`` (epoch seconds). DynamoDB
+  indexes and expires only top-level attributes, never ``d.x``, so these are written explicitly;
+  every store keeps them and ``query_index`` reads them back in the same order (D3-10). A rewrite
+  replaces the attributes with the ones it names (leaving one out removes it). Index partition
+  keys are scoped like item keys: a team's is stored as ``TEAM#<team>#<pk>``, so one team can
+  never read another's entries. DynamoDB reads an index eventually consistently; callers that
+  decide something re-read the item with ``get``. The in-process stores never expire an item on
+  ``ttl`` (DynamoDB deletes expired items itself, up to days late), so a reader that cares compares
+  it to the clock.
 * A transaction is all or nothing. Any failed condition raises ``ConditionFailedError`` and
   nothing is applied.
 """
@@ -48,6 +58,9 @@ _MAX_DEPTH = 32
 # DynamoDB's smallest non-zero magnitude (1E-130). Memory and SQLite could hold less, so every
 # store refuses it: a run that works locally must not fail in production.
 _MIN_NUMBER = 1e-130
+# ``ttl`` is epoch *seconds*. A millisecond value (about 1.7e12 today) would be read as a date
+# thousands of years away, so the item would never expire: refuse anything from year 5138 on.
+_MAX_TTL = 10**11
 
 # The team's own bare partition (PLAN 11: Team META and switches, CONFIG, WF#, BUD#, SLOT#, CONN#,
 # IMAGE# live under exactly ``TEAM#<t>``). ``Key(TEAM_ROOT, "META")`` addresses it, so every caller
@@ -160,11 +173,20 @@ class Key:
             raise ValueError(f"unknown table {self.table!r}; use one of {TABLES}")
 
 
+INDEXES = ("gsi1", "gsi2", "gsi3", "gsi4", "gsi5")
+TTL_ATTR = "ttl"
+# Every top-level attribute besides pk, sk, v and d that a Put may set.
+ATTR_NAMES = frozenset({f"{i}{part}" for i in INDEXES for part in ("pk", "sk")} | {TTL_ATTR})
+
+Attrs = Mapping[str, str | int]
+
+
 @dataclass(frozen=True)
 class Item:
     key: Key
     data: dict[str, Any]
     version: int
+    attrs: dict[str, str | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -200,14 +222,40 @@ def resolve(scope: Scope, key: Key, override: PlatformScope | None = None) -> Ad
                 f"key pk is longer than {MAX_PK_BYTES} bytes once prefixed with the team"
             )
         return Addr(f"TEAM#{scope.team}", key.table, "" if key.pk == TEAM_ROOT else key.pk, key.sk)
+    _require_platform_key(key.pk)
+    return Addr("PLATFORM", key.table, key.pk, key.sk)
+
+
+def _require_platform_key(pk: str) -> None:
     if not any(
-        key.pk == p or key.pk.startswith(p if p.endswith("#") else p + "#")
-        for p in PLATFORM_PREFIXES
+        pk == p or pk.startswith(p if p.endswith("#") else p + "#") for p in PLATFORM_PREFIXES
     ):
         raise ValueError(
             f"platform key must start with one of {PLATFORM_PREFIXES}; team data needs a TeamScope"
         )
-    return Addr("PLATFORM", key.table, key.pk, key.sk)
+
+
+def index_pk(partition: str, pk: str) -> str:
+    """The stored form of an index partition key: ``TEAM#<team>#<pk>`` for a team (the partition
+    is ``TEAM#<team>``), the key itself for the platform."""
+    return pk if partition == "PLATFORM" else f"{partition}#{pk}"
+
+
+def resolve_index_pk(scope: Scope, pk: str) -> tuple[str, str]:
+    """``(partition, stored index pk)`` for an index key used with ``scope``."""
+    partition = f"TEAM#{scope.team}" if isinstance(scope, TeamScope) else "PLATFORM"
+    return partition, checked_index_pk(partition, pk)
+
+
+def checked_index_pk(partition: str, pk: str) -> str:
+    """Stored form of ``pk`` in ``partition``, refusing what the key rules refuse."""
+    if partition == "PLATFORM":
+        _require_platform_key(pk)
+    elif len(index_pk(partition, pk).encode()) > MAX_PK_BYTES:
+        raise ValueError(
+            f"index pk is longer than {MAX_PK_BYTES} bytes once prefixed with the team"
+        )
+    return index_pk(partition, pk)
 
 
 def require_key(key: object) -> Key:
@@ -238,6 +286,53 @@ def decode_cursor(cursor: object, partition: str, table: str, pk: str, sk_prefix
     if parts[:4] != [partition, table, pk, sk_prefix]:
         raise ValueError("cursor belongs to a different query")
     return str(parts[4])
+
+
+def encode_index_cursor(
+    partition: str,
+    index: str,
+    pk: str,
+    sk_prefix: str,
+    descending: bool,
+    last: tuple[str, str, str],
+) -> str:
+    """Opaque cursor of an index query, bound to it. ``last`` is the index sort key and the item's
+    ``(pk, sk)`` of the last item returned: the item key breaks ties between equal index sort
+    keys, so every order is total and a page never skips or repeats an entry."""
+    raw = json.dumps(
+        ["idx", partition, index, pk, sk_prefix, descending, *last], separators=(",", ":")
+    )
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_index_cursor(
+    cursor: object, partition: str, index: str, pk: str, sk_prefix: str, descending: bool
+) -> tuple[str, str, str]:
+    """``(index sk, item pk, item sk)`` to continue after. Refuses a malformed cursor and one made
+    by another query, team, index, prefix or direction."""
+    try:
+        if not isinstance(cursor, str):
+            raise TypeError
+        raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
+        parts = json.loads(raw.decode("utf-8"))
+        ok = (
+            isinstance(parts, list)
+            and len(parts) == 9
+            and parts[0] == "idx"
+            and isinstance(parts[5], bool)
+            and all(isinstance(p, str) for p in (*parts[1:5], *parts[6:]))
+            # DynamoDB refuses an empty key, so no store ever made a cursor with one: a forged
+            # one is refused here, the same on every store, rather than by the server.
+            and bool(parts[6])
+            and bool(parts[8])
+        )
+    except (TypeError, ValueError, binascii.Error, RecursionError):
+        raise ValueError("invalid cursor") from None
+    if not ok:
+        raise ValueError("invalid cursor")
+    if parts[1:6] != [partition, index, pk, sk_prefix, descending]:
+        raise ValueError("cursor belongs to a different query")
+    return parts[6], parts[7], parts[8]
 
 
 # --- data -------------------------------------------------------------------------------------
@@ -292,9 +387,58 @@ def canonical_data(data: object) -> dict[str, Any]:
     return result
 
 
-def _item_size(key: Key, data: dict[str, Any]) -> int:
+def canonical_attrs(attrs: object) -> dict[str, str | int]:
+    """The one stored form of promoted attributes (a fresh dict), or ``ValueError``/``TypeError``.
+    Only the five GSIs' keys and ``ttl`` are allowed; an index's two keys come together, as
+    non-empty text within the key size limits; ``ttl`` is an integer of epoch seconds, from 0
+    up to (not including) 10**11."""
+    if attrs is None:
+        return {}
+    if not isinstance(attrs, Mapping):
+        raise TypeError(f"attrs must be a mapping, not {type(attrs).__name__}")
+    out: dict[str, str | int] = {}
+    for name, value in attrs.items():
+        if name not in ATTR_NAMES:
+            raise ValueError(f"unknown attribute {name!r}; use one of the index keys or 'ttl'")
+        if name == TTL_ATTR:
+            if type(value) is not int:
+                raise TypeError("ttl must be an int of epoch seconds")
+            if not 0 <= value < _MAX_TTL:
+                raise ValueError(
+                    f"ttl is out of range: epoch seconds below {_MAX_TTL} (is it milliseconds?)"
+                )
+        else:
+            limit = MAX_PK_BYTES if name.endswith("pk") else MAX_SK_BYTES
+            _check_part(name, value, limit)
+            _utf8_ok(name, str(value))
+        out[name] = value
+    for index in INDEXES:
+        if (f"{index}pk" in out) != (f"{index}sk" in out):
+            raise ValueError(f"{index}pk and {index}sk are set together or not at all")
+    return out
+
+
+def _utf8_ok(name: str, text: str) -> None:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"attribute {name} must be valid UTF-8 text") from None
+
+
+def attrs_size(attrs: Mapping[str, str | int], partition: str = "PLATFORM") -> int:
+    """Bytes the promoted attributes take in the stored item: name, value and one byte of
+    overhead each. An index partition key counts with the ``TEAM#<team>#`` prefix the store adds
+    (``partition`` is the item's: ``TEAM#<team>`` or ``PLATFORM``)."""
+    total = 0
+    for name, value in attrs.items():
+        text = index_pk(partition, str(value)) if name.endswith("pk") else str(value)
+        total += len(name) + len(text.encode("utf-8", "surrogatepass")) + 1
+    return total
+
+
+def _item_size(key: Key, data: dict[str, Any], attrs_bytes: int = 0) -> int:
     size = len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    size += len(key.pk.encode()) + len(key.sk.encode())
+    size += len(key.pk.encode()) + len(key.sk.encode()) + attrs_bytes
     if size > MAX_ITEM_BYTES:
         raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
     return size
@@ -362,12 +506,18 @@ def _check_condition(condition: object, *, required: bool) -> None:
 
 @dataclass(frozen=True)
 class Put:
-    """Create or replace an item. Bumps its version."""
+    """Create or replace an item. Bumps its version.
+
+    **A Put replaces the whole item, promoted attributes included.** Leave ``attrs`` out (or leave
+    an index's keys out) and the item drops out of that index: a writer that updates an indexed
+    item must pass the same ``attrs`` again, with the changed parts changed.
+    """
 
     key: Key
     data: dict[str, Any]
     when: Condition | None = None
     scope: PlatformScope | None = None
+    attrs: Attrs | None = None
     size: int = field(init=False, default=0, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -375,8 +525,14 @@ class Put:
         _check_condition(self.when, required=False)
         _check_op_scope(self.scope)
         data = canonical_data(self.data)  # a private copy: later caller mutation cannot reach it
+        attrs = canonical_attrs(self.attrs)
+        if attrs and self.key.table == AUDIT:
+            raise ValueError("the audit table has no indexes or ttl: attrs are not allowed there")
         object.__setattr__(self, "data", data)
-        object.__setattr__(self, "size", _item_size(self.key, data))
+        object.__setattr__(self, "attrs", attrs)
+        # The team prefix of the index keys is not known yet (it comes from the scope), so this
+        # is a lower bound; ``validate_ops`` counts the prefix and refuses what it pushes over.
+        object.__setattr__(self, "size", _item_size(self.key, data, attrs_size(attrs)))
 
 
 @dataclass(frozen=True)
@@ -422,6 +578,7 @@ class Prepared(NamedTuple):
     op: Op
     addr: Addr
     data: dict[str, Any] | None
+    attrs: dict[str, str | int] = {}  # noqa: RUF012  (never mutated; a Put's are canonical copies)
 
 
 def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Prepared, ...]:
@@ -446,10 +603,14 @@ def validate_ops(scope: Scope, ops: Sequence[Op]) -> tuple[Prepared, ...]:
         ):
             raise ValueError("the audit table is append-only: only Put with Absent() is allowed")
         data = None
+        attrs: dict[str, str | int] = {}
         if isinstance(op, Put):
             data = canonical_data(op.data)
-            total += _item_size(op.key, data)
-        prepared.append(Prepared(op, addr, data))
+            attrs = canonical_attrs(op.attrs)
+            for name in (n for n in attrs if n.endswith("pk")):
+                checked_index_pk(addr.partition, str(attrs[name]))
+            total += _item_size(op.key, data, attrs_size(attrs, addr.partition))
+        prepared.append(Prepared(op, addr, data, attrs))
     if total > MAX_TRANSACTION_BYTES:
         raise ValueError(f"transaction is {total} bytes; the limit is {MAX_TRANSACTION_BYTES}")
     return tuple(prepared)
@@ -465,6 +626,12 @@ def check_query_args(pk: object, limit: int | None, table: str, sk_prefix: objec
         raise ValueError("limit must be a positive int")
     if table not in TABLES:
         raise ValueError(f"unknown table {table!r}; use one of {TABLES}")
+
+
+def check_index_args(index: object, pk: object, limit: int | None, sk_prefix: object) -> None:
+    if index not in INDEXES:
+        raise ValueError(f"unknown index {index!r}; use one of {INDEXES}")
+    check_query_args(pk, limit, MAIN, sk_prefix)
 
 
 # --- the port ---------------------------------------------------------------------------------
@@ -506,3 +673,28 @@ class Store(Protocol):
     ) -> None: ...
 
     def delete(self, scope: Scope, key: Key, *, when: Condition | None = None) -> None: ...
+
+
+@runtime_checkable
+class IndexedStore(Store, Protocol):
+    """A ``Store`` that also reads the promoted GSI attributes (D3-10). Memory, SQLite and
+    DynamoDB implement it; a wrapper or fake that only forwards the base calls is still a
+    ``Store``."""
+
+    def query_index(
+        self,
+        scope: Scope,
+        index: str,
+        pk: str,
+        *,
+        sk_prefix: str = "",
+        limit: int | None = None,
+        cursor: str | None = None,
+        descending: bool = False,
+    ) -> Page:
+        """Main-table items whose ``<index>pk`` attribute equals ``pk`` (inside the scope's
+        partition), by ``<index>sk`` ascending, or descending, ties broken by item key so the
+        order is total. ``sk_prefix`` is literal. Paging by cursor neither skips nor repeats items
+        that stayed put; an item whose index key changes between pages shows up at most once at
+        its new place. Never scans. On DynamoDB the read is eventually consistent."""
+        ...

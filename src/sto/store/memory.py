@@ -28,12 +28,16 @@ from .ports import (
     Put,
     Scope,
     VersionIs,
+    check_index_args,
     check_query_args,
     decode_cursor,
+    decode_index_cursor,
     encode_cursor,
+    encode_index_cursor,
     require_key,
     require_scope,
     resolve,
+    resolve_index_pk,
     validate_ops,
 )
 
@@ -101,6 +105,53 @@ class MemoryStore:
             encode_cursor(partition, table, pk, sk_prefix, items[-1].key.sk) if more else None,
         )
 
+    def query_index(
+        self,
+        scope: Scope,
+        index: str,
+        pk: str,
+        *,
+        sk_prefix: str = "",
+        limit: int | None = None,
+        cursor: str | None = None,
+        descending: bool = False,
+    ) -> Page:
+        require_scope(scope)
+        check_index_args(index, pk, limit, sk_prefix)
+        partition, _ = resolve_index_pk(scope, pk)
+        after = (
+            None
+            if cursor is None
+            else decode_index_cursor(cursor, partition, index, pk, sk_prefix, descending)
+        )
+        with self._lock:
+            entries = sorted(
+                (
+                    (str(item.attrs[f"{index}sk"]), addr.pk, addr.sk, item)
+                    for addr, item in self._items.items()
+                    if addr.partition == partition
+                    and addr.table == MAIN
+                    and item.attrs.get(f"{index}pk") == pk
+                    and str(item.attrs[f"{index}sk"]).startswith(sk_prefix)
+                ),
+                key=lambda e: e[:3],
+                reverse=descending,
+            )
+            if after is not None:
+                entries = [
+                    e for e in entries if (e[:3] > after if not descending else e[:3] < after)
+                ]
+            more = limit is not None and len(entries) > limit
+            if limit is not None:
+                entries = entries[:limit]
+            items = tuple(c for e in entries if (c := self._copy(e[3])) is not None)
+        return Page(
+            items,
+            encode_index_cursor(partition, index, pk, sk_prefix, descending, entries[-1][:3])
+            if more
+            else None,
+        )
+
     def transact(self, scope: Scope, ops: Sequence[Op]) -> None:
         require_scope(scope)
         ops = tuple(ops)
@@ -117,7 +168,9 @@ class MemoryStore:
                 match p:
                     case Prepared(op=Put(key=k), addr=addr, data=d) if d is not None:
                         old = self._items.get(addr)
-                        writes[addr] = Item(k, d, 1 if old is None else old.version + 1)
+                        writes[addr] = Item(
+                            k, d, 1 if old is None else old.version + 1, dict(p.attrs)
+                        )
                     case Prepared(op=Delete(), addr=addr):
                         writes[addr] = None
             for addr, new in writes.items():
@@ -141,4 +194,8 @@ class MemoryStore:
 
     @staticmethod
     def _copy(item: Item | None) -> Item | None:
-        return None if item is None else Item(item.key, copy.deepcopy(item.data), item.version)
+        return (
+            None
+            if item is None
+            else Item(item.key, copy.deepcopy(item.data), item.version, dict(item.attrs))
+        )

@@ -44,8 +44,16 @@ UTF-8 text (the port checks number range and empty keys). The server is still th
 authority: its size and validation refusals are mapped to ``ValueError`` too.
 
 Numbers below 1E-130 and empty object keys, which DynamoDB cannot hold, are refused by the port
-for every store. Not here: GSI and TTL attributes (the ``{pk, sk, v, d}`` item cannot serve an
-index; D3-10 owns that) and the client factory.
+for every store. Not here: the client factory.
+
+Promoted attributes (D3-10). GSI keys and TTL cannot read ``d.x``, so a ``Put`` also writes the
+port's ``attrs`` as top-level attributes next to ``pk, sk, v, d``: ``gsi1pk``/``gsi1sk`` ...
+``gsi5pk``/``gsi5sk`` (strings) and ``ttl`` (a number of epoch seconds). The ``Update`` sets the
+ones it names and ``REMOVE``s the rest, so a rewrite replaces them as it replaces ``d``. An index
+partition key is stored with the item's partition prefix (``TEAM#<team>#<pk>``), like ``pk``.
+``query_index`` is a ``Query`` on ``IndexName=gsiN`` (never a scan); GSIs cannot be read
+consistently, so it is eventually consistent. ``create_tables`` makes the five GSIs
+(projection ALL, main table only) and turns TTL on for ``ttl``.
 
 The audit table gets a native ``PutItem``-style ``Put`` (not an ``Update``), because its role may
 only be allowed to create items (ADR-0017); the main table uses ``Update``.
@@ -76,11 +84,15 @@ from botocore.exceptions import (
 from sto.domain.errors import PermanentError
 
 from .ports import (
+    ATTR_NAMES,
     AUDIT,
+    INDEXES,
     MAIN,
     MAX_ITEM_BYTES,
     MAX_TRANSACTION_BYTES,
     MAX_TRANSACTION_OPS,
+    TEAM_ROOT,
+    TTL_ATTR,
     Absent,
     Addr,
     Check,
@@ -99,12 +111,18 @@ from .ports import (
     TransactionConflictError,
     TransactionOutcomeUnknownError,
     VersionIs,
+    attrs_size,
+    check_index_args,
     check_query_args,
     decode_cursor,
+    decode_index_cursor,
     encode_cursor,
+    encode_index_cursor,
+    index_pk,
     require_key,
     require_scope,
     resolve,
+    resolve_index_pk,
     validate_ops,
 )
 
@@ -436,7 +454,7 @@ class DynamoDbStore:
         except (ClientError, *_TRANSPORT_ERRORS) as exc:
             _fail(exc, write=False)
         found = response.get("Item")
-        return None if found is None else _to_item(key, found)
+        return None if found is None else _to_item(key, found, addr.partition)
 
     def query(
         self,
@@ -491,10 +509,88 @@ class DynamoDbStore:
         more = limit is not None and len(found) > limit
         if limit is not None:
             found = found[:limit]
-        items = tuple(_to_item(Key(pk, f["sk"]["S"], table), f) for f in found)
+        items = tuple(_to_item(Key(pk, f["sk"]["S"], table), f, root.partition) for f in found)
         return Page(
             items,
             encode_cursor(root.partition, table, pk, sk_prefix, items[-1].key.sk) if more else None,
+        )
+
+    def query_index(
+        self,
+        scope: Scope,
+        index: str,
+        pk: str,
+        *,
+        sk_prefix: str = "",
+        limit: int | None = None,
+        cursor: str | None = None,
+        descending: bool = False,
+    ) -> Page:
+        require_scope(scope)
+        check_index_args(index, pk, limit, sk_prefix)
+        partition, stored = resolve_index_pk(scope, pk)
+        _utf8(pk, "key")
+        _utf8(sk_prefix, "sk_prefix")
+        after = (
+            None
+            if cursor is None
+            else decode_index_cursor(cursor, partition, index, pk, sk_prefix, descending)
+        )
+        names = {"#ip": f"{index}pk"}
+        values: dict[str, Any] = {":ip": {"S": stored}}
+        expression = "#ip = :ip"
+        if sk_prefix:
+            names["#is"] = f"{index}sk"
+            values[":prefix"] = {"S": sk_prefix}
+            expression += " AND begins_with(#is, :prefix)"
+        want = None if limit is None else limit + 1
+        found: list[dict[str, Any]] = []
+        start: dict[str, Any] | None = None
+        if after is not None:
+            isk, item_pk, item_sk = after
+            start = {
+                **_table_key(Addr(partition, MAIN, item_pk, item_sk)),
+                f"{index}pk": {"S": stored},
+                f"{index}sk": {"S": isk},
+            }
+        while True:
+            args: dict[str, Any] = {
+                "TableName": self._tables[MAIN],
+                "IndexName": index,
+                "KeyConditionExpression": expression,
+                "ExpressionAttributeNames": names,
+                "ExpressionAttributeValues": values,
+                "ScanIndexForward": not descending,
+            }
+            if want is not None:
+                args["Limit"] = min(want - len(found), _MAX_QUERY_LIMIT)
+            if start is not None:
+                args["ExclusiveStartKey"] = start
+            try:
+                response = self._client.query(**args)
+            except (ClientError, *_TRANSPORT_ERRORS) as exc:
+                _fail(exc, write=False)
+            found += response["Items"]
+            start = response.get("LastEvaluatedKey")
+            if not start or (want is not None and len(found) >= want):
+                break
+        more = limit is not None and len(found) > limit
+        if limit is not None:
+            found = found[:limit]
+        items = tuple(_index_item(f, partition) for f in found)
+        last = found[-1] if found else None
+        return Page(
+            items,
+            encode_index_cursor(
+                partition,
+                index,
+                pk,
+                sk_prefix,
+                descending,
+                (last[f"{index}sk"]["S"], _addr_pk(last, partition), items[-1].key.sk),
+            )
+            if more and last is not None
+            else None,
         )
 
     # -- writes
@@ -523,6 +619,7 @@ class DynamoDbStore:
         match p:
             case Prepared(op=Put(when=when), data=data) if data is not None:
                 size = estimate_item_bytes(data, pk=key["pk"]["S"], sk=p.addr.sk)
+                size += attrs_size(p.attrs, p.addr.partition)
                 if size > MAX_ITEM_BYTES:
                     raise ValueError(f"item is {size} bytes; the limit is {MAX_ITEM_BYTES}")
                 if p.addr.table == AUDIT:
@@ -539,10 +636,23 @@ class DynamoDbStore:
                 condition = _condition(when, names, values)
                 names |= {"#v": "v", "#d": "d"}
                 values |= {":zero": {"N": "0"}, ":one": {"N": "1"}, ":data": _attr(data)}
+                sets = ["#v = if_not_exists(#v, :zero) + :one", "#d = :data"]
+                removes: list[str] = []
+                # A Put replaces the item, so every promoted attribute it does not name goes.
+                for n, name in enumerate(sorted(ATTR_NAMES)):
+                    names[f"#a{n}"] = name
+                    if name in p.attrs:
+                        sets.append(f"#a{n} = :a{n}")
+                        values[f":a{n}"] = _promoted(name, p.attrs[name], p.addr.partition)
+                    else:
+                        removes.append(f"#a{n}")
+                expression = f"SET {', '.join(sets)}"
+                if removes:
+                    expression += f" REMOVE {', '.join(removes)}"
                 update: dict[str, Any] = {
                     "TableName": table,
                     "Key": key,
-                    "UpdateExpression": "SET #v = if_not_exists(#v, :zero) + :one, #d = :data",
+                    "UpdateExpression": expression,
                 }
                 if condition:
                     update["ConditionExpression"] = condition
@@ -575,18 +685,70 @@ class DynamoDbStore:
         self.transact(scope, [Delete(key, when)])
 
 
-def _to_item(key: Key, raw: Mapping[str, Any]) -> Item:
+def _promoted(name: str, value: str | int, partition: str) -> dict[str, Any]:
+    """Wire form of a promoted attribute; an index partition key gets the item's prefix."""
+    if name == TTL_ATTR:
+        return {"N": str(value)}
+    text = str(value)
+    _utf8(text, "attribute")
+    return {"S": index_pk(partition, text) if name.endswith("pk") else text}
+
+
+def _attrs_of(raw: Mapping[str, Any], partition: str) -> dict[str, str | int]:
+    out: dict[str, str | int] = {}
+    prefix = "" if partition == _PLATFORM else f"{partition}#"
+    for name in ATTR_NAMES & raw.keys():
+        if name == TTL_ATTR:
+            out[name] = int(raw[name]["N"])
+        else:
+            text = raw[name]["S"]
+            out[name] = text.removeprefix(prefix) if name.endswith("pk") else text
+    return out
+
+
+def _addr_pk(raw: Mapping[str, Any], partition: str) -> str:
+    """The port-level pk of a stored item (empty for a team's root partition)."""
+    stored = raw["pk"]["S"]
+    if partition == _PLATFORM:
+        return str(stored)
+    return "" if stored == partition else str(stored).removeprefix(f"{partition}#")
+
+
+def _to_item(key: Key, raw: Mapping[str, Any], partition: str) -> Item:
     data = _from_wire(_DESER.deserialize(raw["d"]))
-    return Item(key, data, int(raw["v"]["N"]))
+    return Item(key, data, int(raw["v"]["N"]), _attrs_of(raw, partition))
+
+
+def _index_item(raw: Mapping[str, Any], partition: str) -> Item:
+    pk = _addr_pk(raw, partition)
+    return _to_item(Key(pk or TEAM_ROOT, raw["sk"]["S"]), raw, partition)
 
 
 # --- tables ----------------------------------------------------------------------------------
 
 
 def create_tables(client: DynamoDBClient, *, main_table: str, audit_table: str) -> None:
-    """Create the two tables if they are missing (on-demand billing, ``pk``/``sk`` strings). For
-    tests and local setups; the real tables, with indexes, TTL and backups, come from CDK."""
+    """Create the two tables if they are missing (on-demand billing, ``pk``/``sk`` strings), the
+    main one with its five GSIs and TTL on ``ttl``. For tests and local setups; the real tables,
+    with indexes, TTL and backups, come from CDK. A main table that already exists is not
+    altered: if it lacks one of the five indexes this raises ``RuntimeError``."""
+    index_keys = [f"{i}{part}" for i in INDEXES for part in ("pk", "sk")]
     for name in (main_table, audit_table):
+        definitions = [{"AttributeName": a, "AttributeType": "S"} for a in ("pk", "sk")]
+        extra: dict[str, Any] = {}
+        if name == main_table:
+            definitions += [{"AttributeName": a, "AttributeType": "S"} for a in index_keys]
+            extra["GlobalSecondaryIndexes"] = [
+                {
+                    "IndexName": i,
+                    "KeySchema": [
+                        {"AttributeName": f"{i}pk", "KeyType": "HASH"},
+                        {"AttributeName": f"{i}sk", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+                for i in INDEXES
+            ]
         try:
             client.create_table(
                 TableName=name,
@@ -594,13 +756,32 @@ def create_tables(client: DynamoDBClient, *, main_table: str, audit_table: str) 
                     {"AttributeName": "pk", "KeyType": "HASH"},
                     {"AttributeName": "sk", "KeyType": "RANGE"},
                 ],
-                AttributeDefinitions=[
-                    {"AttributeName": "pk", "AttributeType": "S"},
-                    {"AttributeName": "sk", "AttributeType": "S"},
-                ],
+                AttributeDefinitions=definitions,  # type: ignore[arg-type]
                 BillingMode="PAY_PER_REQUEST",
+                **extra,
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ResourceInUseException":
                 raise
         client.get_waiter("table_exists").wait(TableName=name)
+    # A table that already exists is left alone, so one made before D3-10 would silently lack
+    # the indexes and every ``query_index`` would fail later. Say so now instead.
+    have = {
+        g["IndexName"]
+        for g in client.describe_table(TableName=main_table)["Table"].get(
+            "GlobalSecondaryIndexes", []
+        )
+    }
+    if missing := sorted(set(INDEXES) - have):
+        raise RuntimeError(
+            f"table {main_table!r} exists without the indexes {missing}; "
+            "create_tables does not change an existing table: recreate it or add them"
+        )
+    try:
+        client.update_time_to_live(
+            TableName=main_table,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": TTL_ATTR},
+        )
+    except ClientError as exc:
+        if "already enabled" not in str(exc):  # a second run is fine
+            raise
