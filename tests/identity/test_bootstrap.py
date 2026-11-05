@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+
 import pytest
 
 from sto.config.org_policy import ORG_ADMIN, Principal
-from sto.domain.errors import PermanentError
-from sto.identity.bootstrap import Bootstrap, BootstrapRefusedError
+from sto.identity.bootstrap import Bootstrap, BootstrapRefusedError, BootstrapRetryError
 from sto.identity.mapping import RoleMapping, UserDisabledError, UserIdentity
 from sto.identity.oidc import VerifiedToken
 from sto.store.memory import MemoryStore
-from sto.store.ports import PLATFORM, Key
+from sto.store.ports import (
+    PLATFORM,
+    ConditionFailedError,
+    Key,
+    TransactionOutcomeUnknownError,
+)
 
 ISS = "https://idp.example.test"
 NOW = 1_800_000_000.0
@@ -31,8 +38,8 @@ def _tok(groups: list[str], sub: str = "u-1", iss: str = ISS, **claims: object) 
 
 
 class Env:
-    def __init__(self) -> None:
-        self.store = MemoryStore()
+    def __init__(self, store: MemoryStore | None = None) -> None:
+        self.store = store or MemoryStore()
         self.mapping = RoleMapping(self.store, issuers=[ISS], clock=lambda: NOW)
         self.audit: list[dict[str, object]] = []
         self.boot = Bootstrap(
@@ -50,18 +57,31 @@ def env() -> Env:
     return Env()
 
 
+def _marker(env: Env) -> dict[str, object] | None:
+    item = env.store.get(PLATFORM, Key("ORG", "BOOTSTRAP#USED"))
+    return item.data if item else None
+
+
 def test_empty_system_bootstrap_group_gets_in(env: Env) -> None:
     assert env.boot.is_open()
-    who = env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
+    who = env.boot.claim(_tok([BOOT]))
     assert who.is_org_admin
-    got = env.mapping.resolve(_tok([ADMINS], sub="u-2"))
+    got = env.mapping.resolve(_tok([BOOT], sub="u-2"))
     assert isinstance(got, UserIdentity)
     assert (None, ORG_ADMIN) in got.memberships
 
 
-def test_default_admin_group_is_the_bootstrap_group(env: Env) -> None:
-    env.boot.claim(_tok([BOOT]))
+def test_mapping_written_is_the_configured_group_and_nothing_else(env: Env) -> None:
+    env.boot.claim(_tok([BOOT, "grp-other"]))
     assert env.mapping.mapping(ISS, BOOT) == (None, ORG_ADMIN)
+    assert env.mapping.mapping(ISS, "grp-other") is None
+    keys = [i.key.sk for i in env.store.query(PLATFORM, "ORG").items]
+    assert sorted(keys) == ["BOOTSTRAP#USED", f"MAP#{ISS}#{BOOT}"]
+
+
+def test_claim_takes_no_admin_group(env: Env) -> None:
+    with pytest.raises(TypeError):
+        env.boot.claim(_tok([BOOT]), admin_group="grp-evil")  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -79,71 +99,183 @@ def test_only_the_named_group_in_the_named_issuer_is_a_way_in(
     env: Env, token: VerifiedToken
 ) -> None:
     with pytest.raises(BootstrapRefusedError):
-        env.boot.claim(token, admin_group=ADMINS)
+        env.boot.claim(token)
     assert env.boot.is_open()
     assert env.audit == []
 
 
 def test_cannot_be_reused_after_it_worked(env: Env) -> None:
-    env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
+    env.boot.claim(_tok([BOOT]))
     assert not env.boot.is_open()
     with pytest.raises(BootstrapRefusedError):
-        env.boot.claim(_tok([BOOT], sub="u-3"), admin_group="grp-evil")
-    assert env.mapping.mapping(ISS, "grp-evil") is None
+        env.boot.claim(_tok([BOOT], sub="u-3"))
+    assert len(env.audit) == 1
 
 
 def test_stays_closed_after_all_mappings_are_removed(env: Env) -> None:
-    env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
-    env.mapping.remove_mapping(ORG, idp=ISS, group=ADMINS, team=None)
+    env.boot.claim(_tok([BOOT]))
+    env.mapping.remove_mapping(ORG, idp=ISS, group=BOOT, team=None)
     assert not env.boot.is_open()
     with pytest.raises(BootstrapRefusedError):
-        env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
+        env.boot.claim(_tok([BOOT]))
+    assert env.mapping.mapping(ISS, BOOT) is None
 
 
-def test_closed_by_any_existing_mapping(env: Env) -> None:
+def test_mapping_written_through_role_mapping_closes_bootstrap(env: Env) -> None:
+    """Fails if mapping.py's key layout drifts from the prefix this module queries."""
     env.mapping.set_mapping(ORG, idp=ISS, group="g-x", team=None, role=ORG_ADMIN)
     assert not env.boot.is_open()
     with pytest.raises(BootstrapRefusedError):
-        env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
-    assert env.mapping.mapping(ISS, ADMINS) is None
+        env.boot.claim(_tok([BOOT]))
+    assert env.mapping.mapping(ISS, BOOT) is None
+    assert env.audit == []
 
 
 def test_disabled_user_cannot_bootstrap(env: Env) -> None:
     env.mapping.disable_user(ORG, idp=ISS, subject="u-1")
-    # a disabled-user record is not a mapping, so the system is still empty
     with pytest.raises(UserDisabledError):
-        env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
+        env.boot.claim(_tok([BOOT]))
     assert env.boot.is_open()
 
 
-def test_use_is_audited(env: Env) -> None:
-    env.boot.claim(_tok([BOOT]), admin_group=ADMINS)
-    assert env.audit == [
-        {
-            "event": "bootstrap.claimed",
-            "actor": f"{ISS}|u-1",
-            "idp": ISS,
-            "bootstrap_group": BOOT,
-            "admin_group": ADMINS,
-            "at": NOW,
-        }
-    ]
-    marker = env.store.get(PLATFORM, Key("ORG", "BOOTSTRAP#USED"))
-    assert marker is not None
-    assert marker.data["by"] == f"{ISS}|u-1"
+def test_use_is_audited_and_marker_is_the_durable_record(env: Env) -> None:
+    env.boot.claim(_tok([BOOT]))
+    record = {"by": f"{ISS}|u-1", "at": NOW, "idp": ISS, "group": BOOT}
+    assert _marker(env) == record
+    assert env.audit == [{"event": "bootstrap.claimed", **record}]
 
 
-def test_bad_admin_group_is_refused_and_leaves_it_open(env: Env) -> None:
-    with pytest.raises(PermanentError):
-        env.boot.claim(_tok([BOOT]), admin_group=" bad ")
+def test_audit_failure_after_commit_is_logged_and_claim_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = MemoryStore()
+
+    def boom(event: dict[str, object]) -> None:
+        raise RuntimeError("audit sink down")
+
+    env = Env(store)
+    boot = Bootstrap(store, env.mapping, idp=ISS, group=BOOT, clock=lambda: NOW, audit=boom)
+    with caplog.at_level(logging.ERROR):
+        who = boot.claim(_tok([BOOT]))
+    assert who.is_org_admin
+    assert env.mapping.mapping(ISS, BOOT) == (None, ORG_ADMIN)
+    assert _marker(env) is not None
+    assert "audit callback failed" in caplog.text
+
+
+def test_audit_is_required() -> None:
+    store = MemoryStore()
+    mapping = RoleMapping(store, issuers=[ISS])
+    with pytest.raises(TypeError):
+        Bootstrap(store, mapping, idp=ISS, group=BOOT)  # type: ignore[call-arg]
+
+
+class _Barrier(MemoryStore):
+    """Holds every claim's transaction until both have passed ``is_open()``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bar = threading.Barrier(2, timeout=5)
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        self.bar.wait()
+        super().transact(scope, ops)
+
+
+def test_racing_claims_have_one_winner() -> None:
+    env = Env(_Barrier())
+    wins: list[str] = []
+    errs: list[BaseException] = []
+
+    def go(sub: str) -> None:
+        try:
+            env.boot.claim(_tok([BOOT], sub=sub))
+            wins.append(sub)
+        except BaseException as exc:
+            errs.append(exc)
+
+    threads = [threading.Thread(target=go, args=(s,)) for s in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(wins) == 1
+    assert len(errs) == 1
+    assert type(errs[0]) is BootstrapRefusedError  # not a raw ConditionFailedError
+    assert not isinstance(errs[0], ConditionFailedError)
+    assert len(env.audit) == 1
+    assert _marker(env)["by"] == f"{ISS}|{wins[0]}"  # type: ignore[index]
+
+
+class _Unknown(MemoryStore):
+    """The transaction raises an unknown outcome, applied or not."""
+
+    def __init__(self, *, applied: bool) -> None:
+        super().__init__()
+        self.applied = applied
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        if self.applied:
+            super().transact(scope, ops)
+        raise TransactionOutcomeUnknownError("answer lost")
+
+
+def test_unknown_outcome_that_committed_finishes_as_success() -> None:
+    env = Env(_Unknown(applied=True))
+    who = env.boot.claim(_tok([BOOT]))
+    assert who.is_org_admin
+    assert env.mapping.mapping(ISS, BOOT) == (None, ORG_ADMIN)
+    assert _marker(env) is not None
+    assert [e["event"] for e in env.audit] == ["bootstrap.claimed"]
+
+
+def test_unknown_outcome_that_did_not_commit_is_retryable_and_still_open() -> None:
+    env = Env(_Unknown(applied=False))
+    with pytest.raises(BootstrapRetryError):
+        env.boot.claim(_tok([BOOT]))
     assert env.boot.is_open()
+    assert _marker(env) is None
+    assert env.mapping.mapping(ISS, BOOT) is None
     assert env.audit == []
 
 
-def test_misconfigured_bootstrap_is_refused() -> None:
+def test_unknown_outcome_after_someone_else_won_is_refused() -> None:
+    class Lost(MemoryStore):
+        done = False
+
+        def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+            if self.done:
+                return super().transact(scope, ops)
+            self.done = True
+            other = Bootstrap(
+                self, RoleMapping(self, issuers=[ISS]), idp=ISS, group=BOOT, audit=lambda e: None
+            )
+            other.claim(_tok([BOOT], sub="winner"))
+            raise TransactionOutcomeUnknownError("answer lost")
+
+    env = Env(Lost())
+    with pytest.raises(BootstrapRefusedError):
+        env.boot.claim(_tok([BOOT], sub="loser"))
+    assert env.audit == []
+    assert _marker(env)["by"] == f"{ISS}|winner"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("group", ["", " " + BOOT, BOOT + " ", "a\x00b", "x" * 500])
+def test_misconfigured_group_is_refused(group: str) -> None:
     store = MemoryStore()
-    mapping = RoleMapping(store, issuers=[ISS])
-    with pytest.raises(ValueError, match="configured issuer"):
-        Bootstrap(store, mapping, idp="https://nope.example.test", group=BOOT)
-    with pytest.raises(ValueError, match="non-empty"):
-        Bootstrap(store, mapping, idp=ISS, group="")
+    with pytest.raises(ValueError, match="bad bootstrap configuration"):
+        Bootstrap(
+            store, RoleMapping(store, issuers=[ISS]), idp=ISS, group=group, audit=lambda e: None
+        )
+
+
+def test_misconfigured_idp_is_refused() -> None:
+    store = MemoryStore()
+    with pytest.raises(ValueError, match="bad bootstrap configuration"):
+        Bootstrap(
+            store,
+            RoleMapping(store, issuers=[ISS]),
+            idp="https://nope.example.test",
+            group=BOOT,
+            audit=lambda e: None,
+        )
