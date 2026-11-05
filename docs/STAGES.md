@@ -674,7 +674,7 @@ Found in review of D3-05 and D3-18. An issuer containing `|` lets two identities
 #### D3-22: Handlers enforce own and stop-at-gate grants
 Found in review of D3-03. The middleware refuses an "own" or stop-at-gate grant on any route that does not declare it checks ownership or the gate, so today a developer cannot cancel their own run, and a custom gate role cannot stop a run at its gate. The decide handler records every decision as actor `dev`.
 **AC:** the cancel route declares both checks and its handler enforces them: an "own" holder cancels only runs they started, and a stop-at-gate holder only a run waiting at a gate their role may decide; both are refused otherwise, by the shared tenancy suite. The decide handler records the authenticated actor, never a constant. The decide 409's stop link works for every role it is offered to.
-**Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
+**Deps:** D3-03. **Size:** S. **Run:** serial. **Files:** `src/sto/api/routers/runs.py`, `src/sto/api/routers/gates.py`, `src/sto/api/auth.py`, `tests/api/test_tenancy.py`, `src/sto/api/runtime.py` (records who started a run, and a gate's deciding roles).
 
 ---
 
