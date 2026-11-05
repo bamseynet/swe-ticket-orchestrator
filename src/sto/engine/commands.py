@@ -6,6 +6,12 @@ commands from their own files, so adding one never edits this file.
 ``OpenGate`` carries no gate ID, because the reducer has no randomness. It is identified by
 ``(run_id, name, round)`` (the ``GATE#g#round`` key). D1-06 must make opening a gate
 idempotent on that triple, not mint an ID and insert, or a replayed command opens it twice.
+
+``OpenGate.subject`` is a head subject for every gate type but ``pre_push``, whose gate closes
+before any commit exists and so takes the short pre-push subject (the ``Gate`` invariant).
+``OpenRevert`` is the engine's implicit scoped effect for a merge that ended without a QA
+approval (PLAN 6.2); like ``pr.open_revert`` it is keyed by ``(run, merge_sha)`` (PLAN 6.3), so a
+replay or a declared revert opens one PR.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ class RunStep:
 @COMMANDS.register("open_gate")
 @dataclass(frozen=True)
 class OpenGate:
-    """Always a head subject: every gate here binds evidence via ``head_sha``."""
+    """A head subject, or the pre-push subject for a ``pre_push`` gate (see the module doc)."""
 
     run_id: RunId
     name: str
@@ -60,8 +66,19 @@ class StopRun:
     run_id: RunId
 
 
+@COMMANDS.register("open_revert")
+@dataclass(frozen=True)
+class OpenRevert:
+    run_id: RunId
+    merge_sha: str
+
+
 @COMMANDS.register("finish")
 @dataclass(frozen=True)
 class Finish:
+    """``incident`` is the ``done_with_incident`` flag of PLAN 6.2: the run merged code and
+    ended without a QA approval of it, so the driver alerts."""
+
     run_id: RunId
     status: RunStatus
+    incident: bool = False
