@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 
 import pytest
 
@@ -16,6 +17,8 @@ from sto.store.ports import (
     PLATFORM,
     ConditionFailedError,
     Key,
+    Put,
+    TransactionConflictError,
     TransactionOutcomeUnknownError,
 )
 
@@ -170,6 +173,14 @@ def test_audit_is_required() -> None:
         Bootstrap(store, mapping, idp=ISS, group=BOOT)  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize("audit", [None, "log", 5])
+def test_audit_must_be_callable(audit: object) -> None:
+    store = MemoryStore()
+    mapping = RoleMapping(store, issuers=[ISS])
+    with pytest.raises(ValueError, match="audit must be callable"):
+        Bootstrap(store, mapping, idp=ISS, group=BOOT, audit=audit)  # type: ignore[arg-type]
+
+
 class _Barrier(MemoryStore):
     """Holds every claim's transaction until both have passed ``is_open()``."""
 
@@ -239,25 +250,123 @@ def test_unknown_outcome_that_did_not_commit_is_retryable_and_still_open() -> No
     assert env.audit == []
 
 
+class _OtherWins(MemoryStore):
+    """Another claimant's transaction commits instead of ours, and the answer is lost."""
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        first = ops[0]
+        other = Put(
+            first.key, {**first.data, "by": f"{ISS}|winner", "at": NOW + 5}, when=first.when
+        )
+        super().transact(scope, [other, ops[1]])
+        raise TransactionOutcomeUnknownError("answer lost")
+
+
 def test_unknown_outcome_after_someone_else_won_is_refused() -> None:
-    class Lost(MemoryStore):
-        done = False
-
-        def transact(self, scope, ops):  # type: ignore[no-untyped-def]
-            if self.done:
-                return super().transact(scope, ops)
-            self.done = True
-            other = Bootstrap(
-                self, RoleMapping(self, issuers=[ISS]), idp=ISS, group=BOOT, audit=lambda e: None
-            )
-            other.claim(_tok([BOOT], sub="winner"))
-            raise TransactionOutcomeUnknownError("answer lost")
-
-    env = Env(Lost())
-    with pytest.raises(BootstrapRefusedError):
+    env = Env(_OtherWins())
+    with pytest.raises(BootstrapRefusedError, match="someone else"):
         env.boot.claim(_tok([BOOT], sub="loser"))
     assert env.audit == []
     assert _marker(env)["by"] == f"{ISS}|winner"  # type: ignore[index]
+
+
+class _SameClaimantEarlier(MemoryStore):
+    """The same claimant's earlier request commits first (at a later time), answer lost."""
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        first = ops[0]
+        super().transact(
+            scope, [Put(first.key, {**first.data, "at": NOW + 5}, when=first.when), ops[1]]
+        )
+        raise TransactionOutcomeUnknownError("answer lost")
+
+
+def test_audit_event_comes_from_the_stored_marker() -> None:
+    env = Env(_SameClaimantEarlier())
+    env.boot.claim(_tok([BOOT]))
+    assert _marker(env)["at"] == NOW + 5  # type: ignore[index]
+    assert env.audit == [{"event": "bootstrap.claimed", **_marker(env)}]  # type: ignore[dict-item]
+
+
+class _ReadFailsAfterCommit(MemoryStore):
+    """The transaction commits, the answer is lost, and the first re-read fails."""
+
+    fail_get = False
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        super().transact(scope, ops)
+        self.fail_get = True
+        raise TransactionOutcomeUnknownError("answer lost")
+
+    def get(self, scope, key):  # type: ignore[no-untyped-def]
+        if self.fail_get:
+            self.fail_get = False
+            raise TransactionConflictError("read failed")
+        return super().get(scope, key)
+
+
+def test_failed_reread_is_retryable_and_the_retry_succeeds_and_notifies() -> None:
+    env = Env(_ReadFailsAfterCommit())
+    with pytest.raises(BootstrapRetryError):
+        env.boot.claim(_tok([BOOT]))
+    assert env.audit == []
+    who = env.boot.claim(_tok([BOOT]))  # the recorded claimant is already org_admin
+    assert who.is_org_admin
+    assert [e["event"] for e in env.audit] == ["bootstrap.claimed"]
+    assert env.audit[0] == {"event": "bootstrap.claimed", **_marker(env)}  # type: ignore[dict-item]
+
+
+def test_idempotent_for_the_recorded_claimant_but_not_for_others(env: Env) -> None:
+    env.boot.claim(_tok([BOOT]))
+    assert env.boot.claim(_tok([BOOT])).is_org_admin
+    assert len(env.audit) == 2
+    with pytest.raises(BootstrapRefusedError, match="someone else"):
+        env.boot.claim(_tok([BOOT], sub="u-9"))
+
+
+def test_marker_for_this_claimant_with_mapping_gone_is_refused_and_says_why(env: Env) -> None:
+    env.boot.claim(_tok([BOOT]))
+    env.mapping.remove_mapping(ORG, idp=ISS, group=BOOT, team=None)
+    with pytest.raises(BootstrapRefusedError, match="mapping has since been removed"):
+        env.boot.claim(_tok([BOOT]))
+    assert env.mapping.mapping(ISS, BOOT) is None
+    assert len(env.audit) == 1
+
+
+class _Interleave(MemoryStore):
+    """Runs ``hook`` once, just before the first transaction."""
+
+    hook: Callable[[], None] | None = None
+
+    def transact(self, scope, ops):  # type: ignore[no-untyped-def]
+        hook, self.hook = self.hook, None
+        if hook:
+            hook()
+        super().transact(scope, ops)
+
+
+def test_marker_absent_condition_holds_when_the_mapping_was_removed_meanwhile() -> None:
+    """A passes is_open(); B claims; an admin removes the mapping; A's transaction must lose."""
+    store = _Interleave()
+    env = Env(store)
+
+    def interleave() -> None:
+        env.boot.claim(_tok([BOOT], sub="B"))
+        env.mapping.remove_mapping(ORG, idp=ISS, group=BOOT, team=None)
+
+    store.hook = interleave
+    with pytest.raises(BootstrapRefusedError):
+        env.boot.claim(_tok([BOOT], sub="A"))
+    assert _marker(env)["by"] == f"{ISS}|B"  # type: ignore[index]
+    assert env.mapping.mapping(ISS, BOOT) is None
+    assert len(env.audit) == 1
+
+
+def test_stored_marker_group_is_the_bootstrap_group_among_many(env: Env) -> None:
+    env.boot.claim(_tok(["grp-a", BOOT, "grp-z"]))
+    assert _marker(env)["group"] == BOOT  # type: ignore[index]
+    assert env.mapping.mapping(ISS, "grp-a") is None
+    assert env.mapping.mapping(ISS, "grp-z") is None
 
 
 @pytest.mark.parametrize("group", ["", " " + BOOT, BOOT + " ", "a\x00b", "x" * 500])

@@ -19,9 +19,11 @@ The required ``audit`` callback is a notification sent after commit; if it raise
 logged and the claim still succeeds, because the grant and its durable record are committed.
 
 If the store reports an unknown outcome the claim re-reads: when the marker names this claimant
-and the mapping exists it finishes as a success; when neither exists the bootstrap is still open
-and :class:`BootstrapRetryError` (transient) is raised. After any refusal or error other than a
-committed claim, the bootstrap is still open.
+and the mapping exists it finishes as a success, notifying from the **stored** marker so the event
+matches the durable record; when neither exists the bootstrap is still open and
+:class:`BootstrapRetryError` (transient) is raised, as it is if the re-read itself fails. A retry
+by the recorded claimant succeeds (idempotent). A marker with its mapping gone is refused: the
+bootstrap stays closed.
 
 Private use, not done here: this module imports ``_check_text`` and calls ``_check_idp`` from
 ``mapping.py`` and copies its ``ORG``/``MAP#`` key layout, because ``mapping.py`` is not in this
@@ -78,6 +80,8 @@ class Bootstrap:
         audit: Callable[[dict[str, Any]], None],
         clock: Callable[[], float] = time.time,
     ) -> None:
+        if not callable(audit):
+            raise ValueError("bad bootstrap configuration: audit must be callable")
         try:
             _check_text("the bootstrap group", group)
             mapping._check_idp(idp)
@@ -95,8 +99,12 @@ class Bootstrap:
     def claim(self, token: VerifiedToken) -> Principal:
         """Map the bootstrap group to ``org_admin``. Works once. Returns the acting principal.
 
-        Raises :class:`BootstrapRefusedError`, ``UserDisabledError`` or
-        :class:`BootstrapRetryError`; the bootstrap stays open after each of them.
+        Idempotent for the recorded claimant: if the marker names them and the mapping exists,
+        the call succeeds and notifies again (the first notification may have been lost).
+
+        Raises :class:`BootstrapRefusedError` (not the bootstrap group, a service identity, or
+        already used: the bootstrap is closed for good), ``UserDisabledError`` (still open) or
+        :class:`BootstrapRetryError` (the outcome could not be confirmed; retry).
         """
         if token.issuer != self._idp or self._group not in token.groups:
             raise BootstrapRefusedError("not the bootstrap group")
@@ -107,34 +115,53 @@ class Bootstrap:
         else:
             if isinstance(who, ServiceIdentity):
                 raise BootstrapRefusedError("a service identity cannot bootstrap")
-        if not self.is_open():
-            raise BootstrapRefusedError("the bootstrap has been used or mappings exist")
         actor = f"{token.issuer}|{token.subject}"
-        now = self._clock()
-        marker = {"by": actor, "at": now, "idp": self._idp, "group": self._group}
-        grant = {"team": None, "role": ORG_ADMIN, "by": actor, "at": now}
         map_key = Key("ORG", f"{_MAP_PREFIX}{self._idp}#{self._group}")
-        try:
-            self._store.transact(
-                PLATFORM,
-                [Put(_USED, marker, when=Absent()), Put(map_key, grant, when=Absent())],
-            )
-        except ConditionFailedError as exc:
-            raise BootstrapRefusedError("the bootstrap has been used") from exc
-        except TransactionOutcomeUnknownError as exc:
-            if not self._committed(map_key, actor):
-                raise BootstrapRetryError("outcome unknown and nothing was written") from exc
-        self._notify({"event": "bootstrap.claimed", **marker})
+        recorded = self._recorded(map_key, actor)
+        if recorded is None:
+            if not self.is_open():
+                raise BootstrapRefusedError("the bootstrap has been used or mappings exist")
+            now = self._clock()
+            marker = {"by": actor, "at": now, "idp": self._idp, "group": self._group}
+            grant = {"team": None, "role": ORG_ADMIN, "by": actor, "at": now}
+            try:
+                self._store.transact(
+                    PLATFORM,
+                    [Put(_USED, marker, when=Absent()), Put(map_key, grant, when=Absent())],
+                )
+            except ConditionFailedError as exc:
+                raise BootstrapRefusedError("the bootstrap has been used") from exc
+            except TransactionOutcomeUnknownError as exc:
+                recorded = self._reread(map_key, actor, exc)
+            else:
+                recorded = marker
+        self._notify({"event": "bootstrap.claimed", **recorded})
         return Principal(actor, frozenset({ORG_ADMIN}))
 
-    def _committed(self, map_key: Key, actor: str) -> bool:
-        """After an unknown outcome: True if this claimant's claim is there in full."""
+    def _reread(self, map_key: Key, actor: str, cause: Exception) -> dict[str, Any]:
+        """After an unknown outcome: the stored marker if this claim committed, else retry."""
+        try:
+            recorded = self._recorded(map_key, actor)
+        except TransientError as exc:
+            raise BootstrapRetryError("outcome unknown and could not be confirmed") from exc
+        if recorded is None:  # one transaction: no marker means nothing was written
+            raise BootstrapRetryError("outcome unknown and nothing was written") from cause
+        return recorded
+
+    def _recorded(self, map_key: Key, actor: str) -> dict[str, Any] | None:
+        """The stored marker if it is this claimant's and complete; ``None`` if there is none.
+
+        Refuses when the marker is someone else's, or this claimant's with the mapping gone."""
         used = self._store.get(PLATFORM, _USED)
         if used is None:
-            return False  # one transaction: no marker means no mapping, and still open
-        if used.data.get("by") != actor or self._store.get(PLATFORM, map_key) is None:
-            raise BootstrapRefusedError("the bootstrap has been used")
-        return True
+            return None
+        if used.data.get("by") != actor:
+            raise BootstrapRefusedError("the bootstrap has been used by someone else")
+        if self._store.get(PLATFORM, map_key) is None:
+            raise BootstrapRefusedError(
+                "the bootstrap was used and its mapping has since been removed; it stays closed"
+            )
+        return {k: used.data[k] for k in ("by", "at", "idp", "group")}
 
     def _notify(self, event: dict[str, Any]) -> None:
         try:
