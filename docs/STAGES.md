@@ -722,7 +722,7 @@ Consumers treat the delivery as a nudge and re-read state.
 `X-Hub-Signature-256` in constant time, dedupe by `X-GitHub-Delivery`, event parsing to `ExternalChange`.
 Installation and permission events update connection state.
 **AC:** conformance signature and duplicate tests pass; each subscribed event type has a fixture. A static check enforces constant-time signature comparison, which the black-box suite cannot see; the signature and duplicate sections run with `signed_timestamp=False`, relying on durable dedupe and re-reading. The dedupe record does not expire, as D4-03 rules. The constant-time static check covers every signature comparison under `src/sto/adapters/`, not only this one, so Jira and Slack are held to it. The conformance target is a class defined in `sto.ingest.github`, since the vendor check refuses a generic class from `sto/ingest/core.py`.
-**Deps:** D4-03, D4-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`.
+**Deps:** D4-03, D4-16. **Size:** S. **Run:** parallel. **Files:** `src/sto/ingest/github.py`, `tests/ingest/test_github.py`, `src/sto/adapters/ports.py` (one optional field, `ExternalChange.installation_id`).
 
 #### D4-05: GitHub issues as tickets
 `TicketSource` on issues: intake by label, comments, labels and `/sto` commands from linked users only, recording the actor from the issue's events.
