@@ -19,6 +19,12 @@ is a path, and a failing rule prints it, so a team can see which way round the g
   not lead to a ``rejected`` terminal on a path with no QA gate, because PLAN 7.7 says a rejected
   run blocks the release, and only a QA decision can say so. V17 allows that shape and leaves
   it to this rule.
+  The merge-before-QA clause removes the QA gates' ``approved`` edges and follows every other
+  edge, so a QA gate that answers ``rejected`` straight to ``closed`` is refused, because that
+  ends a merged run with no revert. That is stricter than "QA gates removed" and deliberate;
+  route the rejection to ``pr.open_revert`` (as PLAN 7.7 does) or to a ``rejected`` terminal.
+  Q2 (PLAN 7.5) is also applied: with every review gate's approval removed, ``done`` is
+  unreachable too.
 * V11. With ``review_panel`` stages removed, no ``review`` gate is reachable from a
   code-changing stage: LLM reviews come before the human review.
 * V14. With the QA evidence stages removed (``qa_suite`` checks, and agents whose profile holds
@@ -37,6 +43,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Collection, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from sto.config.manifest import Manifest, load_manifest
@@ -58,9 +65,17 @@ __all__ = ["check_gate_dominance", "code_changing_stages", "qa_evidence_stages"]
 _WRITES = "workspace.write"
 _EVIDENCE_TOOL = "record_evidence"
 _UPDATE_BRANCH = "pr.update_branch"
-_MAX_PATH = 10  # nodes shown; a longer path keeps its ends and elides the middle
 
 Parents = dict[str, str | None]
+
+
+@dataclass(frozen=True)
+class _Finding(Issue):
+    """An ``Issue`` that keeps its whole message. ``Issue`` cuts text at 600 characters, which
+    would cut the end of a long path. Every name in a message is a validated identifier."""
+
+    def __post_init__(self) -> None:
+        pass
 
 
 def _targets(edges: Any) -> dict[str, str]:
@@ -112,9 +127,7 @@ def _path(parents: Parents, to: str) -> list[str]:
 
 
 def _show(path: list[str]) -> str:
-    if len(path) > _MAX_PATH:
-        keep = _MAX_PATH // 2
-        path = [*path[:keep], "...", *path[-keep:]]
+    """The whole path: the bypass edge is often in the middle, which is the part a cut drops."""
     return " -> ".join(path)
 
 
@@ -143,6 +156,22 @@ def code_changing_stages(wf: Workflow, manifest: Manifest | None = None) -> set[
             if isinstance(st, ChecksStage) and st.source == "ci"
         }
     return {sid for sid in out if sid in wf.stages}
+
+
+def _writing_stages(wf: Workflow, manifest: Manifest) -> set[str]:
+    """Stages that really start a follow-up change: an agent with ``workspace.write`` and
+    ``pr.update_branch``. Narrower than ``code_changing_stages``: a ``ci`` stage is only an entry
+    point for someone else's commit, and an unknown agent is not known to write, so neither
+    ends V6's rejected search."""
+    out: set[str] = set()
+    for sid, stage in wf.stages.items():
+        if isinstance(stage, AgentStage):
+            tools = _agent_profile_tools(manifest, stage)
+            if tools is not None and _WRITES in tools:
+                out.add(sid)
+        elif isinstance(stage, EffectStage) and stage.effect == _UPDATE_BRANCH:
+            out.add(sid)
+    return out
 
 
 def qa_evidence_stages(wf: Workflow, manifest: Manifest | None = None) -> set[str]:
@@ -188,7 +217,7 @@ def _v4_v5(wf: Workflow, manifest: Manifest) -> list[Issue]:
         gated.append((sid, stage))
         if not stage.requires_gates:
             issues.append(
-                Issue(
+                _Finding(
                     None,
                     f"stages.{sid}.requires_gates",
                     f"V4: {sid} ({stage.effect}) is a gated effect and lists no gate; "
@@ -206,7 +235,7 @@ def _v4_v5(wf: Workflow, manifest: Manifest) -> list[Issue]:
             what = "does not exist" if gate is None else "is not a gate"
             for sid, _ in effects:
                 issues.append(
-                    Issue(
+                    _Finding(
                         None,
                         f"stages.{sid}.requires_gates",
                         f"V4: {sid} lists {gid} in requires_gates, but {gid} {what}; "
@@ -216,7 +245,7 @@ def _v4_v5(wf: Workflow, manifest: Manifest) -> list[Issue]:
             continue
         if "approved" not in gate.next:
             issues.append(
-                Issue(
+                _Finding(
                     None,
                     f"stages.{gid}.next",
                     f"V4: gate {gid} has no approved edge, so nothing can pass it; add "
@@ -228,7 +257,7 @@ def _v4_v5(wf: Workflow, manifest: Manifest) -> list[Issue]:
         for sid, stage in effects:
             if sid in from_start:
                 issues.append(
-                    Issue(
+                    _Finding(
                         None,
                         f"stages.{sid}.requires_gates",
                         f"V4: {sid} ({stage.effect}) is reachable without {gid}'s approval; "
@@ -241,7 +270,7 @@ def _v4_v5(wf: Workflow, manifest: Manifest) -> list[Issue]:
             for sid, stage in effects:
                 if sid in after and sid != cid:
                     issues.append(
-                        Issue(
+                        _Finding(
                             None,
                             f"stages.{sid}.requires_gates",
                             f"V5: {sid} ({stage.effect}) is reachable from {cid}, which can "
@@ -265,7 +294,7 @@ def _v6_floors(wf: Workflow) -> list[Issue]:
         if need and not listed & need[1]:
             kind, _ = need
             issues.append(
-                Issue(
+                _Finding(
                     None,
                     f"stages.{sid}.requires_gates",
                     f"V6: {sid} ({stage.effect}) must list a {kind} gate (a gate stage of "
@@ -282,7 +311,7 @@ def _v6_paths(wf: Workflow, manifest: Manifest) -> list[Issue]:
     for sid, stage in wf.stages.items():
         if isinstance(stage, TerminalStage) and stage.result == "done" and sid in without_qa:
             issues.append(
-                Issue(
+                _Finding(
                     None,
                     f"stages.{sid}",
                     f"V6: terminal {sid} (done) is reachable without a QA approval; "
@@ -290,12 +319,26 @@ def _v6_paths(wf: Workflow, manifest: Manifest) -> list[Issue]:
                     f"path: {_show(_path(without_qa, sid))}",
                 )
             )
-    code = code_changing_stages(wf, manifest)
+    review = _gate_ids(wf, "review")
+    without_review = _reach(wf, [wf.start], drop_approved=review)
+    for sid, stage in wf.stages.items():
+        if isinstance(stage, TerminalStage) and stage.result == "done" and sid in without_review:
+            issues.append(
+                _Finding(
+                    None,
+                    f"stages.{sid}",
+                    f"V6: terminal {sid} (done) is reachable without a review approval; "
+                    f"Q2: every path to done must pass a review gate's approved edge; "
+                    f"path: {_show(_path(without_review, sid))}",
+                )
+            )
+    writers = _writing_stages(wf, manifest)
     merges = [sid for sid, st in _effects(wf) if st.effect == "pr.merge"]
     all_reach = _reach(wf, [wf.start])
     for mid in merges:
         merge = wf.stages[mid]
-        assert isinstance(merge, EffectStage)
+        if not isinstance(merge, EffectStage):
+            raise TypeError(f"{mid} was listed as an effect stage but is a {merge.kind} stage")
         landed = _targets(merge.next).get("done")
         if landed is None or landed not in wf.stages:
             continue
@@ -308,7 +351,7 @@ def _v6_paths(wf: Workflow, manifest: Manifest) -> list[Issue]:
                     and tid in after
                 ):
                     issues.append(
-                        Issue(
+                        _Finding(
                             None,
                             f"stages.{mid}.next",
                             f"V6: {mid} can merge before QA, and from its done edge terminal "
@@ -319,11 +362,11 @@ def _v6_paths(wf: Workflow, manifest: Manifest) -> list[Issue]:
                     )
         if mid not in all_reach:
             continue
-        after = _reach(wf, [landed], skip=qa, stop=code)
+        after = _reach(wf, [landed], skip=qa, stop=writers)
         for tid, term in wf.stages.items():
             if isinstance(term, TerminalStage) and term.result == "rejected" and tid in after:
                 issues.append(
-                    Issue(
+                    _Finding(
                         None,
                         f"stages.{mid}.next",
                         f"V6: after {mid} merges, terminal {tid} (rejected) is reachable with no "
@@ -353,7 +396,7 @@ def _v11_v14(wf: Workflow, manifest: Manifest) -> list[Issue]:
                 reported.add(gid)
                 have = f" (now: {', '.join(removed)})" if removed else ""
                 issues.append(
-                    Issue(
+                    _Finding(
                         None,
                         f"stages.{gid}",
                         f"{rule}: {label} {gid} is reachable from {cid}, which can change the "

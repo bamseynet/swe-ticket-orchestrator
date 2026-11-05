@@ -707,3 +707,101 @@ def test_v6_an_unreachable_merge_followed_by_a_rejection_is_not_reported() -> No
         }
 
     assert only(check(standard(island)), "V6") == []
+
+
+# --- pass 1 review ----------------------------------------------------------------------------
+
+
+def test_v6_a_rejection_after_a_merge_through_a_ci_stage_is_refused() -> None:
+    def post_ci(data: dict[str, Any]) -> None:
+        data["stages"]["post_ci"] = {
+            "kind": "checks",
+            "source": "ci",
+            "required": "team_default",
+            "timeout": "1h",
+            "next": {"green": "qa_auto", "red": "closed_rejected"},
+        }
+        data["stages"]["merge"]["next"]["done"] = "post_ci"
+
+    issues = only(_kanban(post_ci), "V6")
+    assert any("rejected" in i.message and "post_ci" in i.message for i in issues)
+
+
+def test_v6_a_rejection_after_a_merge_through_an_unknown_agent_is_refused() -> None:
+    def mystery(data: dict[str, Any]) -> None:
+        data["stages"]["mystery"] = {
+            "kind": "agent",
+            "agent": "mystery_agent",
+            "next": {"fail": "closed_rejected", "pass": "qa_auto"},
+        }
+        data["stages"]["merge"]["next"]["done"] = "mystery"
+
+    issues = only(_kanban(mystery), "V6")
+    assert any("rejected" in i.message and "mystery" in i.message for i in issues)
+
+
+def test_v6_a_rejection_after_a_merge_behind_an_implementer_is_still_the_engines() -> None:
+    def follow_up(data: dict[str, Any]) -> None:
+        data["stages"]["merge"]["next"]["done"] = "implement"
+
+    assert [i for i in only(_kanban(follow_up), "V6") if "rejected" in i.message] == []
+
+
+def test_v6_done_is_unreachable_without_a_review_approval() -> None:
+    wf = _no_review()
+    issues = only(check(wf), "V6")
+    assert any("without a review approval" in i.message and "done" in i.message for i in issues)
+    assert only(check(_no_review(with_review=True)), "V6") == []
+
+
+def _no_review(*, with_review: bool = False) -> Workflow:
+    stages: dict[str, Any] = {
+        "impl": {"kind": "agent", "agent": "implementer", "next": {"ready": "qa_gate"}},
+        "qa_gate": QA_GATE | {"next": {"approved": "done", "rejected": "closed"}},
+        "closed": {"kind": "terminal", "result": "closed"},
+        "done": {"kind": "terminal", "result": "done"},
+    }
+    if with_review:
+        stages["impl"]["next"]["ready"] = "review_gate"
+        stages["review_gate"] = REVIEW_GATE | {
+            "next": {"approved": "qa_gate", "rejected": "closed"}
+        }
+    return wf_of(
+        {
+            "apiVersion": "sto/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "flow", "team": "platform"},
+            "limits": {"max_steps_per_run": 20, "max_run_age": "10d"},
+            "start": "impl",
+            "stages": stages,
+        }
+    )
+
+
+def test_v6_a_qa_rejection_straight_to_closed_after_a_merge_is_refused_on_purpose() -> None:
+    def closes(data: dict[str, Any]) -> None:
+        data["stages"]["qa_gate"]["next"]["rejected"] = "closed"
+
+    issues = only(_kanban(closes), "V6")
+    assert any("can merge before QA" in i.message and "closed" in i.message for i in issues)
+
+
+def test_the_whole_failing_path_is_printed_with_the_bypass_edge() -> None:
+    n = 14
+
+    def chain(stages: dict[str, Any]) -> None:
+        for k in range(n):
+            stages[f"hop{k}"] = {
+                "kind": "checks",
+                "source": "ci",
+                "required": "team_default",
+                "timeout": "1h",
+                "next": {"green": f"hop{k + 1}" if k + 1 < n else "llm_review", "red": "implement"},
+            }
+        stages["ci"]["next"]["green"] = "hop0"
+        stages[f"hop{n // 2}"]["next"]["green"] = "merge"  # the bypass edge, mid-path
+
+    msgs = [i.message for i in only(check(standard(chain)), "V4")]
+    want = f"hop{n // 2 - 1} -> hop{n // 2} -> merge"
+    assert any(want in m for m in msgs), msgs
+    assert not any("..." in m for m in msgs)
