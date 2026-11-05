@@ -540,7 +540,7 @@ Custom gate roles are declared per team.
 Middleware turns a verified identity into a `TeamScope` and enforces the permission matrix from PLAN.md section 9.3. Repositories already require the scope from D1-01.
 A shared suite tries every route as every role from another team.
 **AC:** matrix tests are generated from one table; cross-team access is refused on every route; T9 covered; a new route with no declared permission fails a test. An import-boundary test fails if any module outside its own tests imports `sto/identity/fake_issuer.py`. A service identity is denied on every route unless the route declares a service permission.
-**Deps:** D3-02, D1-08. **Size:** M. **Run:** serial. **Files:** `src/sto/api/auth.py`, `tests/api/test_tenancy.py`.
+**Deps:** D3-02, D1-08. **Size:** M. **Run:** serial. **Files:** `src/sto/api/auth.py`, `src/sto/api/app.py`, `tests/api/test_tenancy.py`.
 
 #### D3-04: Account linking
 Linking proves control of a Slack, GitHub or **Jira** account through that vendor's OAuth flow, while signed in to SSO.
