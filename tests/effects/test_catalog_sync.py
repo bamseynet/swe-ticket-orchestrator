@@ -20,6 +20,11 @@ MANIFEST = load_manifest()
 # PLAN 6.3, scoped row: "Engine-implicit, needing no stage: check runs, gate notifications,
 # `pr.close` on reject, a revert PR for an unqualified merge". The revert PR is `pr.open_revert`,
 # which a workflow may also declare, so it is in the catalog.
+# Nothing in src emits `check.publish` or `gate.notify` yet. PLAN 6.3 (the `scoped` row of the
+# effect-class table) names them as engine-implicit: "check runs, gate notifications". The check
+# run is the GitHub App's `sto/review-gate` and `sto/qa-gate` check (PLAN, GitHub enforcement),
+# planned in STAGES.md D4-08 "Gate check runs". `pr.close` is the close on reject (PLAN 6.3).
+# The set pins the exact names, so a typo or rename in `IMPLICIT_TYPES` fails here.
 ENGINE_ONLY = frozenset({"check.publish", "gate.notify", "pr.close"})
 
 

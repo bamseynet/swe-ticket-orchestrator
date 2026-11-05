@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -451,7 +452,9 @@ def test_v3_a_loop_name_must_have_a_limit() -> None:
     def change(s: dict[str, Any]) -> None:
         s["panel"]["next"]["findings"] = {"to": "implement", "loop": "mystery"}
 
-    _refused(_stages(change), names="panel", says="mystery")
+    issues = _refused(_stages(change), names="panel", says="mystery")
+    # and a loop with no limit caps nothing, so the cycle it was meant to cap is reported too
+    assert any("cycle" in i.message for i in issues), _text(issues)
 
 
 def test_v3_a_loop_limit_may_not_pass_the_platform_cap() -> None:
@@ -490,14 +493,69 @@ def test_v7_the_validator_also_refuses_an_empty_roles_list_that_got_past_the_sch
     assert any("review_gate" in i.path and "eligible_roles" in i.message for i in issues)
 
 
-def test_v7_a_quorum_role_must_be_eligible() -> None:
-    def change(s: dict[str, Any]) -> None:
-        s["review_gate"]["gate"]["quorum"] = [
-            {"role": "reviewer", "count": 1},
-            {"role": "x", "count": 1},
-        ]
+def _custom_gate(s: dict[str, Any], **gate: Any) -> None:
+    """A custom gate between review and merge: no mandatory-role rule applies to it."""
+    s["sec"] = _gate(
+        "custom",
+        ["security_officer"],
+        {
+            "approved": "merge",
+            "changes_requested": {"to": "implement", "loop": "review_loop"},
+            "rejected": "closed",
+        },
+        **gate,
+    )
+    s["review_gate"]["next"]["approved"] = "sec"
 
-    _refused(_stages(change), names="review_gate", says="x")
+
+def _custom_surfaces(d: dict[str, Any]) -> None:
+    d["floors"]["decision_surfaces"]["custom"] = ["ui"]
+
+
+def test_v7_a_quorum_role_must_be_eligible() -> None:
+    # a custom gate, so V15's mandatory-role check cannot be what refuses it
+    def change(s: dict[str, Any]) -> None:
+        _custom_gate(s, quorum=[{"role": "intern", "count": 1}])
+
+    assert _issues(_stages(lambda s: _custom_gate(s)), org=_custom_surfaces) == []
+    issues = _issues(_stages(change), org=_custom_surfaces)
+    assert [i for i in issues if "not in eligible_roles" in i.message and "intern" in i.message]
+    assert not [i for i in issues if "may not decide" in i.message]
+
+
+def test_v7_a_quorum_count_below_one_is_refused_by_the_validator_too() -> None:
+    wf = _wf(
+        _stages(
+            lambda s: s["review_gate"]["gate"].__setitem__(
+                "quorum", [{"role": "reviewer", "count": 1}]
+            )
+        )
+    )
+    stage = wf.stages["review_gate"]
+    gate = stage.gate  # type: ignore[union-attr]
+    assert gate.quorum is not None
+    entry = gate.quorum[0].model_copy(update={"count": 0})
+    bad_gate = gate.model_copy(update={"quorum": (entry,)})
+    stages = {**wf.stages, "review_gate": stage.model_copy(update={"gate": bad_gate})}
+    issues = validate_structure(
+        wf.model_copy(update={"stages": stages}), manifest=MANIFEST, policy=_org()
+    )
+    assert any("count" in i.message and "review_gate" in i.path for i in issues), _text(issues)
+
+
+def test_v15_a_quorum_role_the_org_does_not_give_a_mandatory_gate_is_refused() -> None:
+    # past the schema and V7, so only V15's quorum check can name the role
+    wf = _wf()
+    stage = wf.stages["review_gate"]
+    gate = stage.gate  # type: ignore[union-attr]
+    from sto.config.schema import Quorum
+
+    bad_gate = gate.model_copy(update={"quorum": (Quorum(role="intern", count=1),)})
+    stages = {**wf.stages, "review_gate": stage.model_copy(update={"gate": bad_gate})}
+    issues = validate_structure(
+        wf.model_copy(update={"stages": stages}), manifest=MANIFEST, policy=_org()
+    )
+    assert any("intern may not decide a review gate" in i.message for i in issues), _text(issues)
 
 
 def test_v7_duplicate_quorum_roles_are_refused() -> None:
@@ -757,7 +815,9 @@ def test_v13_the_validator_refuses_an_empty_panel_list_that_got_past_the_schema(
     issues = validate_structure(
         wf.model_copy(update={"stages": stages}), manifest=MANIFEST, policy=_org()
     )
-    assert any("panel" in i.path and field in i.message for i in issues), _text(issues)
+    assert any("panel" in i.path and f"{field} is empty" in i.message for i in issues), _text(
+        issues
+    )
 
 
 def test_v13_a_required_reviewer_must_be_on_the_panel() -> None:
@@ -1099,3 +1159,319 @@ def test_all_issues_are_reported_not_just_the_first() -> None:
 
     issues = _issues(_stages(change))
     assert len({i.path.split(".")[1] for i in issues if i.path.startswith("stages.")}) >= 3
+
+
+# --- pass 1 ------------------------------------------------------------------------------
+
+
+def _when_org(value: str = "medium", *, ranked: bool = True) -> Callable[[dict[str, Any]], None]:
+    def org(d: dict[str, Any]) -> None:
+        _custom_surfaces(d)
+        d["teams"] = {
+            "ledger": {
+                "required_gates": [
+                    {
+                        "id": "change_gate",
+                        "role": "change_manager",
+                        "when": {"field": "risk", "value": value},
+                    }
+                ]
+            }
+        }
+        if not ranked:
+            del d["route_orders"]
+
+    return org
+
+
+def test_pass1_1_a_when_gate_needs_the_org_to_rank_its_field() -> None:
+    with pytest.raises(SchemaError) as err:
+        _org(_when_org(ranked=False))
+    assert "route_orders.risk" in str(err.value)
+    assert "change_gate" in str(err.value)
+
+
+def test_pass1_1_the_ranking_must_contain_the_when_value() -> None:
+    with pytest.raises(SchemaError) as err:
+        _org(_when_org("critical"))
+    assert "critical" in str(err.value)
+    assert isinstance(_org(_when_org("medium")), OrgPolicy)
+
+
+def _skipping_route(order: list[str], skip: str) -> Workflow:
+    def change(s: dict[str, Any]) -> None:
+        nxt = {v: "change_gate" for v in order if v != skip}
+        nxt[skip] = "review_gate"
+        nxt["default"] = "change_gate"
+        s["by_risk"] = {"kind": "route", "field": "risk", "order": order, "next": nxt}
+        s["panel"]["next"]["clean"] = "by_risk"
+        s["panel"]["next"]["degraded"] = "by_risk"
+        s["change_gate"] = _gate(
+            "custom",
+            ["change_manager"],
+            {
+                "approved": "review_gate",
+                "changes_requested": {"to": "implement", "loop": "review_loop"},
+                "rejected": "rejected_end",
+            },
+        )
+
+    return _wf(_stages(change))
+
+
+def test_pass1_2_a_team_value_below_the_orgs_highest_is_refused_naming_the_gate() -> None:
+    wf = _skipping_route(["low", "critical", "medium", "high"], "critical")
+    policy = _org(_when_org("medium"))
+    issues = validate_structure(wf, manifest=MANIFEST, policy=policy)
+    hits = [i for i in issues if "by_risk" in i.path and "critical" in i.message]
+    assert hits, _text(issues)
+    assert "change_gate" in hits[0].message
+    assert "high" in hits[0].message  # says where to put it
+
+
+def test_pass1_2_a_team_value_above_the_orgs_highest_is_allowed() -> None:
+    wf = _skipping_route(["low", "medium", "high", "critical"], "critical")
+    issues = check_route_orders(wf, _org(_when_org("medium")))
+    assert issues == []
+
+
+def test_pass1_2_a_value_below_the_orgs_lowest_is_refused_too() -> None:
+    wf = _skipping_route(["trivial", "low", "medium", "high"], "trivial")
+    issues = check_route_orders(wf, _org(_when_org("medium")))
+    assert any("trivial" in i.message for i in issues), _text(issues)
+
+
+def _promote_org(role: str, gate: str) -> Callable[[dict[str, Any]], None]:
+    def org(d: dict[str, Any]) -> None:
+        d["teams"] = {"ledger": {"required_gates": [{"id": gate, "role": role}]}}
+
+    return org
+
+
+def _qa_exits_refuse(s: dict[str, Any]) -> None:
+    """After the merge every exit but QA's approval is a rejection, which V17 allows."""
+    s["merge"]["next"]["conflict"] = "rejected_end"
+    s["merge"]["next"]["stale"] = "rejected_end"
+    s["qa_gate"]["next"]["changes_requested"] = "rejected_end"
+
+
+def _promote_before_qa() -> Workflow:
+    def change(s: dict[str, Any]) -> None:
+        _qa_exits_refuse(s)
+        s["promote"] = {
+            "kind": "effect",
+            "effect": "branch.promote",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "merge"},
+        }
+        s["review_gate"]["next"]["approved"] = "promote"
+
+    return _wf(_stages(change))
+
+
+def test_pass1_4_a_promote_before_a_required_qa_gate_need_not_list_it() -> None:
+    # QA comes after the promote that releases its secrets, so it cannot be listed there
+    policy = _org(_promote_org("qa", "qa_gate"))
+    assert check_org_required_gates(_promote_before_qa(), policy, team="ledger") == []
+
+
+def test_pass1_4_a_promote_that_does_not_list_a_required_review_gate_is_refused() -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["promote"] = {
+            "kind": "effect",
+            "effect": "branch.promote",
+            "requires_gates": ["qa_gate"],
+            "next": {"done": "merge"},
+        }
+        s["review_gate"]["next"]["approved"] = "promote"
+
+    policy = _org(_promote_org("reviewer", "review_gate"))
+    issues = check_org_required_gates(_wf(_stages(change)), policy, team="ledger")
+    assert [i.path for i in issues if "promote" in i.path] == ["stages.promote.requires_gates"]
+
+
+def _promote_then_sec(*, sec_first: bool) -> Workflow:
+    """A non-QA required gate ``sec`` beside the promote: after it, or before it."""
+
+    def change(s: dict[str, Any]) -> None:
+        sec_next = {
+            "approved": "promote" if sec_first else "merge",
+            "changes_requested": {"to": "implement", "loop": "review_loop"},
+            "rejected": "closed",
+        }
+        s["sec"] = _gate("custom", ["security_officer"], sec_next)
+        s["promote"] = {
+            "kind": "effect",
+            "effect": "branch.promote",
+            "requires_gates": ["review_gate"],
+            "next": {"done": "merge" if sec_first else "sec"},
+        }
+        s["review_gate"]["next"]["approved"] = "sec" if sec_first else "promote"
+        s["merge"]["requires_gates"] = ["review_gate", "sec"]
+
+    return _wf(_stages(change))
+
+
+def test_pass1_4_a_promote_the_run_reaches_without_the_gate_is_not_preceded_by_it() -> None:
+    # promote -> sec -> merge: the promote runs before sec decides, so it cannot list sec
+    policy = _org(_promote_org("security_officer", "sec"))
+    assert check_org_required_gates(_promote_then_sec(sec_first=False), policy, team="ledger") == []
+
+
+def test_pass1_4_a_gate_that_precedes_the_promote_must_be_listed_by_it() -> None:
+    policy = _org(_promote_org("security_officer", "sec"))
+    issues = check_org_required_gates(_promote_then_sec(sec_first=True), policy, team="ledger")
+    assert [i.path for i in issues] == ["stages.promote.requires_gates"], _text(issues)
+    assert "sec" in issues[0].message
+
+
+def test_pass1_5_a_rejection_cannot_reach_a_gated_effect_through_an_unrelated_gate() -> None:
+    def change(s: dict[str, Any]) -> None:
+        _custom_gate(s)
+        s["review_gate"]["next"]["approved"] = "merge"
+        s["review_gate"]["next"]["rejected"] = "sec"
+
+    issues = _refused(
+        _stages(change), org=_custom_surfaces, names="review_gate", says="sec -> merge"
+    )
+    assert issues
+
+
+def test_pass1_5_passing_the_gate_the_effect_requires_is_still_fine() -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["qa_gate"]["next"]["rejected"] = {"to": "review_gate", "loop": "review_loop"}
+
+    assert _issues(_stages(change)) == []
+
+
+def test_pass1_6_escalate_after_without_escalate_to_is_refused() -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["review_gate"]["gate"]["timeouts"] = {"escalate_after": "2d"}
+
+    issues = _refused(_stages(change), names="review_gate", says="escalate_to")
+    assert any(i.path == "stages.review_gate.gate.timeouts.escalate_to" for i in issues)
+
+
+def test_pass1_6_escalate_after_with_escalate_to_passes() -> None:
+    def change(s: dict[str, Any]) -> None:
+        s["review_gate"]["gate"]["timeouts"] = {"escalate_after": "2d", "escalate_to": "reviewer"}
+
+    assert _issues(_stages(change)) == []
+
+
+def _team(run_usd: float, stage_usd: dict[str, float] | None = None) -> TeamConfig:
+    budgets: dict[str, Any] = {"run_usd": run_usd, "team_monthly_usd": 500}
+    if stage_usd:
+        budgets["stage_usd"] = stage_usd
+    doc = {
+        "apiVersion": "sto/v1",
+        "kind": "TeamConfig",
+        "metadata": {"team": "ledger"},
+        "budgets": budgets,
+    }
+    cfg = load_document(_dump(doc))
+    assert isinstance(cfg, TeamConfig)
+    return cfg
+
+
+def test_pass1_7_the_entry_point_checks_the_teams_budgets() -> None:
+    wf, pol = _wf(), _org()
+    ok = validate_structure(wf, manifest=MANIFEST, policy=pol, team_config=_team(50))
+    assert ok == []
+    over = validate_structure(wf, manifest=MANIFEST, policy=pol, team_config=_team(51))
+    assert any(i.path == "budgets.run_usd" for i in over), _text(over)
+
+
+def test_pass1_7_the_entry_point_checks_each_stage_budget() -> None:
+    wf, pol = _wf(), _org()
+    over = validate_structure(
+        wf, manifest=MANIFEST, policy=pol, team_config=_team(10, {"implement": 51})
+    )
+    assert any(i.path == "budgets.stage_usd.implement" for i in over), _text(over)
+    fine = validate_structure(
+        wf, manifest=MANIFEST, policy=pol, team_config=_team(10, {"implement": 50})
+    )
+    assert fine == []
+
+
+def test_pass1_7_without_a_team_config_no_budget_is_checked() -> None:
+    assert validate_structure(_wf(), manifest=MANIFEST, policy=_org()) == []
+
+
+def _release(**with_: Any) -> Callable[[dict[str, Any]], None]:
+    def change(s: dict[str, Any]) -> None:
+        s["release"] = {
+            "kind": "effect",
+            "effect": "release.trigger",
+            "with": with_,
+            "requires_gates": ["qa_gate"],
+            "next": {"done": "done", "stale": {"to": "implement", "loop": "fix_loop"}},
+        }
+        s["qa_gate"]["next"]["approved"] = "release"
+
+    return _stages(change)
+
+
+def test_pass1_8_a_blank_text_value_in_with_is_refused() -> None:
+    assert _issues(_release(workflow="deploy.yml", sha_input="sha")) == []
+    for blank in ("", "   ", "\t"):
+        issues = _issues(_release(workflow=blank, sha_input="sha"))
+        assert any(
+            i.path == "stages.release.with.workflow" and "blank" in i.message for i in issues
+        )
+
+
+def test_pass1_v10_github_is_refused_off_review_gates_even_if_a_policy_lists_it() -> None:
+    # the schema stops an org document listing it, so build the policy past the schema
+    pol = _org()
+    surfaces = {**pol.floors.decision_surfaces, "qa": ("ui", "github")}
+    floors = pol.floors.model_copy(update={"decision_surfaces": surfaces})
+    pol = pol.model_copy(update={"floors": floors})
+
+    def change(s: dict[str, Any]) -> None:
+        s["qa_gate"]["gate"]["decision_surfaces"] = ["github"]
+
+    issues = validate_structure(_wf(_stages(change)), manifest=MANIFEST, policy=pol)
+    assert any("only for review gates" in i.message and "qa_gate" in i.path for i in issues)
+
+
+_RULE_FIXTURES: dict[str, tuple[str, Callable[[dict[str, Any]], None]]] = {
+    "V1": ("triage", _stages(lambda s: s["triage"]["next"].__setitem__("ready", "nope"))),
+    "V2": ("panel", _stages(lambda s: s["panel"]["next"].pop("degraded"))),
+    "V3": ("merge", _stages(lambda s: s["merge"]["next"].__setitem__("stale", "implement"))),
+    "V7": (
+        "review_gate",
+        _stages(
+            lambda s: s["review_gate"]["gate"].__setitem__(
+                "quorum", [{"role": "reviewer", "count": 1}, {"role": "reviewer", "count": 1}]
+            )
+        ),
+    ),
+    "V8": (
+        "review_gate",
+        _stages(lambda s: s["review_gate"]["next"].__setitem__("rejected", "merge")),
+    ),
+    "V9": ("ask", _stages(lambda s: s["ask"].__setitem__("timeout", "15d"))),
+    "V10": (
+        "qa_gate",
+        _stages(lambda s: s["qa_gate"]["gate"].__setitem__("decision_surfaces", ["github"])),
+    ),
+    "V13": ("panel", _stages(lambda s: s["panel"].__setitem__("required", ["security_reviewer"]))),
+    "V15": (
+        "review_gate",
+        _stages(lambda s: s["review_gate"]["gate"].__setitem__("eligible_roles", ["developer"])),
+    ),
+}
+
+
+@pytest.mark.parametrize("rule", sorted(_RULE_FIXTURES))
+def test_every_rule_names_the_stage_and_says_how_to_fix_it_for(rule: str) -> None:
+    stage, change = _RULE_FIXTURES[rule]
+    hits = [i for i in _issues(change) if stage in i.path]
+    assert hits, f"{rule}: nothing names {stage}"
+    for issue in hits:
+        assert stage in issue.message, issue
+        # a fix: an imperative after the problem, always set off by a semicolon or comma
+        assert re.search(
+            r"[;,] (add|remove|use|put|lower|shorten|name|list|send|fix|raise|set)\b", issue.message
+        ), issue

@@ -882,6 +882,24 @@ class OrgPolicy(_Strict):
     ] = Field(default_factory=lambda: FrozenMap())
     teams: FMap[TeamName, TeamPolicy] = Field(default_factory=lambda: FrozenMap())
 
+    @model_validator(mode="after")
+    def _a_when_gate_needs_the_orgs_ranking(self) -> OrgPolicy:
+        # Without the org's own ranking of the field, a team ranks the value last and skips the
+        # gate, and nothing else says the ranking was ever the org's.
+        for team, policy in self.teams.items():
+            for gate in policy.required_gates:
+                when = gate.when
+                if when is None:
+                    continue
+                ranked = self.route_orders.get(when.field, ())
+                if when.value not in ranked:
+                    raise ValueError(
+                        f"teams.{team}: required gate {gate.id} applies when {when.field} is "
+                        f"{when.value}, so route_orders.{when.field} must rank {when.value}; "
+                        f"add it, lowest to highest"
+                    )
+        return self
+
 
 Document = Workflow | WorkflowOverlay | TeamConfig | OrgPolicy
 _KINDS: dict[str, type[Document]] = {

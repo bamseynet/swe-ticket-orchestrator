@@ -421,6 +421,16 @@ def _v7(wf: Workflow) -> list[Issue]:
                     "this gate; list the roles that may",
                 )
             )
+        t = gate.timeouts
+        if t is not None and t.escalate_after is not None and t.escalate_to is None:
+            issues.append(
+                Issue(
+                    None,
+                    _at(sid, "gate", "timeouts", "escalate_to"),
+                    f"stage {sid}: escalate_after is set but escalate_to is not, so there is "
+                    "no one to escalate to; add escalate_to with a role",
+                )
+            )
         seen: set[str] = set()
         for entry in gate.quorum or ():
             if entry.role in seen:
@@ -458,54 +468,56 @@ def _v7(wf: Workflow) -> list[Issue]:
 
 
 def _v8(wf: Workflow, manifest: Manifest) -> list[Issue]:
+    """From each ``rejected`` or ``expired`` edge, look for each gated effect, per effect: the
+    search may not pass through the ``approved`` edge of a gate in that effect's
+    ``requires_gates`` (that approval is what earns it), but every other gate's approval is
+    no help, since the effect did not ask for it."""
     issues: list[Issue] = []
     stages = wf.stages
-
-    def gated(stage: Any) -> bool:
-        spec = manifest.effects.get(stage.effect) if isinstance(stage, EffectStage) else None
-        return spec is not None and spec.effect_class == "gated"
-
+    effects = {
+        eid: st
+        for eid, st in stages.items()
+        if isinstance(st, EffectStage)
+        and (spec := manifest.effects.get(st.effect)) is not None
+        and spec.effect_class == "gated"
+    }
     for gid, stage in stages.items():
         if not isinstance(stage, GateStage):
             continue
         for outcome, target, _ in _edges(stage):
             if outcome not in ("rejected", "expired") or target not in stages:
                 continue
-            parent: dict[str, str | None] = {target: None}
-            queue = deque([target])
-            while queue:
-                sid = queue.popleft()
-                node = stages[sid]
-                if gated(node):
-                    chain = [sid]
-                    while (p := parent[chain[-1]]) is not None:
-                        chain.append(p)
-                    issues.append(
-                        Issue(
-                            None,
-                            _at(gid, "next", outcome),
-                            f"stage {gid}: the {outcome} edge reaches gated effect "
-                            f"{sid} ({' -> '.join(reversed(chain))}); a refusal or "
-                            "an expiry must not run it, so send the edge to a "
-                            "terminal",
-                        )
+            for eid, effect in effects.items():
+                held = set(effect.requires_gates or ())
+                parent: dict[str, str | None] = {target: None}
+                queue = deque([target])
+                while queue and eid not in parent:
+                    sid = queue.popleft()
+                    for out, nxt, _ in _edges(stages[sid]):
+                        if isinstance(stages[sid], GateStage) and out == "approved" and sid in held:
+                            continue
+                        if nxt in stages and nxt not in parent:
+                            parent[nxt] = sid
+                            queue.append(nxt)
+                if eid not in parent:
+                    continue
+                chain = [eid]
+                while (p := parent[chain[-1]]) is not None:
+                    chain.append(p)
+                issues.append(
+                    Issue(
+                        None,
+                        _at(gid, "next", outcome),
+                        f"stage {gid}: the {outcome} edge reaches gated effect {eid} "
+                        f"({' -> '.join(reversed(chain))}) without passing the approval it "
+                        "requires; a refusal or an expiry must not run it; send the edge to "
+                        "a terminal",
                     )
-                    break
-                for out, nxt, _ in _edges(node):
-                    if isinstance(node, GateStage) and out == "approved":
-                        continue  # a later approval is what earns the effect
-                    if nxt in stages and nxt not in parent:
-                        parent[nxt] = sid
-                        queue.append(nxt)
+                )
     return issues
 
 
 # --- V9 ------------------------------------------------------------------------------------
-
-
-def _fmt_age(seconds: int) -> str:
-    days, rest = divmod(seconds, 86400)
-    return f"{days}d" if not rest else f"{seconds}s"
 
 
 def _v9(wf: Workflow, policy: OrgPolicy) -> list[Issue]:
@@ -610,12 +622,23 @@ def check_budget_ceilings(config: TeamConfig, policy: OrgPolicy) -> list[Issue]:
     return issues
 
 
+def _gates_on(policy: OrgPolicy, field: str) -> str:
+    """The org gates a route on ``field`` could skip, for a message."""
+    named = [
+        f"{g.id} (when {field} is {g.when.value})"
+        for team in policy.teams.values()
+        for g in team.required_gates
+        if g.when is not None and g.when.field == field
+    ]
+    return "the org gate " + ", ".join(dict.fromkeys(named)) if named else "an org gate"
+
+
 def check_route_orders(wf: Workflow, policy: OrgPolicy) -> list[Issue]:
     """A route on a field the org ranks must rank those values the way the org does.
 
-    Extra values are the team's. Without this a team could list a value lower, so the V17 search
-    (which raises a value to all values ranked above it) would not consider the one that skips a
-    gate."""
+    A value the org does not rank is the team's, but only above the org's highest value. Ranked
+    anywhere lower, a route could send it past a required gate and the V17 search (which raises a
+    value to all values ranked above it) would not consider it."""
     issues: list[Issue] = []
     for sid, stage in wf.stages.items():
         org = policy.route_orders.get(stage.field) if isinstance(stage, RouteStage) else None
@@ -642,6 +665,18 @@ def check_route_orders(wf: Workflow, policy: OrgPolicy) -> list[Issue]:
                     f"ranks {stage.field} {ranking}, so include every one",
                 )
             )
+        last = max((i for i, v in enumerate(stage.order) if v in org), default=-1)
+        for i, value in enumerate(stage.order):
+            if value not in org and i < last:
+                issues.append(
+                    Issue(
+                        None,
+                        _at(sid, "order"),
+                        f"stage {sid}: order ranks {value} below {org[-1]}, so a route could "
+                        f"send {value} past {_gates_on(policy, stage.field)}; move {value} "
+                        f"above {org[-1]}, the org's highest {stage.field}",
+                    )
+                )
         theirs = [v for v in stage.order if v in org]
         if theirs != [v for v in org if v in theirs]:
             issues.append(
@@ -761,8 +796,8 @@ def _v15(
                         Issue(
                             None,
                             _at(sid, "gate", "eligible_roles"),
-                            f"stage {sid}: {role} may not decide a {gate.type} gate; "
-                            f"org policy allows only: {_words(roles)}",
+                            f"stage {sid}: {role} may not decide a {gate.type} gate; remove {role} "
+                            f"(org policy allows only: {_words(roles)})",
                         )
                     )
         elif isinstance(stage, EffectStage):
@@ -798,7 +833,7 @@ def _typed_with(sid: str, stage: EffectStage, manifest: Manifest) -> list[Issue]
             )
             extra = (
                 "; an approval comes only from a human decision at a gate, so use requires_gates"
-                if "approv" in key
+                if "approv" in key.casefold()
                 else ""
             )
             issues.append(
@@ -845,11 +880,14 @@ def validate_structure(
     manifest: Manifest,
     policy: OrgPolicy,
     sandbox_images: Collection[str] | None = None,
+    team_config: TeamConfig | None = None,
 ) -> list[Issue]:
     """Every structural problem in ``wf``, empty when it passes.
 
     ``policy`` is required: a rule that reads the org fails closed, so there is no way to ask
-    without one. ``sandbox_images`` is the registry of image names; ``None`` skips that check."""
+    without one. ``sandbox_images`` is the registry of image names; ``None`` skips that check.
+    ``team_config`` is the team's, whose budgets V9 checks against the org ceilings; without it
+    there are none."""
     return [
         *_v1(wf),
         *_v2(wf, manifest),
@@ -861,4 +899,5 @@ def validate_structure(
         *_v10(wf, policy),
         *_v13(wf),
         *_v15(wf, manifest, policy, sandbox_images),
+        *([] if team_config is None else check_budget_ceilings(team_config, policy)),
     ]

@@ -60,6 +60,7 @@ ORG_DOC: dict[str, Any] = {
         "hold_after_approval_min": "10m",
         "identity_max_age": "8h",
     },
+    "route_orders": {"risk": ["low", "medium", "high"]},
     "teams": {
         "ledger": {
             "required_gates": [

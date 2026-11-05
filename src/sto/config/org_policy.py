@@ -38,8 +38,9 @@ What counts as getting round a required gate, with its approval removed:
   release clears that), and the run then opened a revert (``pr.open_revert``). A rejection that
   ends in ``rejected`` or ``expired`` is fine. Once merged, a wait timeout is ignored only when
   it goes straight to a ``closed`` terminal (as V6 ignores a timeout that gives up); every other
-  timeout is followed, so waiting cannot reach ``done``, a release or a ticket move. A merge that
-  ends in a terminal with no QA gate on that path is tolerated, as V6 tolerates it.
+  timeout is followed, so waiting cannot reach ``done``, a release or a ticket move. V17 does not
+  judge a merge that ends in a terminal with no QA gate on that path: it leaves that to V6, which
+  refuses a ``rejected`` terminal there (PLAN 7.7: a rejected run blocks the release).
 * For an entry without ``when``, every merge or release reachable from the gate's approval lists
   the gate in ``requires_gates``, so the gate cannot approve before there is code (V4 and V5 do
   the rest). The walk follows every edge and never stops at an effect that lists the gate, since
