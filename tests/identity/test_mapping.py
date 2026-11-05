@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from sto.config.org_policy import ORG_ADMIN, PermissionDeniedError, Principal
@@ -9,6 +11,7 @@ from sto.domain.errors import PermanentError
 from sto.identity.fake_issuer import FakeIssuer
 from sto.identity.mapping import (
     BUILTIN_ROLES,
+    MAX_NAME_BYTES,
     InvalidMappingError,
     NoAccessError,
     RoleMapping,
@@ -16,10 +19,12 @@ from sto.identity.mapping import (
     UserDisabledError,
     UserIdentity,
 )
-from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks
+from sto.identity.oidc import OidcConfig, OidcValidator, StaticJwks, VerifiedToken
 from sto.store.memory import MemoryStore
+from sto.store.ports import PLATFORM, ConditionFailedError, Key, TeamScope
 
 ISS = "https://idp.example.test"
+OTHER = "https://other.example.test"
 CLIENT = "sto-client"
 NOW = 1_800_000_000.0
 ORG = Principal("root", frozenset({ORG_ADMIN}))
@@ -39,7 +44,7 @@ def validator(issuer: FakeIssuer) -> OidcValidator:
 
 @pytest.fixture
 def mapping() -> RoleMapping:
-    return RoleMapping(MemoryStore())
+    return RoleMapping(MemoryStore(), issuers=[ISS, OTHER], clock=lambda: NOW)
 
 
 def _user(issuer: FakeIssuer, validator: OidcValidator, groups: list[str], sub: str = "u-1"):  # type: ignore[no-untyped-def]
@@ -99,7 +104,7 @@ def test_unmapped_user_has_no_access(mapping, issuer, validator) -> None:  # typ
 
 
 def test_mapping_is_per_idp(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
-    mapping.set_mapping(ADMIN_A, idp="https://other.example.test", group="g-1", team="alpha",
+    mapping.set_mapping(ADMIN_A, idp=OTHER, group="g-1", team="alpha",
                         role="reviewer")  # fmt: skip
     with pytest.raises(NoAccessError):
         mapping.resolve(_user(issuer, validator, ["g-1"]))
@@ -131,7 +136,7 @@ def test_disabled_wins_over_unmapped(mapping, issuer, validator) -> None:  # typ
 
 def test_disabling_is_per_subject_and_idp(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
     mapping.set_mapping(ADMIN_A, idp=ISS, group="g-1", team="alpha", role="reviewer")
-    mapping.disable_user(ORG, idp="https://other.example.test", subject="u-1")
+    mapping.disable_user(ORG, idp=OTHER, subject="u-1")
     mapping.disable_user(ORG, idp=ISS, subject="u-2")
     mapping.resolve(_user(issuer, validator, ["g-1"]))
 
@@ -211,17 +216,237 @@ def test_org_level_mapping_needs_org_admin_and_only_org_admin_role(  # type: ign
     assert who.roles_in("alpha") == frozenset()  # org_admin is not a team role
 
 
-def test_stored_team_org_admin_is_ignored_on_read(issuer, validator) -> None:  # type: ignore[no-untyped-def]
-    """Defence in depth: a hand-written store item cannot make a team org_admin."""
-    from sto.store.ports import PLATFORM, Key
+def _raw_roles(store: MemoryStore, team: str, roles: list[str]) -> None:
+    store.put(TeamScope(team), Key("TEAM", "ROLES"), {"roles": roles})
 
+
+def _raw_map(store: MemoryStore, group: str, team: str | None, role: str, idp: str = ISS) -> None:
+    store.put(PLATFORM, Key("ORG", f"MAP#{idp}#{group}"), {"team": team, "role": role})
+
+
+def test_stored_team_org_admin_is_ignored_on_read(issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    """M5: a hand-written item, with org_admin even declared as a team role, grants nothing,
+    so only the org_admin check on read stops it."""
     store = MemoryStore()
-    m = RoleMapping(store)
-    m.set_mapping(ADMIN_A, idp=ISS, group="g", team="alpha", role="reviewer")
-    item = next(iter(store.query(PLATFORM, "ORG", sk_prefix="MAP#").items))
-    store.put(PLATFORM, Key(item.key.pk, item.key.sk), {"team": "alpha", "role": ORG_ADMIN})
+    m = RoleMapping(store, issuers=[ISS])
+    _raw_roles(store, "alpha", [ORG_ADMIN])
+    _raw_map(store, "g", "alpha", ORG_ADMIN)
     with pytest.raises(NoAccessError):
         m.resolve(_user(issuer, validator, ["g"]))
+
+
+def test_stored_org_level_non_admin_record_grants_nothing(issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    """M6: an org-level record can only carry org_admin."""
+    store = MemoryStore()
+    m = RoleMapping(store, issuers=[ISS])
+    _raw_map(store, "g", None, "reviewer")
+    with pytest.raises(NoAccessError):
+        m.resolve(_user(issuer, validator, ["g"]))
+
+
+def test_write_side_org_admin_refusal_does_not_rest_on_declared_roles() -> None:
+    """M7: even when org_admin sits in a team's declared roles, mapping it is refused."""
+    store = MemoryStore()
+    m = RoleMapping(store, issuers=[ISS])
+    _raw_roles(store, "alpha", [ORG_ADMIN])
+    with pytest.raises(InvalidMappingError, match="org_admin"):
+        m.set_mapping(ORG, idp=ISS, group="g", team="alpha", role=ORG_ADMIN)
+    assert m.mapping(ISS, "g") is None
+
+
+def test_principal_for_a_team_excludes_org_level_roles(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    """M21: the org-level role never leaks into a team principal, nor team roles into the org's."""
+    mapping.set_mapping(ORG, idp=ISS, group="boss", team=None, role=ORG_ADMIN)
+    mapping.set_mapping(ORG, idp=ISS, group="rev", team="alpha", role="reviewer")
+    who = mapping.resolve(_user(issuer, validator, ["boss", "rev"]))
+    assert isinstance(who, UserIdentity)
+    assert who.principal("alpha").roles == {"reviewer"}
+    assert not who.principal("alpha").is_org_admin
+    assert who.principal(None).roles == {ORG_ADMIN}
+    assert who.principal("beta").roles == frozenset()
+
+
+def test_second_issuer_resolves_separately() -> None:
+    """M20b: a token is looked up under its own issuer, and an unconfigured one is refused."""
+    second = "https://second.example.test"
+    iss_a = FakeIssuer(issuer=ISS, key_id="a", clock=lambda: NOW)
+    iss_b = FakeIssuer(issuer=second, key_id="b", clock=lambda: NOW)
+
+    def check(fake: FakeIssuer, issuer_url: str) -> VerifiedToken:
+        cfg = OidcConfig(issuer=issuer_url, audience=CLIENT)
+        v = OidcValidator(cfg, StaticJwks(fake.jwks()), clock=lambda: NOW)
+        return v.validate(fake.issue(sub="u", audience=CLIENT, groups=["g"]))
+
+    tok_a, tok_b = check(iss_a, ISS), check(iss_b, second)
+    m = RoleMapping(MemoryStore(), issuers=[ISS, second])
+    m.set_mapping(ORG, idp=second, group="g", team="beta", role="qa")
+    with pytest.raises(NoAccessError):  # same group id under the other issuer is not mapped
+        m.resolve(tok_a)
+    who = m.resolve(tok_b)
+    assert isinstance(who, UserIdentity)
+    assert who.roles_in("beta") == {"qa"}
+    m.disable_user(ORG, idp=ISS, subject="u")
+    with pytest.raises(UserDisabledError):
+        m.resolve(tok_a)
+    assert isinstance(m.resolve(tok_b), UserIdentity)  # same sub, other issuer: not disabled
+    only_first = RoleMapping(MemoryStore(), issuers=[ISS])
+    with pytest.raises(NoAccessError):
+        only_first.resolve(tok_b)
+
+
+def test_enable_user_needs_org_admin(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    """M16: a team admin or anyone else cannot re-enable a disabled user."""
+    mapping.set_mapping(ADMIN_A, idp=ISS, group="g-1", team="alpha", role="reviewer")
+    mapping.disable_user(ORG, idp=ISS, subject="u-1")
+    for who in (ADMIN_A, Principal("dan", frozenset({"developer"}), team="alpha"), Principal("x")):
+        with pytest.raises(PermissionDeniedError):
+            mapping.enable_user(who, idp=ISS, subject="u-1")
+    with pytest.raises(UserDisabledError):
+        mapping.resolve(_user(issuer, validator, ["g-1"]))
+
+
+# --- idp must be a configured issuer (disable and mapping must not fail open) -----------------
+
+
+@pytest.mark.parametrize("idp", [ISS + "/", "not a url", "", ISS.upper(), ISS + "#", 5])
+def test_unconfigured_idp_refused_everywhere(mapping, idp) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(InvalidMappingError):
+        mapping.disable_user(ORG, idp=idp, subject="u-1")
+    with pytest.raises(InvalidMappingError):
+        mapping.enable_user(ORG, idp=idp, subject="u-1")
+    with pytest.raises(InvalidMappingError):
+        mapping.set_mapping(ORG, idp=idp, group="g", team="alpha", role="reviewer")
+    with pytest.raises(InvalidMappingError):
+        mapping.remove_mapping(ORG, idp=idp, group="g", team="alpha")
+
+
+def test_disable_with_the_right_idp_does_take_effect(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    mapping.set_mapping(ADMIN_A, idp=ISS, group="g-1", team="alpha", role="reviewer")
+    with pytest.raises(InvalidMappingError):
+        mapping.disable_user(ORG, idp=ISS + "/", subject="u-1")
+    mapping.resolve(_user(issuer, validator, ["g-1"]))  # still resolvable: nothing was written
+    mapping.disable_user(ORG, idp=ISS, subject="u-1")
+    with pytest.raises(UserDisabledError):
+        mapping.resolve(_user(issuer, validator, ["g-1"]))
+
+
+def test_needs_at_least_one_valid_issuer() -> None:
+    for bad in ([], [""], ["a#b"], ["x" * 500]):
+        with pytest.raises(ValueError, match="issuer"):
+            RoleMapping(MemoryStore(), issuers=bad)
+
+
+# --- races between the check and the write -----------------------------------------------------
+
+
+class _Racing(MemoryStore):
+    """After the first read of a MAP item, run ``hook`` once: a competing write in the gap."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hook: Callable[[], None] | None = None
+
+    def get(self, scope, key):  # type: ignore[no-untyped-def]
+        item = super().get(scope, key)
+        if self.hook is not None and key.sk.startswith("MAP#"):
+            hook, self.hook = self.hook, None
+            hook()
+        return item
+
+
+ADMIN_B = Principal("bob", frozenset({"team_admin"}), team="beta")
+
+
+def test_racing_new_mapping_cannot_overwrite(mapping) -> None:  # type: ignore[no-untyped-def]
+    """Team B read 'absent'; team A's write lands first; B's write must fail, not overwrite."""
+    store = _Racing()
+    m = RoleMapping(store, issuers=[ISS])
+    store.hook = lambda: m.set_mapping(ADMIN_A, idp=ISS, group="g", team="alpha", role="reviewer")
+    with pytest.raises(ConditionFailedError):
+        m.set_mapping(ADMIN_B, idp=ISS, group="g", team="beta", role="qa")
+    assert m.mapping(ISS, "g") == ("alpha", "reviewer")
+
+
+def test_racing_change_cannot_overwrite() -> None:
+    """B's admin legitimately holds the group; org moves it to A between B's read and write."""
+    store = _Racing()
+    m = RoleMapping(store, issuers=[ISS])
+    m.set_mapping(ADMIN_B, idp=ISS, group="g", team="beta", role="qa")
+    store.hook = lambda: m.set_mapping(ORG, idp=ISS, group="g", team="alpha", role="reviewer")
+    with pytest.raises(ConditionFailedError):
+        m.set_mapping(ADMIN_B, idp=ISS, group="g", team="beta", role="reviewer")
+    assert m.mapping(ISS, "g") == ("alpha", "reviewer")
+
+
+def test_racing_remove_cannot_delete_a_moved_mapping() -> None:
+    store = _Racing()
+    m = RoleMapping(store, issuers=[ISS])
+    m.set_mapping(ADMIN_B, idp=ISS, group="g", team="beta", role="qa")
+    store.hook = lambda: m.set_mapping(ORG, idp=ISS, group="g", team="alpha", role="reviewer")
+    with pytest.raises(ConditionFailedError):
+        m.remove_mapping(ADMIN_B, idp=ISS, group="g", team="beta")
+    assert m.mapping(ISS, "g") == ("alpha", "reviewer")
+
+
+def test_remove_mapping_team_must_match_stored_team(mapping) -> None:  # type: ignore[no-untyped-def]
+    mapping.set_mapping(ORG, idp=ISS, group="g", team="alpha", role="reviewer")
+    with pytest.raises(InvalidMappingError):
+        mapping.remove_mapping(ORG, idp=ISS, group="g", team="beta")
+    with pytest.raises(InvalidMappingError):
+        mapping.remove_mapping(ORG, idp=ISS, group="g", team=None)
+    assert mapping.mapping(ISS, "g") == ("alpha", "reviewer")
+    mapping.remove_mapping(ORG, idp=ISS, group="g", team="alpha")
+    assert mapping.mapping(ISS, "g") is None
+    mapping.remove_mapping(ORG, idp=ISS, group="g", team="alpha")  # already gone: no error
+
+
+# --- long names ---------------------------------------------------------------------------------
+
+
+def test_overlong_group_in_token_is_skipped_not_a_lockout(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    mapping.set_mapping(ADMIN_A, idp=ISS, group="g-1", team="alpha", role="reviewer")
+    for long_group in ("g" * 1200, "é" * 300, "g" * (MAX_NAME_BYTES + 1)):
+        who = mapping.resolve(_user(issuer, validator, [long_group, "g-1"]))
+        assert isinstance(who, UserIdentity)
+        assert who.roles_in("alpha") == {"reviewer"}
+    with pytest.raises(NoAccessError):  # a too-long group alone is just unmapped
+        mapping.resolve(_user(issuer, validator, ["g" * 1200]))
+
+
+def test_group_at_the_limit_still_works(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    group = "g" * MAX_NAME_BYTES
+    mapping.set_mapping(ADMIN_A, idp=ISS, group=group, team="alpha", role="reviewer")
+    assert isinstance(mapping.resolve(_user(issuer, validator, [group])), UserIdentity)
+    mapping.disable_user(ORG, idp=ISS, subject="s" * MAX_NAME_BYTES)
+
+
+def test_overlong_subject_is_a_domain_refusal(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    mapping.set_mapping(ADMIN_A, idp=ISS, group="g-1", team="alpha", role="reviewer")
+    with pytest.raises(NoAccessError):
+        mapping.resolve(_user(issuer, validator, ["g-1"], sub="s" * 2000))
+
+
+def test_overlong_names_on_write_are_domain_refusals(mapping) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(InvalidMappingError):
+        mapping.set_mapping(ORG, idp=ISS, group="g" * 2000, team="alpha", role="reviewer")
+    with pytest.raises(InvalidMappingError):
+        mapping.disable_user(ORG, idp=ISS, subject="s" * 2000)
+    with pytest.raises(InvalidMappingError):
+        mapping.remove_mapping(ORG, idp=ISS, group="g" * 2000, team="alpha")
+    with pytest.raises(InvalidMappingError):
+        mapping.set_mapping(ORG, idp=ISS, group="g", team="t" * 2000, role="reviewer")
+
+
+def test_records_store_who_and_when(mapping) -> None:  # type: ignore[no-untyped-def]
+    store = MemoryStore()
+    m = RoleMapping(store, issuers=[ISS], clock=lambda: 1234.5)
+    m.set_mapping(ADMIN_A, idp=ISS, group="g", team="alpha", role="reviewer")
+    m.disable_user(ORG, idp=ISS, subject="u")
+    for sk in (f"MAP#{ISS}#g", f"DISABLED#{ISS}#u"):
+        item = store.get(PLATFORM, Key("ORG", sk))
+        assert item is not None
+        assert item.data["at"] == 1234.5
+        assert item.data["by"] in ("ann", "root")
 
 
 # --- who may write --------------------------------------------------------------------------
@@ -322,15 +547,14 @@ def test_token_without_client_id_is_not_a_service(mapping, issuer) -> None:  # t
         mapping.resolve(token)
 
 
-def test_non_string_client_id_is_not_a_service(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
-    token = issuer.issue(
-        sub="1", audience=CLIENT, extra={"client_id": CLIENT, "token_use": "access"}
-    )
-    cfg = OidcConfig(issuer=ISS, audience=CLIENT, audience_claim="client_id", token_use="access")
+def test_non_string_client_id_is_not_a_service(mapping, issuer) -> None:  # type: ignore[no-untyped-def]
+    cfg = OidcConfig(issuer=ISS, audience=CLIENT)
     v = OidcValidator(cfg, StaticJwks(issuer.jwks()), clock=lambda: NOW)
-    assert v.validate(token).subject == "1"
-    with pytest.raises(NoAccessError):
-        mapping.resolve(v.validate(token))
+    for client_id in (1, ["1"], None):
+        token = v.validate(issuer.issue(sub="1", audience=CLIENT, extra={"client_id": client_id}))
+        assert token.claims["client_id"] == (tuple(client_id) if client_id == ["1"] else client_id)
+        with pytest.raises(NoAccessError):
+            mapping.resolve(token)
 
 
 def test_disabled_service_is_refused(mapping, issuer, validator) -> None:  # type: ignore[no-untyped-def]
@@ -341,3 +565,9 @@ def test_disabled_service_is_refused(mapping, issuer, validator) -> None:  # typ
 
 def test_service_identity_has_no_principal() -> None:
     assert not hasattr(ServiceIdentity(subject="c", issuer=ISS, client_id="c"), "principal")
+
+
+def test_token_from_unconfigured_issuer_is_refused_even_as_a_service(issuer, validator) -> None:  # type: ignore[no-untyped-def]
+    m = RoleMapping(MemoryStore(), issuers=["https://elsewhere.example.test"])
+    with pytest.raises(NoAccessError, match="not configured"):
+        m.resolve(_m2m(issuer, validator))
