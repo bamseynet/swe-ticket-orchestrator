@@ -318,9 +318,9 @@ def test_order_by_priority_and_two_keys(jira: FakeJiraIssues) -> None:
     jira.add_issue(summary="b", priority="Highest")
     jira.add_issue(summary="c", priority="Low")
     assert keys(search(jira, "project = SYN ORDER BY priority ASC, created DESC")) == [
-        "SYN-2",
         "SYN-3",
         "SYN-1",
+        "SYN-2",
     ]
 
 

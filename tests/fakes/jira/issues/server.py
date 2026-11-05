@@ -27,8 +27,9 @@ Known departures, each deliberate:
 * Error bodies are Jira's ``{"errorMessages": [...], "errors": {...}}`` (documented). Texts
   quoted from Jira, not the docs, are unsourced, observed behaviour to prove live: the 400 texts
   for unknown fields, labels with spaces, invalid priority, issue type or user, summary length,
-  unknown JQL values and operators, unbounded JQL, bad page tokens and bad comment bodies; the
-  404 text for a missing comment.
+  unknown JQL operators, unbounded JQL, bad page tokens and bad comment bodies; the 404 text for
+  a missing comment. A JQL value that does not exist is a 400 here and may not be in Jira (see
+  ``jql.py``: the v3 spec has no ``validateQuery`` on ``/search/jql``): unsourced, for D12.
 * The 401 body is ``{"message": ...}`` with no ``WWW-Authenticate`` header: unsourced, and
   different in shape from the errorMessages body.
 * The site is ``HOST``. 3LO calls go to ``api.atlassian.com/ex/jira/{cloudId}/rest/api/3``
@@ -38,10 +39,17 @@ Known departures, each deliberate:
   (the spec says null; omission and null both read as absent). ``maxResults`` is capped at 100
   here (the spec allows far more, and says fewer may be returned). The default order is issue ID
   ascending, and equal issues stay in ID ascending order whatever the direction (unsourced).
-* Paging is a keyset: the token holds the sort position of the last issue returned, so the next
-  page continues after that position even if the issue no longer matches, and an issue created
-  mid-paging is neither skipped nor repeated. Real tokens are opaque (unsourced); the fake's
-  search is immediately consistent (the real one is eventually consistent, unsourced).
+* Paging is a keyset: the token holds the sort position of the last issue returned, and the next
+  page is every matching issue that sorts strictly after that position, whether or not the last
+  issue still matches. So nothing already returned is repeated, and an issue that sorts after the
+  position (created mid-paging under ``ORDER BY created ASC``) is returned; one that sorts
+  before it (created mid-paging under ``DESC``) is not. Real tokens are opaque (unsourced); the
+  fake's search is immediately consistent (the real one is eventually consistent, unsourced).
+* The comment ``maxResults`` cap of 100 is unsourced (the spec names none).
+* Unsourced limits of the fake: issue keys in the path are case-sensitive (``syn-1`` is a 404);
+  on create, project and issue type take an exact key/name or a string ID (a lowercase project
+  key or an integer ID is a 400), and assignee takes ``accountId`` only (``{"id": ...}`` is a
+  400); JQL ``summary ~`` is a substring match.
 * A denied project (``deny_project``) is a 404 on direct access and absent from search.
 * The rate budget is a count per sixty seconds of fake time (``budget``, unlimited by default);
   Jira publishes no numbers. Only the 429-with-``Retry-After`` shape is modelled, as in the
@@ -51,7 +59,10 @@ Known departures, each deliberate:
   ``properties`` on get; ``transition`` and ``properties`` on edit; comment ``visibility`` and
   ``properties``; edit operations other than add/remove/set on labels and set elsewhere; fields
   beyond summary, description, labels, assignee and priority (and project and issuetype on
-  create), which are refused as unknown; issue deletion, attachments, worklogs, GET search.
+  create): standard Jira fields get a "not modelled" message and the rest Jira's "unknown" text;
+  ``expand`` on edit and on comment create and update; ``updateHistory`` on create; issue
+  deletion, attachments, worklogs, GET search. ``returnIssue=true`` on edit is modelled (200
+  with the issue, spec).
 * The fake does not sanitise ADF: links, mentions and media are stored verbatim.
 """
 
@@ -61,6 +72,7 @@ import base64
 import binascii
 import hashlib
 import json as jsonlib
+import math
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping
@@ -72,6 +84,7 @@ from contract.suite import RateShape
 from fakes.jira.issues.adf import adf_error
 from fakes.jira.issues.jql import (
     FIELDS,
+    STANDARD_FIELDS,
     JqlError,
     Resolver,
     compare,
@@ -95,7 +108,7 @@ PRIORITIES: Mapping[str, str] = {
     "Low": "4",
     "Lowest": "5",
 }
-DEFAULT_STATUSES = ("To Do", "In Progress", "Done")
+DEFAULT_STATUSES: Mapping[str, str] = {"To Do": "10000", "In Progress": "3", "Done": "10001"}
 DEFAULT_SEARCH_PAGE = 50  # spec: SearchAndReconcileRequestBean.maxResults default
 DEFAULT_COMMENT_PAGE = 100  # spec: comment maxResults default
 MAX_RESULTS = 100
@@ -128,6 +141,16 @@ _SEARCH_UNMODELLED = frozenset(
 )
 _ORDER_BY = ("created", "-created", "+created")
 _UNKNOWN_FIELD = "Field '{}' cannot be set. It is not on the appropriate screen, or unknown."
+_UNMODELLED_FIELD = "Field '{}' is a standard Jira field that the fake Jira does not model."
+
+
+def _field_problem(name: str) -> str:
+    """Why ``name`` cannot be set: standard fields are not modelled, the rest are unknown."""
+    if name.casefold() in STANDARD_FIELDS | {"reporter", "project", "issuetype"}:
+        return _UNMODELLED_FIELD.format(name)
+    return _UNKNOWN_FIELD.format(name)
+
+
 _ADF_BAD = "Operation value must be an Atlassian Document"
 
 
@@ -178,6 +201,15 @@ def _int(raw: Any, default: int) -> int | None:
         return None
 
 
+def _flag(raw: Any) -> bool | None:
+    """A boolean query parameter: false when absent, None when it is not true or false."""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return {"true": True, "false": False}.get(str(raw).casefold())
+
+
 def _not_modelled(what: str) -> Response:
     return _err(400, f"Not modelled by the fake Jira: {what}.")
 
@@ -195,7 +227,8 @@ class FakeJiraIssues(Resolver):
         self._comments: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._next_id, self._next_comment = 10_000, 20_000
         self._project_seq: Counter[str] = Counter()
-        self._statuses = {s.casefold() for s in DEFAULT_STATUSES}
+        self._statuses = {name.casefold(): ident for name, ident in DEFAULT_STATUSES.items()}
+        self._priorities = dict(PRIORITIES)
         self._accounts = {ACCOUNT_ID, OTHER_ACCOUNT_ID}
         self._denied: set[str] = set()
         self._bearers = {"synthetic-oauth-1"}
@@ -228,7 +261,9 @@ class FakeJiraIssues(Resolver):
         self._next_id += 1
         key = f"{project}-{self._project_seq[project]}"
         stamp = _iso(self.now)
-        self._statuses.add(status.casefold())
+        self.add_status(status)
+        if priority not in self._priorities:
+            self.add_priority(priority)
         if assignee:
             self._accounts.add(assignee)
         issue: dict[str, Any] = {
@@ -241,10 +276,11 @@ class FakeJiraIssues(Resolver):
                 "project": {"key": project, "id": PROJECTS.get(project, "10999")},
                 "status": {
                     "name": status,
+                    "id": self._statuses[status.casefold()],
                     "statusCategory": {"key": _STATUS_CATEGORY.get(status.casefold(), "new")},
                 },
                 "issuetype": {"name": issuetype, "id": ISSUE_TYPES.get(issuetype, "10999")},
-                "priority": {"name": priority, "id": PRIORITIES.get(priority, "3")},
+                "priority": {"name": priority, "id": self._priorities[priority]},
                 "labels": list(labels or []),
                 "assignee": {"accountId": assignee} if assignee else None,
                 "reporter": {"accountId": ACCOUNT_ID},
@@ -256,6 +292,19 @@ class FakeJiraIssues(Resolver):
         self._by_id[issue["id"]] = issue
         self.now += 1  # every issue gets its own created time, so ORDER BY created is total
         return issue
+
+    def add_status(self, name: str, ident: str | None = None) -> None:
+        """Register a status (so JQL may name it) without creating an issue in it."""
+        ident = ident or str(10_100 + len(self._statuses))
+        self._statuses.setdefault(name.casefold(), ident)
+
+    def add_priority(self, name: str, ident: str | None = None) -> None:
+        """Register a priority; it sorts below Lowest under ORDER BY priority."""
+        self._priorities.setdefault(name, ident or str(10 + len(self._priorities)))
+
+    def add_account(self, account_id: str) -> None:
+        """Register an account (assignable, and usable in JQL) without an issue."""
+        self._accounts.add(account_id)
 
     def deny_project(self, project: str) -> None:
         self._denied.add(project)
@@ -305,9 +354,13 @@ class FakeJiraIssues(Resolver):
                 if folded in (name.casefold(), ident):
                     return name.casefold()
         elif field == "priority":
-            return folded if folded in {p.casefold() for p in PRIORITIES} else None
+            for name, ident in self._priorities.items():
+                if folded in (name.casefold(), ident):
+                    return name.casefold()
         elif field == "status":
-            return folded if folded in self._statuses else None
+            for name, ident in self._statuses.items():
+                if folded in (name, ident):
+                    return name
         elif field in ("assignee", "reporter"):
             return folded if raw in self._accounts else None
         return None
@@ -321,9 +374,9 @@ class FakeJiraIssues(Resolver):
         *,
         auth: str | None = None,
         params: Mapping[str, Any] | None = None,
-        json: Mapping[str, Any] | None = None,  # noqa: A002 - the HTTP client's own name
+        json: Any = None,  # noqa: A002 - the HTTP client's own name; any JSON value
     ) -> Response:
-        params, body = params or {}, json or {}
+        params, body = params or {}, ({} if json is None else json)
         route = self._route(method.upper(), path)
         if route is None:
             if not self._check_auth(auth):  # authentication comes before routing
@@ -331,10 +384,14 @@ class FakeJiraIssues(Resolver):
                 return self._unauthorized()
             return _err(404, "Not Found")
         op, args = route
-        early = self._preflight(op, auth, self._token_page(body.get("nextPageToken")))
+        sent = body.get("nextPageToken") if isinstance(body, Mapping) else None
+        early = self._preflight(op, auth, self._token_page(sent))
         if early is not None:
             return early
-        result: Response = getattr(self, f"_{op}")(*args, params=params, body=body)
+        if not isinstance(body, Mapping):  # the API takes a JSON object
+            result: Response = _err(400, "Request body must be a JSON object.")
+        else:
+            result = getattr(self, f"_{op}")(*args, params=params, body=body)
         lose, self._lose = self._lose, False  # a planted loss applies to this request only
         if lose and result.status < 300:
             raise TimeoutError("response lost")
@@ -478,7 +535,7 @@ class FakeJiraIssues(Resolver):
             settable |= {"project", "issuetype"}
         for name in fields:
             if name not in settable:
-                errors[name] = _UNKNOWN_FIELD.format(name)
+                errors[name] = _field_problem(name)
         if creating:
             self._check_project(fields, errors, values)
             self._check_issuetype(fields, errors, values)
@@ -549,10 +606,10 @@ class FakeJiraIssues(Resolver):
         else:
             values["assignee"] = raw["accountId"]
 
-    @staticmethod
-    def _check_priority(raw: Any, errors: dict[str, str], values: dict[str, Any]) -> None:
+    def _check_priority(self, raw: Any, errors: dict[str, str], values: dict[str, Any]) -> None:
+        priorities = self._priorities
         ref = raw if isinstance(raw, dict) else {}
-        for name, ident in PRIORITIES.items():
+        for name, ident in priorities.items():
             if ref.get("name") == name or ref.get("id") == ident:
                 values["priority"] = name
                 return
@@ -562,6 +619,8 @@ class FakeJiraIssues(Resolver):
         fields = body.get("fields")
         if not isinstance(fields, dict):
             return _err(400, "Request body must contain 'fields'.")
+        if "updateHistory" in params:
+            return _not_modelled("'updateHistory' on create")
         if body.get("transition") is not None or body.get("properties") is not None:
             return _not_modelled("'transition' and 'properties' on create")
         errors, values = self._check_fields(fields, creating=True)
@@ -585,6 +644,11 @@ class FakeJiraIssues(Resolver):
         issue = self._visible(ref)
         if issue is None:
             return _err(404, _NOT_FOUND)
+        if "expand" in params:
+            return _not_modelled("'expand' on edit")
+        return_issue = _flag(params.get("returnIssue"))
+        if return_issue is None:
+            return _err(400, "'returnIssue' must be true or false.")
         if body.get("transition") is not None or body.get("properties") is not None:
             return _not_modelled("'transition' and 'properties' on edit")
         fields, update = body.get("fields") or {}, body.get("update") or {}
@@ -610,10 +674,12 @@ class FakeJiraIssues(Resolver):
             if name == "assignee":
                 target[name] = {"accountId": value} if value else None
             elif name == "priority":
-                target[name] = {"name": value, "id": PRIORITIES[value]}
+                target[name] = {"name": value, "id": self._priorities[value]}
             else:
                 target[name] = value
         self._touch(issue)
+        if return_issue:  # spec: returnIssue gives the edited issue, in the Get issue format
+            return Response(200, Headers(), issue)
         return Response(204, Headers(), None)
 
     @staticmethod
@@ -623,7 +689,7 @@ class FakeJiraIssues(Resolver):
         """Fold ``update[name]`` (a list of ``{op: value}``) into ``changes``; an error text or
         None. Labels take add, remove and set; summary, description, assignee and priority set."""
         if name not in {"summary", "description", "labels", "assignee", "priority"}:
-            return _UNKNOWN_FIELD.format(name)
+            return _field_problem(name)
         if not isinstance(operations, list) or not all(
             isinstance(o, dict) and len(o) == 1 for o in operations
         ):
@@ -637,7 +703,9 @@ class FakeJiraIssues(Resolver):
             if name != "labels":
                 changes[name] = value
             elif verb == "set":
-                current = list(value) if isinstance(value, list) else [value]
+                if not isinstance(value, list):
+                    return "Operation value must be an array of labels"
+                current = list(value)
             elif verb == "add":
                 current += [value] if value not in current else []
             else:
@@ -666,10 +734,12 @@ class FakeJiraIssues(Resolver):
         good = (
             isinstance(data.get("q"), str)
             and isinstance(data.get("e"), int)
+            and not isinstance(data.get("e"), bool)
             and isinstance(page, int)
             and not isinstance(page, bool)
             and page >= 1
             and isinstance(issued, int | float)
+            and math.isfinite(issued)
             and isinstance(data.get("k"), list)
         )
         return data if good else None
@@ -703,6 +773,10 @@ class FakeJiraIssues(Resolver):
             if tok is None or tok["q"] != digest or tok["e"] != self._page_epoch or expired:
                 return _err(400, "Invalid request payload. Refer to the REST API documentation.")
             position, page = tok["k"], tok["p"] + 1
+            last = position[-1] if position else None
+            well_formed = isinstance(last, int) and not isinstance(last, bool)
+            if len(position) != len(query.order) + 1 or not well_formed:
+                return _err(400, "Invalid request payload. Refer to the REST API documentation.")
         rows = [
             i
             for i in self._issues.values()
@@ -805,6 +879,8 @@ class FakeJiraIssues(Resolver):
         issue = self._visible(ref)
         if issue is None:
             return _err(404, _NOT_FOUND)
+        if "expand" in params:
+            return _not_modelled("'expand' on comment create")
         problem = self._comment_body_problem(body)
         if problem is not None:
             return problem
@@ -843,6 +919,8 @@ class FakeJiraIssues(Resolver):
         comment = self._find_comment(ref, cid)
         if comment is None:
             return _err(404, "Can not find comment with id " + cid)
+        if "expand" in params:
+            return _not_modelled("'expand' on comment update")
         problem = self._comment_body_problem(body)
         if problem is not None:
             return problem

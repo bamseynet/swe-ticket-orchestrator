@@ -12,13 +12,29 @@ Modelled, per field:
   departure) and ``is [not] EMPTY``.
 * ``created``, ``updated``: ``<``, ``<=``, ``>``, ``>=`` against ``yyyy/MM/dd``, ``yyyy-MM-dd``
   and either with `` HH:mm`` (UTC), and ``is [not] EMPTY``.
-* ``AND``, ``OR``, parentheses; ``ORDER BY f [ASC|DESC], ...``. Names and values compare
-  case-insensitively (assumed, not tried live). Values for project, status, issuetype, priority
-  and assignee must exist, else a 400 as Jira gives; ``project`` and ``issuetype`` also take IDs.
+* ``EMPTY`` and ``NULL`` are keywords, not values, with ``=``, ``!=``, ``in`` and ``not in`` too:
+  ``labels = EMPTY`` is ``labels is EMPTY`` (the JQL page documents ``duedate = empty``). A
+  quoted "EMPTY" is the literal value.
+* ``AND``, ``OR``, parentheses; ``ORDER BY f [ASC|DESC], ...``. ``ORDER BY priority DESC`` runs
+  from highest to lowest, as the JQL page says. Names and values compare case-insensitively
+  (assumed, not tried live). ``project``, ``issuetype``, ``priority`` and ``status`` also take
+  IDs.
+* DEPARTURE, unsourced: a value that does not exist (``project = INVALID``, an unknown status,
+  priority, issue type or account) is a 400. The v3 spec shows ``/search/jql`` has no
+  ``validateQuery`` and ``/jql/parse`` reports such values as warnings, so real Jira may well
+  answer 200 with nothing. The fake fails loudly because that is safer for adapters; the live
+  suite (D12) settles it. Controls ``add_status``, ``add_priority`` and ``add_account`` register
+  values without creating an issue.
+* DEPARTURES, unsourced: ``key = SYN-999`` (no such issue) and ``project = OTH`` on a project the
+  caller may not see answer ``[]`` (real Jira may give a 400), though the fake 404s the same
+  project on direct access. Empty values sort first under ``ORDER BY assignee``; ``status``
+  sorts by name, not workflow order; a custom priority sorts below Lowest.
 
 Everything else is REFUSED with a 400 and "not modelled", never answered wrongly: functions
 (``currentUser()``, ``startOfDay()``), relative dates (``-1d``), ``NOT``, ``was``/``changed``,
-operators a field does not support in Jira, and a date compared with ``=``, ``!=``, ``in``.
+a date compared with ``=``, ``!=``, ``in``, a user given by email address, and the standard
+fields and aliases in ``STANDARD_FIELDS`` (``type``, ``issuekey``, ``duedate``, ...). Operators
+a modelled field does not support in Jira are a 400 with Jira's own text.
 """
 
 from __future__ import annotations
@@ -62,7 +78,43 @@ _TOKEN = re.compile(
     r"""\s*(?:(?P<str>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"""
     r"""|(?P<op>!=|!~|>=|<=|=|~|>|<|\(|\)|,)|(?P<word>[^\s=!~<>(),"']+))"""
 )
-PRIORITY_RANK = {"highest": 1, "high": 2, "medium": 3, "low": 4, "lowest": 5}
+# ASC runs lowest to highest, so DESC is highest to lowest (the JQL page). Unknown: below Lowest.
+PRIORITY_RANK = {"highest": 5, "high": 4, "medium": 3, "low": 2, "lowest": 1}
+EMPTY = "\x00empty"  # the keyword EMPTY/NULL as a value, never a literal
+# Standard Jira fields and JQL aliases the fake does not model: refused as "not modelled".
+STANDARD_FIELDS = frozenset(
+    {
+        "type",
+        "issuekey",
+        "id",
+        "duedate",
+        "description",
+        "resolution",
+        "resolutiondate",
+        "resolved",
+        "component",
+        "components",
+        "fixversion",
+        "fixversions",
+        "affectedversion",
+        "versions",
+        "sprint",
+        "parent",
+        "epic",
+        "text",
+        "comment",
+        "environment",
+        "creator",
+        "watcher",
+        "votes",
+        "voter",
+        "timetracking",
+        "security",
+        "issuelinks",
+        "attachment",
+        "worklog",
+    }
+)
 
 Match = Callable[[dict[str, Any]], bool]
 
@@ -156,7 +208,7 @@ def sort_value(issue: dict[str, Any], field: str) -> Any:
         project, _, number = issue["key"].rpartition("-")
         return [project.casefold(), int(number)]
     if field == "priority":
-        return PRIORITY_RANK.get(field_values(issue, "priority")[0], 99)
+        return PRIORITY_RANK.get(field_values(issue, "priority")[0], 0)
     values = field_values(issue, field)
     return values[0] if values else ""
 
@@ -205,7 +257,8 @@ class _Parser:
             return tok[1]
         return None
 
-    def raw_value(self) -> str:
+    def raw_value(self) -> tuple[str, str]:
+        """The next value and whether it was a bare ``word`` or a quoted ``str``."""
         tok = self.peek()
         if tok is None or tok[0] == "op":
             raise JqlError("Error in the JQL Query: expecting a value but got end of query.")
@@ -213,7 +266,7 @@ class _Parser:
         nxt = self.peek()
         if tok[0] == "word" and nxt == ("op", "("):
             raise _not_modelled(f"the function '{tok[1]}()'")
-        return tok[1]
+        return tok[1], tok[0]
 
     def expr(self) -> Match:
         left = self.term()
@@ -262,6 +315,8 @@ class _Parser:
             raise JqlError("Error in the JQL Query: expecting a field name.")
         self.i += 1
         field = tok[1].casefold()
+        if field in STANDARD_FIELDS:
+            raise _not_modelled(f"the field '{tok[1]}'")
         if field not in FIELDS:
             raise JqlError(
                 f"Field '{tok[1]}' does not exist or you do not have permission to view it."
@@ -275,15 +330,21 @@ class _Parser:
         if op in ("in", "not in"):
             return self.membership(field, op)
         if field in ("created", "updated"):
-            cut = parse_date(self.raw_value(), field)
+            cut = parse_date(self.raw_value()[0], field)
             return lambda i: self.date_test(issue_date(i, field), op, cut)
         want = self.value(field)
         if op in _RELATIONAL:
+            if want == EMPTY:
+                raise JqlError("Error in the JQL Query: EMPTY cannot be compared with " + op)
             return lambda i: self.key_test(i, op, want)
         return lambda i: self.compare(field_values(i, field), op, want)
 
     def value(self, field: str) -> str:
-        raw = self.raw_value()
+        raw, kind = self.raw_value()
+        if kind == "word" and raw.casefold() in ("empty", "null") and field != "summary":
+            return EMPTY
+        if field in ("assignee", "reporter") and "@" in raw:
+            raise _not_modelled("a user given by email address")
         if field in ("summary", "labels"):
             return raw.casefold()
         if field == "key":
@@ -304,8 +365,13 @@ class _Parser:
         if not self.op(")"):
             raise JqlError("Error in the JQL Query: expecting ')'.")
         if op == "in":
-            return lambda i: bool(wanted & set(field_values(i, field)))
+            return lambda i: self.is_in(field_values(i, field), wanted)
         return lambda i: bool(field_values(i, field)) and not wanted & set(field_values(i, field))
+
+    @staticmethod
+    def is_in(have: list[str], wanted: set[str]) -> bool:
+        """``in (EMPTY, x)`` matches an empty field as well as one holding ``x``."""
+        return (EMPTY in wanted and not have) or bool((wanted - {EMPTY}) & set(have))
 
     @staticmethod
     def date_test(have: datetime, op: str, cut: datetime) -> bool:
@@ -324,9 +390,9 @@ class _Parser:
     @staticmethod
     def compare(have: list[str], op: str, want: str) -> bool:
         if op == "=":
-            return want in have
+            return not have if want == EMPTY else want in have
         if op == "!=":
-            return bool(have) and want not in have
+            return bool(have) and want not in have  # EMPTY is never in ``have``
         if op == "~":
             return any(want in h for h in have)
         return bool(have) and not any(want in h for h in have)  # "!~"
@@ -366,6 +432,8 @@ def _order(parser: _Parser) -> tuple[tuple[str, bool], ...]:
             raise JqlError("Error in the JQL Query: expecting a field after 'order by'.")
         parser.i += 1
         field = tok[1].casefold()
+        if field in STANDARD_FIELDS:
+            raise _not_modelled(f"the field '{tok[1]}'")
         if field not in FIELDS:
             raise JqlError(
                 f"Field '{tok[1]}' does not exist or you do not have permission to view it."
