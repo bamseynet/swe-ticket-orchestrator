@@ -460,7 +460,7 @@ Checks are a registry of named evaluators, with no free-form expressions.
 Start runs from closed intake selectors, honour active-sprint filtering, WIP limits and freeze and change windows, and record the intake actor, ticket revision and frozen route inputs.
 Duplicate active runs and tickets matching two workflows start nothing, and a non-member's edit pauses the run for a member to confirm.
 **AC:** a ticket outside the active sprint does not start; WIP holds runs queued; a freeze holds merge in `WAITING_EXTERNAL`; overlapping selectors are refused at publish (V12); T11: public repos need opt-in, and an edit by a non-member or unknown editor pauses the run.
-**Deps:** D2-06, D2-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/intake.py`, `tests/engine/test_intake.py`.
+**Deps:** D2-06, D2-12. **Size:** M. **Run:** parallel. **Files:** `src/sto/engine/intake.py`, `src/sto/gates/windows.py`, `tests/engine/test_intake.py`.
 
 #### D2-19: Run migration
 Admins can move a pinned run to a newer manifest, only if the target is valid at its current stage and meets `OrgPolicy.teams`, and it is audited.
