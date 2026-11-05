@@ -10,6 +10,7 @@ re-evaluates then.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -54,29 +55,32 @@ class CronError(ValueError):
 _RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 
 
+_DIGITS = re.compile(r"[0-9]+")  # ASCII only: str.isdigit() and int() accept ², ١ and the like
+
+
+def _num(text: str, part: str) -> int:
+    if not _DIGITS.fullmatch(text):
+        raise CronError(f"{part!r} is not a number")
+    return int(text)
+
+
 def _field(text: str, lo: int, hi: int) -> frozenset[int]:
     out: set[int] = set()
     for part in text.split(","):
         base, slash, step_text = part.partition("/")
-        if slash and not step_text.isdigit():
-            raise CronError(f"bad step in {part!r}")
-        step = int(step_text) if slash else 1
+        step = _num(step_text, part) if slash else 1
         if step < 1:
             raise CronError(f"step must be at least 1 in {part!r}")
         if base == "*":
             a, b = lo, hi
         elif "-" in base:
             x, _, y = base.partition("-")
-            if not (x.isdigit() and y.isdigit()):
-                raise CronError(f"bad range {part!r}")
-            a, b = int(x), int(y)
-        elif base.isdigit():
-            a = int(base)
-            b = hi if slash else a
+            a, b = _num(x, part), _num(y, part)
         else:
-            raise CronError(f"bad value {part!r}")
+            a = _num(base, part)
+            b = hi if slash else a
         if not (lo <= a <= b <= hi):
-            raise CronError(f"{part!r} is outside {lo}-{hi}")
+            raise CronError(f"{part!r} is outside {lo}-{hi}, or its range is reversed")
         out.update(range(a, b + 1, step))
     return frozenset(out)
 
@@ -110,43 +114,64 @@ def _parse_cron(text: str) -> _Cron:
     )
 
 
-_CRON_SCAN_MINUTES = 8 * 24 * 60
+_CRON_SCAN_DAYS = 400
 
 
 def _local(t: dt.datetime, tz: ZoneInfo | dt.tzinfo) -> dt.datetime:
     return t.astimezone(tz)
 
 
+def _next_match(cron: _Cron, after: dt.datetime, tz: ZoneInfo | dt.tzinfo) -> dt.datetime | None:
+    """The first matching minute strictly after ``after`` (UTC), scanning local days. A local time
+    that does not exist (the hour skipped in spring) is not a match; a repeated autumn hour is
+    matched at its first pass."""
+    start = _local(after, tz)
+    hours, minutes = sorted(cron.hour), sorted(cron.minute)
+    for offset in range(_CRON_SCAN_DAYS):
+        day = start.date() + dt.timedelta(days=offset)
+        for h in hours:
+            for m in minutes:
+                local = dt.datetime.combine(day, dt.time(h, m), tzinfo=tz)
+                utc = local.astimezone(dt.UTC)
+                if utc > after and cron.matches(_local(utc, tz)):
+                    return utc
+    return None
+
+
 def _cron_window(text: str, now: dt.datetime, tz: ZoneInfo | dt.tzinfo) -> MergeWindow | None:
     try:
         cron = _parse_cron(text)
-    except CronError as exc:
+    except ValueError as exc:  # CronError, and anything else a bad cron could raise
         return _held(f"change_windows.allow_only is not a valid cron ({exc}); merge is held", None)
-    base = now.replace(second=0, microsecond=0)
-    if cron.matches(_local(base, tz)):
+    if cron.matches(_local(now, tz)):  # the cron has minute resolution: seconds never matter
         return None
-    for i in range(1, _CRON_SCAN_MINUTES):
-        t = base + dt.timedelta(minutes=i)
-        if cron.matches(_local(t, tz)):
-            return _held("outside change_windows.allow_only", t)
-    return _held("outside change_windows.allow_only", None)
+    return _held("outside change_windows.allow_only", _next_match(cron, now, tz))
 
 
 def _sprint_window(
     cfg: TeamConfig, now: dt.datetime, tz: ZoneInfo | dt.tzinfo
 ) -> MergeWindow | None:
+    """The sprint is whole local dates in the team zone, so a daylight-saving change inside it
+    moves neither the day it ends on nor the local midnight it ends at. The freeze starts a
+    whole-day (``d``, ``w``) or absolute (``s``, ``m``, ``h``) duration before that midnight."""
     sprint = cfg.sprint
-    if sprint is None or sprint.merge_freeze_before_end is None:
+    freeze = None if sprint is None else sprint.merge_freeze_before_end
+    if sprint is None or freeze is None:
         return None
-    length = dt.timedelta(weeks=int(sprint.cadence[0]))
-    start = dt.datetime.combine(sprint.anchor, dt.time(), tzinfo=tz)
-    if now < start:
+    today = now.astimezone(tz).date()
+    if today < sprint.anchor:
         return None
-    end = start + length * ((now - start) // length + 1)
-    freeze = dt.timedelta(seconds=duration_seconds(sprint.merge_freeze_before_end))
-    if now >= end - freeze:
-        return _held("sprint merge freeze", end)
-    return None
+    length = 7 * int(sprint.cadence[0])
+    end_date = sprint.anchor + dt.timedelta(
+        days=((today - sprint.anchor).days // length + 1) * length
+    )
+    end_local = dt.datetime.combine(end_date, dt.time(), tzinfo=tz)
+    end = end_local.astimezone(dt.UTC)
+    span = dt.timedelta(seconds=duration_seconds(freeze))
+    # same-zone arithmetic on an aware datetime is wall-clock: a "1d" freeze starts at the local
+    # midnight a calendar day earlier, even if that day is 23 or 25 hours long
+    start = (end_local - span if freeze[-1] in "dw" else end - span).astimezone(dt.UTC)
+    return _held("sprint merge freeze", end) if now >= start else None
 
 
 def merge_window(cfg: TeamConfig, now: dt.datetime) -> MergeWindow:
