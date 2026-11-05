@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlencode
 import pytest
 
 from fakes.slack import (
+    BOT_TOKEN,
     RESPONSE_URL_LIMIT,
     RESPONSE_URL_WINDOW,
     SIGNING_SECRET,
@@ -160,25 +161,37 @@ def test_reserialise_keeps_the_content(slack: FakeSlack) -> None:
 def test_views_open_succeeds_within_three_seconds(slack: FakeSlack, clock: Clock) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
     clock.now += TRIGGER_TTL
-    assert slack.views_open(trigger, VIEW) == {"ok": True, "view": {"id": "V1", **VIEW}}
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN) == {
+        "ok": True,
+        "view": {"id": "V1", **VIEW},
+    }
 
 
 def test_expired_trigger_fails_as_documented(slack: FakeSlack, clock: Clock) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
     clock.now += TRIGGER_TTL + 0.001
-    assert slack.views_open(trigger, VIEW) == {"ok": False, "error": "expired_trigger_id"}
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN) == {
+        "ok": False,
+        "error": "expired_trigger_id",
+    }
     assert slack.opened_views == []
 
 
 def test_trigger_is_single_use(slack: FakeSlack) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
-    assert slack.views_open(trigger, VIEW)["ok"] is True
-    assert slack.views_open(trigger, VIEW) == {"ok": False, "error": "exchanged_trigger_id"}
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN)["ok"] is True
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN) == {
+        "ok": False,
+        "error": "exchanged_trigger_id",
+    }
     assert len(slack.opened_views) == 1
 
 
 def test_unknown_trigger_is_invalid(slack: FakeSlack) -> None:
-    assert slack.views_open("nope", VIEW) == {"ok": False, "error": "invalid_trigger_id"}
+    assert slack.views_open("nope", VIEW, token=BOT_TOKEN) == {
+        "ok": False,
+        "error": "invalid_trigger_id",
+    }
 
 
 def test_each_interaction_gets_its_own_trigger(slack: FakeSlack) -> None:
@@ -225,22 +238,27 @@ def test_unknown_response_url_is_404(slack: FakeSlack) -> None:
 
 
 def test_post_message_returns_ts_and_update_edits_in_place(slack: FakeSlack) -> None:
-    posted = slack.chat_post_message("C1", blocks=[{"type": "divider"}], text="gate")
+    posted = slack.chat_post_message(
+        "C1", blocks=[{"type": "divider"}], text="gate", token=BOT_TOKEN
+    )
     assert posted["ok"]
     assert posted["channel"] == "C1"
     ts = posted["ts"]
-    assert slack.chat_update("C1", ts, text="closed")["ok"] is True
+    assert slack.chat_update("C1", ts, text="closed", token=BOT_TOKEN)["ok"] is True
     assert slack.messages[("C1", ts)]["text"] == "closed"
     assert len(slack.messages) == 1
 
 
 def test_update_unknown_message_fails(slack: FakeSlack) -> None:
-    assert slack.chat_update("C1", "1.1", text="x") == {"ok": False, "error": "message_not_found"}
+    assert slack.chat_update("C1", "1.1", text="x", token=BOT_TOKEN) == {
+        "ok": False,
+        "error": "message_not_found",
+    }
 
 
 def test_message_ts_is_unique_and_ordered(slack: FakeSlack) -> None:
-    a = slack.chat_post_message("C1", text="a")["ts"]
-    b = slack.chat_post_message("C1", text="b")["ts"]
+    a = slack.chat_post_message("C1", text="a", token=BOT_TOKEN)["ts"]
+    b = slack.chat_post_message("C1", text="b", token=BOT_TOKEN)["ts"]
     assert float(b) > float(a)
 
 
@@ -256,22 +274,24 @@ def test_bad_token_is_invalid_auth(slack: FakeSlack) -> None:
 @pytest.mark.parametrize("token", [None, ""])
 def test_missing_token_is_not_authed(slack: FakeSlack, token: str | None) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
-    posted = slack.chat_post_message("C1", text="x")
+    posted = slack.chat_post_message("C1", text="x", token=BOT_TOKEN)
     assert slack.chat_post_message("C1", text="x", token=token) == {
         "ok": False,
         "error": "not_authed",
     }
     assert slack.views_open(trigger, VIEW, token=token)["error"] == "not_authed"
     assert slack.chat_update("C1", posted["ts"], text="y", token=token)["error"] == "not_authed"
-    assert slack.views_open(trigger, VIEW)["ok"] is True  # the refused call spent nothing
+    assert (
+        slack.views_open(trigger, VIEW, token=BOT_TOKEN)["ok"] is True
+    )  # the refused call spent nothing
     assert len(slack.messages) == 1
 
 
 def test_empty_messages_are_refused_as_no_text(slack: FakeSlack) -> None:
-    assert slack.chat_post_message("C1") == {"ok": False, "error": "no_text"}
+    assert slack.chat_post_message("C1", token=BOT_TOKEN) == {"ok": False, "error": "no_text"}
     assert slack.messages == {}
-    ts = slack.chat_post_message("C1", text="a")["ts"]
-    assert slack.chat_update("C1", ts, text="")["error"] == "no_text"
+    ts = slack.chat_post_message("C1", text="a", token=BOT_TOKEN)["ts"]
+    assert slack.chat_update("C1", ts, text="", token=BOT_TOKEN)["error"] == "no_text"
     assert slack.messages[("C1", ts)]["text"] == "a"  # not blanked
 
 
@@ -289,9 +309,12 @@ def test_bad_views_are_invalid_arguments_and_spend_no_trigger(
     slack: FakeSlack, view: dict[str, object]
 ) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
-    assert slack.views_open(trigger, view) == {"ok": False, "error": "invalid_arguments"}
+    assert slack.views_open(trigger, view, token=BOT_TOKEN) == {
+        "ok": False,
+        "error": "invalid_arguments",
+    }
     assert slack.opened_views == []
-    assert slack.views_open(trigger, VIEW)["ok"] is True
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN)["ok"] is True
 
 
 def test_empty_response_url_body_is_refused_and_uncounted(slack: FakeSlack) -> None:
@@ -306,25 +329,29 @@ def test_empty_response_url_body_is_refused_and_uncounted(slack: FakeSlack) -> N
 def test_expired_trigger_is_not_burned(slack: FakeSlack, clock: Clock) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
     clock.now += TRIGGER_TTL + 1
-    assert slack.views_open(trigger, VIEW)["error"] == "expired_trigger_id"
-    assert slack.views_open(trigger, VIEW)["error"] == "expired_trigger_id"  # not exchanged_
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN)["error"] == "expired_trigger_id"
+    assert (
+        slack.views_open(trigger, VIEW, token=BOT_TOKEN)["error"] == "expired_trigger_id"
+    )  # not exchanged_
 
 
 def test_bad_token_does_not_burn_a_trigger(slack: FakeSlack) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
     assert slack.views_open(trigger, VIEW, token="xoxb-wrong")["ok"] is False
-    assert slack.views_open(trigger, VIEW)["ok"] is True
+    assert slack.views_open(trigger, VIEW, token=BOT_TOKEN)["ok"] is True
 
 
 @pytest.mark.parametrize("method", ["views.open", "chat.update", "chat.postMessage"])
 def test_any_method_can_be_rate_limited(slack: FakeSlack, method: str) -> None:
     trigger = slack.trigger_of(slack.block_actions("approve"))
-    ts = slack.chat_post_message("C1", text="a")["ts"]
+    ts = slack.chat_post_message("C1", text="a", token=BOT_TOKEN)["ts"]
     slack.rate_limit_next(retry_after=9, method=method)
     calls = {
-        "views.open": lambda: slack.views_open_response(trigger, VIEW),
-        "chat.update": lambda: slack.chat_update_response("C1", ts, text="b"),
-        "chat.postMessage": lambda: slack.chat_post_message_response("C1", text="c"),
+        "views.open": lambda: slack.views_open_response(trigger, VIEW, token=BOT_TOKEN),
+        "chat.update": lambda: slack.chat_update_response("C1", ts, text="b", token=BOT_TOKEN),
+        "chat.postMessage": lambda: slack.chat_post_message_response(
+            "C1", text="c", token=BOT_TOKEN
+        ),
     }
     limited = calls[method]()
     assert limited.status == 429
@@ -336,17 +363,17 @@ def test_any_method_can_be_rate_limited(slack: FakeSlack, method: str) -> None:
 
 
 def test_ts_is_per_channel_so_channels_can_share_one(slack: FakeSlack) -> None:
-    a = slack.chat_post_message("C1", text="a")["ts"]
-    b = slack.chat_post_message("C2", text="b")["ts"]
+    a = slack.chat_post_message("C1", text="a", token=BOT_TOKEN)["ts"]
+    b = slack.chat_post_message("C2", text="b", token=BOT_TOKEN)["ts"]
     assert a == b  # same second, same sequence: key a message by (channel, ts)
     assert set(slack.messages) == {("C1", a), ("C2", b)}
-    assert slack.chat_update("C2", a, text="b2")["ok"] is True
+    assert slack.chat_update("C2", a, text="b2", token=BOT_TOKEN)["ok"] is True
     assert slack.messages[("C1", a)]["text"] == "a"  # the other channel's message is untouched
 
 
 def test_ts_ordering_holds_past_999999_in_one_second(slack: FakeSlack) -> None:
     slack._last_micro["C1"] = int(slack.clock()) * 1_000_000 + 999_998
-    stamps = [slack.chat_post_message("C1", text="x")["ts"] for _ in range(4)]
+    stamps = [slack.chat_post_message("C1", text="x", token=BOT_TOKEN)["ts"] for _ in range(4)]
     assert [float(t) for t in stamps] == sorted(float(t) for t in stamps)
     assert len(set(stamps)) == 4
     assert all(len(t.split(".")[1]) == 6 for t in stamps)
@@ -355,15 +382,63 @@ def test_ts_ordering_holds_past_999999_in_one_second(slack: FakeSlack) -> None:
 
 def test_rate_limit_is_429_with_retry_after(slack: FakeSlack) -> None:
     slack.rate_limit_next(retry_after=7)
-    limited = slack.chat_post_message_response("C1", text="x")
+    limited = slack.chat_post_message_response("C1", text="x", token=BOT_TOKEN)
     assert limited.status == 429
     assert limited.headers["Retry-After"] == "7"
     assert limited.json == {"ok": False, "error": "ratelimited"}
-    assert slack.chat_post_message_response("C1", text="x").status == 200
+    assert slack.chat_post_message_response("C1", text="x", token=BOT_TOKEN).status == 200
 
 
 def test_posting_to_unknown_channel_fails(slack: FakeSlack) -> None:
-    assert slack.chat_post_message("C404", text="x")["error"] == "channel_not_found"
+    assert (
+        slack.chat_post_message("C404", text="x", token=BOT_TOKEN)["error"] == "channel_not_found"
+    )
+
+
+def test_token_is_a_required_keyword_on_every_web_api_method(slack: FakeSlack) -> None:
+    with pytest.raises(TypeError):
+        slack.chat_post_message("C1", text="x")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        slack.chat_update("C1", "1.1", text="x")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        slack.views_open("t", VIEW)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        slack.chat_post_message_response("C1", text="x")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        slack.chat_update_response("C1", "1.1", text="x")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        slack.views_open_response("t", VIEW)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("flag", ["true", "True", True])
+def test_delete_original_is_accepted_without_text_and_counts_a_use(
+    slack: FakeSlack, flag: object
+) -> None:
+    url = slack.response_url_of(slack.block_actions("approve"))
+    assert slack.post_response_url(url, {"delete_original": flag}).status == 200
+    assert slack.deleted_originals == [url]
+    assert slack.uses(url) == 1
+    assert slack.responses == []
+
+
+@pytest.mark.parametrize("flag", ["false", "", False, "no"])
+def test_delete_original_must_be_truthy(slack: FakeSlack, flag: object) -> None:
+    url = slack.response_url_of(slack.block_actions("approve"))
+    assert slack.post_response_url(url, {"delete_original": flag}).body == "no_text"
+    assert slack.deleted_originals == []
+    assert slack.uses(url) == 0
+
+
+def test_retry_refuses_a_url_verification(slack: FakeSlack) -> None:
+    with pytest.raises(ValueError, match="Events API"):
+        slack.retry(slack.url_verification(), attempt=1)
+
+
+def test_url_verification_challenge_with_a_slash_round_trips(slack: FakeSlack) -> None:
+    raw = slack.url_verification("a/b/c")
+    assert verifies(raw)
+    assert json.loads(raw.body)["challenge"] == "a/b/c"
+    assert not verifies(reencoded(raw))
 
 
 def test_docs_and_sources_are_linked() -> None:

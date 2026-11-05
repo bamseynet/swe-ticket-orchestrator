@@ -14,8 +14,8 @@ Sources:
   timestamp more than 5 minutes away from its clock, in either direction (an absolute difference,
   so one 5 minutes in the future is refused too). The fake can sign at any age, so a stale request
   is genuinely signed. The raw body is verified before it is deserialised (PLAN T6): the fake sends
-  bytes that no parse-and-re-encode reproduces (compact JSON with ``\\/`` escapes, ``%20`` for
-  spaces), so a verifier that re-encodes fails. ``tamper`` and ``reserialise`` make the two
+  bytes that no parse-and-re-encode reproduces (compact JSON with ``\\/`` escapes), so a verifier
+  that re-encodes fails. ``tamper`` and ``reserialise`` make the two
   attacks.
 * [S48] Interactivity. https://docs.slack.dev/interactivity/handling-user-interaction/ says an
   interactive request is form-encoded with one ``payload`` field of JSON, needs a 200 within 3
@@ -57,6 +57,17 @@ Known departures, each deliberate:
 * Not modelled until D7-04 needs them: the interactive payload's ``api_app_id``, ``container``,
   ``message``, ``token`` and ``action_ts``, and the real format of a ``trigger_id``. The
   ``url_verification`` body omits the deprecated ``token``.
+* A form body writes a space as ``%20``. That is a deliberate, unsourced choice (Slack's form
+  bodies likely use ``+``), made so that a re-encoder that writes ``+`` differs; a receiver must
+  decode both.
+* A ``response_url`` body of ``{"delete_original": "true"}`` (or ``true``) with no ``text`` or
+  ``blocks`` deletes the original message and counts as a use, as Slack documents
+  (https://docs.slack.dev/interactivity/handling-user-interaction/#message_responses). The fake
+  records the URL in ``deleted_originals`` and tracks no message to remove.
+* Token revocation (``token_revoked``) is not modelled until D7-07.
+* Every Web API method takes ``token`` as a required keyword, so an adapter that never forwards the
+  bot token fails with a ``TypeError`` rather than passing. Pass ``None`` for no token
+  (``not_authed``).
 * Transport details are not modelled here. Content-Type and charset, the ``Bearer`` Authorization
   header, and a view sent as a JSON string in a form post are checked by the D7-08 transport shim.
 """
@@ -134,6 +145,7 @@ class FakeSlack:
         self.clock, self.secret = clock, secret
         self.opened_views: list[Mapping[str, Any]] = []
         self.responses: list[Mapping[str, Any]] = []
+        self.deleted_originals: list[str] = []  # response_urls used with delete_original
         self.messages: dict[tuple[str, str], dict[str, Any]] = {}
         self._triggers: dict[str, float] = {}  # trigger_id -> issued at
         self._used_triggers: set[str] = set()
@@ -215,7 +227,10 @@ class FakeSlack:
     def retry(self, raw: RawWebhook, attempt: int, reason: str = "http_timeout") -> RawWebhook:
         """The same bytes again, re-signed at the clock's time (reasoned, not sourced), with
         Slack's retry headers. Only Events API deliveries are retried."""
-        if raw.headers["Content-Type"] != "application/json":
+        if (
+            raw.headers["Content-Type"] != "application/json"
+            or json.loads(raw.body).get("type") != "event_callback"
+        ):
             raise ValueError("Slack retries Events API deliveries only")
         headers = self._headers(raw.body, "application/json")
         headers["X-Slack-Retry-Num"] = str(attempt)
@@ -277,7 +292,7 @@ class FakeSlack:
         return None
 
     def views_open_response(
-        self, trigger_id: str, view: Mapping[str, Any], *, token: str | None = BOT_TOKEN
+        self, trigger_id: str, view: Mapping[str, Any], *, token: str | None
     ) -> WebResponse:
         """``views.open``. A trigger works once, within 3 seconds of the interaction."""
         if (limited := self._limited(VIEWS_OPEN)) is not None:
@@ -302,7 +317,7 @@ class FakeSlack:
         return _ok(view={"id": f"V{len(self.opened_views)}", **view})
 
     def views_open(
-        self, trigger_id: str, view: Mapping[str, Any], *, token: str | None = BOT_TOKEN
+        self, trigger_id: str, view: Mapping[str, Any], *, token: str | None
     ) -> dict[str, Any]:
         return dict(self.views_open_response(trigger_id, view, token=token).json)
 
@@ -312,7 +327,7 @@ class FakeSlack:
         *,
         text: str = "",
         blocks: Sequence[Mapping[str, Any]] = (),
-        token: str | None = BOT_TOKEN,
+        token: str | None,
     ) -> WebResponse:
         if (limited := self._limited(POST_MESSAGE)) is not None:
             return limited
@@ -337,7 +352,7 @@ class FakeSlack:
         *,
         text: str = "",
         blocks: Sequence[Mapping[str, Any]] = (),
-        token: str | None = BOT_TOKEN,
+        token: str | None,
     ) -> dict[str, Any]:
         response = self.chat_post_message_response(channel, text=text, blocks=blocks, token=token)
         return dict(response.json)
@@ -349,7 +364,7 @@ class FakeSlack:
         *,
         text: str = "",
         blocks: Sequence[Mapping[str, Any]] = (),
-        token: str | None = BOT_TOKEN,
+        token: str | None,
     ) -> WebResponse:
         if (limited := self._limited(UPDATE_MESSAGE)) is not None:
             return limited
@@ -369,7 +384,7 @@ class FakeSlack:
         *,
         text: str = "",
         blocks: Sequence[Mapping[str, Any]] = (),
-        token: str | None = BOT_TOKEN,
+        token: str | None,
     ) -> dict[str, Any]:
         response = self.chat_update_response(channel, ts, text=text, blocks=blocks, token=token)
         return dict(response.json)
@@ -388,8 +403,12 @@ class FakeSlack:
             return UrlResponse(404, "expired_url")
         if self._uses[url] >= RESPONSE_URL_LIMIT:
             return UrlResponse(404, "used_url")
-        if not body.get("text") and not body.get("blocks"):
+        deleting = str(body.get("delete_original", "")).lower() == "true"
+        if not deleting and not body.get("text") and not body.get("blocks"):
             return UrlResponse(400, "no_text")
         self._uses[url] += 1
-        self.responses.append(body)
+        if deleting and not body.get("text") and not body.get("blocks"):
+            self.deleted_originals.append(url)
+        else:
+            self.responses.append(body)
         return UrlResponse(200, "ok")
