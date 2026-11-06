@@ -46,8 +46,10 @@ records its ``head_sha``. A merge records the head it merged, and a merge is cov
 approval (a waive counts) of that head. A run with an uncovered merge ends with ``incident`` set
 whichever terminal it reaches, plans one ``OpenRevert`` per uncovered merge SHA, and says so in
 ``Finish`` (PLAN 6.2). Merged code is immutable: once a merge is recorded a report of any other head
-BLOCKS the run (``head_moved``). ``workflow_version`` is the workflow's name until D2-07 pins
-the digest.
+BLOCKS the run (``head_moved``). ``workflow_version`` is the run's pin (D2-30):
+``name@version#digest`` of the published workflow it started on, set before ``RunStarted`` and
+kept by it, or, for the built-in twin that is not published, the workflow's name. A run whose
+pinned manifest no longer loads BLOCKS (``pin_unavailable``, see ``UnavailablePin`` in the reducer).
 """
 
 from __future__ import annotations
@@ -166,6 +168,11 @@ class EffectFailedPermanently:
 
 @BLOCKED_REASONS.register("effect_voided")
 class EffectVoided:
+    pass
+
+
+@BLOCKED_REASONS.register("pin_unavailable")
+class PinUnavailable:
     pass
 
 
@@ -458,8 +465,10 @@ def _report(
 def on_run_started(rs: RunState, event: RunStarted, wf: Graph) -> Transition:
     if rs.run.status is not RunStatus.QUEUED:
         raise _out(f"run already started ({rs.run.status.value})")
+    # a run on a published workflow carries its pin already; a built-in's name is set here
     running = dataclasses.replace(
-        rs.run.advance(RunStatus.RUNNING), workflow_version=wf.metadata.name
+        rs.run.advance(RunStatus.RUNNING),
+        workflow_version=rs.run.workflow_version or wf.metadata.name,
     )
     return _goto(dataclasses.replace(rs, run=running), wf, wf.start)
 
