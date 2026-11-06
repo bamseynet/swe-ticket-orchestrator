@@ -174,7 +174,8 @@ def grant_refusal(
     The blocked edge is read from ``RunState.blocked_edge``, never derived from the workflow or
     the counts, which can change after the block. PLAN 6.2 says a grant never changes an outcome,
     so it must name that edge (``other_edge``). With no recorded edge it fails closed
-    (``edge_unknown``)."""
+    (``edge_unknown``). The workflow's edge for ``grant.outcome`` is used only after it has been
+    checked against the recorded one, so the target a grant resumes through is the blocked one."""
     if grant is None:
         return "missing"
     if grant.run_id != rs.run.id:
@@ -308,11 +309,6 @@ def _route_target(rs: RunState, wf: Graph) -> str | None:
     stage = wf.stages.get(rs.run.stage or "")
     if not isinstance(stage, ReviewPanelStage) or "clean" not in stage.next:
         return None
-    blocked = _blocked_edge(rs)
-    if blocked is None or not any(
-        o != "clean" and _target(e) == (blocked.to, blocked.loop) for o, e in stage.next.items()
-    ):
-        return None  # no recorded loop edge of this panel: nothing was spent here
     to, loop = _target(stage.next["clean"])
     if loop is not None or not isinstance(wf.stages.get(to), GateStage):
         return None

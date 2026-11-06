@@ -930,16 +930,64 @@ def test_the_edge_is_recorded_when_a_gate_edge_blocks() -> None:
     assert out.blocked_edge == QA_RETEST
 
 
-def test_a_route_needs_the_recorded_edge_to_be_at_the_panel() -> None:
-    rs = spent_at_panel()
+def test_a_run_saved_without_the_edge_can_still_be_routed() -> None:
+    """Route-to-gate does not need the edge, so a run saved before the field existed is routed."""
+    rs = dataclasses.replace(spent_at_panel(), blocked_edge=None)
     assert route_refusal(rs, W, route(rs)) is None
-    for edge in (
-        None,
-        BlockedEdge("merge", "update", "stale"),
-        BlockedEdge("panel", "review_gate", "x"),
-    ):
-        bad = dataclasses.replace(rs, blocked_edge=edge)
-        assert route_refusal(bad, W, route(bad)) == "no_next_gate"
+    out = next(rs, route(rs), W)
+    assert out.state.run.stage == "review_gate"
+    assert [type(c) for c in out.commands] == [BarFromRound, OpenGate, AddToAttention]
+
+
+def test_route_clears_the_edge_through_the_reducer() -> None:
+    rs = spent_at_panel()
+    assert rs.blocked_edge is not None
+    out = next(rs, route(rs), W).state
+    assert out.run.status is RunStatus.WAITING_HUMAN
+    assert out.blocked_edge is None
+
+
+def test_cancel_clears_the_edge() -> None:
+    from sto.engine.handlers.core import CancelRequested
+
+    rs = spent_at_panel()
+    assert rs.blocked_edge is not None
+    out = next(rs, CancelRequested(RID), W).state
+    assert out.run.blocked_reason != "loop_exhausted"
+    assert out.blocked_edge is None
+
+
+def test_an_edge_left_on_a_run_not_blocked_on_a_loop_is_dropped_by_any_event() -> None:
+    stale = dataclasses.replace(started(), blocked_edge=BlockedEdge("panel", "implement", "fix"))
+    assert report(stale, "ready").blocked_edge is None
+
+
+def _merge_wf(stale_edge: dict[str, str]) -> Graph:
+    def mutate(d: dict[str, Any]) -> None:
+        d["stages"]["merge"]["next"]["stale"] = stale_edge
+
+    return wf(mutate, valid=False)
+
+
+def _blocked_on_conflict(w: Graph) -> RunState:
+    edge = BlockedEdge("merge", "implement", "fix")  # the conflict edge blocked
+    return blocked_at(started(w), "merge", (("fix", 2), ("stale", 1)), edge)
+
+
+def test_an_edge_is_its_target_and_its_loop_same_loop_other_target() -> None:
+    w = _merge_wf({"to": "update", "loop": "fix"})
+    rs = _blocked_on_conflict(w)
+    stale = grant(rs, stage="merge", outcome="stale", loop="fix")
+    assert grant_refusal(rs, w, stale, applied_at=NOW + 1) == "other_edge"
+    conflict = grant(rs, stage="merge", outcome="conflict", loop="fix")
+    assert grant_refusal(rs, w, conflict, applied_at=NOW + 1) is None
+
+
+def test_an_edge_is_its_target_and_its_loop_same_target_other_loop() -> None:
+    w = _merge_wf({"to": "implement", "loop": "stale"})
+    rs = _blocked_on_conflict(w)
+    stale = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, w, stale, applied_at=NOW + 1) == "other_edge"
 
 
 def test_route_emits_the_bar_before_the_gate_opens() -> None:

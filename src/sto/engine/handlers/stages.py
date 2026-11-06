@@ -277,8 +277,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     if entry is None and not isinstance(stage, _SUPPORTED):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
-        edge = BlockedEdge(rs.run.stage, name, loop) if rs.run.stage else None
-        return _block(rs, "loop_exhausted", edge)
+        assert rs.run.stage is not None  # a loop edge is followed from a stage
+        return _block(rs, "loop_exhausted", BlockedEdge(rs.run.stage, name, loop))
     if isinstance(stage, TerminalStage):  # reaching the end is not a step
         counted = dataclasses.replace(rs, loops=_inc(rs.loops, loop)) if loop else rs
         run = dataclasses.replace(counted.run, stage=name)
