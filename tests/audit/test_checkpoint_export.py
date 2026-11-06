@@ -34,7 +34,7 @@ Wire = dict[str, Any]
 
 def built() -> MemoryStore:
     rec = Recorder()
-    service = GateService(rec, audit=ChainedAuditWriter())
+    service = GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter())
     template_run(service, RUN)
     template_run(service, RUN2)
     return rec.inner
@@ -164,7 +164,7 @@ class World:
 
     def __init__(self) -> None:
         rec = Recorder()
-        self.service = GateService(rec, audit=ChainedAuditWriter())
+        self.service = GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter())
         self.store = rec.inner
         template_run(self.service, RUN)
         self.n_old = len(audit_items(self.store, RUN))
@@ -528,7 +528,7 @@ def test_a_signed_checkpoint_of_another_team_is_refused_in_an_export() -> None:
 
     rec = Recorder()
     other = TeamScope("t2")
-    GateService(rec, audit=ChainedAuditWriter()).open_gate(
+    GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter()).open_gate(
         other, OpenGate(RUN, "review", GateType.REVIEW, 1, subject())
     )
     foreign = create_checkpoint(rec.inner, other, signer(), [RUN], at=99, previous=[])

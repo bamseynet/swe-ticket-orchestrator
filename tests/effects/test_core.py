@@ -301,7 +301,9 @@ def world(inner: Store) -> World:
     scm.seed_branch(REPO, "sto/x", "h1", parent="b0")
     receipt = scm.ensure_draft_pr(PrSpec(REPO, "sto/x", "main", "t", "b"), "k-pr")
     fx = EffectExecutor(store, SCOPE, clock=clock)
-    w = World(store, fx, scm, run, PrRef.of(REPO, receipt), clock, GateService(store))
+    w = World(
+        store, fx, scm, run, PrRef.of(REPO, receipt), clock, GateService.unpoliced_for_tests(store)
+    )
     store.put(SCOPE, w.run_key(), to_wire(run))
     scm.spy.clear()
     return w
@@ -461,7 +463,7 @@ def _demo(inner: Store) -> Demo:
         Key(f"RUN#{rid}", "META"),
         to_wire(Run(rid, "acme", RunStatus.RUNNING, version=1, stage="merge")),
     )
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     state = RunState(Run(id=rid, team="acme"))
     approvals: dict[str, Decided] = {}
 
@@ -888,7 +890,7 @@ def test_a_newer_gate_round_opened_before_the_claim_aborts_it(world: World, roun
 def test_the_next_round_is_checked_even_if_the_audit_writer_never_moves_the_chain(
     world: World,
 ) -> None:
-    world.svc = GateService(world.store, audit=NoChainAudit())
+    world.svc = GateService.unpoliced_for_tests(world.store, audit=NoChainAudit())
     world.approve()
     e = world.plan()
     world.store.before_next_transaction(lambda: world.gate(round=2))
@@ -2099,7 +2101,7 @@ def test_pinned_a_writer_that_never_moves_the_chain_lets_a_skipped_round_through
     """The dependency, pinned: with an ``AuditWriter`` that does not move ``RUN#r/CHAIN``, a round
     that skips a number is invisible to the claim and the stale approval is used (PLAN 4.3.2
     broken). Every AuditWriter must move the chain; see the note at ``EffectExecutor._approval``."""
-    world.svc = GateService(world.store, audit=NoChainAudit())
+    world.svc = GateService.unpoliced_for_tests(world.store, audit=NoChainAudit())
     world.approve()
     e = world.plan()
     world.store.before_next_transaction(lambda: world.gate(round=3))  # not round 2

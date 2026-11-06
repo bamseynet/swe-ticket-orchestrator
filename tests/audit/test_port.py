@@ -33,7 +33,7 @@ def test_the_port_has_no_mutating_method() -> None:
 
 def test_the_port_reads_what_the_writer_stored() -> None:
     rec = Recorder()
-    template_run(GateService(rec, audit=ChainedAuditWriter()), RUN)
+    template_run(GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter()), RUN)
     log = StoreAuditLog(rec.inner, page_size=2)
     got = [dict(e) for e in log.entries(TEAM, RUN)]
     assert got == audit_items(rec.inner, RUN)
@@ -51,7 +51,7 @@ def test_the_store_refuses_to_replace_or_delete_an_audit_entry(make: Any, tmp_pa
     from sto.domain import GateType
     from sto.engine.commands import OpenGate
 
-    GateService(store, audit=rec_ops).open_gate(
+    GateService.unpoliced_for_tests(store, audit=rec_ops).open_gate(
         TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject())
     )
     key = Key(audit_pk(RUN), f"{1:012d}", AUDIT)
@@ -71,7 +71,7 @@ def test_the_store_refuses_to_replace_or_delete_an_audit_entry(make: Any, tmp_pa
 
 def test_the_writer_only_ever_emits_absent_puts_to_the_audit_table() -> None:
     rec = Recorder()
-    template_run(GateService(rec, audit=ChainedAuditWriter()), RUN)
+    template_run(GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter()), RUN)
     for _, ops in rec.committed:
         for op in ops:
             if op.key.table == AUDIT:

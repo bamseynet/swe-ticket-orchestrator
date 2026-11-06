@@ -46,8 +46,7 @@ from sto.engine.commands import RunEffect, RunStep
 from sto.engine.drivers.ports import Done, Outcome
 from sto.engine.handlers.core import StepSucceeded
 from sto.engine.reducer import LINEAR_V0
-from sto.gates.policy import GatePolicy, LinearGates, StoreRecords
-from sto.gates.service import GateService
+from sto.gates.policy import GatePolicy, LinearGates, StoreRecords, build_gate_service
 from sto.identity.linking import AccountLinking
 from sto.identity.mapping import ServiceIdentity, UserIdentity
 from sto.store.ports import Key, Scope, Store, TeamScope
@@ -360,7 +359,7 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
     runtime = Runtime(
         store,
         scope,
-        gates=GateService(store, policy=gate_policy(store, DevDirectory(scope.team))),
+        gates=build_gate_service(store, gate_policy(store, DevDirectory(scope.team))),
         effects=EffectExecutor(store, scope),
         steps=SimulatedSteps(subject_for),
         merges=scm_merge_factory(scm, store, scope, lambda run_id: pr, MergeMethod.SQUASH),

@@ -196,7 +196,9 @@ def open_gate_with_run(store: MemoryStore, status: RunStatus = RunStatus.WAITING
         TEAM, Key(f"RUN#{RUN}", "META"), to_wire(Run(RUN, "t1", status, blocked_reason=reason))
     )
     subject = head_subject()
-    return GateService(store).open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    return GateService.unpoliced_for_tests(store).open_gate(
+        TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject)
+    )
 
 
 def set_run(store: MemoryStore, status: RunStatus) -> None:
@@ -274,7 +276,7 @@ class TestFiring:
         assert entry["decision"] is None
         assert entry["subject"] is None
         with pytest.raises(GateClosedError):
-            GateService(store).decide(
+            GateService.unpoliced_for_tests(store).decide(
                 TEAM,
                 run_id=RUN,
                 gate="review",
@@ -289,7 +291,7 @@ class TestFiring:
     def test_a_late_timer_on_a_decided_gate_changes_nothing(self) -> None:
         store = MemoryStore()
         gate = open_gate_with_run(store)
-        GateService(store).decide(
+        GateService.unpoliced_for_tests(store).decide(
             TEAM,
             run_id=RUN,
             gate="review",
@@ -343,7 +345,7 @@ class TestFiring:
     def test_only_the_timers_round_is_touched(self, round_: int) -> None:
         store = MemoryStore()
         gate = open_gate_with_run(store)
-        svc = GateService(store)
+        svc = GateService.unpoliced_for_tests(store)
         svc.decide(
             TEAM,
             run_id=RUN,
@@ -671,7 +673,7 @@ class TestRaces:
     def test_age_out_closes_every_open_gate(self) -> None:
         store = MemoryStore()
         open_gate_with_run(store)
-        svc = GateService(store)
+        svc = GateService.unpoliced_for_tests(store)
         for name in [f"g{i}" for i in range(15)]:  # more than any retry bound
             svc.open_gate(TEAM, OpenGate(RUN, name, GateType.REVIEW, 1, head_subject(name)))
         assert handler(store).fire(TEAM, timer(TimerKind.MAX_RUN_AGE), T0) is FireOutcome.DONE

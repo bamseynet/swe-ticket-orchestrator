@@ -230,7 +230,7 @@ def test_the_default_writer_redacts_data_and_action_but_not_the_actor() -> None:
 
 def test_a_secret_in_a_comment_is_not_in_the_chain_and_the_hash_covers_the_stored_form() -> None:
     store = Recorder()
-    service = GateService(store)  # the default writer, nothing opted in
+    service = GateService.unpoliced_for_tests(store)  # the default writer, nothing opted in
     template_run(service, RUN, comment=f"my token is {GH} and {AWS}")
     blob = str(audit_items(store.inner, RUN))
     assert GH not in blob

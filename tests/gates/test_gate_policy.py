@@ -481,7 +481,7 @@ def test_a_service_with_no_policy_cannot_count_a_quorum_gate(store: Store) -> No
     rig = Rig(store, quorum=[{"role": "reviewer", "count": 2}])
     a = rig.join("alice")
     rig.open()
-    bare = GateService(store)  # the same store, no policy
+    bare = GateService.unpoliced_for_tests(store)  # the same store, no policy
     with pytest.raises(QuorumConfigError):
         bare.decide(
             SCOPE,
@@ -606,7 +606,7 @@ def test_the_records_skip_an_approval_by_an_actor_that_is_not_issuer_pipe_subjec
     rig = Rig(store, quorum=None)
     gate = rig.open()
     # the dev token's actor is the bare string "dev": it can never equal an evaluated actor
-    GateService(store).decide(
+    GateService.unpoliced_for_tests(store).decide(
         SCOPE,
         run_id=RUN,
         gate="review_gate",
@@ -636,7 +636,9 @@ def test_the_records_need_a_team_scope(store: Store) -> None:
 def test_the_local_app_builds_its_gate_service_with_a_policy(tmp_path: Path) -> None:
     app = app_module.build_local({"STO_MODE": "local", "STO_DB": str(tmp_path / "d.db")})
     service = app.state.runtime._gates
-    assert isinstance(service._policy, GatePolicy)  # never GateService(store) with none
+    assert isinstance(
+        service._policy, GatePolicy
+    )  # never GateService.unpoliced_for_tests(store) with none
 
 
 def test_the_local_policy_lets_the_dev_actor_decide_and_refuses_everyone_else(
@@ -983,3 +985,76 @@ def test_the_records_follow_the_paging_cursor_to_every_approval(store: Store) ->
     )
     facts = paged.facts(SCOPE, gate)
     assert sorted(a.actor for a in facts.approvals) == sorted(people)  # two votes and the close
+
+
+# --- D3-25: one production builder -------------------------------------------------------------
+
+
+def _decide(svc: GateService, who: str) -> object:
+    return svc.decide(
+        SCOPE,
+        run_id=RUN,
+        gate="review_gate",
+        round=1,
+        kind=DecisionKind.APPROVE,
+        actor=who,
+        surface=Surface.UI,
+        subject_digest=DIGEST,
+    )
+
+
+def test_a_service_with_no_policy_refuses_every_decision(store: Store) -> None:
+    from sto.gates.service import PolicyMissingError
+
+    rig = Rig(store, quorum=None)
+    a = rig.join("alice")
+    rig.open()
+    with pytest.raises(PolicyMissingError):
+        _decide(GateService(store), a)
+
+
+def test_the_v0_path_is_an_explicit_test_only_constructor(store: Store) -> None:
+    rig = Rig(store, quorum=None)
+    a = rig.join("alice")
+    rig.open()
+    assert _decide(GateService.unpoliced_for_tests(store), a)  # explicit, and it works
+
+
+def test_the_builder_refuses_a_missing_policy(store: Store) -> None:
+    from sto.gates.policy import build_gate_service
+
+    with pytest.raises(TypeError):
+        build_gate_service(store, None)  # type: ignore[arg-type]
+
+
+def test_the_builder_supplies_the_policy(store: Store) -> None:
+    from sto.gates.policy import build_gate_service
+
+    rig = Rig(store, quorum=None)
+    rig.open()
+    svc = build_gate_service(store, rig.policy)
+    assert svc._policy is rig.policy
+
+
+def test_production_code_builds_gate_service_only_through_the_builder() -> None:
+    import ast
+    from pathlib import Path
+
+    src = Path(policy_module.__file__).parents[1]
+    offenders: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+            target = (
+                fn.value.id
+                if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name)
+                else ""
+            )
+            if name == "GateService" or (target == "GateService"):
+                if path.name == "policy.py" and name == "GateService":
+                    continue  # the builder itself
+                offenders.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert not offenders, offenders

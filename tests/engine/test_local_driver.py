@@ -956,7 +956,7 @@ class RealWorld:
 
     def __init__(self, tmp_path: Path, **fx_args: Any) -> None:
         self.store = MemoryStore()
-        self.svc = GateService(self.store)
+        self.svc = GateService.unpoliced_for_tests(self.store)
         self.fx = EffectExecutor(self.store, SCOPE, **fx_args)
         self.scm = FakeScm()
         repo = RepoRef("acme", "app")

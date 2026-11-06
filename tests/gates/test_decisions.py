@@ -306,7 +306,7 @@ def test_a_close_that_lands_between_the_count_and_the_vote_wins() -> None:
             return page
 
     store = Racing()
-    svc = GateService(
+    svc = GateService.unpoliced_for_tests(
         store, policy=Policy((QuorumRule("reviewer", 2),), REVIEWERS), audit=NoAudit()
     )
     gate = svc.open_gate(TEAM, open_cmd())
@@ -358,7 +358,7 @@ def test_a_voter_who_stops_being_eligible_before_the_close_does_not_count() -> N
 
 def test_without_a_policy_one_approval_closes_the_gate() -> None:
     store = Recording()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     gate = svc.open_gate(TEAM, open_cmd())
     decide(svc, APPROVE, A, gate=gate)
     assert gate_of(store).status is GateStatus.APPROVED
@@ -595,7 +595,7 @@ def test_open_gate_contention_is_a_gate_contention_error(error: Exception) -> No
     store = Losing(error)
     store.armed = True
     with pytest.raises(GateContentionError) as err:
-        GateService(store).open_gate(TEAM, open_cmd())
+        GateService.unpoliced_for_tests(store).open_gate(TEAM, open_cmd())
     assert isinstance(err.value, TransientError)
     assert not isinstance(err.value, ConditionFailedError)
     assert err.value.__cause__ is error
@@ -606,7 +606,7 @@ def test_open_gate_contention_is_a_gate_contention_error(error: Exception) -> No
 )
 def test_decide_contention_is_a_gate_contention_error(error: Exception) -> None:
     store = Losing(error)
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     gate = svc.open_gate(TEAM, open_cmd())
     store.armed = True
     with pytest.raises(GateContentionError) as err:

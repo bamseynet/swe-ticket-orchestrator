@@ -834,7 +834,7 @@ def test_create_app_mounts_links_only_when_given_with_a_session_reader() -> None
             self.runtime = Runtime(
                 store,
                 scope,
-                gates=GateService(store),
+                gates=GateService.unpoliced_for_tests(store),
                 gate_roles=lambda gate: None,
                 effects=EffectExecutor(store, scope),
                 steps=NoSteps(),

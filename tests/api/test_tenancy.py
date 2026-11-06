@@ -104,7 +104,7 @@ class World:
         self.runtime = Runtime(
             store,
             self.scope,
-            gates=GateService(store),
+            gates=GateService.unpoliced_for_tests(store),
             gate_roles=gate_roles,
             effects=EffectExecutor(store, self.scope),
             steps=_NoSteps(),

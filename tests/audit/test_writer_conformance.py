@@ -251,7 +251,7 @@ def test_the_real_writer_fails_nothing() -> None:
 
 def test_every_gate_open_and_decision_of_a_template_shaped_sequence_has_one_audit_event() -> None:
     rec = Recorder()
-    service = GateService(rec)
+    service = GateService.unpoliced_for_tests(rec)
     changes = template_run(service, RUN)
 
     state_txs = [ops for _, ops in rec.committed if any(o.key.table != AUDIT for o in ops)]
@@ -266,7 +266,7 @@ def test_every_gate_open_and_decision_of_a_template_shaped_sequence_has_one_audi
 
 def test_a_refused_decision_leaves_no_audit_entry() -> None:
     rec = Recorder()
-    service = GateService(rec)
+    service = GateService.unpoliced_for_tests(rec)
     template_run(service, RUN)
     n = len(audit_items(rec.inner, RUN))
     with pytest.raises(GateClosedError):

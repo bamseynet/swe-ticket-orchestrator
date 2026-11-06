@@ -127,7 +127,7 @@ class World:
         self.prs: dict[RunId, PrRef] = {}
         self.default_pr = self.make_pr("sto/x", "abc")
         self.pr_queue: list[PrRef] = []
-        self.gates = GateService(store)
+        self.gates = GateService.unpoliced_for_tests(store)
         self.effects = EffectExecutor(store, SCOPE)
         self.steps = Steps(self)
         self.revision = "r1"
