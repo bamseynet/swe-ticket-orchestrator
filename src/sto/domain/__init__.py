@@ -11,6 +11,7 @@ from .errors import (
 )
 from .ids import DecisionId, EffectId, EvidenceId, GateId, OutboxId, RunId, Ulid
 from .models import (
+    BlockedEdge,
     Decision,
     DecisionKind,
     Effect,
@@ -37,6 +38,7 @@ from .states import (
 )
 
 __all__ = [
+    "BlockedEdge",
     "BLOCKED_REASONS",
     "COMMANDS",
     "EVENTS",

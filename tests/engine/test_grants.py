@@ -19,6 +19,7 @@ import pytest
 
 from sto.config.schema import Workflow as Graph
 from sto.domain import BLOCKED_REASONS, COMMANDS, EVENTS, RunStatus, TransientError
+from sto.domain.models import BlockedEdge
 from sto.engine.commands import OpenGate, RunStep
 from sto.engine.handlers.grants import (
     MAX_GRANT_ROUNDS_FACTOR,
@@ -776,62 +777,217 @@ def test_a_counter_above_the_cap_is_brought_back_to_the_cap_before_the_grant() -
 # --- review fixes (pass 1) -----------------------------------------------------------------
 
 
-def blocked_at(rs: RunState, stage: str, loops: tuple[tuple[str, int], ...]) -> RunState:
+def blocked_at(
+    rs: RunState,
+    stage: str,
+    loops: tuple[tuple[str, int], ...],
+    edge: BlockedEdge | None = None,
+) -> RunState:
+    """A hand-built BLOCKED(loop_exhausted) run, with the edge the reducer would have recorded."""
     run = dataclasses.replace(
         rs.run, stage=stage, status=RunStatus.BLOCKED, blocked_reason="loop_exhausted"
     )
-    return dataclasses.replace(rs, run=run, loops=loops)
+    return dataclasses.replace(rs, run=run, loops=loops, blocked_edge=edge)
 
 
-def qa_blocked_with_both_loops_spent() -> RunState:
+QA_CHANGES = BlockedEdge("qa_gate", "implement", "review_loop")
+QA_RETEST = BlockedEdge("qa_gate", "qa_agent", "retest")
+
+
+def qa_blocked_with_both_loops_spent(edge: BlockedEdge | None) -> RunState:
     rs = started()
     rs = report(rs, "ready")
     rs = report(rs, "clean", S1)
-    return blocked_at(rs, "qa_gate", (("review_loop", 2), ("retest", 2)))
+    return blocked_at(rs, "qa_gate", (("review_loop", 2), ("retest", 2)), edge)
 
 
 def test_a_grant_cannot_turn_request_changes_into_a_retest() -> None:
-    """P1: QA asked for changes (review_loop spent) and retest is spent too. The blocked edge is not
-    recorded, so a grant could name either; with two spent looped edges it must name neither."""
-    rs = qa_blocked_with_both_loops_spent()
-    for outcome, loop in (("retest", "retest"), ("changes_requested", "review_loop")):
-        g = grant(rs, stage="qa_gate", outcome=outcome, loop=loop)
-        assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "ambiguous_edge"
-        unchanged(rs, granted(rs, g))
-
-
-def test_a_merge_with_both_conflict_and_stale_spent_takes_no_grant() -> None:
-    rs = blocked_at(started(), "merge", (("fix", 2), ("stale", 1)))
-    for outcome, loop in (("conflict", "fix"), ("stale", "stale")):
-        g = grant(rs, stage="merge", outcome=outcome, loop=loop)
-        assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "ambiguous_edge"
-        unchanged(rs, granted(rs, g))
-
-
-def test_with_exactly_one_spent_edge_the_grant_must_name_that_edge() -> None:
-    rs = blocked_at(started(), "merge", (("fix", 1), ("stale", 1)))  # only ``stale`` is spent
-    ok = grant(rs, stage="merge", outcome="stale", loop="stale")
+    """P1: both QA loops are spent. The recorded edge says which one blocked, so the grant for the
+    other is refused and the grant for the blocked one is not ambiguous."""
+    rs = qa_blocked_with_both_loops_spent(QA_CHANGES)
+    other = grant(rs, stage="qa_gate", outcome="retest", loop="retest")
+    assert grant_refusal(rs, W, other, applied_at=NOW + 1) == "other_edge"
+    unchanged(rs, granted(rs, other))
+    ok = grant(rs, stage="qa_gate", outcome="changes_requested", loop="review_loop")
     assert grant_refusal(rs, W, ok, applied_at=NOW + 1) is None
-    other = grant(rs, stage="merge", outcome="conflict", loop="fix")  # not the blocked edge
+
+
+def test_the_recorded_edge_decides_even_when_both_edges_look_spent() -> None:
+    """The edge is read, not derived: it names the retest, so only the retest is granted."""
+    rs = qa_blocked_with_both_loops_spent(QA_RETEST)
+    ok = grant(rs, stage="qa_gate", outcome="retest", loop="retest")
+    assert grant_refusal(rs, W, ok, applied_at=NOW + 1) is None
+    assert next(rs, granted(rs, ok), W).state.run.stage == "qa_agent"
+    other = grant(rs, stage="qa_gate", outcome="changes_requested", loop="review_loop")
+    assert grant_refusal(rs, W, other, applied_at=NOW + 1) == "other_edge"
+
+
+def test_a_run_saved_without_the_edge_takes_no_grant() -> None:
+    """A run saved before the field existed is blocked on a loop with no edge: it fails closed
+    rather than guessing, even when only one edge looks spent."""
+    rs = blocked_at(started(), "merge", (("fix", 1), ("stale", 1)), None)
+    g = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "edge_unknown"
+    unchanged(rs, granted(rs, g))
+
+
+def test_a_merge_with_both_conflict_and_stale_spent_follows_the_recorded_edge() -> None:
+    edge = BlockedEdge("merge", "update", "stale")
+    rs = blocked_at(started(), "merge", (("fix", 2), ("stale", 1)), edge)
+    stale = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, W, stale, applied_at=NOW + 1) is None
+    conflict = grant(rs, stage="merge", outcome="conflict", loop="fix")
+    assert grant_refusal(rs, W, conflict, applied_at=NOW + 1) == "other_edge"
+    unchanged(rs, granted(rs, conflict))
+
+
+def test_a_grant_for_a_loop_that_is_not_spent_is_not_spent_even_with_an_edge() -> None:
+    edge = BlockedEdge("merge", "update", "stale")
+    rs = blocked_at(started(), "merge", (("fix", 1), ("stale", 1)), edge)
+    other = grant(rs, stage="merge", outcome="conflict", loop="fix")
     assert grant_refusal(rs, W, other, applied_at=NOW + 1) == "not_spent"
     unchanged(rs, granted(rs, other))
 
 
-def test_the_standard_template_qa_gate_takes_no_grant_when_both_its_loops_are_spent() -> None:
+def test_a_stale_edge_for_another_stage_takes_no_grant() -> None:
+    edge = BlockedEdge("panel", "implement", "fix")
+    rs = blocked_at(started(), "merge", (("fix", 2), ("stale", 1)), edge)
+    g = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, W, g, applied_at=NOW + 1) == "edge_unknown"
+
+
+def test_the_standard_template_qa_gate_follows_the_recorded_edge() -> None:
     from sto.config.schema import load_document
 
     path = Path(__file__).parents[2] / "templates" / "standard" / "workflow.yaml"
     graph = load_document(path.read_text())
     assert isinstance(graph, Graph)
     edges = graph.stages["qa_gate"].next  # type: ignore[union-attr]
-    looped = {o: e.loop for o, e in edges.items() if not isinstance(e, str) and e.loop}
-    assert set(looped.values()) == {"qa_fix", "retest"}
-    rs = started(graph)
-    spent = tuple((lp, graph.limits.loops[lp]) for lp in looped.values())
-    rs = blocked_at(rs, "qa_gate", spent)
-    for outcome, loop in looped.items():
-        g = grant(rs, stage="qa_gate", outcome=outcome, loop=loop)
-        assert grant_refusal(rs, graph, g, applied_at=NOW + 1) == "ambiguous_edge"
+    looped = {
+        o: BlockedEdge("qa_gate", e.to, e.loop)
+        for o, e in edges.items()
+        if not isinstance(e, str) and e.loop
+    }
+    assert {e.loop for e in looped.values()} == {"qa_fix", "retest"}
+    spent = tuple((e.loop, graph.limits.loops[e.loop]) for e in looped.values())
+    for blocked_outcome, edge in looped.items():
+        rs = blocked_at(started(graph), "qa_gate", spent, edge)
+        for outcome, e in looped.items():
+            g = grant(rs, stage="qa_gate", outcome=outcome, loop=e.loop)
+            want = None if outcome == blocked_outcome else "other_edge"
+            assert grant_refusal(rs, graph, g, applied_at=NOW + 1) == want
+
+
+# --- the reducer records the blocked edge (D2-34) -------------------------------------------
+
+
+def test_the_reducer_records_the_edge_it_blocked_on() -> None:
+    rs = spent_at_panel()
+    assert rs.blocked_edge == BlockedEdge("panel", "implement", "fix")
+
+
+def test_the_edge_is_cleared_when_the_run_is_no_longer_blocked_on_a_loop() -> None:
+    rs = spent_at_panel()
+    out = next(rs, granted(rs), W).state
+    assert out.run.status is RunStatus.RUNNING
+    assert out.blocked_edge is None
+
+
+def test_a_recorded_edge_does_not_survive_a_different_block() -> None:
+    """A grant that another guard re-blocks (step limit) leaves a run that is not blocked on the
+    loop, so no edge is kept."""
+    rs = spent_at_panel()
+    tight = dataclasses.replace(rs, steps=W.limits.max_steps_per_run)
+    out = next(tight, granted(tight), W).state
+    assert out.run.blocked_reason == "max_steps_exceeded"
+    assert out.blocked_edge is None
+
+
+def test_the_edge_survives_the_wire_and_an_old_run_without_it_still_loads() -> None:
+    from sto.domain import from_wire, to_wire
+
+    rs = spent_at_panel()
+    wire = to_wire(rs)
+    assert from_wire(RunState, wire) == rs
+    old = {k: v for k, v in wire.items() if k != "blocked_edge"}  # saved before the field
+    loaded = from_wire(RunState, old)
+    assert loaded.blocked_edge is None
+    assert loaded.run.blocked_reason == "loop_exhausted"
+
+
+def test_the_edge_is_recorded_when_a_gate_edge_blocks() -> None:
+    """A gate leaves by the decision's outcome: QA's retest edge, with its own loop spent."""
+    rs = started()
+    rs = report(rs, "ready")
+    rs = report(rs, "clean", S1)  # panel -> review_gate
+    rs = _fx.close(rs, _fx.K.APPROVE)  # review_gate -> merge
+    rs = dataclasses.replace(rs, run=dataclasses.replace(rs.run, stage="qa_gate"), round=1)
+    rs = dataclasses.replace(
+        rs, run=rs.run.advance(RunStatus.WAITING_HUMAN), loops=(("retest", 2),)
+    )
+    out = _fx.close(rs, _fx.K.RETEST)
+    assert out.run.blocked_reason == "loop_exhausted"
+    assert out.blocked_edge == QA_RETEST
+
+
+def test_a_run_saved_without_the_edge_can_still_be_routed() -> None:
+    """Route-to-gate does not need the edge, so a run saved before the field existed is routed."""
+    rs = dataclasses.replace(spent_at_panel(), blocked_edge=None)
+    assert route_refusal(rs, W, route(rs)) is None
+    out = next(rs, route(rs), W)
+    assert out.state.run.stage == "review_gate"
+    assert [type(c) for c in out.commands] == [BarFromRound, OpenGate, AddToAttention]
+
+
+def test_route_clears_the_edge_through_the_reducer() -> None:
+    rs = spent_at_panel()
+    assert rs.blocked_edge is not None
+    out = next(rs, route(rs), W).state
+    assert out.run.status is RunStatus.WAITING_HUMAN
+    assert out.blocked_edge is None
+
+
+def test_cancel_clears_the_edge() -> None:
+    from sto.engine.handlers.core import CancelRequested
+
+    rs = spent_at_panel()
+    assert rs.blocked_edge is not None
+    out = next(rs, CancelRequested(RID), W).state
+    assert out.run.blocked_reason != "loop_exhausted"
+    assert out.blocked_edge is None
+
+
+def test_an_edge_left_on_a_run_not_blocked_on_a_loop_is_dropped_by_any_event() -> None:
+    stale = dataclasses.replace(started(), blocked_edge=BlockedEdge("panel", "implement", "fix"))
+    assert report(stale, "ready").blocked_edge is None
+
+
+def _merge_wf(stale_edge: dict[str, str]) -> Graph:
+    def mutate(d: dict[str, Any]) -> None:
+        d["stages"]["merge"]["next"]["stale"] = stale_edge
+
+    return wf(mutate, valid=False)
+
+
+def _blocked_on_conflict(w: Graph) -> RunState:
+    edge = BlockedEdge("merge", "implement", "fix")  # the conflict edge blocked
+    return blocked_at(started(w), "merge", (("fix", 2), ("stale", 1)), edge)
+
+
+def test_an_edge_is_its_target_and_its_loop_same_loop_other_target() -> None:
+    w = _merge_wf({"to": "update", "loop": "fix"})
+    rs = _blocked_on_conflict(w)
+    stale = grant(rs, stage="merge", outcome="stale", loop="fix")
+    assert grant_refusal(rs, w, stale, applied_at=NOW + 1) == "other_edge"
+    conflict = grant(rs, stage="merge", outcome="conflict", loop="fix")
+    assert grant_refusal(rs, w, conflict, applied_at=NOW + 1) is None
+
+
+def test_an_edge_is_its_target_and_its_loop_same_target_other_loop() -> None:
+    w = _merge_wf({"to": "implement", "loop": "stale"})
+    rs = _blocked_on_conflict(w)
+    stale = grant(rs, stage="merge", outcome="stale", loop="stale")
+    assert grant_refusal(rs, w, stale, applied_at=NOW + 1) == "other_edge"
 
 
 def test_route_emits_the_bar_before_the_gate_opens() -> None:

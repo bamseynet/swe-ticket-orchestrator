@@ -9,9 +9,11 @@ stage it was leaving. A team admin can grant it extra rounds of that loop. The g
 stage, the outcome (the looping edge) and the loop, and is bounded and fails closed. It gives no
 extra iteration when it is missing, is for another run, stage or loop edge, is not yet valid or has
 expired (``applied_at`` is outside ``[issued_at, expires_at)``, or a time is not finite), the loop
-is not actually spent, the stage has more than one spent looped edge (``ambiguous_edge``: the
-blocked edge is not recorded, so a grant must not pick one, and PLAN 6.2 says a grant never changes
-an outcome; with exactly one the grant must name it), or the rounds would take the run's total
+is not actually spent, the grant does not name the edge the run was blocked on (``other_edge``: the
+reducer records it in ``RunState.blocked_edge`` and a grant reads it, so a QA stage blocked on
+request-changes is never granted into a retest, as PLAN 6.2 requires), the run has no recorded edge
+for this stage (``edge_unknown``: a run saved before the field existed, which fails closed rather
+than guessing), or the rounds would take the run's total
 grants for that loop past the loop's own cap (``MAX_GRANT_ROUNDS_FACTOR`` times it) or past the org
 ceiling ``max_loop`` (``LoopGranted.loop_ceiling``, read by the service; none set means the platform
 cap), so the loop never runs more often than the org allows.
@@ -28,7 +30,7 @@ An accepted grant gives the rounds back by lowering that loop's counter, then ta
 through ``stages._goto``, so every other guard (``max_steps_per_run``, a gate's subject) still
 applies; if one of them blocks, the counters are as they were. The running total of rounds granted
 is kept in ``RunState.loops`` under ``"<loop>#granted"`` (identifiers cannot contain ``#``, so it
-cannot collide with a loop): ``reducer.py`` is a serial file and gains no field for it.
+cannot collide with a loop). A grant that resumes the run clears ``blocked_edge``.
 
 **Route-to-gate.** For a persistent false positive of a ``review_panel`` (its ``findings`` edge is a
 spent loop), a team admin sends the run to the gate its ``clean`` edge leads to, under the org floor
@@ -64,6 +66,7 @@ from typing import Protocol
 from sto.config.schema import PLATFORM_MAX_STEPS, Edge, GateStage, ReviewPanelStage
 from sto.config.schema import Workflow as Graph
 from sto.domain import COMMANDS, EVENTS, RunId, RunStatus
+from sto.domain.models import BlockedEdge
 from sto.engine.handlers.stages import _goto, _target
 from sto.engine.reducer import (
     MalformedEventError,
@@ -146,21 +149,16 @@ def _blocked_on_loop(rs: RunState) -> bool:
     return rs.run.status is RunStatus.BLOCKED and rs.run.blocked_reason == "loop_exhausted"
 
 
+def _blocked_edge(rs: RunState) -> BlockedEdge | None:
+    """The recorded edge, if it is for the stage the run is blocked on."""
+    edge = rs.blocked_edge
+    return edge if edge is not None and edge.stage == rs.run.stage else None
+
+
 def _edges(wf: Graph, stage: str | None) -> Mapping[str, str | Edge] | None:
     found = wf.stages.get(stage or "")
     edges = getattr(found, "next", None)
     return edges if edges else None
-
-
-def _spent_edges(rs: RunState, wf: Graph, edges: Mapping[str, str | Edge]) -> list[str]:
-    """The outcomes of a stage whose edge names a declared loop that is at its cap."""
-    spent = []
-    for outcome, edge in edges.items():
-        _, loop = _target(edge)
-        cap = wf.limits.loops.get(loop) if loop is not None else None
-        if loop is not None and cap is not None and rs.loop_count(loop) >= cap:
-            spent.append(outcome)
-    return spent
 
 
 def grant_refusal(
@@ -173,11 +171,11 @@ def grant_refusal(
 ) -> str | None:
     """Why ``grant`` gives no extra iteration, or ``None`` when it does. Pure.
 
-    Which edge blocked is not recorded (``RunState`` has no field for it, and ``reducer.py`` is
-    serial), so a grant must not choose between two: PLAN 6.2 says a grant never changes an
-    outcome, and a QA stage blocked on request-changes must not be granted into a retest. It fails
-    closed: with more than one spent looped edge on the stage no grant applies
-    (``ambiguous_edge``), and with exactly one the grant must name it."""
+    The blocked edge is read from ``RunState.blocked_edge``, never derived from the workflow or
+    the counts, which can change after the block. PLAN 6.2 says a grant never changes an outcome,
+    so it must name that edge (``other_edge``). With no recorded edge it fails closed
+    (``edge_unknown``). The workflow's edge for ``grant.outcome`` is used only after it has been
+    checked against the recorded one, so the target a grant resumes through is the blocked one."""
     if grant is None:
         return "missing"
     if grant.run_id != rs.run.id:
@@ -193,16 +191,16 @@ def grant_refusal(
     edges = _edges(wf, grant.stage)
     if edges is None or grant.outcome not in edges:
         return "other_loop"
-    _, edge_loop = _target(edges[grant.outcome])
+    edge_to, edge_loop = _target(edges[grant.outcome])
     cap = wf.limits.loops.get(grant.loop)
     if edge_loop != grant.loop or cap is None:
         return "other_loop"
     if rs.loop_count(grant.loop) < cap:
         return "not_spent"
-    spent = _spent_edges(rs, wf, edges)
-    if len(spent) > 1:
-        return "ambiguous_edge"
-    if spent != [grant.outcome]:
+    blocked = _blocked_edge(rs)
+    if blocked is None:
+        return "edge_unknown"
+    if (blocked.to, blocked.loop) != (edge_to, edge_loop):
         return "other_edge"
     ceiling = PLATFORM_MAX_STEPS if loop_ceiling is None else loop_ceiling
     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 1:
@@ -241,11 +239,15 @@ def on_loop_granted(rs: RunState, event: LoopGranted, wf: Graph) -> Transition:
     loops = _with_count(
         loops, _granted_key(grant.loop), rs.loop_count(_granted_key(grant.loop)) + grant.rounds
     )
-    resumed = dataclasses.replace(rs, run=rs.run.advance(RunStatus.RUNNING), loops=loops)
+    resumed = dataclasses.replace(
+        rs, run=rs.run.advance(RunStatus.RUNNING), loops=loops, blocked_edge=None
+    )
     out = _goto(resumed, wf, to, loop)
     if out.state.run.status is RunStatus.BLOCKED:
         # Another guard refused the entry (step limit, a gate's subject): the rounds are not spent.
-        return Transition(dataclasses.replace(out.state, loops=rs.loops), out.commands)
+        return Transition(
+            dataclasses.replace(out.state, loops=rs.loops, blocked_edge=None), out.commands
+        )
     return out
 
 

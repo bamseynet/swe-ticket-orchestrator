@@ -78,6 +78,7 @@ from sto.domain import (
     StepKey,
     Subject,
 )
+from sto.domain.models import BlockedEdge
 from sto.engine.commands import Finish, OpenGate, OpenRevert, RunEffect, RunStep
 from sto.engine.handlers import core
 from sto.engine.handlers.core import (
@@ -220,9 +221,11 @@ def _with(rs: RunState, run: Run, **changes: object) -> RunState:
     return dataclasses.replace(rs, run=bumped, **changes)  # type: ignore[arg-type]
 
 
-def _block(rs: RunState, reason: str) -> Transition:
-    """BLOCK a RUNNING run where it stands: no command, and no counter moves."""
-    return Transition(_with(rs, rs.run.advance(RunStatus.BLOCKED, blocked_reason=reason)))
+def _block(rs: RunState, reason: str, edge: BlockedEdge | None = None) -> Transition:
+    """BLOCK a RUNNING run where it stands: no command, and no counter moves. ``edge`` is the loop
+    edge a ``loop_exhausted`` block refused, kept in the state for a grant (D2-34)."""
+    blocked = rs.run.advance(RunStatus.BLOCKED, blocked_reason=reason)
+    return Transition(_with(rs, blocked, blocked_edge=edge))
 
 
 def _target(edge: str | Edge) -> tuple[str, str | None]:
@@ -274,7 +277,8 @@ def _goto(rs: RunState, wf: Graph, name: str, loop: str | None = None) -> Transi
     if entry is None and not isinstance(stage, _SUPPORTED):
         return _block(rs, "stage_unsupported")
     if loop is not None and rs.loop_count(loop) >= wf.limits.loops.get(loop, 0):
-        return _block(rs, "loop_exhausted")
+        assert rs.run.stage is not None  # a loop edge is followed from a stage
+        return _block(rs, "loop_exhausted", BlockedEdge(rs.run.stage, name, loop))
     if isinstance(stage, TerminalStage):  # reaching the end is not a step
         counted = dataclasses.replace(rs, loops=_inc(rs.loops, loop)) if loop else rs
         run = dataclasses.replace(counted.run, stage=name)
