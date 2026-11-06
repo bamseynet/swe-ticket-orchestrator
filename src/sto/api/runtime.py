@@ -37,6 +37,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any, Literal
 
 from sto.adapters.ports import MergeMethod, PrRef, ScmProvider
+from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import Decision as DecisionRecord
 from sto.domain import (
     DecisionKind,
@@ -54,12 +55,18 @@ from sto.domain import (
 )
 from sto.effects.core import EffectExecutor
 from sto.effects.ports import EffectHandler, Failed, MergeHandler, Outcome, Voided
-from sto.engine.commands import Finish, OpenGate, RunEffect, RunStep, StopRun
-from sto.engine.drivers.local import EffectsExecutor, LeaseHeldError, LocalDriver
+from sto.engine.commands import Finish, OpenGate, OpenRevert, RunEffect, RunStep, StopRun
+from sto.engine.drivers.local import (
+    LINEAR_V0_GRAPH,
+    EffectsExecutor,
+    LeaseHeldError,
+    LocalDriver,
+)
 from sto.engine.drivers.ports import CommandExecutor, Done, StillRunning
 from sto.engine.drivers.ports import Outcome as CommandOutcome
+from sto.engine.handlers.cancel import Alarm, RevertWriter, StopExecutor
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed
-from sto.engine.reducer import LINEAR_V0, RunState, Workflow, load_handlers
+from sto.engine.reducer import RunState, Workflow, load_handlers
 from sto.gates.service import Decided, GateService
 from sto.store.ports import (
     Absent,
@@ -212,9 +219,10 @@ class _Commands:
         steps: CommandExecutor,
         status_of: Callable[[RunId], RunStatus],
         wait: float,
+        reverts: CommandExecutor,
     ):
         self._gates, self._scope, self._steps = gates, scope, steps
-        self._status_of, self._wait = status_of, wait
+        self._status_of, self._wait, self._reverts = status_of, wait, reverts
 
     async def execute(self, key: str, command: object) -> CommandOutcome:
         if isinstance(command, OpenGate):
@@ -227,12 +235,21 @@ class _Commands:
             return Done([CancelCompleted(command.run_id)])
         if isinstance(command, Finish):
             return Done()
+        if isinstance(command, OpenRevert):
+            return await self._reverts.execute(key, command)  # idempotent per (run, merge_sha)
         if isinstance(command, RunStep):
             status = await asyncio.to_thread(self._status_of, command.run_id)
             if status.is_terminal or status is RunStatus.CANCELLING:
                 return Done()  # the run was stopped while this step waited: do not start it
             return await self._steps.execute(key, command)
         raise TypeError(f"no executor for {type(command).__name__}")
+
+
+class _LogAlarm:
+    """The alarm of a runtime given none: it is logged, loudly, and nothing else."""
+
+    def raise_alarm(self, run_id: RunId, name: str, detail: str) -> None:
+        log.error("alarm %s for run %s: %s", name, run_id, detail)
 
 
 class _TaggedDriver(LocalDriver):
@@ -271,7 +288,9 @@ class Runtime:
         steps: CommandExecutor,
         merges: MergeFactory,
         live: LiveSubject,
-        workflow: Workflow = LINEAR_V0,
+        workflow: Workflow | GraphWorkflow = LINEAR_V0_GRAPH,
+        revert: RevertWriter | None = None,
+        alarm: Alarm | None = None,
         gate_roles: GateRoles = default_gate_roles,
         clock: Callable[[], float] = time.time,
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
@@ -305,12 +324,24 @@ class Runtime:
         def status_of(run_id: RunId) -> RunStatus:
             return self.driver.state(run_id).run.status
 
+        # OpenRevert is StopExecutor's (D2-11): one revert effect per (run, merge sha), so a replay
+        # or a second ask opens nothing more. Without a writer it raises, which the driver shows.
+        self._reverts = StopExecutor(
+            store=store,
+            scope=scope,
+            effects=effects,
+            handlers={},
+            load=lambda run_id: self.driver.state(run_id),
+            clock=clock,
+            alarm=alarm or _LogAlarm(),
+            revert=revert,
+        )
         adapter = EffectsExecutor(
             effects,
             _Handlers(merges),
             live,
             status_of,
-            others=_Commands(gates, scope, steps, status_of, poll_interval),
+            others=_Commands(gates, scope, steps, status_of, poll_interval, self._reverts),
             poll_interval=poll_interval,
         )
         self.driver = _TaggedDriver(
@@ -692,6 +723,9 @@ class Runtime:
             return False
         if stage == gate:
             return True
+        if isinstance(self._wf, GraphWorkflow):
+            at = self._wf.stages.get(stage)
+            return at is not None and gate in (getattr(at, "requires_gates", None) or ())
         return any(
             n.name == stage and n.kind == "effect" and gate in n.requires_gates
             for n in self._wf.nodes

@@ -46,6 +46,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sto.config.schema import Workflow as GraphWorkflow
+from sto.config.schema import load_document
 from sto.domain import (
     COMMANDS,
     EVENTS,
@@ -122,6 +124,79 @@ _IDLE_OK = frozenset({RunStatus.WAITING_HUMAN, RunStatus.WAITING_EXTERNAL, RunSt
 _NEVER_AFTER_STOP = frozenset({"run_step", "open_gate"})
 
 
+def _twin() -> GraphWorkflow:
+    """``LINEAR_V0`` as a graph (D2-26): the same stages, gates and re-entries under the same
+    names, so a gate, an effect or a stored run means the same on either reducer. A linear step has
+    one outcome (a ``StepSucceeded``), so each agent stage has the one edge. The linear workflow had
+    no loop caps; a graph must name them, so the three re-entries are capped at 20 visits each."""
+    gate = {"eligible_roles": ["reviewer"], "decision_surfaces": ["ui"]}
+    doc = {
+        "apiVersion": "sto/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "linear-v0", "team": "_builtin"},
+        "limits": {
+            "loops": {"review_changes": 20, "qa_changes": 20, "retest": 20},
+            "max_steps_per_run": 200,
+            "max_run_age": "30d",
+        },
+        "start": "implement",
+        "stages": {
+            "implement": {
+                "kind": "agent",
+                "agent": "implementer",
+                "next": {"ready": "review_gate"},
+            },
+            "review_gate": {
+                "kind": "gate",
+                "gate": {
+                    **gate,
+                    "type": "review",
+                    "decisions": ["approve", "request_changes", "reject"],
+                },
+                "next": {
+                    "approved": "qa",
+                    "changes_requested": {"to": "implement", "loop": "review_changes"},
+                    "rejected": "rejected",
+                },
+            },
+            "qa": {"kind": "agent", "agent": "qa_agent", "next": {"pass": "qa_gate"}},
+            "qa_gate": {
+                "kind": "gate",
+                "gate": {
+                    **gate,
+                    "type": "qa",
+                    "eligible_roles": ["qa"],
+                    "decisions": ["approve", "request_changes", "reject", "waive", "retest"],
+                },
+                "next": {
+                    "approved": "merge",
+                    "changes_requested": {"to": "implement", "loop": "qa_changes"},
+                    "retest": {"to": "qa", "loop": "retest"},
+                    "rejected": "rejected",
+                },
+            },
+            "merge": {
+                "kind": "effect",
+                "effect": "pr.merge",
+                "requires_gates": ["review_gate", "qa_gate"],
+                "next": {"done": "done"},
+            },
+            "done": {"kind": "terminal", "result": "done"},
+            "rejected": {"kind": "terminal", "result": "rejected"},
+        },
+    }
+    import json
+
+    import yaml
+
+    loaded = load_document(yaml.safe_dump(json.loads(json.dumps(doc)), sort_keys=False))
+    assert isinstance(loaded, GraphWorkflow)
+    return loaded
+
+
+LINEAR_V0_GRAPH = _twin()
+
+
 class RunWedgedError(PermanentError):
     """The run is idle (nothing to apply or execute) yet still in a status that needs the driver:
     a refused or replayed-empty result left it with nothing queued."""
@@ -192,7 +267,7 @@ class LocalDriver:
         self,
         store: Store,
         scope: Scope,
-        workflow: Workflow,
+        workflow: Workflow | GraphWorkflow | None,
         executor: CommandExecutor,
         *,
         owner: str,
@@ -212,7 +287,8 @@ class LocalDriver:
         if not (retry_budget > 0 and retry_budget != float("inf")):
             raise ValueError("retry_budget must be a positive, finite number of seconds")
         load_handlers()  # before any stored event is decoded (decoding needs the registries)
-        self._store, self._scope, self._wf = store, scope, workflow
+        self._store, self._scope = store, scope
+        self._wf: Workflow | GraphWorkflow = LINEAR_V0_GRAPH if workflow is None else workflow
         self._executor, self._registry = executor, registry
         self._owner, self._clock = f"{owner}/{new_id()}", clock
         self._resume_wait = lease_seconds if resume_wait is None else resume_wait
