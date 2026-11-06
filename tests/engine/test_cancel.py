@@ -1170,7 +1170,7 @@ def _assert_landed_under_blocked_record(
 
 
 def test_stop_wins_every_interleaving_with_an_in_flight_merge() -> None:
-    ticks = 4
+    ticks = 3  # request, poll, land: the Stop after the last tick is the position (ticks, 0)
     points = [(t, p) for t in range(ticks) for p in range(len(PHASES))] + [(ticks, 0)]
     cases = [
         (c, m, order)
@@ -1562,12 +1562,14 @@ def test_stop_wins_every_interleaving_with_a_service_retry_of_a_blocked_effect(
     from sto.engine.handlers.failures import RetryService
     from sto.store.sqlite import SqliteStore
 
-    ticks = 4
+    ticks = 3
+    # The Retry and the Stop fire on exact ticks, so the order of the two matters only when they
+    # share a tick: every position is run, and both orders only there.
     cases = [
         (r, c, order, land)
         for r in range(ticks)
         for c in range(ticks)
-        for order in ("rc", "cr")
+        for order in (("rc", "cr") if r == c else ("rc",))
         for land in (False, True)
     ]
     failures: list[str] = []
