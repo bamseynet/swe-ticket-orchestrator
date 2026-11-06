@@ -19,6 +19,7 @@ from sto.effects.relay import (
     AlreadyClosedError,
     OutboxEntry,
     OutboxRelay,
+    RelayReport,
     TokenNotStoredError,
 )
 from sto.engine.commands import OpenGate
@@ -312,3 +313,112 @@ def test_a_delivery_failure_says_decision_recorded_only_when_this_request_commit
         asyncio.run(route(str(RUN), "review", 1, body, Rt(), request))  # type: ignore[arg-type]
     assert caught.value.code == "delivery_failed"
     assert caught.value.extra == {"decision_recorded": recorded}
+
+
+# --- review pass 1 --------------------------------------------------------------------------
+
+
+def _two_runs_decided() -> tuple[MemoryStore, Driver]:
+    store, driver = MemoryStore(), Driver()
+    svc = GateService.unpoliced_for_tests(store)
+    for run in (RUN, OTHER):
+        open_gate(svc, run)
+        approve(svc, run)
+    return store, driver
+
+
+def test_a_timer_outbox_entry_is_skipped_and_counted_not_raised() -> None:
+    import datetime as dt
+
+    from sto.gates.timers import Timer, TimerKind, _outbox_key
+
+    store, driver = _two_runs_decided()
+    timer = Timer(
+        "t1", RUN, TimerKind.REMIND, dt.datetime(2026, 1, 1, tzinfo=dt.UTC), gate="review", round=1
+    )
+    store.put(TEAM, _outbox_key(timer), {"kind": "gate.remind", "run_id": str(RUN)})
+    # an expiry is gate.closed by kind but is not ours by key shape
+    store.put(TEAM, Key(f"RUN#{RUN}", "OUT#timer#x"), {"kind": "gate.closed", "run_id": str(RUN)})
+    store.put(TEAM, Key(f"RUN#{RUN}", "OUT#garbage"), {"kind": "gate.closed"})
+    metrics = Metrics()
+    report = relay_for(store, driver, metrics).sweep([RUN, OTHER])
+    assert report.delivered == 2
+    assert report.skipped == 3
+    assert metrics.gauges["outbox_skipped"] == 3
+    assert len(entries(store)) == 3  # the three foreign entries are left in place
+
+
+def test_a_store_error_on_one_run_does_not_hide_the_others_or_the_metrics() -> None:
+    store, driver = _two_runs_decided()
+    real = store.delete
+
+    def flaky(scope: Scope, key: Key, *, when: Condition | None = None) -> None:
+        if key.pk.endswith(str(RUN)):
+            raise TransientError("throttled")
+        real(scope, key, when=when)
+
+    store.delete = flaky  # type: ignore[method-assign]
+    metrics = Metrics()
+    report = relay_for(store, driver, metrics).sweep([RUN, OTHER])
+    assert report.failed == 1
+    assert report.delivered == 1
+    assert entries(store, OTHER) == []
+    assert "outbox_stuck" in metrics.gauges
+
+
+def test_a_reconcile_that_raises_keeps_the_entry() -> None:
+    store, driver = MemoryStore(), Driver()
+    svc = GateService.unpoliced_for_tests(store)
+    open_gate(svc)
+    approve(svc)
+    driver.closed_runs.add(str(RUN))
+
+    def boom(entry: OutboxEntry) -> bool:
+        raise TransientError("reconcile down")
+
+    driver.reconcile = boom  # type: ignore[method-assign]
+    report = relay_for(store, driver).drain(RUN)
+    assert report.delivered == 0
+    assert report.failed == 1
+    assert len(entries(store)) == 1
+
+
+def test_a_missing_token_holds_back_the_runs_later_entries() -> None:
+    store, driver = MemoryStore(), Driver()
+    driver.token_stored = False
+    svc = GateService.unpoliced_for_tests(store)
+    for round in (1, 2):
+        open_gate(svc, RUN, "review", round)
+        approve(svc, RUN, "review", round)
+    report = relay_for(store, driver).drain(RUN)
+    assert report.waiting == 1
+    assert driver.deliveries == []
+    assert len(entries(store)) == 2
+
+
+def test_reports_add_counts_and_take_the_oldest_age_as_a_max() -> None:
+    a = RelayReport(1, 2, 3, 4, 10.0, 5)
+    b = RelayReport(10, 20, 30, 40, 7.0, 50)
+    assert a + b == RelayReport(11, 22, 33, 44, 10.0, 55)
+
+
+def test_the_runtime_says_not_recorded_on_a_repeat_against_a_closed_gate() -> None:
+    from api.test_v0 import World, code_of, run
+
+    async def body() -> None:
+        w = World(MemoryStore())
+        async with w.up() as api:
+            run_id = await api.to_review_gate()
+
+            async def down(rid: RunId, event: object) -> None:
+                raise OSError("disk went away")
+
+            api.rt.driver.submit = down  # type: ignore[method-assign,assignment]
+            seen = []
+            for _ in range(2):
+                r = await api.decide(run_id, "review_gate")
+                assert (r.status_code, code_of(r)) == (503, "delivery_failed")
+                seen.append(r.json()["error"]["decision_recorded"])
+            assert seen == [True, False]
+
+    run(body())

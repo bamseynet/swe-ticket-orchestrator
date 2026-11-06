@@ -23,6 +23,12 @@ transaction (PLAN 4.3 rule 6, 4.8). This relay reads those entries and hands eac
   and ``outbox_oldest_age_seconds`` (0 when empty) to the :class:`Metrics` port. The age is the
   entry's ULID time against the injected clock; no wall clock is read here.
 
+* **No claim or lease.** Two relays may deliver the same entry; the idempotency key absorbs it. A
+  stalled relay can redeliver an earlier entry after a later one was delivered by another.
+* **Poison entries** (a sink that always fails) block their run's queue; only the ``outbox_stuck``
+  gauge signals it. Entries this relay does not own (timers) or cannot read are skipped and
+  counted in ``outbox_skipped``.
+
 Per-run order follows the ULID, which orders by millisecond only; entries of one run in the same
 millisecond are not ordered among themselves (the gate service's chain head serialises a run's
 decisions, so they are committed one after another, but their ULIDs are random within a ms).
@@ -36,12 +42,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from sto.domain import OutboxId, PermanentError, RunId, TransientError
+from sto.domain import InvalidIdError, OutboxId, PermanentError, RunId, TransientError
 from sto.store.ports import ConditionFailedError, Item, Key, Scope, Store, VersionIs
 
 log = logging.getLogger(__name__)
 
 OUTBOX_PREFIX = "OUT#"
+GATE_SIGNAL_KIND = "gate.closed"
 DEFAULT_STUCK_AFTER_SECONDS = 300.0
 _PAGE = 100
 
@@ -94,6 +101,7 @@ class RelayReport:
     failed: int = 0  # a delivery that did not work; the entry stays
     stuck: int = 0
     oldest_age_seconds: float = 0.0
+    skipped: int = 0  # entries this relay does not own or cannot read; left alone
 
     def __add__(self, other: RelayReport) -> RelayReport:
         return RelayReport(
@@ -102,6 +110,7 @@ class RelayReport:
             self.failed + other.failed,
             self.stuck + other.stuck,
             max(self.oldest_age_seconds, other.oldest_age_seconds),
+            self.skipped + other.skipped,
         )
 
 
@@ -120,17 +129,26 @@ class OutboxRelay:
         self._metrics, self._clock, self._stuck_after = metrics, clock, stuck_after
 
     def pending(self, run_id: RunId) -> list[OutboxEntry]:
-        """The run's undelivered entries, oldest first."""
+        """The run's undelivered gate-signal entries, oldest first (random within a millisecond)."""
+        return self._scan(run_id)[0]
+
+    def _scan(self, run_id: RunId) -> tuple[list[OutboxEntry], int]:
         out: list[OutboxEntry] = []
+        skipped = 0
         cursor: str | None = None
         while True:
             page = self._store.query(
                 self._scope, f"RUN#{run_id}", sk_prefix=OUTBOX_PREFIX, limit=_PAGE, cursor=cursor
             )
-            out += [_entry(run_id, i) for i in page.items]
+            for item in page.items:
+                entry = _entry(run_id, item)
+                if entry is None:
+                    skipped += 1
+                else:
+                    out.append(entry)
             cursor = page.cursor
             if cursor is None:
-                return out
+                return out, skipped
 
     def drain(self, run_id: RunId) -> RelayReport:
         """Deliver this run's entries in order, stopping at the first that does not go."""
@@ -141,7 +159,12 @@ class OutboxRelay:
         another's."""
         total = RelayReport()
         for run_id in run_ids:
-            total += self._drain(run_id)
+            try:
+                total += self._drain(run_id)
+            except Exception as e:  # a store error on one run: count it, go on, still alarm
+                log.error("draining the outbox of run %s failed: %r", run_id, e)
+                total += RelayReport(failed=1)
+        self._metrics.gauge("outbox_skipped", total.skipped)
         self._metrics.gauge("outbox_stuck", total.stuck)
         self._metrics.gauge("outbox_oldest_age_seconds", total.oldest_age_seconds)
         return total
@@ -149,7 +172,7 @@ class OutboxRelay:
     def _drain(self, run_id: RunId) -> RelayReport:
         delivered = waiting = failed = 0
         left: list[OutboxEntry] = []
-        queue = self.pending(run_id)
+        queue, skipped = self._scan(run_id)
         for n, entry in enumerate(queue):
             try:
                 self._sink.deliver(entry)
@@ -169,7 +192,7 @@ class OutboxRelay:
                 break
             self._remove(entry)
             delivered += 1
-        return RelayReport(delivered, waiting, failed, *self._ages(left))
+        return RelayReport(delivered, waiting, failed, *self._ages(left), skipped)
 
     def _reconciled(self, entry: OutboxEntry) -> bool:
         try:
@@ -189,14 +212,17 @@ class OutboxRelay:
         return sum(a >= self._stuck_after for a in ages), max(ages, default=0.0)
 
 
-def _entry(run_id: RunId, item: Item) -> OutboxEntry:
-    return OutboxEntry(
-        run_id,
-        OutboxId.parse(item.key.sk[len(OUTBOX_PREFIX) :]),
-        item.key,
-        item.version,
-        item.data,
-    )
+def _entry(run_id: RunId, item: Item) -> OutboxEntry | None:
+    """The gate-signal entry for ``item``, or None if it is not one this relay owns. Owned: a
+    ULID key and ``kind == "gate.closed"``. Timer entries (``OUT#timer#<id>``, D2-12) and anything
+    unreadable are left alone and counted, never raised: one bad entry must not stop the team."""
+    if item.data.get("kind") != GATE_SIGNAL_KIND:
+        return None
+    try:
+        oid = OutboxId.parse(item.key.sk[len(OUTBOX_PREFIX) :])
+    except InvalidIdError:
+        return None
+    return OutboxEntry(run_id, oid, item.key, item.version, item.data)
 
 
 __all__ = [
