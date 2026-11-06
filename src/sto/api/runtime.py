@@ -44,6 +44,7 @@ from sto.config.publish import (
     Publisher,
     load_pinned,
 )
+from sto.config.schema import Metadata
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import Decision as DecisionRecord
 from sto.domain import (
@@ -77,6 +78,7 @@ from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import (
     PinUnavailableError,
     RunState,
+    UnavailablePin,
     Workflow,
     load_handlers,
     parse_pin,
@@ -335,7 +337,13 @@ class _TaggedDriver(LocalDriver):
     def _workflow_for(self, state: RunState) -> Workflow | GraphWorkflow:
         held = state.run.workflow_version
         if held is not None and parse_pin(held) is not None:
-            return self._pinned(held)  # may raise PinUnavailableError: the run BLOCKS
+            try:
+                return self._pinned(held)
+            except PinUnavailableError as e:  # the run BLOCKS (``next`` consumes the event)
+                pin = parse_pin(held)
+                assert pin is not None
+                meta = Metadata(name=pin.name, team=state.run.team)
+                return UnavailablePin.model_construct(metadata=meta, reason=str(e))
         return super()._workflow_for(state)
 
     async def run_until_idle(self, run_id: RunId) -> RunState:

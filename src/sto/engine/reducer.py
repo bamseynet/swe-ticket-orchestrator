@@ -48,6 +48,7 @@ from sto.domain import (
     DecisionId,
     DecisionKind,
     GateType,
+    InvalidTransitionError,
     PermanentError,
     Run,
     RunId,
@@ -334,8 +335,18 @@ def _blocked_on_loop(rs: RunState) -> bool:
 
 class PinUnavailableError(PermanentError):
     """The manifest a run pinned no longer loads (gone, or it does not hash to the pinned
-    digest). Raised by whoever resolves a run's workflow, never by ``next``; the driver turns it
-    into a BLOCKED run (``block_unavailable_pin`` in ``handlers/stages.py``)."""
+    digest). Raised by whoever resolves a run's workflow, never by ``next``; the resolver answers
+    with an ``UnavailablePin`` instead, so the run BLOCKS."""
+
+
+class UnavailablePin(GraphWorkflow):
+    """Stands in for the workflow of a run whose pinned manifest does not load. Pass it to
+    ``next`` (build it with ``model_construct``: it holds nothing to validate) and the event is
+    consumed by ``block_unavailable_pin``: the run BLOCKS with ``pin_unavailable`` and no command
+    is queued, instead of the drive raising and the event staying queued for ever. ``reason`` is
+    why it did not load."""
+
+    reason: str = ""
 
 
 class PinnedVersion(NamedTuple):
@@ -383,6 +394,18 @@ def workflow_version(workflow: Workflow | GraphWorkflow, pin: str | None = None)
     return name
 
 
+def block_unavailable_pin(rs: RunState) -> Transition:
+    """BLOCK the run with ``pin_unavailable`` and queue nothing; the event is consumed. A run that
+    cannot be blocked from where it is (finished, stopping, or already BLOCKED) stays as it is.
+    The reason is registered in ``handlers/stages.py``."""
+    try:
+        blocked = rs.run.advance(RunStatus.BLOCKED, blocked_reason="pin_unavailable")
+    except InvalidTransitionError:
+        return Transition(rs)
+    bumped = dataclasses.replace(blocked, version=blocked.version + 1)
+    return Transition(dataclasses.replace(rs, run=bumped))
+
+
 DEFAULT_PACKAGE = "sto.engine.handlers"
 _loaded: set[str] = set()
 
@@ -412,6 +435,10 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     registry: HandlerRegistry | None = None,
     graph_registry: HandlerRegistry | None = None,
 ) -> Transition:
+    if isinstance(workflow, UnavailablePin):
+        if event.run_id != state.run.id:
+            raise OutOfOrderEventError(f"{type(event).__name__} is for another run")
+        return block_unavailable_pin(state)
     if isinstance(workflow, GraphWorkflow):
         chosen = graph_registry
         default = GRAPH_HANDLERS

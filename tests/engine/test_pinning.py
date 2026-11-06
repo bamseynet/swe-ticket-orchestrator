@@ -32,12 +32,15 @@ from sto.engine.commands import RunStep
 from sto.engine.drivers.local import LINEAR_V0_GRAPH
 from sto.engine.drivers.ports import Done
 from sto.engine.handlers.core import RunStarted, StepSucceeded
-from sto.engine.handlers.stages import StageReported, block_unavailable_pin
+from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import (
     LINEAR_V0,
+    OutOfOrderEventError,
     PinUnavailableError,
     RunState,
+    UnavailablePin,
     WorkflowMismatchError,
+    block_unavailable_pin,
     load_handlers,
     next,
     parse_pin,
@@ -121,6 +124,23 @@ def test_a_pinned_run_goes_on_under_its_pin_and_a_late_event_for_a_rename_is_ref
     renamed = wf.model_copy(update={"metadata": wf.metadata.model_copy(update={"name": "other"})})
     with pytest.raises(WorkflowMismatchError):
         next(started.state, StageReported(key, "ready", SUBJ), renamed)
+
+
+def test_next_given_an_unavailable_pin_blocks_instead_of_raising() -> None:
+    from sto.config.schema import Metadata
+
+    pin = pin_version("x", 1, DIGEST)
+    running = Run(id=RID, team="t", workflow_version=pin).advance(RunStatus.RUNNING)
+    stand_in = UnavailablePin.model_construct(metadata=Metadata(name="x", team="t"), reason="gone")
+    out = next(RunState(running), StepSucceeded(StepKey(RID, "s", 1, 1), SUBJ), stand_in)
+    assert (out.state.run.status, out.state.run.blocked_reason, out.commands) == (
+        RunStatus.BLOCKED,
+        "pin_unavailable",
+        (),
+    )
+    other = RunId.from_parts(2, bytes(10))
+    with pytest.raises(OutOfOrderEventError):
+        next(RunState(running), StepSucceeded(StepKey(other, "s", 1, 1), SUBJ), stand_in)
 
 
 def test_block_unavailable_pin_blocks_with_a_reason_and_queues_nothing() -> None:

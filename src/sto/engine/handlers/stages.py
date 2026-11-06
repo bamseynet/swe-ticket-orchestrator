@@ -49,7 +49,7 @@ whichever terminal it reaches, plans one ``OpenRevert`` per uncovered merge SHA,
 BLOCKS the run (``head_moved``). ``workflow_version`` is the run's pin (D2-30):
 ``name@version#digest`` of the published workflow it started on, set before ``RunStarted`` and
 kept by it, or, for the built-in twin that is not published, the workflow's name. A run whose
-pinned manifest no longer loads BLOCKS (``pin_unavailable``, see ``block_unavailable_pin``).
+pinned manifest no longer loads BLOCKS (``pin_unavailable``, see ``UnavailablePin`` in the reducer).
 """
 
 from __future__ import annotations
@@ -74,7 +74,6 @@ from sto.domain import (
     DecisionKind,
     FailureClass,
     GateType,
-    InvalidTransitionError,
     Run,
     RunId,
     RunStatus,
@@ -234,17 +233,6 @@ def _block(rs: RunState, reason: str, edge: BlockedEdge | None = None) -> Transi
     edge a ``loop_exhausted`` block refused, kept in the state for a grant (D2-34)."""
     blocked = rs.run.advance(RunStatus.BLOCKED, blocked_reason=reason)
     return Transition(_with(rs, blocked, blocked_edge=edge))
-
-
-def block_unavailable_pin(rs: RunState) -> Transition:
-    """The run's pinned manifest no longer loads (gone, or it does not hash to its digest): BLOCK
-    it with ``pin_unavailable`` instead of raising, and queue nothing. The event is consumed. A
-    run that cannot be blocked from where it is (finished, stopping, or already BLOCKED) stays as
-    it is. Pure: the driver calls it when it cannot resolve the run's workflow."""
-    try:
-        return _block(rs, "pin_unavailable")
-    except InvalidTransitionError:
-        return Transition(rs)
 
 
 def _target(edge: str | Edge) -> tuple[str, str | None]:
