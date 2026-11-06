@@ -56,6 +56,7 @@ from sto.domain import (
     Subject,
 )
 from sto.domain.models import BlockedEdge
+from sto.engine.commands import Finish, OpenRevert
 
 
 class OutOfOrderEventError(PermanentError):
@@ -373,7 +374,7 @@ def parse_pin(text: str | None) -> PinnedVersion | None:
         return None
     name, _, rest = text.partition(_PIN_AT)
     version, sep, digest = rest.partition(_PIN_HASH)
-    if not (name and sep and digest and version.isdigit()):
+    if not (name and sep and digest and version.isascii() and version.isdigit()):
         return None
     return PinnedVersion(name, int(version), digest)
 
@@ -404,6 +405,57 @@ def block_unavailable_pin(rs: RunState) -> Transition:
         return Transition(rs)
     bumped = dataclasses.replace(blocked, version=blocked.version + 1)
     return Transition(dataclasses.replace(rs, run=bumped))
+
+
+def _end_fail_closed(rs: RunState, *, flagged: bool) -> Transition:
+    """End a CANCELLING run without its workflow: no standing approval can be shown to cover a
+    merge, so every recorded merge is uncovered. That is an incident and one ``OpenRevert`` per
+    merge SHA, as ``stages._end`` plans for merges no QA approval covers."""
+    shas = tuple(dict.fromkeys(m.sha for m in rs.merges))
+    incident = flagged or bool(shas)
+    run = rs.run.advance(RunStatus.CANCELLED, incident=incident)
+    run = dataclasses.replace(run, version=run.version + 1)
+    commands = (
+        *(OpenRevert(rs.run.id, sha) for sha in shas),
+        Finish(rs.run.id, RunStatus.CANCELLED, incident),
+    )
+    return Transition(dataclasses.replace(rs, run=run), commands)
+
+
+def _without_workflow(state: RunState, event: Event) -> Transition:
+    """What an event does to a run whose pinned workflow does not load (``UnavailablePin``).
+
+    A Stop must always work, and a merge must never be lost, so the events that never read the
+    workflow are handled: ``CancelRequested`` (BLOCKED to CANCELLING is legal), and while
+    CANCELLING ``EffectLandedDuringStop`` and ``EffectUnresolvedDuringStop`` (their handlers) and
+    ``CancelCompleted`` and ``CancelCompletedUnresolved`` (the end is fail-closed, see
+    ``_end_fail_closed``). A confirmed ``pr.merge`` is recorded, then the run blocks. Anything else
+    BLOCKS the run (``block_unavailable_pin``) and is consumed."""
+    from sto.engine.handlers import cancel, core  # loaded by now: ``next`` checked
+
+    stopping = state.run.status is RunStatus.CANCELLING
+    if isinstance(event, core.CancelRequested):
+        return core.on_cancel_requested(state, event, None)
+    if stopping and isinstance(event, cancel.EffectLandedDuringStop):
+        return cancel.on_effect_landed(state, event, None)
+    if stopping and isinstance(event, cancel.EffectUnresolvedDuringStop):
+        return cancel.on_effect_unresolved(state, event, None)
+    if stopping and isinstance(event, core.CancelCompleted):
+        return _end_fail_closed(state, flagged=False)
+    if stopping and isinstance(event, cancel.CancelCompletedUnresolved):
+        return _end_fail_closed(state, flagged=True)
+    if isinstance(event, core.EffectConfirmed) and event.effect == "pr.merge":
+        sha = (event.merge_sha or "").strip()
+        if not sha:
+            raise MalformedEventError("a pr.merge confirmation must report merge_sha")
+        head = state.subject.head_sha if state.subject else None
+        recorded = dataclasses.replace(state, merges=(*state.merges, Merge(sha, head)))
+        out = block_unavailable_pin(recorded)
+        if out.state is recorded:  # could not block from here: the record still counts
+            run = dataclasses.replace(recorded.run, version=recorded.run.version + 1)
+            return Transition(dataclasses.replace(recorded, run=run))
+        return out
+    return block_unavailable_pin(state)
 
 
 DEFAULT_PACKAGE = "sto.engine.handlers"
@@ -438,7 +490,9 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     if isinstance(workflow, UnavailablePin):
         if event.run_id != state.run.id:
             raise OutOfOrderEventError(f"{type(event).__name__} is for another run")
-        return block_unavailable_pin(state)
+        if DEFAULT_PACKAGE not in _loaded:
+            raise HandlersNotLoadedError("call load_handlers() at startup before next()")
+        return _without_workflow(state, event)
     if isinstance(workflow, GraphWorkflow):
         chosen = graph_registry
         default = GRAPH_HANDLERS

@@ -15,6 +15,7 @@ Fixtures are synthetic; the store is in memory.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import pytest
@@ -24,17 +25,26 @@ from sto.api.runtime import NoPublishedWorkflowError, Runtime, load_pin
 from sto.config.manifest import Manifest, load_manifest
 from sto.config.org_policy import ORG_ADMIN, OrgPolicyStore, Principal
 from sto.config.publish import Pin, Publisher, load_pinned
+from sto.config.schema import Metadata
 from sto.config.schema import Workflow as Graph
 from sto.config.team_config import TEAM_ADMIN
 from sto.domain import Run, RunId, RunStatus, StepKey, Subject
 from sto.effects.core import EffectExecutor
-from sto.engine.commands import RunStep
+from sto.engine.commands import RunStep, StopRun
 from sto.engine.drivers.local import LINEAR_V0_GRAPH
 from sto.engine.drivers.ports import Done
-from sto.engine.handlers.core import RunStarted, StepSucceeded
+from sto.engine.handlers.cancel import EffectLandedDuringStop
+from sto.engine.handlers.core import (
+    CancelCompleted,
+    CancelRequested,
+    EffectConfirmed,
+    RunStarted,
+    StepSucceeded,
+)
 from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import (
     LINEAR_V0,
+    MalformedEventError,
     OutOfOrderEventError,
     PinUnavailableError,
     RunState,
@@ -377,3 +387,321 @@ def test_the_built_in_twin_still_runs_without_a_publisher() -> None:
     state = asyncio.run(go())
     assert state.run.workflow_version == "linear-v0-graph"
     assert steps.stages[0] == "implement"
+
+
+# --- Stop and in-flight events while the pin does not load -----------------------------------
+
+
+def _blocked_world() -> tuple[World, Key, dict[str, Any]]:
+    w = World()
+    v1 = w.publish()
+    key = Key(f"MANIFEST#{v1.digest}", "META")
+    saved: dict[str, Any] = {}
+
+    def gone() -> None:
+        item = w.store.get(PLATFORM, key)
+        assert item is not None
+        saved["data"] = item.data
+        w.store.delete(PLATFORM, key)
+
+    w.steps.during["triage"] = gone
+    return w, key, saved
+
+
+def test_stop_on_a_pin_unavailable_run_is_not_lost() -> None:
+    """ASSERTS: a Stop sent to a run BLOCKED on pin_unavailable either stops it or stays queued.
+    Bug: block_unavailable_pin returns the state unchanged and the driver logs the CancelRequested
+    as 'applied' and drops it: the Stop is silently lost and the run stays BLOCKED."""
+    w, _, _ = _blocked_world()
+
+    async def go() -> tuple[RunState, int]:
+        run = await w.runtime.create_run("T-1")
+        st = await w.drive(run)
+        assert (st.run.status, st.run.blocked_reason) == (RunStatus.BLOCKED, "pin_unavailable")
+        await w.runtime.cancel(run.id)
+        st = await w.drive(run)
+        return st, w.runtime.driver.pending_events(run.id)
+
+    st, pending = asyncio.run(go())
+    assert st.run.status in (RunStatus.CANCELLING, RunStatus.CANCELLED) or pending > 0, (
+        f"Stop lost: status={st.run.status}, inbox={pending}"
+    )
+
+
+def test_a_stop_sent_during_the_outage_takes_effect_once_the_manifest_is_restored() -> None:
+    """ASSERTS: restore the manifest after a Stop sent during the outage, drive, and the run ends
+    stopped without a second Stop. Bug: the first Stop was consumed; the run stays BLOCKED."""
+    w, key, saved = _blocked_world()
+
+    async def go() -> RunState:
+        run = await w.runtime.create_run("T-1")
+        await w.drive(run)
+        await w.runtime.cancel(run.id)
+        await w.drive(run)
+        w.store.put(PLATFORM, key, saved["data"])
+        return await w.drive(run)
+
+    st = asyncio.run(go())
+    assert st.run.status in (RunStatus.CANCELLING, RunStatus.CANCELLED), st.run.status
+
+
+def _cancelling() -> RunState:
+    pin = pin_version("x", 1, DIGEST)
+    run = Run(id=RID, team=SCOPE.team, workflow_version=pin).advance(RunStatus.RUNNING)
+    return RunState(run.advance(RunStatus.CANCELLING))
+
+
+def _stand_in_for_stop() -> UnavailablePin:
+    return UnavailablePin.model_construct(
+        metadata=Metadata(name="x", team=SCOPE.team), reason="gone"
+    )
+
+
+def test_a_stop_in_progress_is_not_frozen_by_a_lost_pin() -> None:
+    """ASSERTS: CancelCompleted for a CANCELLING run whose pin is gone is not silently consumed:
+    next() must either finish the Stop or raise (so LocalDriver._apply keeps it queued).
+    Bug: CANCELLING -> BLOCKED is not a legal transition, so the event was consumed unchanged and
+    the run stayed CANCELLING forever."""
+    rs = _cancelling()
+    try:
+        out = next(rs, CancelCompleted(RID), _stand_in_for_stop())
+    except Exception:
+        return  # kept queued: acceptable
+    assert out.state != rs, "CancelCompleted consumed with no effect: the Stop never completes"
+
+
+def test_a_merge_landed_during_stop_is_not_dropped_by_a_lost_pin() -> None:
+    """ASSERTS: a merge that landed during a Stop (EffectLandedDuringStop, which plans the revert,
+    PLAN 6.2) is not silently consumed when the pin is gone. Bug: dropped, so no revert and no
+    incident is ever recorded for an uncovered merge."""
+    rs = _cancelling()
+    ev = EffectLandedDuringStop(RID, "pr.merge", 1, merge_sha="m" * 40, head_sha="h" * 40)
+    try:
+        out = next(rs, ev, _stand_in_for_stop())
+    except Exception:
+        return
+    assert out.state != rs or out.commands, "landed merge dropped: no revert, no incident"
+
+
+def test_a_confirmed_merge_is_not_dropped_by_a_lost_pin() -> None:
+    """ASSERTS: an EffectConfirmed for pr.merge arriving while the pin is gone is not consumed
+    without recording the merge (Run.merges / uncovered-merge accounting, PLAN 6.2).
+    Bug: the run goes BLOCKED with merges=() and the confirmation is dropped for ever."""
+    pin = pin_version("x", 1, DIGEST)
+    run = Run(id=RID, team=SCOPE.team, workflow_version=pin).advance(RunStatus.RUNNING)
+    rs = RunState(run.advance(RunStatus.WAITING_EXTERNAL))
+    ev = EffectConfirmed(RID, "pr.merge", 1, merge_sha="m" * 40)
+    try:
+        out = next(rs, ev, _stand_in_for_stop())
+    except Exception:
+        return
+    assert out.state.merges, f"merge confirmation dropped; run now {out.state.run.status}"
+
+
+def test_control_a_fresh_stop_after_restore_works() -> None:
+    """CONTROL (passes today): once the manifest is restored a NEW Stop does stop the run."""
+    w, key, saved = _blocked_world()
+
+    async def go() -> RunState:
+        run = await w.runtime.create_run("T-1")
+        await w.drive(run)
+        w.store.put(PLATFORM, key, saved["data"])
+        await w.runtime.cancel(run.id)
+        return await w.drive(run)
+
+    st = asyncio.run(go())
+    assert st.run.status in (RunStatus.CANCELLING, RunStatus.CANCELLED), st.run.status
+
+
+# --- a publish that changes the graph ---------------------------------------------------------
+
+
+V2_TEXT = (
+    OVERLAY_TEXT.replace("  refine: null\n", "")
+    .replace("  plan: null\n", "")
+    .replace(
+        "triage: { model_tier: fast, next: { ready: implement } }", "triage: { model_tier: fast }"
+    )
+)
+
+
+def test_a_publish_that_reroutes_triage_does_not_reroute_a_running_run() -> None:
+    assert V2_TEXT != OVERLAY_TEXT
+    w = World()
+    v1 = w.publish()
+    out = []
+    w.steps.during["triage"] = lambda: out.append(w.publish(text=V2_TEXT))
+
+    async def go() -> None:
+        run = await w.runtime.create_run("T-1")
+        await w.drive(run)
+
+    asyncio.run(go())
+    (v2,) = out
+    assert v2.version == 2
+    assert v2.digest != v1.digest
+    assert w.steps.stages[:2] == ["triage", "implement"], w.steps.stages
+
+    w.steps.stages.clear()
+
+    async def go2() -> None:
+        run = await w.runtime.create_run("T-2")
+        await w.drive(run)
+
+    asyncio.run(go2())
+    assert w.steps.stages[:2] == ["triage", "refine"], w.steps.stages
+
+
+def test_a_stop_ends_fail_closed_with_a_revert_per_recorded_merge() -> None:
+    from sto.engine.commands import Finish, OpenRevert
+    from sto.engine.handlers.cancel import CancelCompletedUnresolved
+    from sto.engine.reducer import Merge
+
+    rs = dataclasses.replace(
+        _cancelling(), merges=(Merge("m1", "h"), Merge("m1", "h"), Merge("m2", None))
+    )
+    out = next(rs, CancelCompleted(RID), _stand_in_for_stop())
+    assert out.state.run.status is RunStatus.CANCELLED
+    assert out.state.run.incident is True
+    assert out.state.run.version == rs.run.version + 1
+    assert out.commands == (
+        OpenRevert(RID, "m1"),
+        OpenRevert(RID, "m2"),
+        Finish(RID, RunStatus.CANCELLED, True),
+    )
+    clean = next(_cancelling(), CancelCompleted(RID), _stand_in_for_stop())
+    assert (clean.state.run.incident, clean.commands) == (
+        False,
+        (Finish(RID, RunStatus.CANCELLED, False),),
+    )
+    flagged = next(_cancelling(), CancelCompletedUnresolved(RID), _stand_in_for_stop())
+    assert flagged.state.run.incident is True
+
+
+def test_a_landed_merge_while_stopping_is_recorded_not_dropped() -> None:
+    ev = EffectLandedDuringStop(RID, "pr.merge", 1, merge_sha="m" * 40, head_sha="h" * 40)
+    out = next(_cancelling(), ev, _stand_in_for_stop())
+    assert [m.sha for m in out.state.merges] == ["m" * 40]
+
+
+def test_stop_and_landed_events_outside_a_stop_block_or_are_refused_not_applied() -> None:
+    running = RunState(
+        Run(id=RID, team=SCOPE.team, workflow_version=pin_version("x", 1, DIGEST)).advance(
+            RunStatus.RUNNING
+        )
+    )
+    landed = EffectLandedDuringStop(RID, "pr.merge", 1, merge_sha="m" * 40)
+    out = next(running, landed, _stand_in_for_stop())  # not stopping: the pin block
+    assert (out.state.run.status, out.state.merges) == (RunStatus.BLOCKED, ())
+    stop = next(running, CancelRequested(RID), _stand_in_for_stop())
+    assert stop.state.run.status is RunStatus.CANCELLING
+    assert stop.commands == (StopRun(RID),)
+    blocked = next(running, StepSucceeded(StepKey(RID, "s", 1, 1), SUBJ), _stand_in_for_stop())
+    assert next(blocked.state, CancelRequested(RID), _stand_in_for_stop()).state.run.status is (
+        RunStatus.CANCELLING
+    )
+
+
+def test_a_confirmed_merge_without_a_sha_is_malformed_even_without_the_workflow() -> None:
+    run = Run(id=RID, team=SCOPE.team, workflow_version=pin_version("x", 1, DIGEST))
+    rs = RunState(run.advance(RunStatus.RUNNING))
+    with pytest.raises(MalformedEventError):
+        next(rs, EffectConfirmed(RID, "pr.merge", 1, merge_sha=" "), _stand_in_for_stop())
+
+
+def test_a_confirmed_merge_records_the_live_head_and_blocks() -> None:
+    run = Run(id=RID, team=SCOPE.team, workflow_version=pin_version("x", 1, DIGEST))
+    rs = RunState(run.advance(RunStatus.RUNNING), subject=SUBJ)
+    out = next(rs, EffectConfirmed(RID, "pr.merge", 1, merge_sha="m1"), _stand_in_for_stop())
+    assert [(m.sha, m.head_sha) for m in out.state.merges] == [("m1", SUBJ.head_sha)]
+    assert out.state.run.status is RunStatus.BLOCKED
+    assert out.state.run.version == rs.run.version + 1
+    # a run that cannot block from where it is (finished) still keeps the record
+    done = RunState(run.advance(RunStatus.RUNNING).advance(RunStatus.DONE))
+    kept = next(done, EffectConfirmed(RID, "pr.merge", 1, merge_sha="m2"), _stand_in_for_stop())
+    assert [m.sha for m in kept.state.merges] == ["m2"]
+    assert kept.state.run.status is RunStatus.DONE
+    assert kept.state.run.version == done.run.version + 1
+
+
+def test_blocking_bumps_the_run_version_once() -> None:
+    running = Run(id=RID, team="t").advance(RunStatus.RUNNING)
+    out = block_unavailable_pin(RunState(running))
+    assert out.state.run.version == running.version + 1
+
+
+# --- the runtime on a pinned run --------------------------------------------------------------
+
+
+def test_the_runtime_finds_a_pinned_runs_workflow_and_not_the_default() -> None:
+    w = World()
+    v1 = w.publish()
+    run = Run(id=RID, team=SCOPE.team, workflow_version=_text(v1))
+    wf = w.runtime._workflow_of(RunState(run))
+    assert isinstance(wf, Graph)
+    assert wf.metadata.name == "platform-kanban"
+    builtin = RunState(Run(id=RID, team=SCOPE.team, workflow_version="linear-v0-graph"))
+    assert w.runtime._workflow_of(builtin) is LINEAR_V0_GRAPH
+    w.store.delete(PLATFORM, Key(f"MANIFEST#{v1.digest}", "META"))
+    assert w.runtime._workflow_of(RunState(run)) is None
+
+
+def test_stop_gate_roles_uses_the_pinned_workflow() -> None:
+    """``mark_ready`` waits on ``review_gate`` in the pinned workflow; the built-in twin has no
+    such stage, so a runtime that used its own workflow would offer nobody."""
+    from sto.domain import DecisionId, Gate, GateId, GateStatus, GateType
+    from sto.engine.reducer import Approval
+
+    w = World()
+    v1 = w.publish()
+    run = Run(id=RID, team=SCOPE.team, workflow_version=_text(v1), stage="mark_ready")
+    approval = Approval("review_gate", 1, DecisionId.from_parts(1, bytes(10)), "d", "abc")
+    state = RunState(run.advance(RunStatus.RUNNING), approvals=(approval,))
+    gate = Gate(
+        GateId.from_parts(1, bytes(10)),
+        RID,
+        "review_gate",
+        GateType.REVIEW,
+        1,
+        SUBJ,
+        status=GateStatus.APPROVED,
+        closed_by="bob",
+    )
+
+    async def astate(run_id: RunId) -> RunState:
+        return state
+
+    async def gates(run_id: RunId) -> list[Gate]:
+        return [gate]
+
+    w.runtime._astate = astate  # type: ignore[method-assign]
+    w.runtime._read_gates = gates  # type: ignore[method-assign]
+    assert asyncio.run(w.runtime.stop_gate_roles(RID)) == {"reviewer"}
+    w.store.delete(PLATFORM, Key(f"MANIFEST#{v1.digest}", "META"))  # the pin is gone: not waiting
+    assert asyncio.run(w.runtime.stop_gate_roles(RID)) == frozenset()
+
+
+def test_waiting_on_follows_the_workflow_it_is_given() -> None:
+    w = World()
+    v1 = w.publish()
+    wf = load_pin(w.store, SCOPE, _text(v1))
+    assert w.runtime._waiting_on("mark_ready", "review_gate", wf) is True
+    assert w.runtime._waiting_on("triage", "review_gate", wf) is False
+    assert w.runtime._waiting_on("review_gate", "review_gate", wf) is True
+    assert w.runtime._waiting_on("mark_ready", "review_gate") is False  # the default twin
+    assert w.runtime._waiting_on(None, "review_gate", wf) is False
+    assert w.runtime._waiting_on("nowhere", "review_gate", wf) is False
+
+
+def test_a_latest_version_that_does_not_load_is_refused_at_create_run() -> None:
+    w = World()
+    v1 = w.publish()
+    w.store.delete(PLATFORM, Key(f"MANIFEST#{v1.digest}", "META"))
+    with pytest.raises(NoPublishedWorkflowError, match="cannot be loaded"):
+        asyncio.run(w.runtime.create_run("T-1"))
+
+
+def test_parse_pin_refuses_a_version_that_is_digits_only_to_unicode() -> None:
+    assert parse_pin(f"a@²#{DIGEST}") is None
+    assert parse_pin(f"a@٣#{DIGEST}") is None
+    assert parse_pin(f"a@2#{DIGEST}") == ("a", 2, DIGEST)

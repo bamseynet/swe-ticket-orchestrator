@@ -297,10 +297,10 @@ class _Commands:
         pin = parse_pin(held)
         wf: Workflow | GraphWorkflow | None = self._wf
         if pin is not None:
-            if self._pinned is None or held is None:
+            if self._pinned is None:
                 return outcome
             try:
-                wf = await asyncio.to_thread(self._pinned, held)
+                wf = await asyncio.to_thread(self._pinned, str(held))
             except PinUnavailableError:
                 return outcome
         if not isinstance(wf, GraphWorkflow):
