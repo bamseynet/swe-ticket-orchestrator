@@ -549,7 +549,7 @@ Found in review of D2-16. `dod.refusal` is not called by anything, so no gate or
 #### D2-34: The blocked loop edge is in RunState
 Found in review of D2-25. A grant for a blocked loop has to re-derive which edge was blocked, so it can name the wrong one after the workflow or the counts change.
 **AC:** the reducer records the blocked loop edge in `RunState` when it blocks a loop, and `grants.py` reads it for `LoopGranted`, `_route_target` and `grant_refusal` instead of deriving it; a run saved before the field existed still loads.
-**Deps:** D2-25. **Size:** M. **Run:** serial. **Files:** `src/sto/domain/models.py`, `src/sto/engine/reducer.py`, `src/sto/engine/handlers/grants.py`, `tests/engine/test_grants.py`, `tests/engine/test_reducer.py`.
+**Deps:** D2-25. **Size:** M. **Run:** serial. **Files:** `src/sto/domain/models.py`, `src/sto/engine/reducer.py`, `src/sto/engine/handlers/grants.py`, `src/sto/engine/handlers/stages.py`, `tests/engine/test_grants.py`, `tests/engine/test_reducer.py`.
 
 #### D2-35: Route policy and grant executors
 Found in review of D2-25. `RoutePolicy` has no production implementation, `FLOOR_TRACKING` still lists D2-25 against `floors.route_to_gate_allowed`, and nothing executes `BarFromRound` or `AddToAttention`.
