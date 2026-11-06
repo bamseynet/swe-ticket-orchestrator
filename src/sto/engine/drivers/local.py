@@ -46,6 +46,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sto.config.schema import Workflow as GraphWorkflow
+from sto.config.schema import load_document
 from sto.domain import (
     COMMANDS,
     EVENTS,
@@ -89,6 +91,7 @@ from sto.engine.handlers.core import (
 )
 from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
 from sto.engine.reducer import (
+    LINEAR_V0,
     HandlerRegistry,
     MalformedEventError,
     OutOfOrderEventError,
@@ -120,6 +123,84 @@ _IDLE_OK = frozenset({RunStatus.WAITING_HUMAN, RunStatus.WAITING_EXTERNAL, RunSt
 # What a stopping run no longer dispatches. A queued RunEffect stays: it may already have been
 # sent, and the Stop must reconcile it.
 _NEVER_AFTER_STOP = frozenset({"run_step", "open_gate"})
+
+
+def _twin() -> GraphWorkflow:
+    """``LINEAR_V0`` as a graph (D2-26): the same stages, gates and re-entries under the same
+    names, so a gate or an effect means the same on either reducer. A step that succeeds takes the
+    first edge of its stage (``ready``, ``pass``; see ``Runtime``). The linear workflow had no loop
+    caps; a graph must name them, so the three re-entries are capped at 20 visits each. Its name
+    differs from ``linear-v0`` on purpose: a run stored under ``linear-v0`` carries linear
+    approvals (no head SHA) and is refused here (``WorkflowMismatchError``), not misjudged."""
+    doc = {
+        "apiVersion": "sto/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "linear-v0-graph", "team": "_builtin"},
+        "limits": {
+            "loops": {"review_changes": 20, "qa_changes": 20, "retest": 20},
+            "max_steps_per_run": 200,
+            "max_run_age": "30d",
+        },
+        "start": "implement",
+        "stages": {
+            "implement": {
+                "kind": "agent",
+                "agent": "implementer",
+                "next": {"ready": "review_gate", "blocked": "rejected"},
+            },
+            "review_gate": {
+                "kind": "gate",
+                "gate": {
+                    "type": "review",
+                    "eligible_roles": ["reviewer"],
+                    "decision_surfaces": ["ui"],
+                    "decisions": ["approve", "request_changes", "reject"],
+                },
+                "next": {
+                    "approved": "qa",
+                    "changes_requested": {"to": "implement", "loop": "review_changes"},
+                    "rejected": "rejected",
+                },
+            },
+            "qa": {
+                "kind": "agent",
+                "agent": "qa_agent",
+                "produces_code": False,  # G1: a QA step that moves the head is refused
+                "next": {"pass": "qa_gate", "fail": "qa_gate", "inconclusive": "qa_gate"},
+            },
+            "qa_gate": {
+                "kind": "gate",
+                "gate": {
+                    "type": "qa",
+                    "eligible_roles": ["qa"],
+                    "decision_surfaces": ["ui"],
+                    "decisions": ["approve", "request_changes", "reject", "waive", "retest"],
+                },
+                "next": {
+                    "approved": "merge",
+                    "changes_requested": {"to": "implement", "loop": "qa_changes"},
+                    "retest": {"to": "qa", "loop": "retest"},
+                    "rejected": "rejected",
+                },
+            },
+            "merge": {
+                "kind": "effect",
+                "effect": "pr.merge",
+                "requires_gates": ["review_gate", "qa_gate"],
+                "next": {"done": "done", "conflict": "rejected", "stale": "rejected"},
+            },
+            "done": {"kind": "terminal", "result": "done"},
+            "rejected": {"kind": "terminal", "result": "rejected"},
+        },
+    }
+    import yaml
+
+    loaded = load_document(yaml.safe_dump(doc, sort_keys=False))
+    assert isinstance(loaded, GraphWorkflow)
+    return loaded
+
+
+LINEAR_V0_GRAPH = _twin()
 
 
 class RunWedgedError(PermanentError):
@@ -192,7 +273,7 @@ class LocalDriver:
         self,
         store: Store,
         scope: Scope,
-        workflow: Workflow,
+        workflow: Workflow | GraphWorkflow | None,
         executor: CommandExecutor,
         *,
         owner: str,
@@ -212,7 +293,8 @@ class LocalDriver:
         if not (retry_budget > 0 and retry_budget != float("inf")):
             raise ValueError("retry_budget must be a positive, finite number of seconds")
         load_handlers()  # before any stored event is decoded (decoding needs the registries)
-        self._store, self._scope, self._wf = store, scope, workflow
+        self._store, self._scope = store, scope
+        self._wf: Workflow | GraphWorkflow = LINEAR_V0_GRAPH if workflow is None else workflow
         self._executor, self._registry = executor, registry
         self._owner, self._clock = f"{owner}/{new_id()}", clock
         self._resume_wait = lease_seconds if resume_wait is None else resume_wait
@@ -226,6 +308,14 @@ class LocalDriver:
         self._retry_budget = retry_budget
         self._retrying: dict[str, float] = {}
         self._redriver = Redriver(self, redrive, clock=clock, sleep=sleep) if redrive else None
+
+    def _workflow_for(self, state: RunState) -> Workflow | GraphWorkflow:
+        """The workflow a run continues on. Only a new run takes the default twin: one stored under
+        ``linear-v0`` keeps the linear reducer (its approvals carry no head SHA, so the graph
+        reducer would judge its merge uncovered and revert it)."""
+        if self._wf is LINEAR_V0_GRAPH and state.run.workflow_version == LINEAR_V0.version:
+            return LINEAR_V0
+        return self._wf
 
     @property
     def redriver(self) -> Redriver | None:
@@ -710,7 +800,7 @@ class LocalDriver:
             return (Put(key, data, when=Absent()),)
 
         try:
-            tr = next(rec.state, event, self._wf, registry=self._registry)
+            tr = next(rec.state, event, self._workflow_for(rec.state), registry=self._registry)
         except (OutOfOrderEventError, MalformedEventError) as e:
             # Late or duplicate (out of order), or never valid (malformed): recorded and dropped,
             # so a bad event cannot block the queue. Anything else (NoHandlerError,

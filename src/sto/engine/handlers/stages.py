@@ -429,6 +429,17 @@ def _report(
         return _block(rs, "degraded")
     if subject is not None:
         live = rs.subject
+        if (
+            isinstance(stage, AgentStage)
+            and not stage.produces_code
+            and live is not None
+            and (subject.head_sha, subject.patch_id) != (live.head_sha, live.patch_id)
+        ):
+            # as the linear path refuses it (G1): a stage that cannot change the code must not
+            # move the head, or a gate would open on a head nobody reviewed
+            raise _out(
+                f"stage {rs.run.stage!r} reported a different SHA or patch than the reviewed one"
+            )
         if rs.merges and subject.head_sha not in {m.head_sha for m in rs.merges}:
             # Well formed but unsafe: raising would be dropped and the run would wedge. Merged
             # code cannot change, so the run BLOCKS with the subject and approvals untouched.
