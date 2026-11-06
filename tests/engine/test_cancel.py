@@ -16,6 +16,7 @@ import itertools
 import sys
 import threading
 import time
+import types
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,7 @@ from sto.domain import (
     to_wire,
 )
 from sto.effects.core import EffectExecutor
-from sto.effects.ports import CallHandler, MergeHandler
+from sto.effects.ports import CallHandler, MergeHandler, effect_item_key
 from sto.engine.commands import OpenGate, OpenRevert, RunStep, StopRun
 from sto.engine.drivers.local import EffectsExecutor, LocalDriver, RunWedgedError
 from sto.engine.drivers.ports import Done, Outcome
@@ -193,8 +194,7 @@ def test_void_planned_does_not_stay_silent_when_conflicts_never_clear() -> None:
     assert len(sleeps) >= 7
 
 
-def _receipt(key: str) -> Any:
-
+def _receipt(key: str) -> Receipt:
     return Receipt(f"x-{key}", "fake://x", True, simulated=True)
 
 
@@ -418,7 +418,6 @@ class World:
 
     def close(self) -> None:
         """Release the threads this world started (a test must not leave pools behind)."""
-        self.driver._beat_pool.shutdown(wait=False, cancel_futures=True)  # noqa: SLF001
         self.stop.close()
         self.adapter.close()
 
@@ -1140,15 +1139,34 @@ def _check_stop_won(w: World, plan: Plan, final: RunState) -> None:
         for name, status in w.executed
     )
     for e in w.effects():
-        # A merge that landed under a blocked effect leaves that record blocked (RETRYING) for a
-        # person: the executor has no handle to confirm it by. The landing itself is recorded on
-        # the run, with its revert and incident (asserted above).
-        settled = (EffectStatus.VOIDED, EffectStatus.CONFIRMED)
-        assert e.status in settled or (landed and e.status is EffectStatus.RETRYING), e.status
+        if e.status not in (EffectStatus.VOIDED, EffectStatus.CONFIRMED):
+            _assert_landed_under_blocked_record(w, final, e)
     refused = [r for r in w.driver.rejected(RID) if r["type"].startswith("effect.")]
     assert refused == [], f"an effect event was refused: {refused}"
     assert w.driver._load(RID).pending == ()  # noqa: SLF001
     assert plan.c_done
+
+
+def _assert_landed_under_blocked_record(
+    w: World, final: RunState, effect: Effect | None = None
+) -> None:
+    """The one way a record may stay unsettled after a Stop: a ``pr.merge`` that really landed
+    under a blocked effect (RETRYING or ATTEMPTING; the executor has no handle to confirm it by).
+    The run must say so: the merge recorded, its revert opened, the landing applied, and the run
+    an incident."""
+    records = [effect] if effect else [e for e in w.effects() if e.type == "pr.merge"]
+    assert records, "no pr.merge record is left unsettled"
+    (record,) = records
+    assert record.type == "pr.merge", record.type
+    assert record.status in (EffectStatus.RETRYING, EffectStatus.ATTEMPTING), record.status
+    item = w.store.get(SCOPE, effect_item_key(RID, record.idempotency_key))
+    assert item is not None
+    assert item.data["meta"].get("blocked"), "the unsettled record is not blocked"
+    assert w.landed(), "a record was left unsettled but no merge landed"
+    assert final.merges, "the merge is not recorded on the run"
+    assert len(w.scm.spy.applied("open_revert_pr")) == 1, "its revert was not opened"
+    assert ("cancel.effect_landed", "applied") in w.timeline_types(), "its landing was not applied"
+    assert final.run.incident is True
 
 
 def test_stop_wins_every_interleaving_with_an_in_flight_merge() -> None:
@@ -1616,7 +1634,7 @@ def test_stop_wins_every_interleaving_with_a_service_retry_of_a_blocked_effect(
     assert failures == [], f"{len(failures)} of {len(cases)}:\n" + "\n".join(failures[:10])
 
 
-# --- which head a converted confirmation is attributed to ---------------------------------------
+# --- which head a converted confirmation is attributed to ---
 
 
 def test_a_converted_confirmation_is_attributed_to_the_head_the_approvals_cover() -> None:
@@ -1665,7 +1683,7 @@ def test_the_stop_prefers_the_effects_frozen_head_over_the_live_subject() -> Non
     assert (event.merge_sha, event.head_sha) == ("m-frozen", "abc")
 
 
-# --- tests for what the first review found unguarded --------------------------------------------
+# --- tests for what the first review found unguarded ---
 
 
 def test_cancel_itself_ends_the_background_redrive() -> None:
@@ -1797,3 +1815,495 @@ def test_the_service_quiesces_the_background_redrive_before_it_submits() -> None
 
     run(go())
     assert order == ["quiesce", "submit"]
+
+
+# === review pass 2 ================================================================================
+
+
+def _bare_stop(
+    fx: EffectExecutor,
+    store: Any,
+    *,
+    lookup: Any = None,
+    revert: Any = None,
+    clock: Clock | None = None,
+    alarm: Alarms | None = None,
+    handlers: dict[str, Any] | None = None,
+    settings: StopSettings | None = None,
+    status: RunStatus = RunStatus.CANCELLING,
+) -> tuple[StopExecutor, Clock, Alarms]:
+    clock, alarm = clock or Clock(), alarm or Alarms()
+    stopping = Run(RID, "t1", status, version=2, stage="s")
+    stop = StopExecutor(
+        store=store,
+        scope=SCOPE,
+        effects=fx,
+        handlers=handlers or {},
+        load=lambda rid: RunState(stopping),
+        clock=clock,
+        alarm=alarm,
+        lookup=lookup,
+        revert=revert,
+        settings=settings,
+    )
+    return stop, clock, alarm
+
+
+def _landed_result(key: str | None, sha: str = "m-x") -> MergeResult:
+    receipt = Receipt("merge-9", "fake://pr/1", True, simulated=True)
+    return MergeResult(MergeState.MERGED, sha, receipt, key=key)
+
+
+# --- F1: no pool thread outlives its work ---
+
+
+def test_no_pool_thread_outlives_the_work_it_was_started_for() -> None:
+    w = World()
+    w.auto_gates = set()
+    run(w.start())
+    for _ in range(50):  # a finished thread may take a moment to be reaped
+        alive = [
+            t.name for t in threading.enumerate() if t.name.startswith(("sto-lease", "sto-scm"))
+        ]
+        if not alive:
+            break
+        time.sleep(0.02)
+    assert alive == [], f"threads left behind: {alive}"
+
+
+# --- F2: only merges that are the orchestrator's are reverted ---
+
+
+async def _watched_stalled_world() -> World:
+    from sto.engine.handlers.failures import RetryPolicy
+
+    w = World(redrive=RetryPolicy(max_attempts=5, base_delay=1, max_delay=5, total_budget=100))
+    fxnow = [1_000_000.0]
+    w.fx._clock = lambda: fxnow[0]  # noqa: SLF001
+    entered, release = threading.Event(), threading.Event()
+
+    def dies(*a: Any, **k: Any) -> Any:
+        entered.set()
+        release.wait(30)
+        raise ConnectionError("the writer died")
+
+    await to_the_merge(w)
+    w.scm.request_merge = dies  # type: ignore[method-assign]
+    assert w.driver.redriver is not None
+    w.driver.redriver.spawn(RID)
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    fxnow[0] += 3600
+    final = await w.driver.cancel(RID)
+    release.set()
+    assert final.run.incident is True
+    del w.scm.request_merge  # the real method again
+    return w
+
+
+def test_a_persons_own_merge_inside_the_window_is_not_reverted() -> None:
+    w = World()
+
+    async def go() -> list[tuple[RunId, str]]:
+        w2 = await _watched_stalled_world()
+        w.close()
+        try:
+            h = w2.scm.request_merge(w2.pr, "abc", MergeMethod.SQUASH, "a-person-merged-it")
+            w2.scm.complete_merge(h, "m-human")
+            out = await w2.watch().recheck()
+            assert "merge_landed_after_stop" not in w2.alarms.names()
+            assert w2.scm.spy.applied("open_revert_pr") == ()
+            return out
+        finally:
+            w2.close()
+
+    assert run(go()) == [(RID, "foreign")]
+
+
+def test_a_merge_whose_author_is_unknown_alarms_and_is_not_reverted() -> None:
+    async def go() -> None:
+        w = await _watched_stalled_world()
+        try:
+            w.stop._lookup = lambda e: _landed_result(None)  # noqa: SLF001 - the SCM cannot say
+            assert await w.watch().recheck() == [(RID, "unattributed")]
+            assert "merge_after_stop_unattributed" in w.alarms.names()
+            assert w.scm.spy.applied("open_revert_pr") == ()
+            assert await w.watch().recheck() == []  # resolved: a person has been told
+        finally:
+            w.close()
+
+    run(go())
+
+
+def test_find_merge_reports_the_key_the_merge_was_requested_with() -> None:
+    scm = FakeScm()
+    scm.seed_branch(REPO, "main", "b0")
+    scm.seed_branch(REPO, "sto/x", "abc", parent="b0")
+    pr = PrRef.of(REPO, scm.ensure_draft_pr(PrSpec(REPO, "sto/x", "main", "t", "b"), "k"))
+    scm.mark_ready(pr, "k2")
+    handle = scm.request_merge(pr, "abc", MergeMethod.SQUASH, "the-key")
+    queued = scm.find_merge(pr)
+    assert queued is not None
+    assert queued.key == "the-key"
+    scm.complete_merge(handle, "m-sha")
+    landed = scm.find_merge(pr)
+    assert landed is not None
+    assert landed.key == "the-key"
+    assert scm.poll_merge(handle).key == "the-key"
+
+
+# --- F3: one bad row does not starve the others ---
+
+
+def test_one_unreadable_watch_row_does_not_stop_the_others_being_checked() -> None:
+    from sto.adapters.ports import UnknownRefError
+
+    fx, store = make_effects(RunStatus.CANCELLING)
+    gone, real = plan(fx, "pr.merge", "a"), plan(fx, "pr.merge", "b")
+    made: list[str] = []
+
+    def revert(rid: RunId, sha: str, key: str) -> Receipt:
+        made.append(sha)
+        return _receipt(key)
+
+    def lookup(effect: Effect) -> MergeResult | None:
+        if effect.idempotency_key == gone:
+            raise UnknownRefError("the PR was deleted")
+        return _landed_result(effect.idempotency_key)
+
+    stop, _, alarms = _bare_stop(fx, store, lookup=lookup, revert=revert)
+    stop._watch(RID, gone)  # noqa: SLF001
+    stop._watch(RID, "no-such-effect")  # noqa: SLF001 - a row whose record is missing
+    stop._watch(RID, real)  # noqa: SLF001
+    out = run(stop.recheck_merges())
+    assert out == [(RID, "landed")]  # the good row was reached
+    assert made == ["m-x"]
+    assert alarms.names().count("recheck_failed") == 2
+    rows = store.query(SCOPE, "STOP_WATCH").items
+    assert len(rows) == 2  # the two bad rows are kept, to be looked at again
+    run(stop.recheck_merges())
+    assert alarms.names().count("recheck_failed") == 2  # the same failure is not shouted twice
+    stop.close()
+
+
+# --- F4: a confirmed merge with no sha is never silently dropped ---
+
+
+def test_a_confirmed_merge_without_a_merge_sha_is_watched_and_an_incident() -> None:
+    fx, store = make_effects(RunStatus.RUNNING)
+    key = plan(fx, "pr.merge")
+    handler = CallHandler(_receipt)
+    fx.execute(RID, key, handler)
+    effect = fx.get(RID, key)
+    assert (effect.status, effect.frozen_subject) == (EffectStatus.CONFIRMED, None)
+    stopping = Run(RID, "t1", RunStatus.CANCELLING, version=2, stage="s")
+    store.inner.put(SCOPE, Key(f"RUN#{RID}", "META"), to_wire(stopping))
+    stop, _, _ = _bare_stop(fx, store, handlers={"pr.merge": handler})
+    out = run(stop.execute("k", StopRun(RID)))
+    assert isinstance(out, Done)
+    assert [type(e).__name__ for e in out.events] == [
+        "EffectUnresolvedDuringStop",
+        "CancelCompletedUnresolved",
+    ]
+    (note,) = [e for e in out.events if isinstance(e, EffectUnresolvedDuringStop)]
+    assert (note.reason, note.key) == ("merge_unconfirmed", key)
+    assert len(store.query(SCOPE, "STOP_WATCH").items) == 1
+    stop.close()
+
+
+def test_an_unconfirmed_merge_makes_the_run_an_incident_whatever_ends_it() -> None:
+    rs = _stopping()
+    note = EffectUnresolvedDuringStop(RID, "pr.merge", 1, "merge_unconfirmed", "k")
+    after = next(rs, note, W).state
+    again = next(after, note, W).state
+    assert [m.sha for m in again.merges] == ["unknown"]  # recorded once
+    ended = next(again, CancelCompleted(RID), W)  # even a plain completion cannot end clean
+    assert (ended.state.run.status, ended.state.run.incident) == (RunStatus.CANCELLED, True)
+    plain = next(rs, EffectUnresolvedDuringStop(RID, "pr.merge", 1), W).state
+    assert plain.merges == ()  # a blocked effect alone is not a merge
+
+
+def test_a_confirmation_without_a_sha_while_stopping_becomes_an_unconfirmed_merge() -> None:
+    from sto.engine.handlers.core import EffectConfirmed
+
+    converted = LocalDriver._while_stopping(  # noqa: SLF001
+        _stopping(), EffectConfirmed(RID, "pr.merge", 1, None)
+    )
+    assert isinstance(converted, EffectUnresolvedDuringStop)
+    assert converted.reason == "merge_unconfirmed"
+    ok = LocalDriver._while_stopping(_stopping(), _fx_confirmed("m1"))  # noqa: SLF001
+    assert isinstance(ok, EffectLandedDuringStop)
+
+
+def test_the_revert_of_an_unknown_merge_asks_a_person() -> None:
+    w = World()
+    run(w.stop.execute("k", OpenRevert(RID, "unknown")))
+    assert "revert_needs_person" in w.alarms.names()
+    assert w.scm.spy.applied("open_revert_pr") == ()
+
+
+# --- F5: what the second review's mutants showed unguarded ---
+
+
+@pytest.mark.parametrize("method", ["poll", "stop", "reconcile"])
+def test_a_bounded_handler_puts_a_deadline_on_poll_stop_and_reconcile(method: str) -> None:
+    from sto.effects.ports import Written
+    from sto.engine.handlers.cancel import ReadPool, bound_handler
+
+    release = threading.Event()
+
+    class Hung:
+        def execute(self, effect: Effect) -> Any:
+            return Written(_receipt("x"))
+
+        def _hang(self, effect: Effect) -> Any:
+            release.wait(10)
+            return Written(_receipt("x"))
+
+        poll = stop = reconcile = _hang
+
+    handler = bound_handler(Hung(), timeout=0.2, pool=ReadPool())
+    fx, _ = make_effects(RunStatus.RUNNING)
+    effect = fx.get(RID, plan(fx))
+    started = time.monotonic()
+    try:
+        with pytest.raises(ScmReadTimeoutError):
+            getattr(handler, method)(effect)
+        assert time.monotonic() - started < 5
+    finally:
+        release.set()
+
+
+def test_the_read_pool_is_bounded_and_leaves_no_idle_thread() -> None:
+    from sto.engine.handlers.cancel import ReadPool
+
+    pool = ReadPool(max_outstanding=2)
+    release = threading.Event()
+    futures = [pool.submit(lambda: release.wait(10)) for _ in range(2)]
+    with pytest.raises(ScmReadTimeoutError, match="outstanding"):
+        pool.submit(lambda: None)  # full: refused at once, never queued behind a hung read
+    release.set()
+    assert [f.result(timeout=5) for f in futures] == [True, True]
+    for _ in range(50):
+        if not any(t.name.startswith("sto-scm") for t in threading.enumerate()):
+            break
+        time.sleep(0.02)
+    assert not any(t.name.startswith("sto-scm") for t in threading.enumerate())
+    assert pool.submit(lambda: 7).result(timeout=5) == 7  # and it is usable again
+
+
+def test_find_merge_prefers_a_landed_merge_over_a_live_queued_one() -> None:
+    from sto.adapters.fake.scm import _Merge
+
+    scm = FakeScm()
+    scm.seed_branch(REPO, "main", "b0")
+    scm.seed_branch(REPO, "sto/x", "abc", parent="b0")
+    pr = PrRef.of(REPO, scm.ensure_draft_pr(PrSpec(REPO, "sto/x", "main", "t", "b"), "k"))
+    scm.mark_ready(pr, "k2")
+    scm.complete_merge(scm.request_merge(pr, "abc", MergeMethod.SQUASH, "m1"), "m-sha")
+    scm.require_up_to_date = False  # so the injected queue entry stays live after the landing
+    scm._merges["merge-extra"] = _Merge("merge-extra", pr, "abc", MergeMethod.SQUASH)  # noqa: SLF001
+    live = {m.id: scm._resolve(m).state for m in scm._merges.values()}  # noqa: SLF001
+    assert set(live.values()) == {MergeState.MERGED, MergeState.PENDING}  # both really live
+    found = scm.find_merge(pr)
+    assert found is not None
+    assert (found.state, found.merge_sha) == (MergeState.MERGED, "m-sha")
+
+
+def test_a_watched_merge_is_kept_while_its_revert_is_not_yet_written() -> None:
+    fx, store = make_effects(RunStatus.CANCELLING)
+    key = plan(fx, "pr.merge")
+    calls = {"n": 0}
+
+    def revert(rid: RunId, sha: str, k: str) -> Receipt:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TransientError("scm blip")
+        return _receipt(k)
+
+    stop, _, alarms = _bare_stop(
+        fx, store, lookup=lambda e: _landed_result(e.idempotency_key), revert=revert
+    )
+    stop._watch(RID, key)  # noqa: SLF001
+    assert run(stop.recheck_merges()) == []  # the revert is not written: nothing resolved
+    assert len(store.query(SCOPE, "STOP_WATCH").items) == 1
+    assert run(stop.recheck_merges()) == [(RID, "landed")]
+    assert alarms.names().count("merge_landed_after_stop") == 1  # told once, not per attempt
+    assert store.query(SCOPE, "STOP_WATCH").items == ()
+    stop.close()
+
+
+def test_a_read_that_timed_out_is_not_read_as_no_merge() -> None:
+    fx, store = make_effects(RunStatus.CANCELLING)
+    key = plan(fx, "pr.merge")
+
+    def slow(effect: Effect) -> MergeResult | None:
+        raise ScmReadTimeoutError("slow")
+
+    stop, clock, alarms = _bare_stop(fx, store, lookup=slow)
+    stop._watch(RID, key)  # noqa: SLF001
+    clock.now += 10_000  # far past the window
+    assert run(stop.recheck_merges()) == []
+    assert len(store.query(SCOPE, "STOP_WATCH").items) == 1  # still watched
+    stop.close()
+
+
+def test_a_repeated_stop_does_not_restart_the_watch_window() -> None:
+    fx, store = make_effects(RunStatus.CANCELLING)
+    key = plan(fx, "pr.merge")
+    stop, clock, _ = _bare_stop(fx, store)
+    stop._watch(RID, key)  # noqa: SLF001
+    (first,) = store.query(SCOPE, "STOP_WATCH").items
+    clock.now += 300
+    stop._watch(RID, key)  # noqa: SLF001
+    (second,) = store.query(SCOPE, "STOP_WATCH").items
+    assert second.data["until"] == first.data["until"]
+    stop.close()
+
+
+def test_a_merge_found_by_reconcile_is_credited_with_the_planned_head_not_the_live_one() -> None:
+    from sto.effects.core import ExecResult
+
+    w = World()
+
+    async def go() -> list[object] | str:
+        await to_the_merge(w)
+        key = w.driver._load(RID).pending[0]["key"]  # noqa: SLF001
+        await w.driver._executor.execute(  # noqa: SLF001
+            key,
+            from_wire_command(w.driver._load(RID).pending[0]),  # noqa: SLF001
+        )
+        (effect,) = w.effects()
+        w.scm.complete_merge(w.scm.merges()[-1], "m-reconciled")
+        moved = dataclasses.replace(_stopping(), subject=_fx.S2, approvals=())
+        result = ExecResult(effect, reason="unreconciled:RefusedError", blocked=True)
+        return w.stop._after_reconcile(effect, result, moved)  # noqa: SLF001
+
+    outcome = run(go())
+    assert isinstance(outcome, list)
+    (reconciled,) = outcome
+    assert isinstance(reconciled, EffectLandedDuringStop)
+    assert (reconciled.merge_sha, reconciled.head_sha) == ("m-reconciled", "abc")
+
+
+def test_the_stops_retry_delay_grows_to_a_cap() -> None:
+    fx, store = make_effects(RunStatus.CANCELLING)
+    stop, _, _ = _bare_stop(fx, store, settings=StopSettings(retry_after=1.0, max_retry_after=10.0))
+    delays = [stop._failing(RID, RuntimeError("x")).retry_after for _ in range(6)]  # noqa: SLF001
+    assert delays == [1.0, 2.0, 4.0, 8.0, 10.0, 10.0]
+    stop.close()
+
+
+def test_a_watched_merge_reported_failed_or_dequeued_is_cleared_not_watched_for_ever() -> None:
+    for state in (MergeState.FAILED, MergeState.DEQUEUED):
+        fx, store = make_effects(RunStatus.CANCELLING)
+        key = plan(fx, "pr.merge")
+        stop, clock, _ = _bare_stop(fx, store, lookup=lambda e, s=state: MergeResult(s))
+        stop._watch(RID, key)  # noqa: SLF001
+        assert run(stop.recheck_merges()) == []  # inside the window
+        clock.now += 601
+        assert run(stop.recheck_merges()) == [(RID, "clear")], state
+        stop.close()
+
+
+def test_two_concurrent_rechecks_raise_the_alarm_once() -> None:
+    fx, store = make_effects(RunStatus.CANCELLING)
+    key = plan(fx, "pr.merge")
+    stop, _, alarms = _bare_stop(
+        fx,
+        store,
+        lookup=lambda e: _landed_result(e.idempotency_key),
+        revert=lambda r, s, k: _receipt(k),
+    )
+    stop._watch(RID, key)  # noqa: SLF001
+
+    async def both() -> None:
+        await asyncio.gather(stop.recheck_merges(), stop.recheck_merges())
+
+    run(both())
+    assert alarms.names().count("merge_landed_after_stop") == 1
+    stop.close()
+
+
+# --- F6: the relaxation is exactly a blocked merge that landed ---
+
+
+def test_the_retry_interleaving_helper_accepts_only_a_landed_blocked_merge() -> None:
+    w = World()
+    w.auto_gates = set()
+    run(w.start())
+    final = run(w.driver.cancel(RID))
+    with pytest.raises(AssertionError):
+        _assert_landed_under_blocked_record(w, final)  # nothing landed: the relaxation is closed
+
+
+# --- F7: a Retry that loses the race says so ---
+
+
+def test_a_retry_that_loses_the_race_is_refused_and_the_audit_says_so() -> None:
+    from sto.engine.handlers.failures import RetryService
+
+    w = World()
+    audit = Audit()
+
+    class Racing:
+        def retry_blocked(self, run_id: RunId, key: str) -> object:
+            raise ValueError("only a blocked effect can be retried, not CONFIRMED")
+
+        def get(self, run_id: RunId, key: str) -> Effect:
+            return w.fx.get(run_id, key)
+
+    class Stopper:
+        def stop_attempt(self, run_id: RunId, stage: str, visit: int, attempt: int) -> None:
+            return None
+
+    async def go() -> None:
+        w.scm.lose_response_next("request_merge", 3)
+        await w.driver.start(Run(RID, "t1"))
+        blocked = await w.driver.run_until_idle(RID)
+        assert blocked.run.status is RunStatus.BLOCKED
+        service = RetryService(
+            audit=audit,
+            stopper=Stopper(),
+            effects=Racing(),
+            submit=w.driver.submit,
+            load=lambda rid: (w.driver.state(rid), W),
+        )
+
+        class Confirmed(Racing):
+            def get(self, run_id: RunId, k: str) -> Effect:
+                return types.SimpleNamespace(status=EffectStatus.CONFIRMED)  # type: ignore[return-value]
+
+        service._effects = Confirmed()  # noqa: SLF001
+        with pytest.raises(OutOfOrderEventError):
+            await service.retry(RID, "bob", "again")
+        assert w.driver.pending_events(RID) == 0  # no Retry event was sent
+
+    run(go())
+    assert [a for _, a, _, _ in audit.rows] == ["run.retry", "run.retry_failed"]
+
+
+def test_a_merge_that_lands_under_a_record_left_attempting_and_blocked_is_accounted_for() -> None:
+    """The writer's request reached the SCM, then the writer died: the record stays ATTEMPTING and
+    blocked for ever. The landing is accounted for by the incident, the alarm and the revert."""
+
+    async def go() -> World:
+        w = await _watched_stalled_world()
+        (record,) = [e for e in w.effects() if e.type == "pr.merge"]
+        handle = w.scm.request_merge(w.pr, "abc", MergeMethod.SQUASH, record.idempotency_key)
+        w.scm.complete_merge(handle, "m-orphaned")
+        assert await w.watch().recheck() == [(RID, "landed")]
+        return w
+
+    w = run(go())
+    try:
+        (record,) = [e for e in w.effects() if e.type == "pr.merge"]
+        assert record.status is EffectStatus.ATTEMPTING
+        item = w.store.get(SCOPE, effect_item_key(RID, record.idempotency_key))
+        assert item is not None
+        assert item.data["meta"].get("blocked")
+        assert w.driver.state(RID).run.incident is True
+        assert len(w.scm.spy.applied("open_revert_pr")) == 1
+        assert "merge_landed_after_stop" in w.alarms.names()
+    finally:
+        w.close()

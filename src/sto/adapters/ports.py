@@ -291,6 +291,10 @@ class MergeResult:
     merge_sha: str | None = None
     receipt: Receipt | None = None
     reason: MergeReason | None = None  # set when ``state`` is FAILED
+    # The idempotency key the merge was requested with, when the SCM can say. A caller that reverts
+    # a merge it did not see land (Stop) reverts only one whose key it recognises; ``None`` means
+    # the author is unknown and nothing is reverted on that basis.
+    key: IdempotencyKey | None = None
 
 
 @dataclass(frozen=True)

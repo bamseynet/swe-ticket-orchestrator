@@ -76,6 +76,7 @@ from sto.engine.drivers.ports import (
 from sto.engine.handlers.cancel import (
     EffectLandedDuringStop,
     EffectUnresolvedDuringStop,
+    ReadPool,
     bound_handler,
     merged_head,
 )
@@ -225,9 +226,6 @@ class LocalDriver:
         self._retry_budget = retry_budget
         self._retrying: dict[str, float] = {}
         self._redriver = Redriver(self, redrive, clock=clock, sleep=sleep) if redrive else None
-        # The lease heartbeat has its own thread: a saturated default pool (handler calls, the
-        # API's reads) must not delay a renewal past the lease.
-        self._beat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sto-lease")
 
     @property
     def redriver(self) -> Redriver | None:
@@ -274,7 +272,6 @@ class LocalDriver:
         """Cancel and await the background re-drive tasks. Call it when the driver is done."""
         if self._redriver is not None:
             await self._redriver.aclose()
-        self._beat_pool.shutdown(wait=False, cancel_futures=True)
 
     async def stop_background(self, run_id: RunId) -> None:
         """End this run's background re-drive (if any) and wait for it, so nothing re-drives an
@@ -502,12 +499,12 @@ class LocalDriver:
         stops = [c for c in rec.pending if c["cmd"]["type"] == "stop_run"]
         return (stops[0] if stops else rec.pending[0]), False
 
-    async def _heartbeat(self, run_id: RunId) -> None:
+    async def _heartbeat(self, run_id: RunId, pool: ThreadPoolExecutor) -> None:
         """Renew the lease while a command executes, so a long one does not lose the run. A
         store error that is not a lost lease is retried until the lease would run out; losing the
         lease for real ends the heartbeat (and so the command)."""
         try:
-            lease = (await self._aload(run_id, self._beat_pool)).lease
+            lease = (await self._aload(run_id, pool)).lease
             expires = lease["expires"] if lease else self._clock()
         except Exception:  # noqa: BLE001 - a store blip on the first read must not abort the command
             # The lease was ours with more than half its time left when the command started
@@ -522,7 +519,7 @@ class LocalDriver:
                         run_id,
                         lambda r: (dataclasses.replace(r), ()),
                         attempts=1,
-                        pool=self._beat_pool,
+                        pool=pool,
                     )  # one try: the retries below are bounded by the lease, not by backoff
                     expires = started + self._ttl  # the stamp is at least this late
                     break
@@ -537,7 +534,11 @@ class LocalDriver:
         work = asyncio.ensure_future(
             self._executor.execute(head["key"], decode(head["cmd"], "command"))
         )
-        beat = asyncio.ensure_future(self._heartbeat(run_id))
+        # The lease heartbeat has a thread of its own, for this command only: a saturated default
+        # pool (handler calls, the API's reads) must not delay a renewal past the lease, and no
+        # thread is left idle once the command is over.
+        beat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sto-lease")
+        beat = asyncio.ensure_future(self._heartbeat(run_id, beat_pool))
         try:
             await asyncio.wait({work, beat}, return_when=asyncio.FIRST_COMPLETED)
             if work.done():
@@ -548,6 +549,7 @@ class LocalDriver:
             for t in (work, beat):
                 t.cancel()
             await asyncio.gather(work, beat, return_exceptions=True)
+            beat_pool.shutdown(wait=False, cancel_futures=True)
 
     async def step(self, run_id: RunId) -> StepResult:
         """One durable unit of work. Queued events come before the next command."""
@@ -749,6 +751,16 @@ class LocalDriver:
         sent while the run was RUNNING and heard about after the Stop was applied."""
         if rs.run.status is not RunStatus.CANCELLING:
             return event
+        if (
+            isinstance(event, EffectConfirmed)
+            and event.effect == "pr.merge"
+            and not (event.merge_sha or "").strip()
+        ):
+            # A confirmed merge that cannot be named: unresolved (an incident), never a landing
+            # the reducer would refuse as malformed while the run ends clean.
+            return EffectUnresolvedDuringStop(
+                event.run_id, event.effect, event.visit, "merge_unconfirmed"
+            )
         if isinstance(event, EffectConfirmed):
             # The head is what the standing approvals cover (``merged_head``), not whatever the
             # live subject is by now; unknown means uncovered, which gets the revert.
@@ -816,7 +828,7 @@ class EffectsExecutor:
         # Polls, stops and reconciles of the SCM have a deadline and a pool of their own, so a
         # hung SCM holds one of its threads and not the default pool the API shares. ``None``
         # leaves the handlers as given.
-        self._scm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sto-scm")
+        self._scm_pool = ReadPool()
         if read_timeout is not None:
             handlers = {
                 name: bound_handler(h, timeout=read_timeout, pool=self._scm_pool)
@@ -827,7 +839,7 @@ class EffectsExecutor:
         self._streak: dict[str, int] = {}
 
     def close(self) -> None:
-        self._scm_pool.shutdown(wait=False, cancel_futures=True)
+        """Nothing to release: reads own their threads (kept so callers can always close)."""
 
     async def execute(self, key: str, command: object) -> Outcome:
         if not isinstance(command, RunEffect):

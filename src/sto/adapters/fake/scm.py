@@ -59,6 +59,7 @@ class _Merge:
     merge_sha: str | None = None
     receipt: Receipt | None = None
     reason: MergeReason | None = None
+    key: str | None = None  # the idempotency key it was requested with
 
 
 def _sha(*parts: str) -> str:
@@ -225,7 +226,7 @@ class FakeScm(FakeBase):
         if handle.id in self._ghosts:  # accepted but never applied: simply not merged
             return MergeResult(MergeState.PENDING)
         merge = self._resolve(self._merge(handle))
-        return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason)
+        return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason, merge.key)
 
     def find_merge(self, pr: PrRef) -> MergeResult | None:
         self._pr(pr)  # an unknown PR is an error, never "no merge"
@@ -233,7 +234,9 @@ class FakeScm(FakeBase):
         for state in (MergeState.MERGED, MergeState.PENDING):
             for merge in found:
                 if merge.state is state:
-                    return MergeResult(merge.state, merge.merge_sha, merge.receipt, merge.reason)
+                    return MergeResult(
+                        merge.state, merge.merge_sha, merge.receipt, merge.reason, merge.key
+                    )
         return None
 
     def ci_trust(self, repo: RepoRef) -> CiTrustReport:
@@ -412,7 +415,7 @@ class FakeScm(FakeBase):
             if pending is not None:
                 self._noop = True
                 return MergeHandle(pending.id, pr)
-            merge = _Merge(self._next_id("merge"), pr, current, method)
+            merge = _Merge(self._next_id("merge"), pr, current, method, key=key)
             self._merges[merge.id] = merge
             if not self.read_back_verified:  # the rollback drops it, the handle must still poll
                 self._ghosts[merge.id] = merge

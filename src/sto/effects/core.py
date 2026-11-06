@@ -205,6 +205,13 @@ class EffectExecutor:
     def get(self, run_id: RunId, idempotency_key: str) -> Effect:
         return self._load(run_id, idempotency_key).effect
 
+    def planned_subject(self, run_id: RunId, idempotency_key: str) -> Subject | None:
+        """The subject the effect was planned for (what its approval covered), if it recorded one.
+        The record's ``frozen_subject`` only exists once a merge has landed; Stop needs the
+        planned one to say which head an unconfirmed merge merged."""
+        wire = self._load(run_id, idempotency_key).meta.get("subject")
+        return from_wire(Subject, wire) if wire else None
+
     def _put(self, effect: Effect, meta: dict[str, Any], when: Condition) -> Put:
         key = effect_item_key(effect.run_id, effect.idempotency_key)
         return Put(key, {"effect": to_wire(effect), "meta": meta}, when=when)

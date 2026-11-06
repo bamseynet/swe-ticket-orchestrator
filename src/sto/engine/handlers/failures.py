@@ -92,6 +92,12 @@ NOT_RETRYABLE_WHY = {
 }
 
 
+class RetryRaceError(OutOfOrderEventError, ValueError):
+    """A Retry that lost a race: the effect was no longer blocked when it was cleared. It is a
+    stale click (``OutOfOrderEventError``) and, for callers written against the executor's
+    refusal, still the ``ValueError`` it came from."""
+
+
 class RetryBudgetExceededError(PermanentError):
     """A transient error outlasted the retry cap. The cause is chained. It blocks the run: nothing
     retries it again until a person does."""
@@ -398,14 +404,32 @@ class RetryService:
                 "blocked_reason": target.blocked_reason,
             },
         )
-        if key is not None:
-            # A delayed click: the run may have moved since it was read (the first Retry ran and
-            # the effect blocked again). Clearing now would clear a new block nobody looked at.
-            if self._load(run_id)[0].run.version != rs.run.version:
-                raise OutOfOrderEventError("the run changed while this retry was being made")
-            self._clear(run_id, key)
-        else:
-            self._stopper.stop_attempt(run_id, target.stage, target.visit, target.attempt)
+        try:
+            if key is not None:
+                # A delayed click: the run may have moved since it was read (the first Retry ran
+                # and the effect blocked again). Clearing now would clear a new block nobody
+                # looked at.
+                if self._load(run_id)[0].run.version != rs.run.version:
+                    raise OutOfOrderEventError("the run changed while this retry was being made")
+                self._clear(run_id, key)
+            else:
+                self._stopper.stop_attempt(run_id, target.stage, target.visit, target.attempt)
+        except (OutOfOrderEventError, ValueError, KeyError) as exc:
+            # The audit entry above says a Retry was asked for; this one says it did not happen,
+            # so the record never claims a success.
+            self._audit.record(
+                run_id,
+                "run.retry_failed",
+                actor,
+                {"reason": f"{type(exc).__name__}: {exc}", "stage": target.stage},
+            )
+            if isinstance(exc, KeyError):
+                raise OutOfOrderEventError(f"the retry no longer applies: {exc}") from exc
+            if type(exc) is ValueError and "only a blocked effect" in str(exc):
+                # A lost race (another click, or Stop, got there first) is a stale click, not a
+                # fault. It stays a ValueError for callers that already handle that refusal.
+                raise RetryRaceError(str(exc)) from exc
+            raise  # a fault (or an out-of-order refusal) goes up as it is
         await self._submit(run_id, event)
         return event
 
@@ -500,6 +524,7 @@ __all__ = [
     "RetryAudit",
     "RetryBudgetExceededError",
     "RetryPolicy",
+    "RetryRaceError",
     "RetryRequested",
     "RetryService",
     "RetryTarget",
