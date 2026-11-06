@@ -137,7 +137,7 @@ def relay_for(
 
 
 def decide_and_deliver(store: MemoryStore, driver: Driver) -> None:
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     approve(svc)
     relay_for(store, driver).drain(RUN)
@@ -164,7 +164,7 @@ def test_a_crash_after_each_write_recovers_and_applies_once(crash_at: int) -> No
     store.crash_at = None
     # recovery: a fresh service, the same store. The caller retries the decision if it never
     # landed (crash 1 is the open itself), and a relay sweep finishes whatever was committed.
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     if not entries(store) and not driver.applied:
         approve(svc)
@@ -177,7 +177,7 @@ def test_a_crash_after_each_write_recovers_and_applies_once(crash_at: int) -> No
 def test_a_crash_between_delivery_and_delete_redelivers_and_the_run_applies_it_once() -> None:
     store = CrashingStore()
     driver = Driver()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     approve(svc)
     inner = driver.deliver
@@ -202,7 +202,7 @@ def test_a_decision_committing_before_the_task_token_is_stored_still_wakes_the_r
     store = MemoryStore()
     driver = Driver()
     driver.token_stored = False
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     approve(svc)
     relay = relay_for(store, driver)
@@ -220,7 +220,7 @@ def test_a_decision_committing_before_the_task_token_is_stored_still_wakes_the_r
 def test_already_closed_is_success_only_after_a_reconcile_confirms_it() -> None:
     store = MemoryStore()
     driver = Driver()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     decided = approve(svc)
     driver.closed_runs.add(str(RUN))
@@ -239,7 +239,7 @@ def test_already_closed_is_success_only_after_a_reconcile_confirms_it() -> None:
 def test_delivery_is_in_order_per_run_and_a_failure_blocks_only_its_own_run() -> None:
     store = MemoryStore()
     driver = Driver()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     for run in (RUN, OTHER):
         for round in (1, 2):
             open_gate(svc, run, "review", round)
@@ -267,7 +267,7 @@ def test_a_stuck_entry_raises_the_alarm_metric() -> None:
     store = MemoryStore()
     driver = Driver()
     driver.down = TransientError("down")
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     open_gate(svc)
     approve(svc)
     metrics, clock = Metrics(), Clock()
