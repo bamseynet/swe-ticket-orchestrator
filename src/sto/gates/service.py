@@ -37,6 +37,12 @@ from anyone) exists only as ``GateService.unpoliced_for_tests``.
   sleep and RNG), so N concurrent approvals of an N-quorum gate all commit (D3-17). A write whose
   answer was lost (``TransactionOutcomeUnknownError``) is reconciled by re-reading, never retried
   blind: if our decision landed it is returned, not refused as a duplicate or a closed gate.
+* A pre-decision guard (D3-26) runs inside every approval attempt, vote or close, on the attempt's
+  fresh reads, after the policy refusals and before the count. It may raise to refuse and returns
+  ``Check`` ops that join the same transaction, so a fact it read cannot change between the read
+  and the write (``gates.moving`` pins ``MOVE#state`` this way). A negative decision runs no
+  guard: a veto is never delayed. A condition that fails on a guard's op is retried like a lost
+  race, so the guard runs again on fresh reads (and then refuses, if it now should).
 * Exhausted retries raise :class:`GateContentionError` (transient), never the store's
   ``ConditionFailedError``.
 
@@ -48,9 +54,10 @@ them all always fits in one transaction (ADR-0017: 100 operations).
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -217,6 +224,23 @@ class QuorumRule:
     count: int
 
 
+@dataclass(frozen=True)
+class GuardContext:
+    """What a pre-decision guard sees: the open gate as read for this attempt, the decision kind
+    and who decides. ``reader`` is read-only."""
+
+    reader: ReadOnly
+    scope: Scope
+    gate: Gate
+    kind: DecisionKind
+    actor: str
+
+
+# Raise a ``StoError`` to refuse; return ops (``Check``) for the decide transaction. It may run
+# several times for one call, on fresh reads each time, so it must have no side effects.
+DecisionGuard = Callable[[GuardContext], Sequence[Op]]
+
+
 class DecisionPolicy(Protocol):
     """What the service cannot know itself: the gate's quorum, who holds which role, and who is
     barred (separation of duties, D3-05). It is read at each attempt and must not write."""
@@ -255,7 +279,9 @@ class GateService:
         audit: AuditWriter | None = None,
         policy: DecisionPolicy | None = None,
         retry: Backoff | None = None,
+        guards: Sequence[DecisionGuard] = (),
     ) -> None:
+        self._guards = tuple(guards)
         self._policy = policy
         self._unpoliced = False
         self._retry = retry if retry is not None else Backoff()
@@ -271,6 +297,13 @@ class GateService:
         service = cls(store, **kwargs)
         service._unpoliced = True
         return service
+
+    def with_guards(self, *guards: DecisionGuard) -> GateService:
+        """A service with the same store, hooks, audit, policy and retry and these guards added.
+        The shared builder's service gets the moving-subject guard this way (D3-26)."""
+        other = copy.copy(self)
+        other._guards = (*self._guards, *guards)
+        return other
 
     # --- open -------------------------------------------------------------------------------
 
@@ -396,6 +429,7 @@ class GateService:
                     f"gate {gate!r} round {round} was superseded by a newer round"
                 )
             self._refuse_if_barred(scope, current, actor, kind)
+            guard_ops = self._guard_ops(scope, current, actor, kind)
             counted = [decision.id]
             if kind is DecisionKind.APPROVE:
                 # A vote's count is only as fresh as the chain head the audit entry will be
@@ -412,7 +446,7 @@ class GateService:
                         self._retry.wait(attempt)
                         continue  # a decision committed while we counted: count again
                     try:
-                        self._store.transact(scope, _within_cap(own))
+                        self._store.transact(scope, _within_cap([*own, *guard_ops]))
                     except ConditionFailedError as err:
                         last = err  # a close or a vote raced us: re-read and count again
                         self._retry.wait(attempt)
@@ -436,11 +470,11 @@ class GateService:
             hook_ops = self._hooks.decide_ops(
                 DecideContext(self._reader, scope, current, closed, decision)
             )
-            ops = _within_cap([*own, *hook_ops])
+            ops = _within_cap([*own, *guard_ops, *hook_ops])
             try:
                 self._store.transact(scope, ops)
             except ConditionFailedError as err:
-                _raise_if_only_hooks(err, len(own))
+                _raise_if_only_hooks(err, len(own) + len(guard_ops))  # a guard's check retries
                 last = err  # re-read: closed now -> gate_closed above; still open -> try again
                 self._retry.wait(attempt)
             except TransactionConflictError as err:
@@ -467,6 +501,13 @@ class GateService:
                 f"{actor} may not {kind.value} gate {gate.name!r} round {gate.round}: "
                 + ", ".join(reasons)
             )
+
+    def _guard_ops(self, scope: Scope, gate: Gate, actor: str, kind: DecisionKind) -> list[Op]:
+        """Run the guards on this attempt's reads; a veto runs none."""
+        if kind.is_negative:
+            return []
+        ctx = GuardContext(self._reader, scope, gate, kind, actor)
+        return [op for guard in self._guards for op in guard(ctx)]
 
     def _landed(
         self, scope: Scope, gate: Gate, actor: str, kind: DecisionKind, decision_id: DecisionId

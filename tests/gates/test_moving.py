@@ -10,6 +10,8 @@ counts for a moved subject.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -37,6 +39,7 @@ from sto.gates.moving import (
     MovingFacts,
     MovingTooLargeError,
     PrClosed,
+    Reaction,
     StaleMovingEventError,
     TicketClosed,
     TicketClosedError,
@@ -47,10 +50,21 @@ from sto.gates.moving import (
     load_state,
     react,
     refuse_closed_ticket,
+    refuse_moved_subject,
 )
-from sto.gates.service import GateClosedError, GateService
+from sto.gates.retry import Backoff
+from sto.gates.service import GateClosedError, GateService, GuardContext
 from sto.store.memory import MemoryStore
-from sto.store.ports import AUDIT, MAX_TRANSACTION_OPS, ConditionFailedError, Key, TeamScope
+from sto.store.ports import (
+    AUDIT,
+    MAX_TRANSACTION_OPS,
+    ConditionFailedError,
+    Key,
+    Op,
+    Store,
+    TeamScope,
+)
+from sto.store.sqlite import SqliteStore
 
 pytestmark = pytest.mark.unit
 
@@ -322,7 +336,7 @@ class OneRoleAll:
         return []
 
 
-def open_with_vote(store: MemoryStore) -> tuple[GateService, Subject]:
+def open_with_vote(store: Store) -> tuple[GateService, Subject]:
     svc = GateService(store, policy=OneRoleAll())
     subject = head_subject()
     svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
@@ -333,21 +347,21 @@ def open_with_vote(store: MemoryStore) -> tuple[GateService, Subject]:
     return svc, subject
 
 
-def stored_gate(store: MemoryStore) -> Gate:
+def stored_gate(store: Store) -> Gate:
     item = store.get(TEAM, Key(f"RUN#{RUN}", "GATE#review#1"))
     assert item is not None
     return from_wire(Gate, item.data)
 
 
-def votes(store: MemoryStore) -> int:
+def votes(store: Store) -> int:
     return len(store.query(TEAM, f"RUN#{RUN}", sk_prefix="VOTE#").items)
 
 
-def audit_actions(store: MemoryStore) -> list[str]:
+def audit_actions(store: Store) -> list[str]:
     return [i.data["action"] for i in store.query(TEAM, audit_pk(RUN), table=AUDIT).items]
 
 
-def run_reaction(store: MemoryStore, reaction: Any) -> None:
+def run_reaction(store: Store, reaction: Any) -> None:
     ops = apply_reaction(store, TEAM, RUN, reaction, actor="system", at=1)
     store.transact(TEAM, ops)
 
@@ -571,3 +585,153 @@ def test_a_reaction_that_does_not_fit_one_transaction_is_refused() -> None:
         svc.open_gate(TEAM, OpenGate(RUN, f"g{n}", GateType.REVIEW, 1, head_subject()))
     with pytest.raises(MovingTooLargeError):
         apply_reaction(store, TEAM, RUN, react(facts(), commit()), actor="system", at=1)
+
+
+# --- the decide transaction pins MOVE#state (D3-26) -------------------------------------------
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def any_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Store]:
+    if request.param == "memory":
+        yield MemoryStore()
+        return
+    sqlite = SqliteStore(tmp_path / "sto.db")
+    yield sqlite
+    sqlite.close()
+
+
+def raced_service(store: Store, *, quorum: bool, race: Any, fired: list[int]) -> GateService:
+    """A service whose guard is the real one, followed by ``race`` once: the ticket edit commits
+    after the guard has read ``MOVE#state`` and before the decision is written."""
+
+    def guard(ctx: GuardContext) -> list[Op]:
+        ops = refuse_moved_subject(ctx)
+        if not fired:
+            fired.append(1)
+            race()
+        return ops
+
+    retry = Backoff(attempts=5, sleep=lambda _: None)
+    if quorum:
+        return GateService(store, policy=OneRoleAll(), guards=(guard,), retry=retry)
+    return GateService.unpoliced_for_tests(store, guards=(guard,), retry=retry)
+
+
+def approve(svc: GateService, subject: Subject, actor: str) -> Any:
+    return svc.decide(
+        TEAM, run_id=RUN, gate="review", round=1, kind=DecisionKind.APPROVE, actor=actor,
+        surface=Surface.UI, subject_digest=subject.digest(),
+    )  # fmt: skip
+
+
+def test_a_sub_quorum_vote_after_a_ticket_edit_never_lands(any_store: Store) -> None:
+    store = any_store
+    subject = head_subject()
+    setup = GateService(store, policy=OneRoleAll())
+    setup.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    approve(setup, subject, "alice")  # the first of two votes, before the edit
+    fired: list[int] = []
+    svc = raced_service(
+        store, quorum=True, fired=fired, race=lambda: run_reaction(store, react(facts(), edit()))
+    )
+    with pytest.raises(AcknowledgementRequiredError):
+        approve(svc, subject, "bob")
+    assert fired == [1]
+    assert votes(store) == 0  # alice's vote was dropped by the edit, bob's never landed
+    assert stored_gate(store).is_open
+    assert load_state(store, TEAM, RUN).pending_revision == "rev2"
+
+
+def test_a_closing_vote_after_a_ticket_edit_never_lands(any_store: Store) -> None:
+    store = any_store
+    subject = head_subject()
+    plain = GateService.unpoliced_for_tests(store)
+    plain.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    fired: list[int] = []
+    svc = raced_service(
+        store, quorum=False, fired=fired, race=lambda: run_reaction(store, react(facts(), edit()))
+    )
+    with pytest.raises(AcknowledgementRequiredError):
+        approve(svc, subject, "alice")
+    assert fired == [1]
+    gate = stored_gate(store)
+    assert gate.is_open and gate.status is GateStatus.OPEN
+    assert not store.query(TEAM, f"RUN#{RUN}", sk_prefix="DEC#").items
+    assert not store.query(TEAM, f"RUN#{RUN}", sk_prefix="OUT#").items  # no gate.closed outbox
+
+
+def test_a_ticket_close_between_guard_and_decide_never_lets_the_approval_land(
+    any_store: Store,
+) -> None:
+    store = any_store
+    subject = head_subject()
+    GateService.unpoliced_for_tests(store).open_gate(
+        TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject)
+    )
+    # a close that does not supersede the gate, so only the MOVE#state check can stop the vote
+    closing = Reaction(ticket_closed=True, audit_action="moving.ticket_closed")
+    svc = raced_service(store, quorum=False, fired=[], race=lambda: run_reaction(store, closing))
+    with pytest.raises(TicketClosedError):
+        approve(svc, subject, "alice")
+    assert stored_gate(store).is_open
+
+
+def test_an_edit_after_the_guard_is_not_reported_as_success_even_when_acknowledged_later(
+    any_store: Store,
+) -> None:
+    """After the refusal the person acknowledges the new revision; the next approval lands."""
+    store = any_store
+    subject = head_subject()
+    GateService.unpoliced_for_tests(store).open_gate(
+        TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject)
+    )
+    svc = raced_service(
+        store, quorum=False, fired=[], race=lambda: run_reaction(store, react(facts(), edit()))
+    )
+    with pytest.raises(AcknowledgementRequiredError):
+        approve(svc, subject, "alice")
+    store.transact(TEAM, acknowledge_ops(store, TEAM, RUN, "rev2"))
+    assert approve(svc, subject, "alice").closed
+    assert stored_gate(store).status is GateStatus.APPROVED
+
+
+def test_a_veto_is_never_held_back_by_a_moved_ticket(any_store: Store) -> None:
+    store = any_store
+    subject = head_subject()
+    GateService.unpoliced_for_tests(store).open_gate(
+        TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject)
+    )
+    run_reaction(store, react(facts(), edit()))
+    run_reaction(store, Reaction(ticket_closed=True, audit_action="moving.ticket_closed"))
+    svc = raced_service(store, quorum=False, fired=[1], race=lambda: None)
+    decided = svc.decide(
+        TEAM, run_id=RUN, gate="review", round=1, kind=DecisionKind.REJECT, actor="alice",
+        surface=Surface.UI, subject_digest=subject.digest(), comment="no",
+    )  # fmt: skip
+    assert decided.closed and stored_gate(store).status is GateStatus.REJECTED
+
+
+def test_an_unmoved_ticket_lets_a_vote_land_and_pins_the_state_version(any_store: Store) -> None:
+    store = any_store
+    subject = head_subject()
+    svc = raced_service(store, quorum=False, fired=[1], race=lambda: None)
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    ctx = GuardContext(ReadOnly(store), TEAM, stored_gate(store), DecisionKind.APPROVE, "alice")
+    checks = refuse_moved_subject(ctx)
+    assert len(checks) == 1  # Check(MOVE#state, Absent) while nothing was ever recorded
+    assert approve(svc, subject, "alice").closed
+
+
+def test_the_app_builder_wires_both_moving_rules(any_store: Store) -> None:
+    from sto.api.app import moving_aware_gates
+
+    store = any_store
+    svc = moving_aware_gates(store, OneRoleAll())
+    subject = head_subject()
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    run_reaction(store, react(facts(), edit()))
+    with pytest.raises(AcknowledgementRequiredError):  # the guard is registered
+        approve(svc, subject, "alice")
+    run_reaction(store, react(facts(seen_revision="rev2"), TicketClosed(run_version=7)))
+    with pytest.raises(TicketClosedError):  # on_open is registered
+        svc.open_gate(TEAM, OpenGate(RUN, "qa", GateType.QA, 1, subject))
