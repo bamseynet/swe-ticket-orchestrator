@@ -403,7 +403,11 @@ def test_reports_add_counts_and_take_the_oldest_age_as_a_max() -> None:
 
 
 def test_the_runtime_says_not_recorded_on_a_repeat_against_a_closed_gate() -> None:
-    from api.test_v0 import World, code_of, run
+    import importlib
+
+    # imported by name, not statically: mypy refuses one file under two module names
+    v0: Any = importlib.import_module("api.test_v0")
+    World, code_of, run = v0.World, v0.code_of, v0.run
 
     async def body() -> None:
         w = World(MemoryStore())
@@ -413,7 +417,7 @@ def test_the_runtime_says_not_recorded_on_a_repeat_against_a_closed_gate() -> No
             async def down(rid: RunId, event: object) -> None:
                 raise OSError("disk went away")
 
-            api.rt.driver.submit = down  # type: ignore[method-assign,assignment]
+            api.rt.driver.submit = down
             seen = []
             for _ in range(2):
                 r = await api.decide(run_id, "review_gate")
