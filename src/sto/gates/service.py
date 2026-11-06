@@ -609,6 +609,12 @@ class GateService:
                     return found
         return None
 
+    def audit_version(self, scope: Scope, run_id: RunId) -> int | None:
+        """The version of the run's audit chain head, as the service's audit writer moves it on
+        every open and decision. Callers (the carry-over engine) condition on it through
+        ``close_carried(chain=...)`` and never touch the chain themselves."""
+        return self._head_version(scope, run_id)
+
     def _head_version(self, scope: Scope, run_id: RunId) -> int | None:
         head = self._store.get(scope, Key(run_pk(run_id), CHAIN_SK))
         return None if head is None else head.version

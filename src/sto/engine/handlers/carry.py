@@ -36,7 +36,7 @@ from sto.gates.carry_over import (
     evaluate_carry_over,
 )
 from sto.gates.evidence import EvidenceCheck
-from sto.gates.hooks import CHAIN_SK, run_pk
+from sto.gates.hooks import run_pk
 from sto.gates.policy import Directory, GateRules, Records
 from sto.gates.service import CARRY_ACTOR, GateService, QuorumRule, cite_key
 from sto.gates.sod import evaluate
@@ -396,7 +396,7 @@ class CarryEngine:
         return PatchHistory(origin.gate.id, tuple(ids)), len(log_items)
 
     def _read(self, scope: Scope, gate: Gate, base: str) -> tuple[_Read, GateInstance]:
-        chain = self._store.get(scope, Key(run_pk(gate.run_id), CHAIN_SK))
+        chain = self._gates.audit_version(scope, gate.run_id)  # via the service's audit writer
         rounds = self._rounds(scope, gate)
         history = [self._instance(scope, g) for g, _ in rounds if g.round < gate.round]
         by_id = {i.gate.id: i for i in history}
@@ -428,7 +428,7 @@ class CarryEngine:
             patch_history,
             files,
             base_range,
-            None if chain is None else chain.version,
+            chain,
             heads,
             round_item,
         )
