@@ -284,3 +284,31 @@ def test_a_stuck_entry_raises_the_alarm_metric() -> None:
     relay.sweep([RUN])
     assert metrics.gauges["outbox_stuck"] == 0
     assert metrics.gauges["outbox_oldest_age_seconds"] == 0
+
+
+# --- what the API says when delivery fails (the pinned runtime test is tests/api/test_v0.py) ----
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_a_delivery_failure_says_decision_recorded_only_when_this_request_committed(
+    recorded: bool,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from sto.api.routers.gates import DecisionIn
+    from sto.api.routers.gates import decide as route
+    from sto.api.routers.runs import ApiError
+    from sto.api.runtime import DeliveryFailedError
+
+    class Rt:
+        async def decide(self, *a: Any, **k: Any) -> Any:
+            # a request that hit a gate somebody else closed passes False (runtime.decide)
+            raise DeliveryFailedError(OSError("down"), decision_recorded=recorded)
+
+    body = DecisionIn(kind=DecisionKind.APPROVE, subject_digest="d")
+    request = SimpleNamespace(state=SimpleNamespace())
+    with pytest.raises(ApiError) as caught:
+        asyncio.run(route(str(RUN), "review", 1, body, Rt(), request))  # type: ignore[arg-type]
+    assert caught.value.code == "delivery_failed"
+    assert caught.value.extra == {"decision_recorded": recorded}
