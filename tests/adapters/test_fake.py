@@ -1031,3 +1031,56 @@ def test_the_up_to_date_waiver_lets_a_request_through_a_moved_base() -> None:
     scm.require_up_to_date = False
     handle = scm.request_merge(PR, head, MergeMethod.MERGE, "m")
     assert scm.poll_merge(handle).state is MergeState.PENDING
+
+
+# --- D2-11: find_merge, the read-only lookup Stop needs ------------------------------------------
+
+
+def test_find_merge_reports_a_landed_merge_a_queued_one_and_none() -> None:
+    scm, spy = _scm()
+    head = _ready_pr(scm)
+    assert scm.find_merge(PR) is None  # nothing was ever requested
+    handle = scm.request_merge(PR, head, MergeMethod.MERGE, "m1")
+    queued = scm.find_merge(PR)
+    assert queued is not None
+    assert queued.state is MergeState.PENDING
+    assert queued.merge_sha is None
+    scm.complete_merge(handle, merge_sha="m-sha")
+    landed = scm.find_merge(PR)
+    assert landed is not None
+    assert (landed.state, landed.merge_sha) == (MergeState.MERGED, "m-sha")
+    assert landed.receipt is not None
+    assert len(spy.applied("request_merge")) == 1  # a read writes nothing
+    assert not spy.applied("find_merge")
+
+
+def test_find_merge_does_not_report_a_dequeued_or_failed_merge_as_a_merge() -> None:
+    scm, _ = _scm()
+    head = _ready_pr(scm)
+    scm.request_merge(PR, head, MergeMethod.MERGE, "m1")
+    scm.dequeue(PR, head)
+    assert scm.find_merge(PR) is None
+    scm2, _ = _scm()
+    h2 = scm2.request_merge(PR, _ready_pr(scm2), MergeMethod.MERGE, "m2")
+    scm2.fail_merge(h2)
+    assert scm2.find_merge(PR) is None
+
+
+def test_find_merge_resolves_a_pending_merge_whose_head_moved() -> None:
+    scm, _ = _scm()
+    head = _ready_pr(scm)
+    scm.request_merge(PR, head, MergeMethod.MERGE, "m1")
+    _advance(scm, "sto/x", "p2")  # the head moved: that pending merge is already dead
+    assert scm.find_merge(PR) is None
+
+
+def test_find_merge_of_an_unknown_pr_is_refused_not_empty() -> None:
+    scm, _ = _scm()
+    with pytest.raises(UnknownRefError):
+        scm.find_merge(PrRef(REPO, 99))  # "no merge" must not be answered for a PR we cannot see
+
+
+def test_find_merge_is_part_of_the_scm_port() -> None:
+    scm, _ = _scm()
+    assert isinstance(scm, ScmProvider)
+    assert callable(ScmProvider.find_merge)

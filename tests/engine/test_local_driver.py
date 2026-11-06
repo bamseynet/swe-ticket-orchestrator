@@ -464,10 +464,9 @@ def test_stop_runs_ahead_of_a_command_that_is_not_finished(tmp_path: Path) -> No
         return await d.run_until_idle(RID)
 
     rs = run(go())
-    # The Stop jumped the stuck head. The head RunStep is then called again after the StopRun
-    # (the run is CANCELLED by then): that is D2-11's to stop (it owns what a Stop does to an
-    # unfinished command), so it changes this line knowingly.
-    assert box["order"][:3] == ["RunStep", "StopRun", "RunStep"]
+    # The Stop jumped the stuck head, and D2-11 dropped that step with the rest of the stopped
+    # run's future: it is not called again after the StopRun (a stopping run starts nothing new).
+    assert box["order"][:3] == ["RunStep", "StopRun", "Finish"]
     assert rs.run.status is RunStatus.CANCELLED
 
 

@@ -291,6 +291,10 @@ class MergeResult:
     merge_sha: str | None = None
     receipt: Receipt | None = None
     reason: MergeReason | None = None  # set when ``state`` is FAILED
+    # The idempotency key the merge was requested with, when the SCM can say. A caller that reverts
+    # a merge it did not see land (Stop) reverts only one whose key it recognises; ``None`` means
+    # the author is unknown and nothing is reverted on that basis.
+    key: IdempotencyKey | None = None
 
 
 @dataclass(frozen=True)
@@ -380,6 +384,14 @@ class ScmProvider(Protocol):
         self, pr: PrRef, expected_sha: str, method: MergeMethod, key: IdempotencyKey
     ) -> MergeHandle: ...
     def poll_merge(self, handle: MergeHandle) -> MergeResult: ...
+    def find_merge(self, pr: PrRef) -> MergeResult | None:
+        """Read-only: did a merge of this PR land, or is one queued? Stop needs it because
+        ``dequeue`` only cancels. ``MERGED`` (with ``merge_sha`` and a receipt) wins over
+        ``PENDING``; ``None`` means a merge neither landed nor could, which a failed or dequeued
+        one does not change. An unknown PR raises ``UnknownRefError`` and a failed read raises:
+        neither is ever answered with ``None``. D4-06 implements it for GitHub."""
+        ...
+
     def dequeue(self, pr: PrRef, expected_head: str) -> Receipt: ...
     def trigger_workflow(
         self, repo: RepoRef, spec: DispatchSpec, key: IdempotencyKey
