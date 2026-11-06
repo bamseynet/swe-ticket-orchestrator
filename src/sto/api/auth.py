@@ -190,6 +190,7 @@ class RouteRule:
 
 WEBSOCKET = "WEBSOCKET"
 STOP_ROUTE = ("POST", "/runs/{run_id}/cancel")
+RETRY_ROUTE = ("POST", "/runs/{run_id}/retry")
 
 ROUTES: dict[tuple[str, str], RouteRule] = {
     ("GET", "/runs"): RouteRule(Permission.VIEW_RUNS),
@@ -204,6 +205,9 @@ ROUTES: dict[tuple[str, str], RouteRule] = {
         checks_own=True,
         checks_gate=True,
     ),
+    # Retry (D3-23): a developer, reviewer or QA person retries a run they started (own), a team
+    # or org admin any run in scope. The handler checks ownership with ``may_retry``.
+    RETRY_ROUTE: RouteRule(Permission.RETRY_RUN, checks_own=True),
     ("GET", "/runs/{run_id}/gates"): RouteRule(Permission.VIEW_RUNS),
     ("POST", "/runs/{run_id}/gates/{name}/{round}/decisions"): RouteRule(Permission.DECIDE_GATE),
     # D3-19: only team and org admins attribute a commit or resolve a SoD term (PLAN 9.3);
@@ -281,6 +285,20 @@ def may_stop(
         return False
     roles = _roles_of(identity, auth.scope.team)
     return any(r in gate_roles and grants(Permission.STOP_AT_GATE, r) is not None for r in roles)
+
+
+def may_retry(auth: Authorized, *, started_by: str | None) -> bool:
+    """Whether the caller may Retry a run, from the flags the middleware set on the Retry route.
+
+    An admin holds the permission outright (no flag). An "own" holder may Retry only a run whose
+    *recorded* starter is their ``issuer|subject``; an unknown starter admits nobody. A service
+    never retries, whatever the table says.
+    """
+    if not isinstance(auth.identity, UserIdentity):
+        return False
+    if not auth.own_only:
+        return True
+    return started_by is not None and started_by == actor_key(auth.identity)
 
 
 def _roles_of(identity: UserIdentity, team: str) -> set[str]:

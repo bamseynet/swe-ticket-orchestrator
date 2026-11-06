@@ -40,6 +40,7 @@ from sto.api.auth import (
     RouteTableError,
     check_table,
     grants,
+    may_retry,
     may_stop,
     routes_of,
     undeclared_routes,
@@ -1484,3 +1485,157 @@ def test_an_approval_of_another_round_than_the_latest_record_gives_no_stop(
 
     monkeypatch.setattr(world.runtime, "_read_gates", both)
     assert stoppable_by(world, run_id, "reviewer") == {"reviewer": False}
+
+
+# --- D3-23: who may Retry a blocked run --------------------------------------------------------
+
+RETRY = ("POST", "/runs/{run_id}/retry")
+
+
+class _Retries:
+    """Stands in for ``RetryService``: records what the handler passes, as the service would
+    audit it (``actor`` is what becomes the audit entry's actor)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[RunId, str, str]] = []
+
+    async def retry(self, run_id: RunId, actor: str, reason: str) -> object:
+        self.calls.append((run_id, actor, reason))
+        return object()
+
+
+def retry_app(world: World) -> tuple[FastAPI, _Retries]:
+    app = world.app()
+    retries = _Retries()
+    app.state.retry = retries
+    return app, retries
+
+
+def test_the_retry_route_declares_the_own_check_and_nothing_about_gates() -> None:
+    rule = ROUTES[RETRY]
+    assert rule.permission is Permission.RETRY_RUN
+    assert (rule.checks_own, rule.checks_gate, rule.service) == (True, False, False)
+
+
+def test_an_own_holder_retries_only_a_run_they_started(world: World) -> None:
+    app, retries = retry_app(world)
+    mine = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    theirs = seed_run(world, started_by=actor_of(ALPHA, "qa"))
+    nobody = seed_run(world, started_by=None)
+    dev = world.user(ALPHA, "developer")
+    body = {"reason": "the flake is fixed"}
+    assert post(app, f"/runs/{mine}/retry", dev, body).status_code == 202
+    for other in (theirs, nobody):
+        refused(post(app, f"/runs/{other}/retry", dev, body), 403, "forbidden")
+    assert [c[0] for c in retries.calls] == [mine]
+
+
+@pytest.mark.parametrize("role", ["developer", "reviewer", "qa"])
+def test_every_own_role_may_retry_its_own_run(world: World, role: str) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by=actor_of(ALPHA, role))
+    assert (
+        post(app, f"/runs/{run_id}/retry", world.user(ALPHA, role), {"reason": "r"}).status_code
+        == 202
+    )
+    assert len(retries.calls) == 1
+
+
+def test_retry_ownership_is_issuer_and_subject_not_the_subject_alone(world: World) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by="https://other.example.test|alpha-developer-user")
+    r = post(app, f"/runs/{run_id}/retry", world.user(ALPHA, "developer"), {"reason": "r"})
+    refused(r, 403, "forbidden")
+    assert retries.calls == []
+
+
+def test_an_admin_retries_any_run_in_scope(world: World) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    admin = world.user(ALPHA, "team_admin")
+    assert post(app, f"/runs/{run_id}/retry", admin, {"reason": "r"}).status_code == 202
+    org = world.token("root-user", ["org-admins"])
+    assert post(app, f"/runs/{run_id}/retry", org, {"reason": "r"}).status_code == 202
+    unowned = seed_run(world, started_by=None)
+    assert post(app, f"/runs/{unowned}/retry", admin, {"reason": "r"}).status_code == 202
+    assert len(retries.calls) == 3
+
+
+def test_an_admin_of_another_team_retries_nothing(world: World) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    r = post(app, f"/runs/{run_id}/retry", world.user(BETA, "team_admin"), {"reason": "r"})
+    assert r.status_code == 403
+    assert retries.calls == []
+
+
+def test_a_service_never_retries_even_with_the_run_it_started(world: World) -> None:
+    app, retries = retry_app(world)
+    svc = service_token(world)
+    run_id = seed_run(world, started_by=None)
+    refused(post(app, f"/runs/{run_id}/retry", svc, {"reason": "r"}), 403, "service_not_permitted")
+    assert retries.calls == []
+
+
+def test_may_retry_refuses_a_service_and_an_unknown_starter() -> None:
+    service = ServiceIdentity(subject="svc", issuer=ISS, client_id="svc")
+    for own_only in (True, False):
+        auth = Authorized(service, PLATFORM, own_only=own_only)
+        assert not may_retry(auth, started_by=f"{ISS}|svc")
+    user = UserIdentity(subject="u", issuer=ISS, memberships=frozenset({(ALPHA, "developer")}))
+    own = Authorized(user, TeamScope(ALPHA), own_only=True)
+    assert may_retry(own, started_by=f"{ISS}|u")
+    assert not may_retry(own, started_by=None)
+    assert not may_retry(own, started_by=f"{ISS}|v")
+    assert may_retry(Authorized(user, TeamScope(ALPHA)), started_by=None)
+
+
+@pytest.mark.parametrize("role", ["auditor", CUSTOM])
+def test_roles_with_no_retry_grant_are_refused_on_their_own_run(world: World, role: str) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by=actor_of(ALPHA, role))
+    r = post(app, f"/runs/{run_id}/retry", world.user(ALPHA, role), {"reason": "r"})
+    refused(r, 403, "forbidden")
+    assert retries.calls == []
+
+
+def test_the_audited_actor_is_the_authenticated_issuer_and_subject(world: World) -> None:
+    app, retries = retry_app(world)
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    # a caller-supplied actor or starter is ignored: the body has no say
+    body = {"reason": "go", "actor": "someone-else", "started_by": "x|y"}
+    assert (
+        post(app, f"/runs/{run_id}/retry", world.user(ALPHA, "developer"), body).status_code == 202
+    )
+    assert retries.calls == [(run_id, actor_of(ALPHA, "developer"), "go")]
+    admin_run = seed_run(world, started_by=None)
+    post(app, f"/runs/{admin_run}/retry", world.user(ALPHA, "team_admin"), {"reason": "go"})
+    assert retries.calls[-1][1] == actor_of(ALPHA, "team_admin")
+
+
+def test_an_unknown_run_is_404_and_a_bad_body_422_before_anything_happens(world: World) -> None:
+    app, retries = retry_app(world)
+    dev = world.user(ALPHA, "developer")
+    refused(post(app, f"/runs/{RunId.new()}/retry", dev, {"reason": "r"}), 404, "run_not_found")
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    assert post(app, f"/runs/{run_id}/retry", dev, {}).status_code == 422
+    assert retries.calls == []
+
+
+def test_retry_without_an_installed_service_is_503_after_the_check(world: World) -> None:
+    app = world.app()
+    run_id = seed_run(world, started_by=actor_of(ALPHA, "developer"))
+    dev = world.user(ALPHA, "developer")
+    refused(post(app, f"/runs/{run_id}/retry", dev, {"reason": "r"}), 503, "retry_unavailable")
+    other = seed_run(world, started_by=actor_of(ALPHA, "qa"))
+    refused(post(app, f"/runs/{other}/retry", dev, {"reason": "r"}), 403, "forbidden")
+
+
+def test_the_dev_token_may_retry(world: World) -> None:
+    app = create_app(world.runtime, token="dev-secret", mode="local")
+    retries = _Retries()
+    app.state.retry = retries
+    run_id = seed_run(world, started_by=None)
+    r = post(app, f"/runs/{run_id}/retry", "dev-secret", {"reason": "r"})
+    assert r.status_code == 202
+    assert retries.calls[0][0] == run_id
