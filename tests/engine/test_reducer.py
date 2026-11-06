@@ -870,3 +870,16 @@ def test_next_refuses_the_default_registry_before_loading(monkeypatch: pytest.Mo
     monkeypatch.setattr(reducer, "_loaded", set())
     with pytest.raises(HandlersNotLoadedError):
         next(new(), START, WF)
+
+
+# --- the blocked loop edge (D2-34) ----------------------------------------------------------
+
+
+def test_run_state_has_no_blocked_edge_by_default_and_loads_without_the_field() -> None:
+    from sto.domain import from_wire, to_wire
+    from sto.engine.reducer import RunState
+
+    rs = RunState(Run(id=RunId.parse("01HZX0000000000000000000A0"), team="t"))
+    assert rs.blocked_edge is None
+    old = {k: v for k, v in to_wire(rs).items() if k != "blocked_edge"}
+    assert from_wire(RunState, old) == rs

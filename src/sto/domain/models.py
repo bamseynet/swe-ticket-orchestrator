@@ -291,6 +291,21 @@ class Gate:
 
 
 @dataclass(frozen=True)
+class BlockedEdge:
+    """The edge of a graph workflow that a loop cap refused: stage ``stage`` leaving for ``to``
+    over the named ``loop``. An edge is its source, target and loop, which is what the entry check
+    sees; two outcomes that share all three move the run identically."""
+
+    stage: str
+    to: str
+    loop: str
+
+    def __post_init__(self) -> None:
+        for name in ("stage", "to", "loop"):
+            _str(f"blocked edge {name}", getattr(self, name))
+
+
+@dataclass(frozen=True)
 class Run:
     id: RunId
     team: str

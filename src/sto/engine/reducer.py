@@ -49,6 +49,7 @@ from sto.domain import (
     RunStatus,
     Subject,
 )
+from sto.domain.models import BlockedEdge
 
 
 class OutOfOrderEventError(PermanentError):
@@ -205,6 +206,10 @@ class RunState:
     steps: int = 0
     merges: tuple[Merge, ...] = ()
     routed_gates: tuple[str, ...] = ()
+    # The loop edge a ``loop_exhausted`` block refused, set where the block is decided and kept only
+    # while the run is blocked on a loop. ``None`` on any other run, and on a run saved before the
+    # field existed (a grant on one fails closed, ``handlers/grants.py``).
+    blocked_edge: BlockedEdge | None = None
 
     def count(self, node: str) -> int:
         return dict(self.visits).get(node, 0)
@@ -318,6 +323,10 @@ def _block_uncovered(before: RunState, out: Transition) -> Transition:
     return Transition(dataclasses.replace(out.state, run=blocked, **restored))
 
 
+def _blocked_on_loop(rs: RunState) -> bool:
+    return rs.run.status is RunStatus.BLOCKED and rs.run.blocked_reason == "loop_exhausted"
+
+
 def workflow_version(workflow: Workflow | GraphWorkflow) -> str:
     """What a run pins: the linear version, or a graph workflow's name (D2-07 pins its digest)."""
     return workflow.metadata.name if isinstance(workflow, GraphWorkflow) else workflow.version
@@ -371,6 +380,8 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
     if state.run.workflow_version not in (None, version):
         raise WorkflowMismatchError(f"run is on {state.run.workflow_version!r}, not {version!r}")
     out = handler(state, event, workflow)
+    if out.state.blocked_edge is not None and not _blocked_on_loop(out.state):
+        out = Transition(dataclasses.replace(out.state, blocked_edge=None), out.commands)
     if (
         isinstance(workflow, GraphWorkflow)
         and graph_registry is not None
