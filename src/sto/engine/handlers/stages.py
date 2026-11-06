@@ -523,6 +523,7 @@ def _open_gate_stage(rs: RunState, wf: Graph, gate: str, round_: int) -> GateSta
 @handles_graph(GateClosed)
 def on_gate_closed(rs: RunState, event: GateClosed, wf: Graph) -> Transition:
     stage = _open_gate_stage(rs, wf, event.gate, event.round)
+    core.check_carried(event, rs.subject)  # a service approval needs its citation (D2-31)
     kind, outcome = event.kind, _DECISION_OUTCOME[event.kind]
     if kind.value not in stage.gate.decisions or outcome not in stage.next:
         raise MalformedEventError(f"{kind.value} is not allowed at {event.gate!r}")
