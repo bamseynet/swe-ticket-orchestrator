@@ -31,10 +31,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import itertools
 import sys
 import threading
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
@@ -67,9 +68,10 @@ from sto.domain import (
 from sto.effects.core import EffectExecutor, ExecResult
 from sto.effects.ports import CallHandler, MergeHandler, Pending, Written
 from sto.engine.commands import Finish, OpenGate, RunStep, StopRun
-from sto.engine.drivers.local import EffectsExecutor, LocalDriver
+from sto.engine.drivers.local import LINEAR_V0_GRAPH, EffectsExecutor, LocalDriver
 from sto.engine.drivers.ports import Done, Outcome
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed, StepSucceeded
+from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import LINEAR_V0, RunState
 from sto.gates.hooks import AuditEntry, Reader
 from sto.gates.service import (
@@ -502,6 +504,27 @@ def make_scm() -> tuple[FakeScm, PrRef]:
     return scm, pr
 
 
+# The driver tests run once on the linear reducer and once on its graph twin (D2-26): the same
+# assertions, the same gate names. ``DriverWorld`` reads the workflow of the current run of a test.
+_DRIVER_WORKFLOWS = {"linear": LINEAR_V0, "twin": LINEAR_V0_GRAPH}
+
+
+@pytest.fixture(autouse=True)
+def _driver_workflow(request: pytest.FixtureRequest) -> Iterator[None]:
+    global DRIVER_WORKFLOW
+    DRIVER_WORKFLOW = _DRIVER_WORKFLOWS[getattr(request, "param", "linear")]
+    yield
+    DRIVER_WORKFLOW = LINEAR_V0
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "DriverWorld()" in inspect.getsource(metafunc.function):
+        metafunc.parametrize("_driver_workflow", list(_DRIVER_WORKFLOWS), indirect=True)
+
+
+DRIVER_WORKFLOW: Any = LINEAR_V0
+
+
 class DriverWorld:
     """The real reducer, driver, gate service, effect executor and ``FakeScm``. Gates are opened
     through the service and left open; the test decides them, like a person would."""
@@ -527,7 +550,12 @@ class DriverWorld:
                 if isinstance(command, RunStep):
                     key_ = StepKey(command.run_id, command.stage, command.visit)
                     world.reported = world.step_subjects.get(command.stage, SUBJECT)
-                    return Done([StepSucceeded(key_, world.reported)])
+                    reported: object = StepSucceeded(key_, world.reported)
+                    stages = getattr(DRIVER_WORKFLOW, "stages", {})  # the twin: several edges
+                    edges = list(getattr(stages.get(command.stage), "next", {}))
+                    if len(edges) > 1:  # the first edge is the step succeeding
+                        reported = StageReported(key_, edges[0], world.reported)
+                    return Done([reported])
                 if isinstance(command, OpenGate):
                     world.svc.open_gate(SCOPE, command)
                     world.opened[command.name] = command
@@ -579,7 +607,7 @@ class DriverWorld:
         self.driver = LocalDriver(
             self.store,
             SCOPE,
-            LINEAR_V0,
+            DRIVER_WORKFLOW,
             adapter,
             owner="g1",
             clock=lambda: 1000.0,

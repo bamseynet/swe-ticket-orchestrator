@@ -65,7 +65,8 @@ from sto.engine.drivers.local import (
 from sto.engine.drivers.ports import CommandExecutor, Done, StillRunning
 from sto.engine.drivers.ports import Outcome as CommandOutcome
 from sto.engine.handlers.cancel import Alarm, RevertWriter, StopExecutor
-from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed
+from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed, StepSucceeded
+from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import RunState, Workflow, load_handlers
 from sto.gates.service import Decided, GateService
 from sto.store.ports import (
@@ -220,9 +221,12 @@ class _Commands:
         status_of: Callable[[RunId], RunStatus],
         wait: float,
         reverts: CommandExecutor,
+        workflow: Workflow | GraphWorkflow,
+        version_of: Callable[[RunId], str | None],
     ):
         self._gates, self._scope, self._steps = gates, scope, steps
         self._status_of, self._wait, self._reverts = status_of, wait, reverts
+        self._wf, self._version_of = workflow, version_of
 
     async def execute(self, key: str, command: object) -> CommandOutcome:
         if isinstance(command, OpenGate):
@@ -241,8 +245,26 @@ class _Commands:
             status = await asyncio.to_thread(self._status_of, command.run_id)
             if status.is_terminal or status is RunStatus.CANCELLING:
                 return Done()  # the run was stopped while this step waited: do not start it
-            return await self._steps.execute(key, command)
+            return await self._reported(command.run_id, await self._steps.execute(key, command))
         raise TypeError(f"no executor for {type(command).__name__}")
+
+    async def _reported(self, run_id: RunId, outcome: CommandOutcome) -> CommandOutcome:
+        """A step that only says it succeeded (``StepSucceeded``) takes the first edge of a graph
+        stage that has several (``ready``, ``pass``): the reducer will not guess one. A stage with
+        one edge needs no help, and a run still on the linear reducer is left alone."""
+        wf = self._wf
+        if not isinstance(wf, GraphWorkflow) or not isinstance(outcome, Done):
+            return outcome
+        if await asyncio.to_thread(self._version_of, run_id) != wf.metadata.name:
+            return outcome
+        events: list[Any] = []
+        for e in outcome.events:
+            stage = wf.stages.get(e.key.stage) if isinstance(e, StepSucceeded) else None
+            nxt = getattr(stage, "next", None)
+            if isinstance(e, StepSucceeded) and nxt is not None and len(nxt) > 1:
+                e = StageReported(e.key, next(iter(nxt)), e.subject)
+            events.append(e)
+        return Done(events)
 
 
 class _LogAlarm:
@@ -336,12 +358,18 @@ class Runtime:
             alarm=alarm or _LogAlarm(),
             revert=revert,
         )
+
+        def version_of(run_id: RunId) -> str | None:
+            return self.driver.state(run_id).run.workflow_version
+
         adapter = EffectsExecutor(
             effects,
             _Handlers(merges),
             live,
             status_of,
-            others=_Commands(gates, scope, steps, status_of, poll_interval, self._reverts),
+            others=_Commands(
+                gates, scope, steps, status_of, poll_interval, self._reverts, workflow, version_of
+            ),
             poll_interval=poll_interval,
         )
         self.driver = _TaggedDriver(

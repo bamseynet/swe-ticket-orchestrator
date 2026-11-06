@@ -69,9 +69,18 @@ def test_the_twin_is_structurally_sound() -> None:
     )
     assert isinstance(org, OrgPolicy)
     issues = validate_structure(LINEAR_V0_GRAPH, manifest=load_manifest(), policy=org)
-    # Linear steps have the one success outcome (a StepSucceeded), so the only thing the
-    # validator can say is that the profile's other outcomes have no edge.
-    assert all("has no edge for outcome" in i.message for i in issues), issues
+    assert issues == []
+
+
+def _as_graph_reports(event: Any) -> Any:
+    """What the runtime does for a graph stage with several edges (``Runtime``'s ``_reported``)."""
+    from sto.engine.handlers.stages import StageReported
+
+    if isinstance(event, StepSucceeded):
+        edges = list(getattr(LINEAR_V0_GRAPH.stages[event.key.stage], "next", {}))
+        if len(edges) > 1:
+            return StageReported(event.key, edges[0], event.subject)
+    return event
 
 
 class Pair:
@@ -83,7 +92,7 @@ class Pair:
 
     def feed(self, event: Any) -> tuple[tuple[object, ...], tuple[object, ...]]:
         a = next(self.lin, event, LINEAR_V0)
-        b = next(self.gr, event, LINEAR_V0_GRAPH)
+        b = next(self.gr, _as_graph_reports(event), LINEAR_V0_GRAPH)
         self.lin, self.gr = a.state, b.state
         return a.commands, b.commands
 
@@ -268,4 +277,175 @@ def test_an_unnameable_merge_needs_a_person_not_a_guess() -> None:
     assert [n for _, n, _ in alarms.calls] == ["revert_needs_person"]
 
 
-_ = dataclasses
+# --- pins on the twin ---------------------------------------------------------------------------
+
+
+def test_the_twin_offers_each_gate_the_decisions_of_the_linear_node() -> None:
+    from sto.config.schema import GateStage
+
+    for node in LINEAR_V0.nodes:
+        if node.kind == "gate":
+            stage = LINEAR_V0_GRAPH.stages[node.name]
+            assert isinstance(stage, GateStage)
+            assert {DecisionKind(d) for d in stage.gate.decisions} == node.decisions, node.name
+            assert stage.gate.type == node.gate_type
+
+
+def test_the_twin_names_its_loops_and_caps_them() -> None:
+    assert dict(LINEAR_V0_GRAPH.limits.loops) == {
+        "review_changes": 20,
+        "qa_changes": 20,
+        "retest": 20,
+    }
+    assert LINEAR_V0_GRAPH.limits.max_steps_per_run == 200
+
+
+def test_the_twin_has_its_own_name() -> None:
+    assert LINEAR_V0_GRAPH.metadata.name != LINEAR_V0.version
+
+
+# --- G1: a QA step that moves the head is refused, on both reducers ------------------------------
+
+
+def _for(workflow: Any, event: Any) -> Any:
+    return event if workflow is LINEAR_V0 else _as_graph_reports(event)
+
+
+def _at_qa(workflow: Any) -> RunState:
+    pair = Pair()
+    for event in (RunStarted(RID),):
+        pair.lin = next(pair.lin, event, LINEAR_V0).state
+        pair.gr = next(pair.gr, event, LINEAR_V0_GRAPH).state
+    _walk_to_qa(pair)
+    return pair.lin if workflow is LINEAR_V0 else pair.gr
+
+
+def _walk_to_qa(pair: Pair) -> None:
+    pair.feed(_step(pair))
+    pair.feed(_close(pair, K.APPROVE, 1))
+
+
+@pytest.mark.parametrize("workflow", [LINEAR_V0, LINEAR_V0_GRAPH], ids=["linear", "twin"])
+def test_a_qa_step_that_changes_the_head_is_refused(workflow: Any) -> None:
+    from sto.engine.reducer import OutOfOrderEventError
+
+    rs = _at_qa(workflow)
+    assert rs.run.stage == "qa"
+    moved = dataclasses.replace(SUBJ, head_sha="other")
+    key = StepKey(RID, "qa", rs.visit, rs.attempt)
+    with pytest.raises(OutOfOrderEventError):
+        next(rs, _for(workflow, StepSucceeded(key, moved)), workflow)
+    ok = next(
+        rs, _for(workflow, StepSucceeded(key, SUBJ)), workflow
+    )  # the reviewed head goes on to the gate
+    assert ok.state.run.stage == "qa_gate"
+
+
+# --- a run stored under the linear reducer ------------------------------------------------------
+
+
+def _linear_run_at_merge() -> RunState:
+    pair = Pair()
+    for event in (RunStarted(RID),):
+        pair.lin = next(pair.lin, event, LINEAR_V0).state
+    rs = pair.lin
+    for n, kind in enumerate((None, K.APPROVE, None, K.APPROVE), 1):
+        if kind is None:
+            ev: Any = StepSucceeded(StepKey(RID, rs.run.stage or "", rs.visit, rs.attempt), SUBJ)
+        else:
+            ev = GateClosed(RID, rs.run.stage or "", rs.round, kind, "alice", _did(n), SUBJ)
+        rs = next(rs, ev, LINEAR_V0).state
+    assert rs.run.stage == "merge"
+    return rs
+
+
+def test_a_linear_run_is_refused_by_the_twin_not_misjudged() -> None:
+    from sto.engine.reducer import WorkflowMismatchError
+
+    rs = _linear_run_at_merge()
+    with pytest.raises(WorkflowMismatchError):
+        next(rs, EffectConfirmed(RID, "pr.merge", 1, "m1"), LINEAR_V0_GRAPH)
+
+
+def test_a_linear_run_that_resumes_on_the_default_driver_stays_linear_and_is_not_reverted() -> None:
+    from sto.store.memory import MemoryStore
+    from sto.store.ports import TeamScope
+
+    class Idle:
+        async def execute(self, key: str, command: object) -> Done:
+            return Done()
+
+    d = LocalDriver(
+        MemoryStore(),
+        TeamScope("t"),
+        None,
+        Idle(),
+        owner="x",
+        clock=lambda: 0.0,
+        new_id=lambda: "1",
+    )
+    old = _linear_run_at_merge()
+    assert d._workflow_for(old) is LINEAR_V0
+    assert d._workflow_for(RunState(Run(id=RID, team="t"))) is LINEAR_V0_GRAPH  # a new run
+    t = next(old, EffectConfirmed(RID, "pr.merge", 1, "m1"), d._workflow_for(old))
+    assert t.state.run.status is RunStatus.DONE
+    assert not any(isinstance(c, OpenRevert) for c in t.commands)
+    assert t.state.run.incident is False
+
+
+# --- the runtime ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stage", "gate", "expected"),
+    [
+        ("review_gate", "review_gate", True),  # still at the gate
+        ("merge", "review_gate", True),  # the merge that needs it (the post-approval hold)
+        ("merge", "qa_gate", True),
+        ("qa", "review_gate", False),  # a step does not need a gate
+        ("implement", "qa_gate", False),
+        (None, "review_gate", False),
+    ],
+)
+def test_a_late_reject_is_still_wanted_while_the_gated_merge_waits(
+    stage: str | None, gate: str, expected: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from sto.api.runtime import Runtime
+
+    stub = SimpleNamespace(_wf=LINEAR_V0_GRAPH)
+    assert Runtime._waiting_on(stub, stage, gate) is expected  # type: ignore[arg-type]
+
+
+def _commands(version: str | None) -> Any:
+    from sto.api.runtime import _Commands
+
+    return _Commands(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        lambda run_id: RunStatus.RUNNING,
+        0.0,
+        None,  # type: ignore[arg-type]
+        LINEAR_V0_GRAPH,
+        lambda run_id: version,
+    )
+
+
+def test_a_step_that_succeeds_takes_the_first_edge_of_a_graph_stage() -> None:
+    from sto.engine.handlers.stages import StageReported
+
+    qa, impl = StepKey(RID, "qa", 1, 1), StepKey(RID, "implement", 1, 1)
+    out = asyncio.run(
+        _commands(LINEAR_V0_GRAPH.metadata.name)._reported(
+            RID, Done([StepSucceeded(qa, SUBJ), StepSucceeded(impl, SUBJ)])
+        )
+    )
+    assert list(out.events) == [StageReported(qa, "pass", SUBJ), StageReported(impl, "ready", SUBJ)]
+
+
+def test_a_run_still_on_the_linear_reducer_keeps_its_plain_success() -> None:
+    done = Done([StepSucceeded(StepKey(RID, "qa", 1, 1), SUBJ)])
+    out = asyncio.run(_commands("linear-v0")._reported(RID, done))
+    assert out is done

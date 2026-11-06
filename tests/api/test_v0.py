@@ -378,9 +378,8 @@ def test_a_run_goes_through_both_gates_to_a_merge() -> None:
                 await api.wait_for(run_id, "WAITING_HUMAN", "qa_gate")
                 assert (await api.decide(run_id, "qa_gate")).status_code == 202
                 done = await api.wait_for(run_id, "DONE")
-                assert (
-                    done["stage"] == "done"
-                )  # D2-26: the graph reducer ends on its terminal stage
+                # D2-26: the graph reducer ends on its terminal stage
+                assert done["stage"] == "done"
                 assert len(w.scm.merges()) == 1
             finally:
                 lander.cancel()
@@ -923,9 +922,8 @@ def test_live_is_read_afresh_when_the_merge_is_claimed() -> None:
                 w.scm.seed_branch(REPO, "sto/x", "moved", parent="abc")
                 await api.decide(run_id, "qa_gate")
                 blocked = await api.wait_for(run_id, "BLOCKED")
-                assert (
-                    blocked["blocked_reason"] == "gate_invalid"
-                )  # D2-26: the graph reducer names the reason (D2-10)
+                # D2-26: the graph reducer names the reason (D2-10)
+                assert blocked["blocked_reason"] == "gate_invalid"
                 assert reads == ["moved"], "the claim must see the head as it is now"
                 assert w.scm.merges() == [], "a moved head must not be merged"
             finally:

@@ -736,6 +736,18 @@
           "default": null,
           "title": "Order"
         },
+        "produces_code": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Produces Code"
+        },
         "required": {
           "anyOf": [
             {

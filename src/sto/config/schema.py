@@ -543,6 +543,9 @@ class AgentStage(_StageBase):
     agent: Ident
     model_tier: ModelTier | None = None
     max_attempts: Annotated[int, Field(ge=1)] | None = None
+    # False: the stage cannot change the code, so the engine refuses a report of another head
+    # (D2-26: the linear workflow's ``qa`` step, which G1 relies on). It can only narrow a stage.
+    produces_code: bool = True
     next: Next
 
 
@@ -662,6 +665,7 @@ class StagePatch(_Patch):
     agent: Ident | None = None
     model_tier: ModelTier | None = None
     max_attempts: Annotated[int, Field(ge=1)] | None = None
+    produces_code: bool | None = None
     reviewers: Idents | None = None
     required: Idents | Texts | Literal["team_default"] | None = None
     fail_closed: bool | None = None

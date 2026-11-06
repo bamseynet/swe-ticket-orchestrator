@@ -91,6 +91,7 @@ from sto.engine.handlers.core import (
 )
 from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
 from sto.engine.reducer import (
+    LINEAR_V0,
     HandlerRegistry,
     MalformedEventError,
     OutOfOrderEventError,
@@ -126,14 +127,15 @@ _NEVER_AFTER_STOP = frozenset({"run_step", "open_gate"})
 
 def _twin() -> GraphWorkflow:
     """``LINEAR_V0`` as a graph (D2-26): the same stages, gates and re-entries under the same
-    names, so a gate, an effect or a stored run means the same on either reducer. A linear step has
-    one outcome (a ``StepSucceeded``), so each agent stage has the one edge. The linear workflow had
-    no loop caps; a graph must name them, so the three re-entries are capped at 20 visits each."""
-    gate = {"eligible_roles": ["reviewer"], "decision_surfaces": ["ui"]}
+    names, so a gate or an effect means the same on either reducer. A step that succeeds takes the
+    first edge of its stage (``ready``, ``pass``; see ``Runtime``). The linear workflow had no loop
+    caps; a graph must name them, so the three re-entries are capped at 20 visits each. Its name
+    differs from ``linear-v0`` on purpose: a run stored under ``linear-v0`` carries linear
+    approvals (no head SHA) and is refused here (``WorkflowMismatchError``), not misjudged."""
     doc = {
         "apiVersion": "sto/v1",
         "kind": "Workflow",
-        "metadata": {"name": "linear-v0", "team": "_builtin"},
+        "metadata": {"name": "linear-v0-graph", "team": "_builtin"},
         "limits": {
             "loops": {"review_changes": 20, "qa_changes": 20, "retest": 20},
             "max_steps_per_run": 200,
@@ -144,13 +146,14 @@ def _twin() -> GraphWorkflow:
             "implement": {
                 "kind": "agent",
                 "agent": "implementer",
-                "next": {"ready": "review_gate"},
+                "next": {"ready": "review_gate", "blocked": "rejected"},
             },
             "review_gate": {
                 "kind": "gate",
                 "gate": {
-                    **gate,
                     "type": "review",
+                    "eligible_roles": ["reviewer"],
+                    "decision_surfaces": ["ui"],
                     "decisions": ["approve", "request_changes", "reject"],
                 },
                 "next": {
@@ -159,13 +162,18 @@ def _twin() -> GraphWorkflow:
                     "rejected": "rejected",
                 },
             },
-            "qa": {"kind": "agent", "agent": "qa_agent", "next": {"pass": "qa_gate"}},
+            "qa": {
+                "kind": "agent",
+                "agent": "qa_agent",
+                "produces_code": False,  # G1: a QA step that moves the head is refused
+                "next": {"pass": "qa_gate", "fail": "qa_gate", "inconclusive": "qa_gate"},
+            },
             "qa_gate": {
                 "kind": "gate",
                 "gate": {
-                    **gate,
                     "type": "qa",
                     "eligible_roles": ["qa"],
+                    "decision_surfaces": ["ui"],
                     "decisions": ["approve", "request_changes", "reject", "waive", "retest"],
                 },
                 "next": {
@@ -179,17 +187,15 @@ def _twin() -> GraphWorkflow:
                 "kind": "effect",
                 "effect": "pr.merge",
                 "requires_gates": ["review_gate", "qa_gate"],
-                "next": {"done": "done"},
+                "next": {"done": "done", "conflict": "rejected", "stale": "rejected"},
             },
             "done": {"kind": "terminal", "result": "done"},
             "rejected": {"kind": "terminal", "result": "rejected"},
         },
     }
-    import json
-
     import yaml
 
-    loaded = load_document(yaml.safe_dump(json.loads(json.dumps(doc)), sort_keys=False))
+    loaded = load_document(yaml.safe_dump(doc, sort_keys=False))
     assert isinstance(loaded, GraphWorkflow)
     return loaded
 
@@ -302,6 +308,14 @@ class LocalDriver:
         self._retry_budget = retry_budget
         self._retrying: dict[str, float] = {}
         self._redriver = Redriver(self, redrive, clock=clock, sleep=sleep) if redrive else None
+
+    def _workflow_for(self, state: RunState) -> Workflow | GraphWorkflow:
+        """The workflow a run continues on. Only a new run takes the default twin: one stored under
+        ``linear-v0`` keeps the linear reducer (its approvals carry no head SHA, so the graph
+        reducer would judge its merge uncovered and revert it)."""
+        if self._wf is LINEAR_V0_GRAPH and state.run.workflow_version == LINEAR_V0.version:
+            return LINEAR_V0
+        return self._wf
 
     @property
     def redriver(self) -> Redriver | None:
@@ -786,7 +800,7 @@ class LocalDriver:
             return (Put(key, data, when=Absent()),)
 
         try:
-            tr = next(rec.state, event, self._wf, registry=self._registry)
+            tr = next(rec.state, event, self._workflow_for(rec.state), registry=self._registry)
         except (OutOfOrderEventError, MalformedEventError) as e:
             # Late or duplicate (out of order), or never valid (malformed): recorded and dropped,
             # so a bad event cannot block the queue. Anything else (NoHandlerError,

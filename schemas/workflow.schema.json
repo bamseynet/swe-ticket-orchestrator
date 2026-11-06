@@ -45,6 +45,11 @@
           },
           "title": "Next",
           "type": "object"
+        },
+        "produces_code": {
+          "default": true,
+          "title": "Produces Code",
+          "type": "boolean"
         }
       },
       "required": [
