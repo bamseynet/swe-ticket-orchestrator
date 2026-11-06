@@ -274,7 +274,7 @@ class World:
         _WORLDS.append(self)
         self.store: Store = kw.pop("store", None) or MemoryStore()
         self.clock, self.alarms, self.steps = Clock(), Alarms(), Steps()
-        self.svc = GateService(self.store)
+        self.svc = GateService.unpoliced_for_tests(self.store)
         self.fx = EffectExecutor(self.store, SCOPE, sleep=lambda s: None)
         self.scm = FakeScm()
         self.scm.seed_branch(REPO, "main", "b0")
