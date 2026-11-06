@@ -58,7 +58,7 @@ from sto.domain import (
     to_wire,
 )
 from sto.gates.hooks import OpenContext, Reader, record_with_audit, run_pk
-from sto.gates.service import GuardContext
+from sto.gates.service import GateError, GuardContext
 from sto.store.ports import (
     MAX_TRANSACTION_OPS,
     Absent,
@@ -112,13 +112,13 @@ class MovingTooLargeError(PermanentError):
     """The change needs more operations than one store transaction takes."""
 
 
-class TicketClosedError(PermanentError):
+class TicketClosedError(GateError):
     """A closed ticket cannot be approved (G11)."""
 
     code = "ticket_closed"
 
 
-class AcknowledgementRequiredError(PermanentError):
+class AcknowledgementRequiredError(GateError):
     """The ticket changed since the gate opened: approving needs the new revision acknowledged."""
 
     code = "ack_required"

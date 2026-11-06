@@ -61,8 +61,10 @@ from sto.store.ports import (
     ConditionFailedError,
     Key,
     Op,
+    Put,
     Store,
     TeamScope,
+    VersionIs,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -735,3 +737,174 @@ def test_the_app_builder_wires_both_moving_rules(any_store: Store) -> None:
     run_reaction(store, react(facts(seen_revision="rev2"), TicketClosed(run_version=7)))
     with pytest.raises(TicketClosedError):  # on_open is registered
         svc.open_gate(TEAM, OpenGate(RUN, "qa", GateType.QA, 1, subject))
+
+
+# --- review fixes (pass 1) ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reaction", "code"),
+    [
+        (Reaction(ticket_closed=True, audit_action="moving.ticket_closed"), "ticket_closed"),
+        (
+            Reaction(require_ack="rev2", record_revision="rev2", audit_action="moving.edited"),
+            "ack_required",
+        ),
+    ],
+)
+def test_a_guard_refusal_is_a_4xx_with_its_code_through_the_decision_route(
+    reaction: Reaction, code: str
+) -> None:
+    """Not a 500: the refusals are gate errors, so the route maps them with their own code."""
+    import asyncio
+    from types import SimpleNamespace
+    from typing import cast
+
+    from starlette.requests import Request
+
+    from sto.api.app import moving_aware_gates
+    from sto.api.routers.gates import DecisionIn, decide
+    from sto.api.routers.runs import ApiError
+    from sto.api.runtime import Runtime
+
+    store = MemoryStore()
+    svc = moving_aware_gates(store, OneRoleAll())
+    subject = head_subject()
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    run_reaction(store, reaction)
+
+    async def decide_(run_id: RunId, gate: str, round: int, kind: DecisionKind, **kw: Any) -> Any:
+        return svc.decide(TEAM, run_id=run_id, gate=gate, round=round, kind=kind, **kw)
+
+    rt = cast(Runtime, SimpleNamespace(decide=decide_))
+    body = DecisionIn(kind=DecisionKind.APPROVE, subject_digest=subject.digest(), comment="")
+    request = Request({"type": "http", "headers": [], "state": {}})
+    with pytest.raises(ApiError) as err:
+        asyncio.run(decide(str(RUN), "review", 1, body, rt, request))
+    assert 400 <= err.value.http_status < 500
+    assert err.value.code == code
+
+
+def test_an_unaudited_acknowledgement_racing_an_open_is_retried_not_raised_raw(
+    any_store: Store,
+) -> None:
+    """``acknowledge_ops`` writes ``MOVE#state`` with no audit entry, so only the open hook's Check
+    fails. The open reads again and succeeds (the revision is pending, not closed)."""
+    from sto.gates.policy import build_gate_service
+
+    store = any_store
+    run_reaction(store, react(facts(), edit()))  # pending = rev2
+    fired: list[int] = []
+    hooks = GateHooks()
+
+    def hook(ctx: OpenContext) -> list[Op]:
+        ops = refuse_closed_ticket(ctx)
+        if not fired:
+            fired.append(1)
+            store.transact(TEAM, acknowledge_ops(store, TEAM, RUN, "rev2"))
+        return ops
+
+    hooks.on_open(hook)
+    svc = build_gate_service(store, OneRoleAll(), hooks=hooks)
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject()))
+    assert stored_gate(store).is_open
+    assert len(fired) == 1
+
+
+def test_an_unaudited_close_state_racing_an_open_ends_in_the_refusal(any_store: Store) -> None:
+    from sto.gates.policy import build_gate_service
+
+    store = any_store
+    run_reaction(store, react(facts(), edit()))
+    fired: list[int] = []
+    hooks = GateHooks()
+
+    def hook(ctx: OpenContext) -> list[Op]:
+        ops = refuse_closed_ticket(ctx)
+        if not fired:
+            fired.append(1)
+            item = store.get(TEAM, Key(f"RUN#{RUN}", "MOVE#state"))
+            assert item is not None
+            data = {**item.data, "ticket_closed": True}  # a write that moves only MOVE#state
+            store.transact(TEAM, [Put(item.key, data, VersionIs(item.version))])
+        return ops
+
+    hooks.on_open(hook)
+    svc = build_gate_service(store, OneRoleAll(), hooks=hooks)
+    with pytest.raises(TicketClosedError):
+        svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject()))
+    assert store.get(TEAM, Key(f"RUN#{RUN}", "GATE#review#1")) is None
+
+
+def refusing_everything(ctx: GuardContext) -> list[Op]:
+    raise TicketClosedError("refuses every kind")
+
+
+@pytest.mark.parametrize("kind", [DecisionKind.REJECT, DecisionKind.REQUEST_CHANGES])
+def test_no_guard_runs_for_a_veto(any_store: Store, kind: DecisionKind) -> None:
+    store = any_store
+    subject = head_subject()
+    svc = GateService.unpoliced_for_tests(store, guards=(refusing_everything,))
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    decided = svc.decide(
+        TEAM, run_id=RUN, gate="review", round=1, kind=kind, actor="alice",
+        surface=Surface.UI, subject_digest=subject.digest(), comment="no",
+    )  # fmt: skip
+    assert decided.closed
+    svc.open_gate(TEAM, OpenGate(RUN, "other", GateType.REVIEW, 1, subject))
+    with pytest.raises(TicketClosedError):  # ... and the same guard does stop an approval
+        svc.decide(
+            TEAM, run_id=RUN, gate="other", round=1, kind=DecisionKind.APPROVE, actor="bob",
+            surface=Surface.UI, subject_digest=subject.digest(),
+        )  # fmt: skip
+
+
+def test_no_guard_runs_for_a_qa_retest(any_store: Store) -> None:
+    store = any_store
+    subject = head_subject()
+    svc = GateService.unpoliced_for_tests(store, guards=(refusing_everything,))
+    svc.open_gate(TEAM, OpenGate(RUN, "qa", GateType.QA, 1, subject))
+    decided = svc.decide(
+        TEAM, run_id=RUN, gate="qa", round=1, kind=DecisionKind.RETEST, actor="alice",
+        surface=Surface.UI, subject_digest=subject.digest(), comment="again",
+    )  # fmt: skip
+    assert decided.closed
+
+
+def test_with_guards_twice_keeps_both_guards(any_store: Store) -> None:
+    store = any_store
+    seen: list[str] = []
+
+    def first(ctx: GuardContext) -> list[Op]:
+        seen.append("first")
+        return []
+
+    def second(ctx: GuardContext) -> list[Op]:
+        seen.append("second")
+        return []
+
+    base = GateService.unpoliced_for_tests(store)
+    svc = base.with_guards(first).with_guards(second)
+    subject = head_subject()
+    svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
+    approve(svc, subject, "alice")
+    assert seen == ["first", "second"]
+    assert base._guards == ()  # the original is not changed
+
+
+def test_a_barred_person_is_not_allowed_before_the_guard_speaks(any_store: Store) -> None:
+    from sto.gates.service import DecisionNotAllowedError
+
+    class Barred(OneRoleAll):
+        def refusals(self, scope: Any, gate: Gate, actor: str, *, negative: bool) -> list[str]:
+            return ["sod"]
+
+    store = any_store
+    subject = head_subject()
+    GateService(store, policy=OneRoleAll()).open_gate(
+        TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject)
+    )
+    run_reaction(store, react(facts(), edit()))  # an approval would now need an acknowledgement
+    svc = GateService(store, policy=Barred(), guards=(refuse_moved_subject,))
+    with pytest.raises(DecisionNotAllowedError):
+        approve(svc, subject, "alice")

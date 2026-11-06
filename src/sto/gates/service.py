@@ -312,6 +312,7 @@ class GateService:
         _check_name(cmd.name)
         key = gate_key(cmd.run_id, cmd.name, cmd.round)
         last: Exception | None = None
+        hook_failures = 0
         for attempt in range(self._retry.attempts):
             existing = self._store.get(scope, key)
             if existing is not None:
@@ -363,7 +364,7 @@ class GateService:
             try:
                 self._store.transact(scope, ops)
             except ConditionFailedError as err:
-                _raise_if_only_hooks(err, len(own))
+                hook_failures = _count_hook_failure(err, len(own), hook_failures)
                 last = err
                 self._retry.wait(attempt)
             except TransactionConflictError as err:
@@ -400,6 +401,7 @@ class GateService:
         key = gate_key(run_id, gate, round)
         decision_id = DecisionId.new()
         last: Exception | None = None
+        hook_failures = 0
         for attempt in range(self._retry.attempts):
             item = self._store.get(scope, key)
             if item is None:
@@ -474,7 +476,8 @@ class GateService:
             try:
                 self._store.transact(scope, ops)
             except ConditionFailedError as err:
-                _raise_if_only_hooks(err, len(own) + len(guard_ops))  # a guard's check retries
+                # a guard's check retries like our own; a hook's gets a few fresh reads
+                hook_failures = _count_hook_failure(err, len(own) + len(guard_ops), hook_failures)
                 last = err  # re-read: closed now -> gate_closed above; still open -> try again
                 self._retry.wait(attempt)
             except TransactionConflictError as err:
@@ -791,10 +794,20 @@ def _check_name(name: str) -> None:
         raise ValueError("gate name must be non-blank and must not contain '#'")
 
 
-def _raise_if_only_hooks(err: ConditionFailedError, own_ops: int) -> None:
-    """A condition that only a hook's op failed will not heal by retrying."""
-    if all(i >= own_ops for i in err.failed):
+HOOK_RETRIES = 3  # fresh reads given to a condition that only a hook's op failed
+
+
+def _count_hook_failure(err: ConditionFailedError, own_ops: int, seen: int) -> int:
+    """How many attempts have failed only on a hook's op, counting this one. A hook's check can
+    fail because what it read moved (``refuse_closed_ticket`` pinning ``MOVE#state``), and the
+    next attempt reads again, so a few such failures are retried; the hook then raises its own
+    refusal. A hook condition that never holds is re-raised after ``HOOK_RETRIES`` tries, not after
+    the whole retry bound."""
+    if not all(i >= own_ops for i in err.failed):
+        return seen
+    if seen >= HOOK_RETRIES:
         raise err
+    return seen + 1
 
 
 def _now_ms() -> int:
