@@ -114,6 +114,11 @@ class ExecResult:
     blocked: bool = False
 
 
+class NotBlockedError(ValueError):
+    """``retry_blocked`` on an effect that is not blocked: another click, or a Stop, got there
+    first. A ``ValueError`` still, for callers written against the old refusal."""
+
+
 @dataclass(frozen=True)
 class StopReport:
     """What Stop found: effects it voided, effects that were tried (ATTEMPTING, RETRYING,
@@ -351,7 +356,7 @@ class EffectExecutor:
         for _ in range(_TRIES):
             rec = self._load(run_id, idempotency_key)
             if not rec.meta.get("blocked"):
-                raise ValueError("only a blocked effect can be retried")
+                raise NotBlockedError("only a blocked effect can be retried")
             meta = {"floor": rec.effect.attempts, "reason": "retry_requested"}
             try:
                 self._store.transact(

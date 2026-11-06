@@ -176,10 +176,12 @@ UNKNOWN_MERGE = "unknown"  # the "sha" of a merge that may exist but cannot be n
 
 def on_effect_unresolved(rs: RunState, event: EffectUnresolvedDuringStop, wf: Any) -> Transition:
     _stopping(rs, "an effect is unresolved")
-    unnamed = event.effect == "pr.merge" and event.reason == "merge_unconfirmed"
+    unnamed = event.effect == "pr.merge" and event.reason == "merge_unnamed"
     if unnamed and not any(m.sha == UNKNOWN_MERGE for m in rs.merges):
-        # A merge that may have landed and cannot be named: the run records it as a merge no QA
+        # A merge that is confirmed and cannot be named: the run records it as a merge no QA
         # approval covers, so however it ends it is an incident (and its revert asks a person).
+        # ("merge_unconfirmed" is a different case: the SCM was read and showed nothing, so there
+        # is no merge to record. The watch looks for it and the run is flagged an incident.)
         return Transition(_bump(rs, merges=(*rs.merges, Merge(UNKNOWN_MERGE, None))))
     return Transition(_bump(rs))
 
@@ -485,7 +487,7 @@ class StopExecutor:
                 effect.run_id,
                 effect.type,
                 effect.visit,
-                "merge_unconfirmed",
+                "merge_unnamed",
                 effect.idempotency_key,
             )
         return EffectLandedDuringStop(
@@ -529,7 +531,7 @@ class StopExecutor:
         if (
             found is not None
             and found.state is MergeState.MERGED
-            and self._ours(found, effect) is not False
+            and self._ours(found, effect) is True
         ):
             return [
                 EffectLandedDuringStop(

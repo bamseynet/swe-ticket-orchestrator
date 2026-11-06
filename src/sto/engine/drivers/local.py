@@ -759,7 +759,7 @@ class LocalDriver:
             # A confirmed merge that cannot be named: unresolved (an incident), never a landing
             # the reducer would refuse as malformed while the run ends clean.
             return EffectUnresolvedDuringStop(
-                event.run_id, event.effect, event.visit, "merge_unconfirmed"
+                event.run_id, event.effect, event.visit, "merge_unnamed"
             )
         if isinstance(event, EffectConfirmed):
             # The head is what the standing approvals cover (``merged_head``), not whatever the

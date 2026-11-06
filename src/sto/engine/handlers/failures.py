@@ -63,6 +63,7 @@ from sto.domain import (
     StoError,
     effect_key,
 )
+from sto.effects.core import NotBlockedError
 from sto.engine.commands import RunEffect, RunStep
 from sto.engine.handlers.core import StepFailed
 from sto.engine.reducer import (
@@ -425,7 +426,7 @@ class RetryService:
             )
             if isinstance(exc, KeyError):
                 raise OutOfOrderEventError(f"the retry no longer applies: {exc}") from exc
-            if type(exc) is ValueError and "only a blocked effect" in str(exc):
+            if isinstance(exc, NotBlockedError):
                 # A lost race (another click, or Stop, got there first) is a stale click, not a
                 # fault. It stays a ValueError for callers that already handle that refusal.
                 raise RetryRaceError(str(exc)) from exc

@@ -52,7 +52,7 @@ from sto.domain import (
     from_wire,
     to_wire,
 )
-from sto.effects.core import EffectExecutor
+from sto.effects.core import EffectExecutor, NotBlockedError
 from sto.effects.ports import CallHandler, MergeHandler, effect_item_key
 from sto.engine.commands import OpenGate, OpenRevert, RunStep, StopRun
 from sto.engine.drivers.local import EffectsExecutor, LocalDriver, RunWedgedError
@@ -1051,7 +1051,7 @@ def test_the_lease_heartbeat_has_its_own_thread_and_survives_a_first_load_error(
     w = World()
     seen: list[str] = []
     real_get = w.store.get
-    state = {"fail_once": True, "beat": False}
+    state = {"fail_once": True, "renew_once": True, "beat": False}
 
     def get(scope: Scope, key: Key) -> Any:
         name = threading.current_thread().name
@@ -1069,16 +1069,27 @@ def test_the_lease_heartbeat_has_its_own_thread_and_survives_a_first_load_error(
         name = threading.current_thread().name
         if state["beat"] and name.startswith("sto-lease"):
             renewals.append(name)
+            if state["renew_once"]:
+                state["renew_once"] = False
+                raise TransientError("store blip on the first renewal")
         real_transact(scope, ops)
 
     w.store.get = get  # type: ignore[method-assign]
     w.store.transact = transact  # type: ignore[method-assign]
-    w.driver._ttl = 0.3  # noqa: SLF001 - a short lease so the beat fires within the test
+    # A short lease on a clock that really moves: the beat sleeps ttl/3 before its first renewal.
+    # The first load failed, so the lease is only known to hold for ttl/2 more; the renewal then
+    # fails once and is retried inside that time. Were the allowance shorter than the sleep (ttl/3)
+    # or negative, the retry would count the lease as gone and abort the command.
+    t0 = time.monotonic()
+    w.driver._clock = lambda: 1000.0 + (time.monotonic() - t0)  # noqa: SLF001
+    w.driver._ttl = 1.2  # noqa: SLF001
     inner = w.driver._executor  # noqa: SLF001
 
     class Slow:
         async def execute(self, key: str, command: object) -> Outcome:
-            await asyncio.sleep(0.5)  # longer than the lease: only the heartbeat keeps the run
+            await asyncio.sleep(
+                1.0
+            )  # longer than ttl/3 and ttl/2: only the heartbeat keeps the run
             return await inner.execute(key, command)
 
     w.driver._executor = Slow()  # noqa: SLF001
@@ -1094,6 +1105,7 @@ def test_the_lease_heartbeat_has_its_own_thread_and_survives_a_first_load_error(
     assert seen, "the heartbeat never used its own thread"
     assert renewals, "no lease renewal was written from the heartbeat's own thread"
     assert state["fail_once"] is False  # the first load failed and the command still finished
+    assert state["renew_once"] is False  # and so did the first renewal, which was then retried
 
 
 # === every interleaving: Stop wins every race ===================================================
@@ -1227,7 +1239,6 @@ def test_stop_wins_every_interleaving_with_an_in_flight_merge() -> None:
 def test_stop_wins_every_interleaving_with_a_retry() -> None:
     ticks = 4
     cases = [(r, c, order) for r in range(ticks) for c in range(ticks) for order in ("rc", "cr")]
-    cases = [x for x in cases if x[0] != x[1] or True]
     failures: list[str] = []
 
     async def one(r_at: int, c_at: int, order: str) -> None:
@@ -1469,6 +1480,11 @@ def test_a_merge_writer_stalled_past_its_lease_never_lets_the_stop_end_clean() -
         final = await w.driver.cancel(RID)
         assert final.run.status is RunStatus.CANCELLED
         assert final.run.incident is True, "an unresolved merge must never end clean"
+        # nothing was seen to land, so the run is given no merge and no revert is planned or
+        # asked for: the watch is what looks for it
+        assert final.merges == ()
+        assert "revert_needs_person" not in w.alarms.names()
+        assert w.scm.spy.applied("open_revert_pr") == ()
         assert "done_with_incident" in w.alarms.names()
         assert ("cancel.completed_unresolved", "applied") in w.timeline_types()
         watch = w.watch()
@@ -2008,14 +2024,14 @@ def test_a_confirmed_merge_without_a_merge_sha_is_watched_and_an_incident() -> N
         "CancelCompletedUnresolved",
     ]
     (note,) = [e for e in out.events if isinstance(e, EffectUnresolvedDuringStop)]
-    assert (note.reason, note.key) == ("merge_unconfirmed", key)
+    assert (note.reason, note.key) == ("merge_unnamed", key)
     assert len(store.query(SCOPE, "STOP_WATCH").items) == 1
     stop.close()
 
 
-def test_an_unconfirmed_merge_makes_the_run_an_incident_whatever_ends_it() -> None:
+def test_an_unnamed_merge_makes_the_run_an_incident_whatever_ends_it() -> None:
     rs = _stopping()
-    note = EffectUnresolvedDuringStop(RID, "pr.merge", 1, "merge_unconfirmed", "k")
+    note = EffectUnresolvedDuringStop(RID, "pr.merge", 1, "merge_unnamed", "k")
     after = next(rs, note, W).state
     again = next(after, note, W).state
     assert [m.sha for m in again.merges] == ["unknown"]  # recorded once
@@ -2023,16 +2039,20 @@ def test_an_unconfirmed_merge_makes_the_run_an_incident_whatever_ends_it() -> No
     assert (ended.state.run.status, ended.state.run.incident) == (RunStatus.CANCELLED, True)
     plain = next(rs, EffectUnresolvedDuringStop(RID, "pr.merge", 1), W).state
     assert plain.merges == ()  # a blocked effect alone is not a merge
+    # A merge the SCM was read about and does not show (a stalled writer) is not a merge either:
+    # the watch looks for it, and the run is not given one that does not exist.
+    stalled = EffectUnresolvedDuringStop(RID, "pr.merge", 1, "merge_unconfirmed", "k")
+    assert next(rs, stalled, W).state.merges == ()
 
 
-def test_a_confirmation_without_a_sha_while_stopping_becomes_an_unconfirmed_merge() -> None:
+def test_a_confirmation_without_a_sha_while_stopping_becomes_an_unnamed_merge() -> None:
     from sto.engine.handlers.core import EffectConfirmed
 
     converted = LocalDriver._while_stopping(  # noqa: SLF001
         _stopping(), EffectConfirmed(RID, "pr.merge", 1, None)
     )
     assert isinstance(converted, EffectUnresolvedDuringStop)
-    assert converted.reason == "merge_unconfirmed"
+    assert converted.reason == "merge_unnamed"
     ok = LocalDriver._while_stopping(_stopping(), _fx_confirmed("m1"))  # noqa: SLF001
     assert isinstance(ok, EffectLandedDuringStop)
 
@@ -2250,7 +2270,7 @@ def test_a_retry_that_loses_the_race_is_refused_and_the_audit_says_so() -> None:
 
     class Racing:
         def retry_blocked(self, run_id: RunId, key: str) -> object:
-            raise ValueError("only a blocked effect can be retried, not CONFIRMED")
+            raise NotBlockedError("only a blocked effect can be retried, not CONFIRMED")
 
         def get(self, run_id: RunId, key: str) -> Effect:
             return w.fx.get(run_id, key)
@@ -2309,3 +2329,62 @@ def test_a_merge_that_lands_under_a_record_left_attempting_and_blocked_is_accoun
         assert "merge_landed_after_stop" in w.alarms.names()
     finally:
         w.close()
+
+
+def test_an_unattributed_merge_found_while_stopping_is_watched_not_reverted() -> None:
+    from sto.effects.core import ExecResult
+
+    w = World()
+
+    async def go() -> list[object] | str:
+        await to_the_merge(w)
+        key = w.driver._load(RID).pending[0]["key"]  # noqa: SLF001
+        await w.driver._executor.execute(  # noqa: SLF001
+            key,
+            from_wire_command(w.driver._load(RID).pending[0]),  # noqa: SLF001
+        )
+        (effect,) = w.effects()
+        w.stop._lookup = lambda e: _landed_result(None)  # noqa: SLF001 - the SCM cannot say who
+        result = ExecResult(effect, reason="unreconciled:RefusedError", blocked=True)
+        return w.stop._after_reconcile(effect, result, _stopping())  # noqa: SLF001
+
+    outcome = run(go())
+    assert isinstance(outcome, list)
+    (note,) = outcome
+    assert isinstance(note, EffectUnresolvedDuringStop)  # never a landing that would be reverted
+    assert note.reason == "merge_unconfirmed"
+
+
+def test_only_the_executors_own_refusal_counts_as_a_lost_race() -> None:
+    from sto.engine.handlers.failures import RetryRaceError, RetryService
+
+    w = World()
+    audit = Audit()
+
+    class Plain:
+        def retry_blocked(self, run_id: RunId, key: str) -> object:
+            raise ValueError("only a blocked effect can be retried (said by something else)")
+
+        def get(self, run_id: RunId, key: str) -> Effect:
+            return types.SimpleNamespace(status=EffectStatus.CONFIRMED)  # type: ignore[return-value]
+
+    class Stopper:
+        def stop_attempt(self, run_id: RunId, stage: str, visit: int, attempt: int) -> None:
+            return None
+
+    async def go() -> None:
+        w.scm.lose_response_next("request_merge", 3)
+        await w.driver.start(Run(RID, "t1"))
+        await w.driver.run_until_idle(RID)
+        service = RetryService(
+            audit=audit,
+            stopper=Stopper(),
+            effects=Plain(),
+            submit=w.driver.submit,
+            load=lambda rid: (w.driver.state(rid), W),
+        )
+        with pytest.raises(ValueError, match="said by something else") as caught:
+            await service.retry(RID, "bob", "again")
+        assert not isinstance(caught.value, RetryRaceError)  # matched by type, not by wording
+
+    run(go())
