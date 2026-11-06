@@ -11,8 +11,9 @@ Two halves, both small:
 * :func:`apply_reaction` turns the gate part into store ops for one transaction: open gates are
   ``superseded``, the votes of a gate whose ticket changed are deleted, the ``MOVE#state`` item is
   written, and one chained audit entry is added (``record_with_audit``). :func:`check_decision` is
-  the decision-time rule a surface calls before ``GateService.decide``: a closed ticket cannot be
-  approved and an approval after an edit must acknowledge the new revision.
+  the decision-time rule: a closed ticket cannot be approved and an approval after an edit must
+  acknowledge the new revision. :func:`refuse_moved_subject` runs it inside ``GateService.decide``
+  as a pre-decision guard and pins ``MOVE#state`` in the same transaction (D3-26).
 
 Rules kept from the gate service and the checks stage:
 
@@ -34,8 +35,8 @@ Classification waits while one of our push or update effects is ``ATTEMPTING`` (
 never mistake our own commit for a person's.
 
 Wiring that this module does not do (it stays inside its own file): the ingest/reconcile layer
-(D4) builds ``MovingFacts`` and events, and the decision surfaces call :func:`check_decision`
-beside ``GateService.decide``.
+(D4) builds ``MovingFacts`` and events. The app registers :func:`refuse_closed_ticket` with
+``GateHooks.on_open`` and :func:`refuse_moved_subject` as a ``GateService`` guard.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from sto.domain import (
     to_wire,
 )
 from sto.gates.hooks import OpenContext, Reader, record_with_audit, run_pk
+from sto.gates.service import GateError, GuardContext
 from sto.store.ports import (
     MAX_TRANSACTION_OPS,
     Absent,
@@ -91,6 +93,7 @@ __all__ = [
     "load_state",
     "react",
     "refuse_closed_ticket",
+    "refuse_moved_subject",
 ]
 
 STATE_KEY_SK = "MOVE#state"
@@ -109,13 +112,13 @@ class MovingTooLargeError(PermanentError):
     """The change needs more operations than one store transaction takes."""
 
 
-class TicketClosedError(PermanentError):
+class TicketClosedError(GateError):
     """A closed ticket cannot be approved (G11)."""
 
     code = "ticket_closed"
 
 
-class AcknowledgementRequiredError(PermanentError):
+class AcknowledgementRequiredError(GateError):
     """The ticket changed since the gate opened: approving needs the new revision acknowledged."""
 
     code = "ack_required"
@@ -551,6 +554,23 @@ def refuse_closed_ticket(ctx: OpenContext) -> list[Op]:
     item = ctx.reader.get(ctx.scope, key)
     if item is not None and _state_of(item).ticket_closed:
         raise TicketClosedError("the ticket is closed, so no gate can open")
+    return [Check(key, Absent() if item is None else VersionIs(item.version))]
+
+
+def refuse_moved_subject(ctx: GuardContext) -> list[Op]:
+    """A pre-decision guard (``GateService(guards=...)``, D3-26): refuse an approval the moved
+    ticket forbids and pin ``MOVE#state`` in the decide transaction.
+
+    ``check_decision`` runs on the state read here, and the returned ``Check`` is the version of
+    that read (``Absent`` if nothing was recorded), so a ticket edit or close that commits after
+    this read fails the decision's transaction. The service then retries with fresh reads and this
+    guard runs again, which refuses if the edit needs acknowledging. A negative decision gets
+    neither (the service runs no guard for it). Approvals carry no acknowledgement through
+    ``decide``: a pending revision is cleared first by ``acknowledge_ops``."""
+    key = _state_key(ctx.gate.run_id)
+    item = ctx.reader.get(ctx.scope, key)
+    state = MoveState() if item is None else _state_of(item)
+    check_decision(state, ctx.kind, acknowledged=None)
     return [Check(key, Absent() if item is None else VersionIs(item.version))]
 
 

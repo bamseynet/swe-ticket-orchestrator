@@ -46,7 +46,10 @@ from sto.engine.commands import RunEffect, RunStep
 from sto.engine.drivers.ports import Done, Outcome
 from sto.engine.handlers.core import StepSucceeded
 from sto.engine.reducer import LINEAR_V0
+from sto.gates.hooks import GateHooks
+from sto.gates.moving import refuse_closed_ticket, refuse_moved_subject
 from sto.gates.policy import GatePolicy, LinearGates, StoreRecords, build_gate_service
+from sto.gates.service import DecisionPolicy, GateService
 from sto.identity.linking import AccountLinking
 from sto.identity.mapping import ServiceIdentity, UserIdentity
 from sto.store.ports import Key, Scope, Store, TeamScope
@@ -292,6 +295,15 @@ class DevDirectory:
 LOCAL_FLOORS = Floors.model_construct(single_human_allowed=True, requester_excluded_from=())
 
 
+def moving_aware_gates(store: Store, policy: DecisionPolicy) -> GateService:
+    """The app's gate service (D3-26): the shared builder plus the moving-subject rules. No gate
+    opens on a closed ticket (``GateHooks.on_open``), and every approval pins ``MOVE#state`` in
+    its own transaction (a pre-decision guard)."""
+    hooks = GateHooks()
+    hooks.on_open(refuse_closed_ticket)
+    return build_gate_service(store, policy, hooks=hooks).with_guards(refuse_moved_subject)
+
+
 def gate_policy(
     store: Store, directory: DevDirectory, *, floors: Floors = LOCAL_FLOORS
 ) -> GatePolicy:
@@ -359,7 +371,7 @@ def build_local(env: Mapping[str, str] | None = None) -> FastAPI:
     runtime = Runtime(
         store,
         scope,
-        gates=build_gate_service(store, gate_policy(store, DevDirectory(scope.team))),
+        gates=moving_aware_gates(store, gate_policy(store, DevDirectory(scope.team))),
         effects=EffectExecutor(store, scope),
         steps=SimulatedSteps(subject_for),
         merges=scm_merge_factory(scm, store, scope, lambda run_id: pr, MergeMethod.SQUASH),

@@ -49,6 +49,7 @@ from sto.gates.service import (
     GateClosedError,
     GateConflictError,
     GateContentionError,
+    GateError,
     GateNotFoundError,
     GateRoundLimitError,
     GateService,
@@ -70,6 +71,7 @@ from sto.store.ports import (
     Scope,
     Store,
     TeamScope,
+    VersionIs,
 )
 from sto.store.sqlite import SqliteStore
 
@@ -1150,3 +1152,70 @@ def test_a_service_without_a_policy_refuses_a_decision(store: Store) -> None:
     gate = GateService.unpoliced_for_tests(store).open_gate(TEAM, open_cmd())
     with pytest.raises(PolicyMissingError):
         decide(GateService(store), DecisionKind.APPROVE, gate=gate)
+
+
+# --- pre-decision guard seam (D3-26) ----------------------------------------------------------
+
+
+def test_a_guard_runs_for_every_approval_and_its_ops_join_the_decide_transaction(
+    store: Store,
+) -> None:
+    from sto.gates.service import GuardContext
+
+    seen: list[tuple[str, DecisionKind]] = []
+
+    def guard(ctx: GuardContext) -> list[Op]:
+        seen.append((ctx.actor, ctx.kind))
+        item = ctx.reader.get(ctx.scope, Key(f"RUN#{RUN}", "PIN"))
+        pin = Key(f"RUN#{RUN}", "PIN")
+        return [Check(pin, Absent() if item is None else VersionIs(item.version))]
+
+    svc = GateService.unpoliced_for_tests(store, guards=(guard,))
+    gate = svc.open_gate(TEAM, open_cmd())
+    decide(svc, DecisionKind.APPROVE, gate=gate)
+    assert seen == [("alice", DecisionKind.APPROVE)]
+
+
+def test_a_guard_that_refuses_writes_nothing(store: Store) -> None:
+    from sto.gates.service import GuardContext
+
+    class Nope(GateError):
+        pass
+
+    def guard(ctx: GuardContext) -> list[Op]:
+        raise Nope("no")
+
+    svc = GateService.unpoliced_for_tests(store, guards=(guard,))
+    gate = svc.open_gate(TEAM, open_cmd())
+    before = len(audit(store))
+    with pytest.raises(Nope):
+        decide(svc, DecisionKind.APPROVE, gate=gate)
+    assert gate_of(store).is_open
+    assert not ledger(store)
+    assert len(audit(store)) == before
+
+
+def test_a_failed_guard_check_is_retried_with_the_guard_run_again(store: Store) -> None:
+    """The pinned item moves after the guard read: the transaction fails on the guard's Check,
+    the service reads again, runs the guard again, and then the decision lands."""
+    from sto.gates.service import GuardContext
+
+    pin = Key(f"RUN#{RUN}", "PIN")
+    runs: list[int | None] = []
+
+    def guard(ctx: GuardContext) -> list[Op]:
+        item = ctx.reader.get(ctx.scope, pin)
+        runs.append(None if item is None else item.version)
+        if len(runs) == 1:
+            store.put(TEAM, pin, {"moved": True})  # lands after the guard's read
+        return [Check(pin, Absent() if item is None else VersionIs(item.version))]
+
+    svc = GateService.unpoliced_for_tests(
+        store, guards=(guard,), retry=Backoff(attempts=5, sleep=lambda _: None)
+    )
+    gate = svc.open_gate(TEAM, open_cmd())
+    decided = decide(svc, DecisionKind.APPROVE, gate=gate)
+    assert decided.closed
+    assert len(runs) == 2
+    assert runs[0] is None
+    assert runs[1] is not None
