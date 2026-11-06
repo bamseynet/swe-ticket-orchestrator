@@ -36,6 +36,7 @@ from sto.engine.reducer import (
     Workflow,
     handles,
 )
+from sto.gates.carry_over import Citation
 
 
 @BLOCKED_REASONS.register("attempts_exhausted")
@@ -99,7 +100,8 @@ class StepFailed:
 class GateClosed:
     """What the decision was made on; ``round`` is the key (a gate has no visit of its own).
     ``subject`` is required for approve and waive (negative
-    decisions are exempt from the digest match, PLAN 4 / ADR-0005) and must be the live one."""
+    decisions are exempt from the digest match, PLAN 4 / ADR-0005) and must be the live one.
+    ``citation`` is set only on a close by carry-over (D2-31)."""
 
     run_id: RunId
     gate: str
@@ -108,6 +110,7 @@ class GateClosed:
     actor: str
     decision_id: DecisionId
     subject: Subject | None = None
+    citation: Citation | None = None  # D2-31: what a carried close cites; only the engine sets it
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", DecisionKind(self.kind))
@@ -270,8 +273,28 @@ def on_step_failed(rs: RunState, event: StepFailed, wf: Workflow) -> Transition:
     return Transition(_with(rs, rs.run.advance(RunStatus.BLOCKED, blocked_reason=reason)))
 
 
+def check_carried(event: GateClosed, live: Subject | None) -> None:
+    """The engine's service identity approves only by carry-over, and only with a citation of the
+    live patch; no one else can attach a citation (D2-31, G13). Fails closed: Malformed."""
+    from sto.gates.service import CARRY_ACTOR  # the service module imports the commands above
+
+    if event.actor != CARRY_ACTOR:
+        if event.citation is not None:
+            raise MalformedEventError("only the engine's carry-over can cite an earlier approval")
+        return
+    if event.kind is not DecisionKind.APPROVE:
+        raise MalformedEventError("the engine's service identity can only approve, by carry-over")
+    if event.citation is None:
+        raise MalformedEventError("a service approval must carry the citation it rests on")
+    if event.subject is None or event.citation.patch_id != event.subject.patch_id:
+        raise MalformedEventError("the citation is not for the patch being approved")
+    if live is not None and event.citation.patch_id != live.patch_id:
+        raise MalformedEventError("the citation is not for the live patch")
+
+
 @handles(GateClosed)
 def on_gate_closed(rs: RunState, event: GateClosed, wf: Workflow) -> Transition:
+    check_carried(event, rs.subject)
     run = rs.run
     if run.status is not RunStatus.WAITING_HUMAN:
         raise _out(f"gate closed while run is {run.status.value}")

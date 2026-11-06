@@ -2180,3 +2180,69 @@ def test_reconcile_confirms_a_write_that_a_handler_can_read_back(world: World) -
     )
     assert result.effect.status is EffectStatus.CONFIRMED
     assert result.effect.receipt == landed
+
+
+# --- D2-31: guard 2 honours a service approval only with its citation -------------------------
+
+
+def _carried(world: World) -> tuple[Gate, Gate]:
+    """Round 1 approved by a person, round 2 closed by carry-over through the real service."""
+    from sto.gates.carry_over import Citation
+    from sto.gates.service import CARRY_ACTOR  # noqa: F401
+
+    first, _ = world.approve()
+    second = world.gate(round=2)
+    cite = Citation(first.id, 1, first.id, 1, SUBJECT.patch_id, ("iss|alice",))
+    world.svc.close_carried(
+        SCOPE, gate=second, citation=cite, chain=world.svc.audit_version(SCOPE, world.run.id)
+    )
+    return first, second
+
+
+def test_a_carried_approval_with_its_citation_lets_the_effect_run(world: World) -> None:
+    _carried(world)
+    e = world.plan()
+    world.go(e)
+    assert len(world.scm.spy.applied("mark_ready")) == 1
+
+
+def test_a_service_approval_without_a_citation_record_does_not_count(world: World) -> None:
+    from sto.gates.service import CARRY_ACTOR
+
+    world.approve()
+    gate = world.gate(round=2)
+    # forged: an approving decision by the service identity and an APPROVED row, but no CITE#
+    approved = dataclasses.replace(gate, status=GateStatus.APPROVED, closed_by=CARRY_ACTOR)
+    world.store.put(SCOPE, Key(f"RUN#{world.run.id}", "GATE#review#2"), to_wire(approved))
+    d = world.raw_decision(gate, DecisionKind.APPROVE, gate.subject.digest())
+    forged = dataclasses.replace(d, actor=CARRY_ACTOR)
+    world.store.put(SCOPE, Key(f"RUN#{world.run.id}", f"DEC#review#2#{d.id}"), to_wire(forged))
+    e = world.plan()
+    world.go(e)
+    assert world.scm.spy.calls == ()
+
+
+def test_a_citation_that_names_another_gate_does_not_count(world: World) -> None:
+    _, second = _carried(world)
+    key = Key(f"RUN#{world.run.id}", "CITE#review#2")
+    item = world.store.get(SCOPE, key)
+    assert item is not None
+    world.store.put(SCOPE, key, {**item.data, "closed_gate_id": str(GateId.new())})
+    e = world.plan()
+    world.go(e)
+    assert world.scm.spy.calls == ()
+
+
+@pytest.mark.parametrize("field", ["decision_id", "origin_gate_id", "patch_id"])
+def test_a_citation_record_that_does_not_match_its_decision_does_not_count(
+    world: World, field: str
+) -> None:
+    _carried(world)
+    key = Key(f"RUN#{world.run.id}", "CITE#review#2")
+    item = world.store.get(SCOPE, key)
+    assert item is not None
+    bad = "" if field == "origin_gate_id" else "other"
+    world.store.put(SCOPE, key, {**item.data, field: bad})
+    e = world.plan()
+    world.go(e)
+    assert world.scm.spy.calls == ()

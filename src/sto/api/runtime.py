@@ -44,7 +44,7 @@ from sto.config.publish import (
     Publisher,
     load_pinned,
 )
-from sto.config.schema import Metadata
+from sto.config.schema import CarryOver, GateStage, Metadata
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import Decision as DecisionRecord
 from sto.domain import (
@@ -73,6 +73,7 @@ from sto.engine.drivers.local import (
 from sto.engine.drivers.ports import CommandExecutor, Done, StillRunning
 from sto.engine.drivers.ports import Outcome as CommandOutcome
 from sto.engine.handlers.cancel import Alarm, RevertWriter, StopExecutor
+from sto.engine.handlers.carry import CarryEngine, CarryRefused
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed, StepSucceeded
 from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import (
@@ -84,7 +85,7 @@ from sto.engine.reducer import (
     parse_pin,
     pin_version,
 )
-from sto.gates.service import Decided, GateService
+from sto.gates.service import CARRY_ACTOR, Decided, GateService, citation_from_comment
 from sto.store.ports import (
     Absent,
     ConditionFailedError,
@@ -258,7 +259,9 @@ class _Commands:
         workflow: Workflow | GraphWorkflow,
         version_of: Callable[[RunId], str | None],
         pinned: Callable[[str], GraphWorkflow] | None = None,
+        carry: CarryEngine | None = None,
     ):
+        self._carry = carry
         self._gates, self._scope, self._steps = gates, scope, steps
         self._status_of, self._wait, self._reverts = status_of, wait, reverts
         self._wf, self._version_of, self._pinned = workflow, version_of, pinned
@@ -266,9 +269,19 @@ class _Commands:
     async def execute(self, key: str, command: object) -> CommandOutcome:
         if isinstance(command, OpenGate):
             try:
-                await asyncio.to_thread(self._gates.open_gate, self._scope, command)
+                gate = await asyncio.to_thread(self._gates.open_gate, self._scope, command)
             except TransientError as e:  # contention, a store conflict: try again shortly
                 return StillRunning(self._wait, f"transient:{type(e).__name__}")
+            if self._carry is not None:
+                # D2-31: a re-entered gate may close on an earlier approval. The engine closes it
+                # (conditionally, under its service identity) and the run hears the same event a
+                # person's decision would send; a replay returns the same event.
+                try:
+                    closed = await asyncio.to_thread(self._carry.on_open, self._scope, gate)
+                except TransientError as e:
+                    return StillRunning(self._wait, f"transient:{type(e).__name__}")
+                if closed is not None:
+                    return Done([closed])
             return Done()  # a person decides; the decision arrives as an event
         if isinstance(command, StopRun):
             return Done([CancelCompleted(command.run_id)])
@@ -280,7 +293,19 @@ class _Commands:
             status = await asyncio.to_thread(self._status_of, command.run_id)
             if status.is_terminal or status is RunStatus.CANCELLING:
                 return Done()  # the run was stopped while this step waited: do not start it
-            return await self._reported(command.run_id, await self._steps.execute(key, command))
+            reported = await self._reported(command.run_id, await self._steps.execute(key, command))
+            if self._carry is not None and isinstance(reported, Done):
+                for event in reported.events:  # every head the run has had, gate or no gate
+                    subject = getattr(event, "subject", None)
+                    try:
+                        await asyncio.to_thread(
+                            self._carry.note_head, self._scope, command.run_id, subject
+                        )
+                    except CarryRefused as why:
+                        # an unrecorded head leaves the log not ending at the subject's head, so
+                        # carry-over refuses and a person decides
+                        log.warning("head not recorded for run %s: %s", command.run_id, why)
+            return reported
         raise TypeError(f"no executor for {type(command).__name__}")
 
     async def _reported(self, run_id: RunId, outcome: CommandOutcome) -> CommandOutcome:
@@ -393,6 +418,7 @@ class Runtime:
         api_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         cooldown: float = 1.0,
         mono: Callable[[], float] = time.monotonic,
+        carry: Callable[[Callable[[RunId, str], CarryOver | None]], CarryEngine] | None = None,
     ) -> None:
         load_handlers()  # before anything stored is decoded (the driver needs the registries)
         if (publisher is None) != (workflow_name is None):
@@ -452,6 +478,7 @@ class Runtime:
                 workflow,
                 version_of,
                 self._load_pin,
+                carry(self.carry_over_of) if carry is not None else None,
             ),
             poll_interval=poll_interval,
         )
@@ -472,6 +499,22 @@ class Runtime:
 
     def _load_pin(self, version: str) -> GraphWorkflow:
         return load_pin(self.store, self.scope, version)
+
+    def carry_over_of(self, run_id: RunId, gate: str) -> CarryOver | None:
+        """The gate's ``carry_over`` read from the run's *pinned* workflow (D2-30), never the
+        latest. None when the workflow is linear, the stage is not a gate, or the pin does not
+        load: carry-over then does not apply and a person decides."""
+        held = self.driver.state(run_id).run.workflow_version
+        wf: Workflow | GraphWorkflow = self._wf
+        if parse_pin(held) is not None:
+            try:
+                wf = self._load_pin(str(held))
+            except PinUnavailableError:
+                return None
+        if not isinstance(wf, GraphWorkflow):
+            return None
+        stage = wf.stages.get(gate)
+        return stage.gate.carry_over if isinstance(stage, GateStage) else None
 
     # --- life cycle ---------------------------------------------------------------------------
 
@@ -1032,6 +1075,8 @@ def _closed_event(gate: Gate, decision: DecisionRecord) -> GateClosed:
         decision.actor,
         decision.id,
         gate.subject if approving else None,
+        # a carried close redelivers with the citation it wrote (else the reducer refuses it)
+        citation_from_comment(decision.comment) if decision.actor == CARRY_ACTOR else None,
     )
 
 

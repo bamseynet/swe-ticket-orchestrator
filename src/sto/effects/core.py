@@ -48,6 +48,7 @@ from sto.store.ports import (
     Condition,
     ConditionFailedError,
     Item,
+    Key,
     Op,
     Put,
     Scope,
@@ -88,6 +89,16 @@ _DEAD = frozenset(
     | {RunStatus.CLOSED, RunStatus.EXPIRED}
 )
 _APPROVING = frozenset({DecisionKind.APPROVE, DecisionKind.WAIVE})
+# The engine's service identity and where its carried close writes the citation. Mirrors
+# ``gates.service.CARRY_ACTOR`` / ``cite_key`` (this package does not import ``gates``);
+# ``tests/engine/test_carry.py`` pins the two together.
+CARRY_ACTOR = "sto-engine|carry-over"
+
+
+def cite_key(gate: Gate) -> Key:
+    return Key(run_pk(gate.run_id), f"CITE#{gate.name}#{gate.round}")
+
+
 _TRIES = 8
 _VOID_BACKOFF = 0.005  # Stop's wait after a lost race on an effect, doubling to the cap
 _VOID_BACKOFF_CAP = 0.2
@@ -505,12 +516,36 @@ class EffectExecutor:
                     from_wire(Decision, i.data)
                     for i in self._pages(self._scope, pk, decision_prefix(name, gate.round))
                 )
-                if d.gate_id == gate.id and d.kind in _APPROVING and d.subject_digest == own
+                if d.gate_id == gate.id
+                and d.kind in _APPROVING
+                and d.subject_digest == own
+                and self._standing(d, gate, ops)
             ]
             if not approvals:
                 return "gate_invalid"
             found.extend(approvals)
         return tuple(found)
+
+    def _standing(self, decision: Decision, gate: Gate, ops: list[Op]) -> bool:
+        """A person's approval stands. The engine's service approval (carry-over, D2-31) stands
+        only with the ``CITE#`` record its close wrote, naming this gate and this patch; the item
+        is pinned in the claim so it cannot change under it."""
+        if decision.actor != CARRY_ACTOR:
+            return True
+        key = cite_key(gate)
+        item = self._store.get(self._scope, key)
+        if item is None:
+            return False
+        c = item.data
+        if (
+            c.get("closed_gate_id") != str(gate.id)
+            or c.get("patch_id") != gate.subject.patch_id
+            or c.get("decision_id") != str(decision.id)
+            or not c.get("origin_gate_id")
+        ):
+            return False
+        ops.append(Check(key, VersionIs(item.version)))
+        return True
 
     def _frozen_subject(self, run_id: RunId) -> Subject | None:
         merged = [
