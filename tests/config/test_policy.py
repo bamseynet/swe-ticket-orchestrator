@@ -2171,12 +2171,12 @@ def test_a_floor_marked_enforced_points_at_a_real_test() -> None:
         assert re.search(rf"^def {re.escape(name)}\(", text, flags=re.M), f"{key}: {entry.evidence}"
 
 
-def test_the_v17_floors_stay_open_until_publish_migrate_and_live_call_it() -> None:
-    # check_org_required_gates is proved here but nothing calls it yet (PLAN 7.3: publish,
-    # migrate and live), so these floors are not enforced and must say who wires them.
+def test_the_v17_floors_stay_open_until_migrate_and_live_call_it() -> None:
+    # check_org_required_gates is called at publish (D2-07, done) but not yet on migrate or live
+    # (PLAN 7.3), so these floors are not enforced and must say who wires them.
     for key in ("teams.*.required_gates", "teams.*.min_quorum", "teams.*.allowed_carry_over"):
         assert not FLOOR_TRACKING[key].done, key
-        assert FLOOR_TRACKING[key].issues == ("D2-07", "D2-19", "D3-16"), key
+        assert FLOOR_TRACKING[key].issues == ("D2-19", "D3-16"), key
 
 
 def test_decision_surfaces_waits_for_both_the_validator_and_the_surface_check() -> None:

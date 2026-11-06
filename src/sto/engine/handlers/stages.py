@@ -46,8 +46,10 @@ records its ``head_sha``. A merge records the head it merged, and a merge is cov
 approval (a waive counts) of that head. A run with an uncovered merge ends with ``incident`` set
 whichever terminal it reaches, plans one ``OpenRevert`` per uncovered merge SHA, and says so in
 ``Finish`` (PLAN 6.2). Merged code is immutable: once a merge is recorded a report of any other head
-BLOCKS the run (``head_moved``). ``workflow_version`` is the workflow's name until D2-07 pins
-the digest.
+BLOCKS the run (``head_moved``). ``workflow_version`` is the run's pin (D2-30):
+``name@version#digest`` of the published workflow it started on, set before ``RunStarted`` and
+kept by it, or, for the built-in twin that is not published, the workflow's name. A run whose
+pinned manifest no longer loads BLOCKS (``pin_unavailable``, see ``block_unavailable_pin``).
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ from sto.domain import (
     DecisionKind,
     FailureClass,
     GateType,
+    InvalidTransitionError,
     Run,
     RunId,
     RunStatus,
@@ -169,6 +172,11 @@ class EffectVoided:
     pass
 
 
+@BLOCKED_REASONS.register("pin_unavailable")
+class PinUnavailable:
+    pass
+
+
 @EVENTS.register("stage.reported")
 @dataclass(frozen=True)
 class StageReported:
@@ -226,6 +234,17 @@ def _block(rs: RunState, reason: str, edge: BlockedEdge | None = None) -> Transi
     edge a ``loop_exhausted`` block refused, kept in the state for a grant (D2-34)."""
     blocked = rs.run.advance(RunStatus.BLOCKED, blocked_reason=reason)
     return Transition(_with(rs, blocked, blocked_edge=edge))
+
+
+def block_unavailable_pin(rs: RunState) -> Transition:
+    """The run's pinned manifest no longer loads (gone, or it does not hash to its digest): BLOCK
+    it with ``pin_unavailable`` instead of raising, and queue nothing. The event is consumed. A
+    run that cannot be blocked from where it is (finished, stopping, or already BLOCKED) stays as
+    it is. Pure: the driver calls it when it cannot resolve the run's workflow."""
+    try:
+        return _block(rs, "pin_unavailable")
+    except InvalidTransitionError:
+        return Transition(rs)
 
 
 def _target(edge: str | Edge) -> tuple[str, str | None]:
@@ -458,8 +477,10 @@ def _report(
 def on_run_started(rs: RunState, event: RunStarted, wf: Graph) -> Transition:
     if rs.run.status is not RunStatus.QUEUED:
         raise _out(f"run already started ({rs.run.status.value})")
+    # a run on a published workflow carries its pin already; a built-in's name is set here
     running = dataclasses.replace(
-        rs.run.advance(RunStatus.RUNNING), workflow_version=wf.metadata.name
+        rs.run.advance(RunStatus.RUNNING),
+        workflow_version=rs.run.workflow_version or wf.metadata.name,
     )
     return _goto(dataclasses.replace(rs, run=running), wf, wf.start)
 

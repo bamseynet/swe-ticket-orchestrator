@@ -90,11 +90,13 @@ from sto.engine.handlers.core import (
     StepFailed,
 )
 from sto.engine.handlers.failures import Redriver, RetryBudgetExceededError, RetryPolicy
+from sto.engine.handlers.stages import block_unavailable_pin
 from sto.engine.reducer import (
     LINEAR_V0,
     HandlerRegistry,
     MalformedEventError,
     OutOfOrderEventError,
+    PinUnavailableError,
     RunState,
     Workflow,
     load_handlers,
@@ -801,6 +803,10 @@ class LocalDriver:
 
         try:
             tr = next(rec.state, event, self._workflow_for(rec.state), registry=self._registry)
+        except PinUnavailableError:
+            # D2-30: the manifest the run pinned no longer loads. The run BLOCKS with a reason
+            # (the event is consumed) instead of the drive raising and the event staying queued.
+            tr = block_unavailable_pin(rec.state)
         except (OutOfOrderEventError, MalformedEventError) as e:
             # Late or duplicate (out of order), or never valid (malformed): recorded and dropped,
             # so a bad event cannot block the queue. Anything else (NoHandlerError,

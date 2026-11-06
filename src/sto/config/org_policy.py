@@ -630,8 +630,8 @@ def _one(issue: str) -> FloorStatus:
 
 
 # V17 is proved here as a pure function, but PLAN 7.3 has it checked at publish, on migrate and
-# live, and no caller exists yet: D2-07 publishes, D2-19 migrates, D3-16 checks at decision time.
-_V17_WIRING = FloorStatus(("D2-07", "D2-19", "D3-16"))
+# live. D2-07 publishes (done); D2-19 migrates and D3-16 checks at decision time are still to come.
+_V17_WIRING = FloorStatus(("D2-19", "D3-16"))
 FLOOR_TRACKING: Mapping[str, FloorStatus] = {
     "floors.single_human_allowed": _one("D3-05"),
     "floors.requester_excluded_from": _one("D3-05"),

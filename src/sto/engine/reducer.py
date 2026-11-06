@@ -11,6 +11,11 @@ stage, visit, attempt, round or subject differs from the live state is refused w
 A malformed event (missing subject, decision not allowed at the gate) raises
 ``MalformedEventError`` instead.
 
+A run pins its workflow in ``Run.workflow_version`` (``workflow_version()``): the pin
+``name@version#digest`` of a published workflow (D2-30), or a built-in's name or linear version
+(``linear-v0`` and the built-in twin ``linear-v0-graph``, which are not published). A pin is set
+before the run starts and ``RunStarted`` keeps it; a built-in's name is set by ``RunStarted``.
+
 Two kinds of workflow run through ``next``. The linear ``Workflow`` of D1-02 (``LINEAR_V0``) is
 handled by ``HANDLERS``. A validated graph ``Workflow`` from ``sto.config.schema`` (D2-01, passed
 by D2-03) is handled by ``GRAPH_HANDLERS`` (reducer v1, ``handlers/stages.py``), which relies on
@@ -34,7 +39,7 @@ import importlib
 import pkgutil
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 from sto.config.schema import TerminalStage
 from sto.config.schema import Workflow as GraphWorkflow
@@ -327,9 +332,55 @@ def _blocked_on_loop(rs: RunState) -> bool:
     return rs.run.status is RunStatus.BLOCKED and rs.run.blocked_reason == "loop_exhausted"
 
 
-def workflow_version(workflow: Workflow | GraphWorkflow) -> str:
-    """What a run pins: the linear version, or a graph workflow's name (D2-07 pins its digest)."""
-    return workflow.metadata.name if isinstance(workflow, GraphWorkflow) else workflow.version
+class PinUnavailableError(PermanentError):
+    """The manifest a run pinned no longer loads (gone, or it does not hash to the pinned
+    digest). Raised by whoever resolves a run's workflow, never by ``next``; the driver turns it
+    into a BLOCKED run (``block_unavailable_pin`` in ``handlers/stages.py``)."""
+
+
+class PinnedVersion(NamedTuple):
+    """A published version a run pinned: ``(name, version, digest)``; the team is the run's own."""
+
+    name: str
+    version: int
+    digest: str
+
+
+_PIN_AT, _PIN_HASH = "@", "#"
+
+
+def pin_version(name: str, version: int, digest: str) -> str:
+    """The text of a pin, stored as the run's ``workflow_version``: ``name@version#digest``. A
+    workflow name is ``[a-z][a-z0-9_-]*`` and the linear version is ``linear-v0``, so neither
+    contains ``@`` and a pin can never be mistaken for a built-in's version."""
+    return f"{name}{_PIN_AT}{version}{_PIN_HASH}{digest}"
+
+
+def parse_pin(text: str | None) -> PinnedVersion | None:
+    """The pin in ``text``; ``None`` for a built-in's version (a name) and for ``None``."""
+    if not text or _PIN_AT not in text:
+        return None
+    name, _, rest = text.partition(_PIN_AT)
+    version, sep, digest = rest.partition(_PIN_HASH)
+    if not (name and sep and digest and version.isdigit()):
+        return None
+    return PinnedVersion(name, int(version), digest)
+
+
+def workflow_version(workflow: Workflow | GraphWorkflow, pin: str | None = None) -> str:
+    """What a run pins, as a string compared with the run's ``workflow_version``.
+
+    A run started on a published workflow carries its pin (``pin_version``: name, version and
+    manifest digest, D2-30), and this returns that pin when ``pin`` is it and names this workflow.
+    ``pin`` is the run's own ``workflow_version``; the digest in it was proved by ``load_pinned``
+    when the workflow was loaded, so the reducer only checks the name. Otherwise a built-in is
+    pinned by its name: the linear version, or a graph workflow's name (the built-in twin
+    ``linear-v0-graph`` is not published and has no digest)."""
+    name = workflow.metadata.name if isinstance(workflow, GraphWorkflow) else workflow.version
+    held = parse_pin(pin)
+    if held is not None and isinstance(workflow, GraphWorkflow) and held.name == name:
+        return str(pin)
+    return name
 
 
 DEFAULT_PACKAGE = "sto.engine.handlers"
@@ -376,7 +427,7 @@ def next(  # noqa: A001 - the name is the contract (PLAN 6.1)
         raise NoHandlerError(f"no handler for {type(event).__name__}")
     if event.run_id != state.run.id:
         raise OutOfOrderEventError(f"{type(event).__name__} is for another run")
-    version = workflow_version(workflow)
+    version = workflow_version(workflow, state.run.workflow_version)
     if state.run.workflow_version not in (None, version):
         raise WorkflowMismatchError(f"run is on {state.run.workflow_version!r}, not {version!r}")
     out = handler(state, event, workflow)

@@ -37,6 +37,13 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any, Literal
 
 from sto.adapters.ports import MergeMethod, PrRef, ScmProvider
+from sto.config.publish import (
+    Pin,
+    PinnedCorruptError,
+    PinnedMissingError,
+    Publisher,
+    load_pinned,
+)
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import Decision as DecisionRecord
 from sto.domain import (
@@ -67,7 +74,14 @@ from sto.engine.drivers.ports import Outcome as CommandOutcome
 from sto.engine.handlers.cancel import Alarm, RevertWriter, StopExecutor
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed, StepSucceeded
 from sto.engine.handlers.stages import StageReported
-from sto.engine.reducer import RunState, Workflow, load_handlers
+from sto.engine.reducer import (
+    PinUnavailableError,
+    RunState,
+    Workflow,
+    load_handlers,
+    parse_pin,
+    pin_version,
+)
 from sto.gates.service import Decided, GateService
 from sto.store.ports import (
     Absent,
@@ -114,6 +128,24 @@ class BadCursorError(PermanentError):
 
 class RunNotFoundError(PermanentError):
     pass
+
+
+class NoPublishedWorkflowError(PermanentError):
+    """A run was asked for on a workflow the team has not published, so there is nothing to pin.
+    The run is not created."""
+
+
+def load_pin(store: Store, scope: TeamScope, version: str) -> GraphWorkflow:
+    """The workflow a run pinned, loaded through ``load_pinned`` (so the stored records are proved
+    to hash to the pinned digest on every call). ``PinUnavailableError`` when it is gone or
+    altered, or when ``version`` is not a pin: the caller turns that into a BLOCKED run."""
+    held = parse_pin(version)
+    if held is None:
+        raise PinUnavailableError(f"{version!r} is not a pin")
+    try:
+        return load_pinned(store, scope, Pin(scope.team, *held)).workflow
+    except (PinnedMissingError, PinnedCorruptError) as e:
+        raise PinUnavailableError(str(e)) from e
 
 
 class RunFinishedError(PermanentError):
@@ -223,10 +255,11 @@ class _Commands:
         reverts: CommandExecutor,
         workflow: Workflow | GraphWorkflow,
         version_of: Callable[[RunId], str | None],
+        pinned: Callable[[str], GraphWorkflow] | None = None,
     ):
         self._gates, self._scope, self._steps = gates, scope, steps
         self._status_of, self._wait, self._reverts = status_of, wait, reverts
-        self._wf, self._version_of = workflow, version_of
+        self._wf, self._version_of, self._pinned = workflow, version_of, pinned
 
     async def execute(self, key: str, command: object) -> CommandOutcome:
         if isinstance(command, OpenGate):
@@ -251,11 +284,26 @@ class _Commands:
     async def _reported(self, run_id: RunId, outcome: CommandOutcome) -> CommandOutcome:
         """A step that only says it succeeded (``StepSucceeded``) takes the first edge of a graph
         stage that has several (``ready``, ``pass``): the reducer will not guess one. A stage with
-        one edge needs no help, and a run still on the linear reducer is left alone."""
-        wf = self._wf
-        if not isinstance(wf, GraphWorkflow) or not isinstance(outcome, Done):
+        one edge needs no help, and a run still on the linear reducer is left alone.
+
+        The stage is looked up in the run's own workflow: a run pinned to a published version
+        (``name@version#digest``) loads that version, never the default or the latest. A pin that
+        no longer loads leaves the outcome as it is; the driver then BLOCKS the run on it."""
+        if not isinstance(outcome, Done):
             return outcome
-        if await asyncio.to_thread(self._version_of, run_id) != wf.metadata.name:
+        held = await asyncio.to_thread(self._version_of, run_id)
+        pin = parse_pin(held)
+        wf: Workflow | GraphWorkflow | None = self._wf
+        if pin is not None:
+            if self._pinned is None or held is None:
+                return outcome
+            try:
+                wf = await asyncio.to_thread(self._pinned, held)
+            except PinUnavailableError:
+                return outcome
+        if not isinstance(wf, GraphWorkflow):
+            return outcome
+        if (pin.name if pin else held) != wf.metadata.name:
             return outcome
         events: list[Any] = []
         for e in outcome.events:
@@ -276,7 +324,19 @@ class _LogAlarm:
 
 class _TaggedDriver(LocalDriver):
     """Tells the sleep which run it is sleeping for, however the drive was started (a kick, or
-    a start-up kick, which calls ``run_until_idle`` per run)."""
+    a start-up kick, which calls ``run_until_idle`` per run). It also resolves the workflow of a
+    run that pinned a published version (D2-30): every event loads it again through
+    ``load_pinned``, so what the run does is what was published when it started."""
+
+    def __init__(self, *args: Any, pinned: Callable[[str], GraphWorkflow], **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self._pinned = pinned
+
+    def _workflow_for(self, state: RunState) -> Workflow | GraphWorkflow:
+        held = state.run.workflow_version
+        if held is not None and parse_pin(held) is not None:
+            return self._pinned(held)  # may raise PinUnavailableError: the run BLOCKS
+        return super()._workflow_for(state)
 
     async def run_until_idle(self, run_id: RunId) -> RunState:
         token = _RUN.set(run_id)
@@ -311,6 +371,8 @@ class Runtime:
         merges: MergeFactory,
         live: LiveSubject,
         workflow: Workflow | GraphWorkflow = LINEAR_V0_GRAPH,
+        publisher: Publisher | None = None,
+        workflow_name: str | None = None,
         revert: RevertWriter | None = None,
         alarm: Alarm | None = None,
         gate_roles: GateRoles = default_gate_roles,
@@ -325,7 +387,12 @@ class Runtime:
         mono: Callable[[], float] = time.monotonic,
     ) -> None:
         load_handlers()  # before anything stored is decoded (the driver needs the registries)
+        if (publisher is None) != (workflow_name is None):
+            raise ValueError("publisher and workflow_name are given together, or not at all")
         self.store, self.scope, self._wf = store, scope, workflow
+        # D2-30: with a publisher, a new run pins the latest published version of this workflow;
+        # without one, runs use ``workflow`` (the built-in), which is pinned by its name.
+        self._publisher, self._workflow_name = publisher, workflow_name
         self._gates = gates
         self._gate_roles = gate_roles
         self._api_sleep, self._backoff = api_sleep, backoff
@@ -368,7 +435,15 @@ class Runtime:
             live,
             status_of,
             others=_Commands(
-                gates, scope, steps, status_of, poll_interval, self._reverts, workflow, version_of
+                gates,
+                scope,
+                steps,
+                status_of,
+                poll_interval,
+                self._reverts,
+                workflow,
+                version_of,
+                self._load_pin,
             ),
             poll_interval=poll_interval,
         )
@@ -384,7 +459,11 @@ class Runtime:
             resume_wait=lease_seconds,
             sleep=self._sleep,
             backoff=backoff,
+            pinned=self._load_pin,
         )
+
+    def _load_pin(self, version: str) -> GraphWorkflow:
+        return load_pin(self.store, self.scope, version)
 
     # --- life cycle ---------------------------------------------------------------------------
 
@@ -639,9 +718,28 @@ class Runtime:
 
     # --- runs ---------------------------------------------------------------------------------
 
+    async def _pin_latest(self) -> str | None:
+        """The pin a new run starts on: the latest published version of the workflow, read now and
+        proved loadable (``load_pinned``), as ``name@version#digest``. ``None`` when this runtime
+        has no publisher (the built-in is used). ``NoPublishedWorkflowError`` before the first
+        publish: a run is never silently started on something else."""
+        if self._publisher is None or self._workflow_name is None:
+            return None
+        publisher, name = self._publisher, self._workflow_name
+        latest = await self._store(publisher.latest, self.scope, name)
+        if latest is None:
+            raise NoPublishedWorkflowError(f"team {self.scope.team} has not published {name!r}")
+        version = pin_version(latest.name, latest.version, latest.digest)
+        try:
+            await self._store(self._load_pin, version)
+        except PinUnavailableError as e:
+            raise NoPublishedWorkflowError(f"the latest {name!r} cannot be loaded: {e}") from e
+        return version
+
     async def create_run(self, ticket: str | None, started_by: str | None = None) -> Run:
         """``started_by``: the starter's actor key (``issuer|subject``), None for the dev token."""
-        run = Run(id=RunId.new(), team=self.scope.team)
+        pinned = await self._pin_latest()
+        run = Run(id=RunId.new(), team=self.scope.team, workflow_version=pinned)
         data = {"ticket": ticket, "started_by": started_by}
         await self._store(
             lambda: self.store.put(self.scope, Key(API_INDEX, str(run.id)), data, when=Absent())
@@ -737,7 +835,8 @@ class Runtime:
             and approved is not None
             and approved.status is GateStatus.APPROVED
             and approved.round == last.round
-            and self._waiting_on(state.run.stage, approved.name)
+            and (wf := self._workflow_of(state)) is not None  # a pin that is gone: not waiting
+            and self._waiting_on(state.run.stage, approved.name, wf)
         ):
             counted.append(approved)
         roles: set[str] = set()
@@ -745,18 +844,32 @@ class Runtime:
             roles |= self._gate_roles(gate) or frozenset()
         return frozenset(roles)
 
-    def _waiting_on(self, stage: str | None, gate: str) -> bool:
-        """Is the run still at ``gate``, or at an effect that requires it?"""
+    def _workflow_of(self, state: RunState) -> Workflow | GraphWorkflow | None:
+        """The workflow the run is on: its pinned version, or the default for a built-in run.
+        ``None`` when the pinned manifest no longer loads."""
+        held = state.run.workflow_version
+        if held is not None and parse_pin(held) is not None:
+            try:
+                return self._load_pin(held)
+            except PinUnavailableError:
+                return None
+        return self._wf
+
+    def _waiting_on(
+        self, stage: str | None, gate: str, wf: Workflow | GraphWorkflow | None = None
+    ) -> bool:
+        """Is the run still at ``gate``, or at an effect that requires it? ``wf`` is the run's own
+        workflow (default: the runtime's)."""
+        wf = wf or self._wf
         if stage is None:
             return False
         if stage == gate:
             return True
-        if isinstance(self._wf, GraphWorkflow):
-            at = self._wf.stages.get(stage)
+        if isinstance(wf, GraphWorkflow):
+            at = wf.stages.get(stage)
             return at is not None and gate in (getattr(at, "requires_gates", None) or ())
         return any(
-            n.name == stage and n.kind == "effect" and gate in n.requires_gates
-            for n in self._wf.nodes
+            n.name == stage and n.kind == "effect" and gate in n.requires_gates for n in wf.nodes
         )
 
     async def can_stop(self, run_id: RunId) -> bool:
