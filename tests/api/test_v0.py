@@ -1228,9 +1228,12 @@ def test_delivery_failed_is_reported_on_every_attempt_not_only_the_first() -> No
                 raise OSError("disk went away")
 
             api.rt.driver.submit = down  # type: ignore[method-assign,assignment]
-            for _ in range(2):
+            # the first request's decision commits; the second finds the gate closed, so it did
+            # not record anything, however it ends (D3-11)
+            for recorded in (True, False):
                 r = await api.decide(run_id, "review_gate")
                 assert (r.status_code, code_of(r)) == (503, "delivery_failed")
+                assert r.json()["error"]["decision_recorded"] is recorded
 
     run(body())
 

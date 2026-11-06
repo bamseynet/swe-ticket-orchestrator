@@ -91,9 +91,11 @@ class DeliveryFailedError(TransientError):
     """The decision is recorded (the gate is closed) but could not be queued for the run. A
     retry of the decision hits the closed gate and queues it then; so does a restart."""
 
-    def __init__(self, cause: BaseException) -> None:
+    def __init__(self, cause: BaseException, *, decision_recorded: bool = True) -> None:
         # The client gets a fixed message; what went wrong is logged where it happened.
-        self.decision_recorded = True
+        # ``decision_recorded`` is true only if THIS request's decision committed. A request that
+        # hit a gate someone else closed recorded nothing; it only tried to finish their delivery.
+        self.decision_recorded = decision_recorded
         self.__cause__ = cause
         super().__init__("the decision was recorded but could not be delivered to the run yet")
 
@@ -779,7 +781,7 @@ class Runtime:
                         raise  # stored data the domain refuses: a server fault, not a retry
                     except Exception as d:  # the delivery is what failed, not the decision
                         log.error("redelivery for run %s failed: %r", run_id, d)
-                        raise DeliveryFailedError(d) from d
+                        raise DeliveryFailedError(d, decision_recorded=False) from d
                 # Whatever is queued for this run must not wait for a drive that died.
                 await self._ensure_driven(run_id)
                 raise
