@@ -185,7 +185,7 @@ async def decide(
             "delivery_failed",
             str(e),
             headers={"Retry-After": "1"},
-            extra={"decision_recorded": True},
+            extra={"decision_recorded": e.decision_recorded},
         ) from e
     except StoreConflictError as e:
         raise _busy(e) from e
