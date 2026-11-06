@@ -64,7 +64,28 @@ class GitReader:
         )
 
     def diff(self, merge_base: str, head: str) -> bytes:
-        """The canonical diff ``patch_id`` is taken over (see ``gates/subject.py``)."""
-        return self._run(
-            "diff", "--binary", "--no-color", "--no-ext-diff", "--full-index", merge_base, head
+        """The canonical diff ``patch_id`` is taken over (see ``gates/subject.py``).
+
+        The repository's own config must not change the bytes (and so the patch id): the
+        settings that do are pinned on the command line, which outranks any config file, and
+        the options are explicit. Renames are off (both sides appear as a delete and an add),
+        context is three lines, the prefixes are ``a/`` and ``b/``."""
+        pinned = (
+            "diff.renames=false",
+            "diff.context=3",
+            "diff.noprefix=false",
+            "diff.mnemonicPrefix=false",
+            "diff.srcPrefix=a/",
+            "diff.dstPrefix=b/",
+            "diff.algorithm=myers",
+            "diff.indentHeuristic=false",
+            "diff.interHunkContext=0",
+            "diff.external=",
+            "core.quotePath=true",
+            "core.autocrlf=false",
         )
+        flags = [f for key in pinned for f in ("-c", key)]
+        return self._run(
+            *flags, "diff", "--binary", "--no-color", "--no-ext-diff", "--full-index",
+            "--no-renames", "-U3", "--src-prefix=a/", "--dst-prefix=b/", merge_base, head,
+        )  # fmt: skip

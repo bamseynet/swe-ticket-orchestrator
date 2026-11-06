@@ -2193,7 +2193,9 @@ def _carried(world: World) -> tuple[Gate, Gate]:
     first, _ = world.approve()
     second = world.gate(round=2)
     cite = Citation(first.id, 1, first.id, 1, SUBJECT.patch_id, ("iss|alice",))
-    world.svc.close_carried(SCOPE, gate=second, citation=cite)
+    world.svc.close_carried(
+        SCOPE, gate=second, citation=cite, chain=world.svc.audit_version(SCOPE, world.run.id)
+    )
     return first, second
 
 
@@ -2226,6 +2228,21 @@ def test_a_citation_that_names_another_gate_does_not_count(world: World) -> None
     item = world.store.get(SCOPE, key)
     assert item is not None
     world.store.put(SCOPE, key, {**item.data, "closed_gate_id": str(GateId.new())})
+    e = world.plan()
+    world.go(e)
+    assert world.scm.spy.calls == ()
+
+
+@pytest.mark.parametrize("field", ["decision_id", "origin_gate_id", "patch_id"])
+def test_a_citation_record_that_does_not_match_its_decision_does_not_count(
+    world: World, field: str
+) -> None:
+    _carried(world)
+    key = Key(f"RUN#{world.run.id}", "CITE#review#2")
+    item = world.store.get(SCOPE, key)
+    assert item is not None
+    bad = "" if field == "origin_gate_id" else "other"
+    world.store.put(SCOPE, key, {**item.data, field: bad})
     e = world.plan()
     world.go(e)
     assert world.scm.spy.calls == ()

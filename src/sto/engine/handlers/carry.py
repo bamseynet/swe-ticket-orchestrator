@@ -298,7 +298,13 @@ class CarryEngine:
             if found.data["merge_base"] != base:
                 raise CarryRefused("the round's merge base changed since it was recorded")
             return
-        data = {"merge_base": base, "carried_from": None}
+        # Where in the head log this round's head sits: the origin of a later carry-over slices the
+        # log from this position, not from wherever its sha appears last (a force-push back to the
+        # same commit would otherwise hide what came between). None when the log does not end at
+        # the head: such a round cannot be an origin.
+        heads = _items(self._store, scope, run_pk(gate.run_id), "HEAD#")
+        at = len(heads) if heads and heads[-1].data["sha"] == gate.subject.head_sha else None
+        data: dict[str, Any] = {"merge_base": base, "carried_from": None, "head_seq": at}
         try:
             self._store.transact(scope, [Put(key, data, Absent())])
         except (ConditionFailedError, TransactionConflictError) as err:
@@ -382,12 +388,13 @@ class CarryEngine:
     ) -> tuple[PatchHistory, int]:
         """The patch id of every head from the origin decision's head to the current one."""
         log_items = _items(self._store, scope, run_pk(run_id), "HEAD#")
-        shas = [i.data["sha"] for i in log_items]
-        origin_head = origin.gate.subject.head_sha
-        if origin_head not in shas:
-            raise CarryRefused("the head log never saw the origin decision's head")
-        start = len(shas) - 1 - shas[::-1].index(origin_head)
-        span = log_items[start:]
+        rec = self._store.get(scope, _round_key(origin.gate))
+        seq = None if rec is None else rec.data.get("head_seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or not 1 <= seq <= len(log_items):
+            raise CarryRefused("the origin decision's position in the head log was not recorded")
+        if log_items[seq - 1].data["sha"] != origin.gate.subject.head_sha:
+            raise CarryRefused("the head log does not hold the origin decision's head there")
+        span = log_items[seq - 1 :]  # every head since the origin decision, in order
         if span[-1].data["sha"] != subject.head_sha:
             raise CarryRefused("the head log does not end at the subject's head")
         ids = [i.data["patch_id"] for i in span]
@@ -469,7 +476,7 @@ class CarryEngine:
             Check(_head_key(gate.run_id, read.heads + 1), Absent()),  # no push since the read
             Put(
                 read.round_item.key,
-                {"merge_base": base, "carried_from": str(previous.id)},
+                {**read.round_item.data, "merge_base": base, "carried_from": str(previous.id)},
                 VersionIs(read.round_item.version),
             ),
         ]

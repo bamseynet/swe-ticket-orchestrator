@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
@@ -128,6 +129,13 @@ _CLOSES_AS = {
     DecisionKind.REJECT: GateStatus.REJECTED,
     DecisionKind.RETEST: GateStatus.RETEST,
 }
+
+
+class _Unread:
+    """The marker for a ``chain`` nobody supplied: refused, never read as 'no condition'."""
+
+
+_UNREAD = _Unread()
 
 
 class GateError(PermanentError):
@@ -508,20 +516,23 @@ class GateService:
         *,
         gate: Gate,
         citation: Citation,
-        chain: int | None = None,
+        chain: int | None | _Unread = _UNREAD,
         extra: Sequence[Op] = (),
     ) -> Decided:
         """Close ``gate`` APPROVED by carry-over, as the engine's service identity.
 
         ``gate`` is the open gate as the engine read it. The close is one conditional transaction:
         the gate is still open, unchanged and on the same subject; ``chain`` (the audit chain head
-        version the engine read before deciding, ``None`` for an absent head) is still current, so
-        nothing was opened or decided on the run since; the pre-decision guards (a closed ticket)
+        version the engine read before deciding, ``None`` for an absent head; required and always
+        compared) is still current, so nothing was opened or decided on the run since; the
+        citation is proved against the stored rounds; the pre-decision guards (a closed ticket)
         run as for a person; and ``extra`` ops the engine read (the head log, the round record)
         join it. The citation is written as ``CITE#name#round`` and into the audit entry. Any
         failed condition is :class:`CarryStaleError` with nothing written: no retry, because the
         engine must decide again on fresh facts."""
         require_scope(scope)
+        if isinstance(chain, _Unread):
+            raise CarryStaleError("a carried close needs the chain version the engine read")
         if citation.gate_id.__class__ is not GateId or citation.patch_id != gate.subject.patch_id:
             raise CarryStaleError("the citation does not name this gate's patch")
         key = gate_key(gate.run_id, gate.name, gate.round)
@@ -533,8 +544,10 @@ class GateService:
             raise CarryStaleError(f"gate {gate.name!r} round {gate.round} is not open as read")
         if any(g.round > gate.round for _, g in self._rounds(scope, gate.run_id, gate.name)):
             raise CarryStaleError(f"gate {gate.name!r} round {gate.round} has a newer round")
-        if chain is not None and self._head_version(scope, gate.run_id) != chain:
+        if self._head_version(scope, gate.run_id) != chain:
             raise CarryStaleError("something was written to the run since the carry-over read")
+        cited_checks = self._cited_checks(scope, current, citation)
+        wire = _citation_wire(citation)
         decision = Decision(
             DecisionId.new(),
             current.id,
@@ -543,9 +556,10 @@ class GateService:
             Surface.UI,  # no engine surface exists; the actor and CITE# identify the origin
             DecisionKind.APPROVE,
             current.subject.digest(),
-            f"carried from round {citation.origin_round} (patch {citation.patch_id})",
+            # the comment carries the citation, so a redelivered event can be rebuilt from the
+            # decision alone; guard 2 still needs the CITE# record, so it proves nothing by itself
+            CARRIED_PREFIX + json.dumps(wire, sort_keys=True),
         )
-        wire = _citation_wire(citation)
         closed = current.advance(GateStatus.APPROVED, closed_by=CARRY_ACTOR)
         own = self._close_ops(
             scope, item, closed, decision, [], [decision.id], audit_extra={"citation": wire}
@@ -559,13 +573,46 @@ class GateService:
         # The audit ops above are conditioned on the chain head they read. Heads only move
         # forward, so equal to the engine's read now means equal when they read it: nothing was
         # opened or decided on the run since.
-        if chain is not None and self._head_version(scope, gate.run_id) != chain:
+        if self._head_version(scope, gate.run_id) != chain:
             raise CarryStaleError("something was written to the run since the carry-over read")
         try:
-            self._store.transact(scope, _within_cap([*own, cite, *guard_ops, *extra]))
+            self._store.transact(
+                scope, _within_cap([*own, cite, *guard_ops, *cited_checks, *extra])
+            )
         except (ConditionFailedError, TransactionConflictError) as err:
             raise CarryStaleError("the gate or the run changed during the carried close") from err
         return Decided(closed, decision)
+
+    def _cited_checks(self, scope: Scope, gate: Gate, citation: Citation) -> list[Op]:
+        """Prove the citation inside the close: it names round ``gate.round - 1`` of this very
+        gate (same run, name and type), APPROVED on this patch, and an origin round at or before
+        it that is APPROVED on this patch too. Both items are pinned by version in the same
+        transaction. Anything else is :class:`CarryStaleError`: a made-up citation closes
+        nothing."""
+
+        def fetch(round_: int, gate_id: GateId) -> tuple[Item, Gate]:
+            found = self._store.get(scope, gate_key(gate.run_id, gate.name, round_))
+            if found is None:
+                raise CarryStaleError(f"the citation names round {round_}, which does not exist")
+            earlier = from_wire(Gate, found.data)
+            if (
+                earlier.id != gate_id
+                or earlier.type is not gate.type
+                or earlier.status is not GateStatus.APPROVED
+                or earlier.subject.patch_id != gate.subject.patch_id
+            ):
+                raise CarryStaleError(f"round {round_} is not an approved round on this patch")
+            return found, earlier
+
+        if citation.round != gate.round - 1 or not 1 <= citation.origin_round <= citation.round:
+            raise CarryStaleError("the citation does not name the previous round of this gate")
+        previous = fetch(citation.round, citation.gate_id)
+        origin = previous if citation.origin_round == citation.round else None
+        origin = origin or fetch(citation.origin_round, citation.origin_gate_id)
+        if origin[1].id != citation.origin_gate_id:
+            raise CarryStaleError("the citation's origin is not that round")
+        items = {previous[0].key: previous[0], origin[0].key: origin[0]}
+        return [Check(k, VersionIs(i.version)) for k, i in items.items()]
 
     # --- internals --------------------------------------------------------------------------
 
@@ -796,6 +843,28 @@ class _Tally:
 
 def _decision_key(gate: Gate, decision_id: DecisionId) -> Key:
     return Key(run_pk(gate.run_id), f"DEC#{gate.name}#{gate.round}#{decision_id}")
+
+
+CARRIED_PREFIX = "carried-over:"
+
+
+def citation_from_comment(comment: str) -> Citation | None:
+    """The citation a carried close wrote into its decision, or None when ``comment`` has none or
+    it is malformed (the reducer then refuses the event: fail closed)."""
+    if not comment.startswith(CARRIED_PREFIX):
+        return None
+    try:
+        c = json.loads(comment[len(CARRIED_PREFIX) :])
+        return Citation(
+            GateId.parse(c["gate_id"]),
+            int(c["round"]),
+            GateId.parse(c["origin_gate_id"]),
+            int(c["origin_round"]),
+            str(c["patch_id"]),
+            tuple(c["approvers"]),
+        )
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def cite_key(gate: Gate) -> Key:

@@ -21,6 +21,7 @@ from test_reducer_v1 import wf as build_workflow
 from sto.api.runtime import Runtime
 from sto.config.schema import Floors
 from sto.domain import (
+    Decision,
     DecisionId,
     DecisionKind,
     Gate,
@@ -45,7 +46,7 @@ from sto.engine.handlers.carry import (
     parse_name_only_z,
     record_head,
 )
-from sto.engine.handlers.core import GateClosed, StepSucceeded
+from sto.engine.handlers.core import GateClosed, StepSucceeded, check_carried
 from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import MalformedEventError
 from sto.engine.reducer import next as reduce
@@ -172,6 +173,10 @@ def _stored_gate(store: MemoryStore, name: str, round_: int) -> Gate:
     return from_wire(Gate, item.data)
 
 
+def _chain(service: GateService) -> int | None:
+    return service.audit_version(SCOPE, RID)
+
+
 def _open(service: GateService, round_: int) -> Gate:
     return service.open_gate(SCOPE, OpenGate(RID, "review", GateType.REVIEW, round_, SUBJ))
 
@@ -194,7 +199,7 @@ def test_a_carried_close_approves_under_the_service_identity_and_cites_in_audit(
     origin = _approved_round_one(service)
     g2 = _open(service, 2)
     cite = _citation(origin, origin)
-    done = service.close_carried(SCOPE, gate=g2, citation=cite)
+    done = service.close_carried(SCOPE, gate=g2, citation=cite, chain=_chain(service))
     assert done.gate.status is GateStatus.APPROVED
     assert done.gate.closed_by == CARRY_ACTOR
     assert done.decision.actor == CARRY_ACTOR
@@ -228,10 +233,14 @@ def test_a_closed_gate_or_another_subject_cannot_be_carried_closed() -> None:
     edited = dataclasses.replace(g2.subject, ticket_revision="r2")
     other = dataclasses.replace(g2, subject=edited)
     with pytest.raises(CarryStaleError):
-        service.close_carried(SCOPE, gate=other, citation=_citation(origin, origin))
-    service.close_carried(SCOPE, gate=g2, citation=_citation(origin, origin))
+        service.close_carried(
+            SCOPE, gate=other, citation=_citation(origin, origin), chain=_chain(service)
+        )
+    service.close_carried(SCOPE, gate=g2, citation=_citation(origin, origin), chain=_chain(service))
     with pytest.raises(CarryStaleError):
-        service.close_carried(SCOPE, gate=g2, citation=_citation(origin, origin))
+        service.close_carried(
+            SCOPE, gate=g2, citation=_citation(origin, origin), chain=_chain(service)
+        )
 
 
 def test_the_service_identity_cannot_decide_through_the_ordinary_path() -> None:
@@ -434,10 +443,10 @@ def test_every_round_persists_merge_base_and_carried_from() -> None:
     r1 = rig.store.get(SCOPE, Key(run_pk(RID), "CARRY#review#1"))
     r2 = rig.store.get(SCOPE, Key(run_pk(RID), "CARRY#review#2"))
     assert r1 is not None
-    assert r1.data == {"merge_base": "m1", "carried_from": None}
+    assert r1.data == {"merge_base": "m1", "carried_from": None, "head_seq": 1}
     g1 = _stored_gate(rig.store, "review", 1)
     assert r2 is not None
-    assert r2.data == {"merge_base": "m2", "carried_from": str(g1.id)}
+    assert r2.data == {"merge_base": "m2", "carried_from": str(g1.id), "head_seq": 2}
 
 
 def test_a_replay_of_the_open_returns_the_same_close_and_writes_nothing_more() -> None:
@@ -482,7 +491,7 @@ def test_the_service_close_cannot_be_forged_with_a_citation_for_another_patch() 
     g2 = rig.open(2, P2)
     cite = dataclasses.replace(_citation(g2, g2), patch_id="patch1")
     with pytest.raises(CarryStaleError):
-        rig.service.close_carried(SCOPE, gate=g2, citation=cite)
+        rig.service.close_carried(SCOPE, gate=g2, citation=cite, chain=_chain(rig.service))
 
 
 # --- the reducer refuses a service approval without a citation -----------------------------------
@@ -598,13 +607,19 @@ class E2E:
             merges=lambda *a, **k: None,  # type: ignore[arg-type]
             live=lambda cmd: cmd.subject,
             workflow=_flow(carry),
-            carry=lambda carry_of: CarryEngine(
+            carry=lambda carry_of: self._engine(
+                CarryEngine(
                 self.store, gates, FakeGit(), carry_of=carry_of,
                 allowed=lambda team: allowed, recheck=recheck,
                 roles_of=lambda scope, gate, actor: {"reviewer"},
+                )
             ),
         )  # fmt: skip
         self.run: Run | None = None
+
+    def _engine(self, engine: CarryEngine) -> CarryEngine:
+        self.engine = engine
+        return engine
 
     async def start(self) -> Run:
         self.run = await self.runtime.create_run(None)
@@ -792,3 +807,181 @@ def test_the_recheck_refuses_a_blocked_gate_even_if_the_person_is_allowed() -> N
 
     unattributed = RunFacts(requester="someone|else", commits=(Commit("deadbeef", False),))
     assert _recheck(facts=unattributed)(ALICE, "reviewer", _gate_for_recheck()) is False
+
+
+# --- review pass 1 (PR #410) ---------------------------------------------------------------------
+
+
+def test_the_same_sha_returning_after_p2_asks_again() -> None:
+    rig = Rig()
+    _first_round(rig)
+    rig.push("h2", "patch2")  # P2, never at the gate
+    rig.push("h1", "patch1")  # force-pushed back to the very first commit
+    assert rig.reenter(2, P1) is None
+    assert rig.status(2) is GateStatus.OPEN
+
+
+def test_the_same_sha_returning_after_p2_asks_again_end_to_end() -> None:
+    async def go() -> None:
+        e = E2E(
+            Script(
+                [_head("h1", "patch1"), _head("h2", "patch2"), _head("h1", "patch1")],
+                panel=["clean", "findings"],
+            )
+        )
+        await _to_second_review(e)
+        assert e.gate_status("review_gate", 2) is GateStatus.OPEN
+
+    asyncio.run(asyncio.wait_for(go(), 30))
+
+
+def test_an_origin_whose_head_was_not_the_log_tip_when_it_opened_cannot_be_carried_from() -> None:
+    rig = Rig()
+    rig.push("h1", "patch1")
+    rig.push("h9", "patch9")  # the log moved on before round 1 opened on h1
+    rig.open(1, P1)
+    rig.engine.on_open(SCOPE, _stored_gate(rig.store, "review", 1))
+    rig.approve(1, P1)
+    rig.push("h1", "patch1")
+    assert rig.reenter(2, P1) is None
+
+
+def test_a_made_up_citation_closes_nothing() -> None:
+    rig = Rig()
+    g1 = rig.open(1, P1)
+    fake = Citation(GateId.new(), 0, GateId.new(), 0, "patch1", ())
+    with pytest.raises(CarryStaleError):
+        rig.service.close_carried(SCOPE, gate=g1, citation=fake, chain=_chain(rig.service))
+    assert rig.status(1) is GateStatus.OPEN
+
+
+def test_a_citation_naming_a_real_but_wrong_round_closes_nothing() -> None:
+    rig = Rig()
+    _first_round(rig)
+    g1 = _stored_gate(rig.store, "review", 1)
+    g2 = rig.open(2, _subj("h3", "patch1"))
+    wrong_round = Citation(g1.id, 2, g1.id, 1, "patch1", ("iss|alice",))
+    wrong_gate = Citation(GateId.new(), 1, g1.id, 1, "patch1", ("iss|alice",))
+    wrong_origin = Citation(g1.id, 1, GateId.new(), 1, "patch1", ("iss|alice",))
+    for bad in (wrong_round, wrong_gate, wrong_origin):
+        with pytest.raises(CarryStaleError):
+            rig.service.close_carried(SCOPE, gate=g2, citation=bad, chain=_chain(rig.service))
+    assert rig.status(2) is GateStatus.OPEN
+
+
+def test_an_absent_chain_head_read_is_still_a_condition() -> None:
+    rig = Rig()
+    _first_round(rig)
+    g1 = _stored_gate(rig.store, "review", 1)
+    g2 = rig.open(2, _subj("h3", "patch1"))
+    cite = Citation(g1.id, 1, g1.id, 1, "patch1", ("iss|alice",))
+    with pytest.raises(CarryStaleError):
+        rig.service.close_carried(SCOPE, gate=g2, citation=cite, chain=None)
+
+
+def test_a_redelivered_carried_close_keeps_its_citation() -> None:
+    from sto.api.runtime import _closed_event
+
+    rig = Rig()
+    _first_round(rig)
+    rig.push("h3", "patch1")
+    first = rig.reenter(2, P1B)
+    assert first is not None
+    gate = _stored_gate(rig.store, "review", 2)
+    page = rig.store.query(SCOPE, f"RUN#{RID}", sk_prefix="DEC#review#2#")
+    again = _closed_event(gate, from_wire(Decision, page.items[0].data))
+    assert again.citation == first.citation
+    check_carried(again, gate.subject)
+
+
+def test_a_carried_decision_with_a_mangled_comment_redelivers_without_a_citation() -> None:
+    from sto.api.runtime import _closed_event
+
+    rig = Rig()
+    _first_round(rig)
+    rig.push("h3", "patch1")
+    assert rig.reenter(2, P1B) is not None
+    gate = _stored_gate(rig.store, "review", 2)
+    page = rig.store.query(SCOPE, f"RUN#{RID}", sk_prefix="DEC#review#2#")
+    decision = dataclasses.replace(
+        from_wire(Decision, page.items[0].data), comment="carried-over:{"
+    )
+    with pytest.raises(MalformedEventError):
+        check_carried(_closed_event(gate, decision), gate.subject)
+
+
+def test_a_round_whose_merge_base_changed_on_replay_refuses() -> None:
+    rig = Rig()
+    _first_round(rig)
+    rig.push("h3", "patch1")
+    gate = rig.open(2, P1B)
+    rig.engine._persist_round(SCOPE, gate, "m1")  # noqa: SLF001 - the round was recorded on m1
+    rig.git.bases["h3"] = "m2"  # the replay now reads another merge base
+    assert rig.engine.on_open(SCOPE, gate) is None
+    assert rig.status(2) is GateStatus.OPEN
+
+
+def test_note_head_refusing_does_not_escape_the_step() -> None:
+    async def go() -> None:
+        e = E2E(Script([_head("h1", "patch1")]))
+
+        def boom(*a: Any, **k: Any) -> None:
+            raise CarryRefused("log busy")
+
+        e.engine.note_head = boom  # type: ignore[method-assign]
+        await e.start()
+        assert e.state().run.stage == "review_gate"  # the step still completed
+
+    asyncio.run(asyncio.wait_for(go(), 30))
+
+
+def test_carry_over_is_read_from_the_pinned_workflow_not_the_default() -> None:
+    from sto.engine.reducer import RunState, pin_version
+
+    e = E2E(Script([]), carry="none")  # the runtime's default workflow says none
+    pin = pin_version("kanban-flow", 1, "sha256:" + "a" * 64)
+    e.runtime._load_pin = lambda version: _flow("patch_id")  # type: ignore[method-assign]
+    pinned = RunState(Run(id=RID, team="t1", workflow_version=pin))
+    unpinned = RunState(Run(id=RID, team="t1", workflow_version="kanban-flow"))
+    e.runtime.driver.state = lambda run_id: pinned  # type: ignore[method-assign]
+    assert e.runtime.carry_over_of(RID, "review_gate") == "patch_id"
+    e.runtime.driver.state = lambda run_id: unpinned  # type: ignore[method-assign]
+    assert e.runtime.carry_over_of(RID, "review_gate") == "none"
+
+
+def test_a_pin_that_will_not_load_means_no_carry_over() -> None:
+    from sto.engine.reducer import PinUnavailableError, RunState, pin_version
+
+    e = E2E(Script([]))
+    pin = pin_version("kanban-flow", 1, "sha256:" + "a" * 64)
+
+    def gone(version: str) -> Any:
+        raise PinUnavailableError("gone")
+
+    e.runtime._load_pin = gone  # type: ignore[method-assign]
+    e.runtime.driver.state = lambda run_id: RunState(  # type: ignore[method-assign]
+        Run(id=RID, team="t1", workflow_version=pin)
+    )
+    assert e.runtime.carry_over_of(RID, "review_gate") is None
+
+
+def test_the_diff_does_not_depend_on_the_repositorys_own_config(repo: Path) -> None:
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "base.txt").write_text("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n")
+    _git(repo, "commit", "-qam", "more")
+    _git(repo, "mv", "base.txt", "moved.txt")
+    head = _commit(repo, "extra.txt", "x\n")
+    reader = GitReader(repo, "main")
+    base = reader.merge_base(head)
+    plain = reader.diff(base, head)
+    for key, value in (
+        ("diff.renames", "true"),
+        ("diff.context", "9"),
+        ("diff.noprefix", "true"),
+        ("diff.mnemonicPrefix", "true"),
+        ("diff.algorithm", "patience"),
+    ):
+        _git(repo, "config", key, value)
+    assert reader.diff(base, head) == plain
+    assert b"rename from" not in plain
+    assert b"\n--- a/" in plain or b"--- /dev/null" in plain

@@ -73,7 +73,7 @@ from sto.engine.drivers.local import (
 from sto.engine.drivers.ports import CommandExecutor, Done, StillRunning
 from sto.engine.drivers.ports import Outcome as CommandOutcome
 from sto.engine.handlers.cancel import Alarm, RevertWriter, StopExecutor
-from sto.engine.handlers.carry import CarryEngine
+from sto.engine.handlers.carry import CarryEngine, CarryRefused
 from sto.engine.handlers.core import CancelCompleted, CancelRequested, GateClosed, StepSucceeded
 from sto.engine.handlers.stages import StageReported
 from sto.engine.reducer import (
@@ -85,7 +85,7 @@ from sto.engine.reducer import (
     parse_pin,
     pin_version,
 )
-from sto.gates.service import Decided, GateService
+from sto.gates.service import CARRY_ACTOR, Decided, GateService, citation_from_comment
 from sto.store.ports import (
     Absent,
     ConditionFailedError,
@@ -297,9 +297,14 @@ class _Commands:
             if self._carry is not None and isinstance(reported, Done):
                 for event in reported.events:  # every head the run has had, gate or no gate
                     subject = getattr(event, "subject", None)
-                    await asyncio.to_thread(
-                        self._carry.note_head, self._scope, command.run_id, subject
-                    )
+                    try:
+                        await asyncio.to_thread(
+                            self._carry.note_head, self._scope, command.run_id, subject
+                        )
+                    except CarryRefused as why:
+                        # an unrecorded head leaves the log not ending at the subject's head, so
+                        # carry-over refuses and a person decides
+                        log.warning("head not recorded for run %s: %s", command.run_id, why)
             return reported
         raise TypeError(f"no executor for {type(command).__name__}")
 
@@ -1070,6 +1075,8 @@ def _closed_event(gate: Gate, decision: DecisionRecord) -> GateClosed:
         decision.actor,
         decision.id,
         gate.subject if approving else None,
+        # a carried close redelivers with the citation it wrote (else the reducer refuses it)
+        citation_from_comment(decision.comment) if decision.actor == CARRY_ACTOR else None,
     )
 
 
