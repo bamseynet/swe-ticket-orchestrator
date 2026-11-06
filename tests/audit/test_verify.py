@@ -39,7 +39,7 @@ World = tuple[MemoryStore, SignedCheckpoint, int]
 @pytest.fixture
 def world() -> World:
     rec = Recorder()
-    service = GateService(rec, audit=ChainedAuditWriter())
+    service = GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter())
     template_run(service, RUN)
     template_run(service, RUN2)
     cp = create_checkpoint(rec.inner, TEAM, signer(), RUNS, at=1_000, previous=[])
@@ -57,7 +57,7 @@ def test_an_untouched_store_verifies(world: World) -> None:
 
 def test_entries_added_after_a_checkpoint_still_verify(world: World) -> None:
     store, cp, n = world
-    GateService(store, audit=ChainedAuditWriter()).open_gate(
+    GateService.unpoliced_for_tests(store, audit=ChainedAuditWriter()).open_gate(
         TEAM, OpenGate(RUN, "extra", GateType.REVIEW, 1, subject("z"))
     )
     assert check(store, cp)[str(RUN)] == n + 1
@@ -192,7 +192,7 @@ def test_a_checkpoint_edited_to_fit_a_forgery_is_refused(world: World) -> None:
 def foreign_checkpoint() -> SignedCheckpoint:
     rec = Recorder()
     other = TeamScope("t2")
-    GateService(rec, audit=ChainedAuditWriter()).open_gate(
+    GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter()).open_gate(
         other, OpenGate(RUN, "review", GateType.REVIEW, 1, subject())
     )
     cp = create_checkpoint(rec.inner, other, signer(), [RUN], at=1, previous=[])
@@ -238,7 +238,7 @@ def test_an_empty_store_is_not_a_verified_run() -> None:
 
 def test_a_run_begun_after_the_newest_checkpoint_is_reported_and_cannot_vanish_unseen() -> None:
     rec = Recorder()
-    service = GateService(rec, audit=ChainedAuditWriter())
+    service = GateService.unpoliced_for_tests(rec, audit=ChainedAuditWriter())
     template_run(service, RUN)
     cp = create_checkpoint(rec.inner, TEAM, signer(), [RUN], at=1, previous=[])
     template_run(service, RUN2)
@@ -339,7 +339,7 @@ class Racy(MemoryStore):
 
 def racy_world() -> tuple[Racy, Callable[[], None]]:
     store = Racy()
-    service = GateService(store, audit=ChainedAuditWriter())
+    service = GateService.unpoliced_for_tests(store, audit=ChainedAuditWriter())
     template_run(service, RUN)
 
     def commit() -> None:
@@ -366,7 +366,7 @@ def test_a_commit_during_create_checkpoint_does_not_abort_it() -> None:
 
 def test_the_first_commit_landing_between_head_and_entries_is_not_tamper() -> None:
     store = Racy()
-    service = GateService(store, audit=ChainedAuditWriter())
+    service = GateService.unpoliced_for_tests(store, audit=ChainedAuditWriter())
 
     def first() -> None:
         service.open_gate(TEAM, OpenGate(RUN, "first", GateType.REVIEW, 1, subject()))

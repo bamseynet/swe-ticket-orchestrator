@@ -13,7 +13,10 @@
 
 Quorum and veto (D3-06) are the close path of ``decide``. A :class:`DecisionPolicy` supplies the
 gate's quorum (a list of ``(role, count)``), each person's roles and any separation-of-duties
-refusals; without a policy a gate is the v0 single-approver gate (one approval from anyone).
+refusals. A service without a policy refuses every decision (:class:`PolicyMissingError`), so a
+missed builder fails closed instead of dropping separation of duties (D3-25). Production code gets
+its service from ``gates.policy.build_gate_service``; the v0 single-approver gate (one approval
+from anyone) exists only as ``GateService.unpoliced_for_tests``.
 
 * The quorum is read when the gate opens and frozen beside it (``QUO#name#round``). Duplicate
   roles, a count below 1 or a blank role are refused then (:class:`QuorumConfigError`), so one
@@ -49,7 +52,7 @@ import hashlib
 import time
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from sto.domain import (
     Decision,
@@ -176,6 +179,12 @@ class QuorumConfigError(GateError):
     code = "quorum_invalid"
 
 
+class PolicyMissingError(GateError):
+    """The service has no :class:`DecisionPolicy`, so it cannot tell who may decide. Refused."""
+
+    code = "policy_missing"
+
+
 class GateContentionError(TransientError):
     """The gate kept changing under this call (or the store kept conflicting) until the retries
     ran out. Nothing was written. Retry the call."""
@@ -248,11 +257,20 @@ class GateService:
         retry: Backoff | None = None,
     ) -> None:
         self._policy = policy
+        self._unpoliced = False
         self._retry = retry if retry is not None else Backoff()
         self._store = store
         self._reader = ReadOnly(store)
         self._hooks = hooks if hooks is not None else GateHooks()
         self._audit: AuditWriter = audit if audit is not None else ChainedAuditWriter()
+
+    @classmethod
+    def unpoliced_for_tests(cls, store: Store, **kwargs: Any) -> GateService:
+        """The v0 single-approver gate: no policy, so one approval from anyone closes a gate.
+        For tests only; production code must use ``gates.policy.build_gate_service``."""
+        service = cls(store, **kwargs)
+        service._unpoliced = True
+        return service
 
     # --- open -------------------------------------------------------------------------------
 
@@ -438,7 +456,11 @@ class GateService:
 
     def _refuse_if_barred(self, scope: Scope, gate: Gate, actor: str, kind: DecisionKind) -> None:
         if self._policy is None:
-            return
+            if self._unpoliced:
+                return
+            raise PolicyMissingError(
+                f"gate {gate.name!r} round {gate.round} cannot be decided: no decision policy"
+            )
         reasons = self._policy.refusals(scope, gate, actor, negative=kind.is_negative)
         if reasons:
             raise DecisionNotAllowedError(

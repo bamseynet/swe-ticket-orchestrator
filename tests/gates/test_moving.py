@@ -402,7 +402,7 @@ def test_an_outside_merge_is_flagged_in_the_audit_chain() -> None:
 
 def test_closed_gates_are_left_alone() -> None:
     store = MemoryStore()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     subject = head_subject()
     svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, subject))
     svc.decide(
@@ -540,7 +540,7 @@ def test_a_closed_ticket_refuses_a_new_gate_atomically() -> None:
     store = MemoryStore()
     hooks = GateHooks()
     hooks.on_open(refuse_closed_ticket)
-    svc = GateService(store, hooks=hooks)
+    svc = GateService.unpoliced_for_tests(store, hooks=hooks)
     cmd = OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject())
     run_reaction(store, react(facts(has_open_gate=False), TicketClosed(run_version=7)))
     with pytest.raises(TicketClosedError):
@@ -552,7 +552,7 @@ def test_an_open_ticket_still_opens_gates_and_the_hook_checks_the_state_version(
     store = MemoryStore()
     hooks = GateHooks()
     hooks.on_open(refuse_closed_ticket)
-    svc = GateService(store, hooks=hooks)
+    svc = GateService.unpoliced_for_tests(store, hooks=hooks)
     svc.open_gate(TEAM, OpenGate(RUN, "review", GateType.REVIEW, 1, head_subject()))
     assert stored_gate(store).is_open
     # the hook returns a Check on MOVE#state, so a close that commits between the read and the
@@ -566,7 +566,7 @@ def test_an_open_ticket_still_opens_gates_and_the_hook_checks_the_state_version(
 
 def test_a_reaction_that_does_not_fit_one_transaction_is_refused() -> None:
     store = MemoryStore()
-    svc = GateService(store)
+    svc = GateService.unpoliced_for_tests(store)
     for n in range(MAX_TRANSACTION_OPS):
         svc.open_gate(TEAM, OpenGate(RUN, f"g{n}", GateType.REVIEW, 1, head_subject()))
     with pytest.raises(MovingTooLargeError):

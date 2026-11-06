@@ -52,8 +52,9 @@ from sto.config.schema import Gate as GateConfig
 from sto.config.schema import Workflow as GraphWorkflow
 from sto.domain import Decision, DecisionKind, Gate, GateId, RunId, from_wire
 from sto.engine.reducer import Workflow as LinearWorkflow
-from sto.gates.hooks import run_pk
-from sto.gates.service import QuorumConfigError, QuorumRule
+from sto.gates.hooks import GateHooks, run_pk
+from sto.gates.retry import Backoff
+from sto.gates.service import DecisionPolicy, GateService, QuorumConfigError, QuorumRule
 from sto.gates.sod import Approval, Commit, Resolution, RunFacts, evaluate
 from sto.identity.mapping import ServiceIdentity, UserIdentity
 from sto.store.ports import Key, Scope, Store, TeamScope
@@ -302,3 +303,18 @@ class StoreRecords:
                 continue
             found.append(Approval(gate.name, gate.type, d.actor))
         return tuple(found)
+
+
+def build_gate_service(
+    store: Store,
+    policy: DecisionPolicy,
+    *,
+    hooks: GateHooks | None = None,
+    retry: Backoff | None = None,
+) -> GateService:
+    """The one place production code builds a :class:`GateService` (D3-25). The policy is required
+    and checked, so the service the app and the runtime share always applies separation of duties
+    and the gate's quorum. A test fails if ``src/`` builds a service any other way."""
+    if policy is None:
+        raise TypeError("a production gate service needs a DecisionPolicy")
+    return GateService(store, hooks=hooks, policy=policy, retry=retry)

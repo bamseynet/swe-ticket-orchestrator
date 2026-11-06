@@ -25,7 +25,7 @@ class AuditWriterConformance:
 
     def _service(self) -> tuple[GateService, Recorder]:
         rec = Recorder()
-        return GateService(rec, audit=self.make_writer()), rec
+        return GateService.unpoliced_for_tests(rec, audit=self.make_writer()), rec
 
     def _head(self, rec: Recorder) -> Any:
         head = rec.get(TEAM, CHAIN)

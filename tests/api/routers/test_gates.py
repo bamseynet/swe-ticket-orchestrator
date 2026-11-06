@@ -98,7 +98,9 @@ def test_a_second_vote_from_the_same_person_is_a_409_already_voted() -> None:
 def test_a_gate_whose_quorum_the_service_cannot_read_is_a_422_quorum_invalid() -> None:
     store = MemoryStore()
     _opened(GateService(store, policy=Policy()))
-    err = _refused(_runtime(GateService(store)), "approve", "")  # the same store, no policy
+    err = _refused(
+        _runtime(GateService.unpoliced_for_tests(store)), "approve", ""
+    )  # the same store, no policy
     assert (err.http_status, err.code) == (422, "quorum_invalid")
 
 
@@ -111,7 +113,7 @@ def test_a_hook_op_that_loses_a_race_is_a_retryable_503_not_a_500() -> None:
     def never_holds(ctx: object) -> Sequence[Op]:
         return [Check(Key("NOPE", "NOPE"), Exists())]
 
-    service = GateService(MemoryStore(), hooks=hooks)
+    service = GateService.unpoliced_for_tests(MemoryStore(), hooks=hooks)
     _opened(service)
     err = _refused(_runtime(service), "approve", "")
     assert (err.http_status, err.code) == (503, "gate_contention")

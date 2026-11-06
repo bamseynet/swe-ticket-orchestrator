@@ -389,7 +389,7 @@ def world() -> World:
     store = HookStore(MemoryStore())
     run = Run(RunId.new(), "acme", RunStatus.RUNNING, version=1, stage="merge")
     store.put(SCOPE, Key(f"RUN#{run.id}", "META"), to_wire(run))
-    return World(store, GateService(store), EffectExecutor(store, SCOPE), run)
+    return World(store, GateService.unpoliced_for_tests(store), EffectExecutor(store, SCOPE), run)
 
 
 # --- G1: the writer is not called before approval -----------------------------------------------
@@ -508,7 +508,7 @@ class DriverWorld:
 
     def __init__(self) -> None:
         self.store = MemoryStore()
-        self.svc = GateService(self.store)
+        self.svc = GateService.unpoliced_for_tests(self.store)
         self.scm, self.pr = make_scm()
         self.rid = RunId.new()
         self.opened: dict[str, OpenGate] = {}
@@ -1192,7 +1192,7 @@ def test_G10_concurrent_claim_and_stop_never_both_win() -> None:
         store = HookStore(MemoryStore())
         run = Run(RunId.new(), "acme", RunStatus.RUNNING, version=1, stage="merge")
         store.put(SCOPE, Key(f"RUN#{run.id}", "META"), to_wire(run))
-        w = World(store, GateService(store), EffectExecutor(store, SCOPE), run)
+        w = World(store, GateService.unpoliced_for_tests(store), EffectExecutor(store, SCOPE), run)
         effect = approved_and_planned(w)
         claimed, stopped = race([partial(w.go, effect), partial(w.fx.void_planned, w.run.id)])
         assert not isinstance(claimed, Exception), f"G10: the claim crashed: {claimed!r}"
@@ -1325,7 +1325,12 @@ def test_G1_the_next_round_check_holds_even_if_the_audit_writer_does_not_move_th
     store = HookStore(MemoryStore())
     run = Run(RunId.new(), "acme", RunStatus.RUNNING, version=1, stage="merge")
     store.put(SCOPE, Key(f"RUN#{run.id}", "META"), to_wire(run))
-    w = World(store, GateService(store, audit=NoAudit()), EffectExecutor(store, SCOPE), run)
+    w = World(
+        store,
+        GateService.unpoliced_for_tests(store, audit=NoAudit()),
+        EffectExecutor(store, SCOPE),
+        run,
+    )
     effect = approved_and_planned(w)
     store.before.append(lambda: w.open(round=2))
     result = calls_cleanly("G1: a claim that lost to a new round", lambda: w.go(effect))
@@ -1656,7 +1661,7 @@ def test_G3_concurrent_approve_and_reject_close_the_gate_once_whoever_wins() -> 
         store = HookStore(MemoryStore())
         run = Run(RunId.new(), "acme", RunStatus.RUNNING, version=1, stage="merge")
         store.put(SCOPE, Key(f"RUN#{run.id}", "META"), to_wire(run))
-        w = World(store, GateService(store), EffectExecutor(store, SCOPE), run)
+        w = World(store, GateService.unpoliced_for_tests(store), EffectExecutor(store, SCOPE), run)
         gate = w.open()
         results = race(
             [
